@@ -135,7 +135,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       title: 'Open Company',
       description: `loads a company into Tally Prime by restarting Tally with the company's data path. Use list-companies first to find available folders. This will briefly disconnect Tally (5-10 seconds) while it restarts.`,
       inputSchema: {
-        companyFolder: z.string().describe('the company folder number from list-companies (e.g. "010000")')
+        companyName: z.string().describe('the company folder number from list-companies (e.g. "010000")')
       },
       annotations: {
         readOnlyHint: false,
@@ -146,7 +146,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       const start = Date.now();
       try {
         const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
-        const companyPath = path.join(tallyDataPath, args.companyFolder);
+        const companyPath = path.join(tallyDataPath, args.companyName);
         const tallyExe = process.env.TALLY_EXE_PATH || 'C:\\Program Files\\TallyPrime\\tally.exe';
 
         if (!fs.existsSync(companyPath)) {
@@ -195,10 +195,10 @@ export async function registerMcpServer(): Promise<McpServer> {
           const resp = await handlePull('list-master', inputParams);
           const companies = resp.data?.map((c: any) => c.name).join(', ') || 'unknown';
           auditLog('open-company', args, 'success', Date.now() - start);
-          return { content: [{ type: 'text', text: `Tally restarted with company folder ${args.companyFolder}. Active companies: ${companies}` }] };
+          return { content: [{ type: 'text', text: `Tally restarted with company folder ${args.companyName}. Active companies: ${companies}` }] };
         } catch {
           auditLog('open-company', args, 'success', Date.now() - start);
-          return { content: [{ type: 'text', text: `Tally restarted with company folder ${args.companyFolder}. Verify with list-master collection company.` }] };
+          return { content: [{ type: 'text', text: `Tally restarted with company folder ${args.companyName}. Verify with list-master collection company.` }] };
         }
       } catch (err) {
         auditLog('open-company', args, 'error', Date.now() - start);
