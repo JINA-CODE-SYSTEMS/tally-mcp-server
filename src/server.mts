@@ -1,14 +1,13 @@
-import path from 'node:path';
-import fs from 'node:fs';
-import express from 'express';
-import crypto from 'node:crypto';
-import dotenv from 'dotenv'
-import cors from 'cors';
-import helmet from 'helmet';
-import rateLimit from 'express-rate-limit';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js'
-import { registerMcpServer } from './mcp.mjs'
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import cors from 'cors';
+import express from 'express';
+import rateLimit from 'express-rate-limit';
+import helmet from 'helmet';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { registerMcpServer } from './mcp.mjs';
 
 
 const mcpPort = parseInt(process.env.PORT || '3000');
