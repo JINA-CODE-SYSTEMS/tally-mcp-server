@@ -98,12 +98,27 @@ export async function registerMcpServer(): Promise<McpServer> {
         const entries = fs.readdirSync(tallyDataPath, { withFileTypes: true });
         const folders = entries
           .filter(e => e.isDirectory() && /^\d+$/.test(e.name))
-          .map(e => ({ folder: e.name, path: path.join(tallyDataPath, e.name) }));
+          .map(e => {
+            const folderPath = path.join(tallyDataPath, e.name);
+            let companyName = '';
+            try {
+              // Try to read company name from Company.900 file
+              const companyFile = path.join(folderPath, 'Company.900');
+              if (fs.existsSync(companyFile)) {
+                const buf = fs.readFileSync(companyFile);
+                // Extract readable ASCII/Unicode text for the company name
+                const text = buf.toString('utf16le').replace(/[^\x20-\x7E\u0900-\u097F]/g, ' ').trim();
+                const match = text.match(/[A-Za-z\u0900-\u097F][\w\s\u0900-\u097F.&(),-]{2,}/);
+                if (match) companyName = match[0].trim();
+              }
+            } catch {}
+            return { folder: e.name, name: companyName, path: folderPath };
+          });
         if (folders.length === 0) {
           auditLog('list-companies', args, 'success', Date.now() - start);
           return { content: [{ type: 'text', text: 'No company folders found in the data directory.' }] };
         }
-        const tsv = 'folder\tpath\n' + folders.map(f => `${f.folder}\t${f.path}`).join('\n');
+        const tsv = 'folder\tname\tpath\n' + folders.map(f => `${f.folder}\t${f.name}\t${f.path}`).join('\n');
         auditLog('list-companies', args, 'success', Date.now() - start);
         return { content: [{ type: 'text', text: tsv }] };
       } catch (err) {
@@ -117,9 +132,9 @@ export async function registerMcpServer(): Promise<McpServer> {
     'open-company',
     {
       title: 'Open Company',
-      description: `loads/opens a company in Tally Prime by its data folder path so other tools can query it. Use list-companies first to find available company folders.`,
+      description: `loads/opens a company in Tally Prime by company name so other tools can query it. Use list-companies first to find available companies and their names.`,
       inputSchema: {
-        companyPath: z.string().describe('full path to the company data folder (e.g. C:\\Users\\Public\\TallyPrimeEditLog\\data\\010000)')
+        companyName: z.string().describe('the company name as shown in Tally (e.g. "My Company Name")')
       },
       annotations: {
         readOnlyHint: false,
@@ -129,7 +144,7 @@ export async function registerMcpServer(): Promise<McpServer> {
     async (args) => {
       const start = Date.now();
       try {
-        const escapedPath = args.companyPath.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        const escapedName = args.companyName.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
         const xml = `<?xml version="1.0" encoding="utf-8"?>
 <ENVELOPE>
   <HEADER>
@@ -158,7 +173,7 @@ export async function registerMcpServer(): Promise<McpServer> {
             <FIELDS>MyOpenCompanyField</FIELDS>
           </LINE>
           <FIELD NAME="MyOpenCompanyField">
-            <SET>$$CmpLoadCompany:"${escapedPath}"</SET>
+            <SET>$$CmpLoadCompany:"${escapedName}"</SET>
           </FIELD>
         </TDLMESSAGE>
       </TDL>
@@ -166,13 +181,8 @@ export async function registerMcpServer(): Promise<McpServer> {
   </BODY>
 </ENVELOPE>`;
         const resp = await postTallyXML(xml);
-        if (resp && (resp.includes('<STATUS>1</STATUS>') || resp.includes('Loaded Successfully') || resp.includes('<RESPONSE>'))) {
-          auditLog('open-company', args, 'success', Date.now() - start);
-          return { content: [{ type: 'text', text: `Tally response: ${resp ? resp.substring(0, 500) : 'empty'}. Use list-master with collection company to verify the company is loaded.` }] };
-        } else {
-          auditLog('open-company', args, 'success', Date.now() - start);
-          return { content: [{ type: 'text', text: `Tally response: ${resp ? resp.substring(0, 500) : 'empty'}. The company may or may not have loaded — try list-master with collection company to verify.` }] };
-        }
+        auditLog('open-company', args, 'success', Date.now() - start);
+        return { content: [{ type: 'text', text: `Tally response: ${resp ? resp.substring(0, 500) : 'empty'}. Use list-master with collection company to verify the company is loaded.` }] };
       } catch (err) {
         auditLog('open-company', args, 'error', Date.now() - start);
         return {
