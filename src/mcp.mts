@@ -147,7 +147,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       try {
         const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
         const companyPath = path.join(tallyDataPath, args.companyName);
-        const tallyExe = process.env.TALLY_EXE_PATH || 'C:\\Program Files\\TallyPrime\\tally.exe';
+        const tallyExe = process.env.TALLY_EXE_PATH || 'C:\\Program Files\\TallyPrimeEditLog\\tally.exe';
 
         if (!fs.existsSync(companyPath)) {
           auditLog('open-company', args, 'error', Date.now() - start);
