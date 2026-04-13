@@ -145,6 +145,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       const start = Date.now();
       try {
         const escapedName = args.companyName.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        // Use SVCURRENTCOMPANY to trigger Tally to load the company, then query its name to confirm
         const xml = `<?xml version="1.0" encoding="utf-8"?>
 <ENVELOPE>
   <HEADER>
@@ -156,6 +157,7 @@ export async function registerMcpServer(): Promise<McpServer> {
   <BODY>
     <DESC>
       <STATICVARIABLES>
+        <SVCURRENTCOMPANY>${escapedName}</SVCURRENTCOMPANY>
         <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
       </STATICVARIABLES>
       <TDL>
@@ -173,7 +175,7 @@ export async function registerMcpServer(): Promise<McpServer> {
             <FIELDS>MyOpenCompanyField</FIELDS>
           </LINE>
           <FIELD NAME="MyOpenCompanyField">
-            <SET>$$CmpLoadCompany:"${escapedName}"</SET>
+            <SET>$$CmpName</SET>
           </FIELD>
         </TDLMESSAGE>
       </TDL>
@@ -181,8 +183,12 @@ export async function registerMcpServer(): Promise<McpServer> {
   </BODY>
 </ENVELOPE>`;
         const resp = await postTallyXML(xml);
-        auditLog('open-company', args, 'success', Date.now() - start);
-        return { content: [{ type: 'text', text: `Tally response: ${resp ? resp.substring(0, 500) : 'empty'}. Use list-master with collection company to verify the company is loaded.` }] };
+        const loaded = resp && resp.includes(args.companyName);
+        auditLog('open-company', args, loaded ? 'success' : 'error', Date.now() - start);
+        if (loaded) {
+          return { content: [{ type: 'text', text: `Company "${args.companyName}" loaded successfully. You can now use other tools like list-master, balance-sheet, etc.` }] };
+        }
+        return { content: [{ type: 'text', text: `Tally response: ${resp ? resp.substring(0, 500) : 'empty'}. The company may not have loaded — verify the company name is correct.` }] };
       } catch (err) {
         auditLog('open-company', args, 'error', Date.now() - start);
         return {
