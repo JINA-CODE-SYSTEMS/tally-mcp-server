@@ -80,7 +80,7 @@ export async function registerMcpServer(): Promise<McpServer> {
     async (args) => {
       const start = Date.now();
       try {
-        const tallyDataPath = process.env.TALLY_DATA_PATH || '';
+        const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
         if (!tallyDataPath) {
           auditLog('list-companies', args, 'error', Date.now() - start);
           return {
