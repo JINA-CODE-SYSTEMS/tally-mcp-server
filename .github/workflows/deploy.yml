@@ -29,16 +29,16 @@ jobs:
       - name: Build TypeScript
         run: npx tsc
 
-        
+
       - name: Restart MCP Server
         run: |
-          $svc = Get-Service -Name TallyMCP -ErrorAction SilentlyContinue
-          if ($svc) {
+          try {
             nssm restart TallyMCP
             Start-Sleep -Seconds 3
             $status = nssm status TallyMCP
             Write-Host "Service status: $status"
-          } else {
-            Write-Error "TallyMCP service not found. Run scripts/setup-windows.ps1 first."
-            exit 1
+          } catch {
+            Write-Host "Warning: Could not restart TallyMCP service via nssm. Trying net stop/start..."
+            net stop TallyMCP 2>$null
+            net start TallyMCP
           }
