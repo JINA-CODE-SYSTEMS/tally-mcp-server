@@ -164,7 +164,17 @@ export async function registerMcpServer(): Promise<McpServer> {
         // Wait for Tally to fully exit
         await new Promise(resolve => setTimeout(resolve, 3000));
 
-        // Use a scheduled task to launch Tally in the interactive user session (not Session 0)
+        // Create a helper script that launches Tally, waits, then sends Enter to select the company
+        const scriptPath = path.join(tallyDataPath, '_open_company.ps1');
+        const ps1 = `
+Add-Type -AssemblyName System.Windows.Forms
+Start-Process -FilePath '${tallyExe.replace(/'/g, "''")}' -ArgumentList '/path:${companyPath.replace(/'/g, "''")}'
+Start-Sleep -Seconds 8
+[System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+`;
+        fs.writeFileSync(scriptPath, ps1, 'utf-8');
+
+        // Use a scheduled task to run the script in the interactive user session
         const taskName = 'TallyMCP_OpenCompany';
         try { execSync(`schtasks /Delete /TN "${taskName}" /F`, { timeout: 5000 }); } catch {}
         // Find active console session user for /RU
@@ -178,9 +188,12 @@ export async function registerMcpServer(): Promise<McpServer> {
             else sessionUser = parts[0];
           }
         } catch {}
-        execSync(`schtasks /Create /TN "${taskName}" /TR "\\"${tallyExe}\\" /path:\\"${companyPath}\\"" /SC ONCE /ST 00:00 /RU "${sessionUser}" /IT /F`, { timeout: 10000 });
+        execSync(`schtasks /Create /TN "${taskName}" /TR "powershell -ExecutionPolicy Bypass -File \\"${scriptPath}\\"" /SC ONCE /ST 00:00 /RU "${sessionUser}" /IT /F`, { timeout: 10000 });
         execSync(`schtasks /Run /TN "${taskName}"`, { timeout: 10000 });
         try { execSync(`schtasks /Delete /TN "${taskName}" /F`, { timeout: 5000 }); } catch {}
+
+        // Wait extra time for Tally to start + SendKeys to select company
+        await new Promise(resolve => setTimeout(resolve, 10000));
 
         // Wait for Tally to start and listen on port
         const tallyPort = parseInt(process.env.TALLY_PORT || '9000');
