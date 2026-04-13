@@ -161,7 +161,7 @@ function sendTally(xml: string, lstVariables: Map<string, any>): Promise<string>
     });
 }
 
-function postTallyXML(xml: string): Promise<string> {
+export function postTallyXML(xml: string): Promise<string> {
     return new Promise<string>((resolve, reject) => {
         try {
 
