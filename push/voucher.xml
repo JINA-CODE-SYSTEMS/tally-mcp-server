@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ENVELOPE>
+    <HEADER>
+        <TALLYREQUEST>Import Data</TALLYREQUEST>
+    </HEADER>
+    <BODY>
+        <IMPORTDATA>
+            <REQUESTDESC>
+                <REPORTNAME>Vouchers</REPORTNAME>
+                <STATICVARIABLES>
+                    <nunjuck>if targetCompany</nunjuck>
+                    <SVCURRENTCOMPANY>{{targetCompany | escape}}</SVCURRENTCOMPANY>
+                    <nunjuck>endif</nunjuck>
+                </STATICVARIABLES>
+            </REQUESTDESC>
+            <REQUESTDATA>
+                <TALLYMESSAGE xmlns:UDF="TallyUDF">
+                    <VOUCHER VCHTYPE="{{voucherType | escape}}" ACTION="Create">
+                        <DATE>{{tallyDate}}</DATE>
+                        <VOUCHERTYPENAME>{{voucherType | escape}}</VOUCHERTYPENAME>
+                        <nunjuck>if voucherNumber</nunjuck>
+                        <VOUCHERNUMBER>{{voucherNumber | escape}}</VOUCHERNUMBER>
+                        <nunjuck>endif</nunjuck>
+                        <nunjuck>if narration</nunjuck>
+                        <NARRATION>{{narration | escape}}</NARRATION>
+                        <nunjuck>endif</nunjuck>
+                        <ALLLEDGERENTRIES.LIST>
+                            <LEDGERNAME>{{debitLedger | escape}}</LEDGERNAME>
+                            <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+                            <AMOUNT>-{{amount}}</AMOUNT>
+                        </ALLLEDGERENTRIES.LIST>
+                        <ALLLEDGERENTRIES.LIST>
+                            <LEDGERNAME>{{creditLedger | escape}}</LEDGERNAME>
+                            <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+                            <AMOUNT>{{amount}}</AMOUNT>
+                        </ALLLEDGERENTRIES.LIST>
+                    </VOUCHER>
+                </TALLYMESSAGE>
+            </REQUESTDATA>
+        </IMPORTDATA>
+    </BODY>
+</ENVELOPE>

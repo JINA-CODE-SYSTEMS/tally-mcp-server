@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ENVELOPE>
+    <HEADER>
+        <VERSION>1</VERSION>
+        <TALLYREQUEST>Export</TALLYREQUEST>
+        <TYPE>Data</TYPE>
+        <ID>MyTallyLiveReport</ID>
+    </HEADER>
+    <BODY>
+        <DESC>
+            <STATICVARIABLES>
+                <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+                <SVFROMDATE>{fromDate}</SVFROMDATE>
+                <SVTODATE>{toDate}</SVTODATE>
+                <nunjuck>if targetCompany</nunjuck>
+                <SVCURRENTCOMPANY>{{targetCompany | escape}}</SVCURRENTCOMPANY>
+                <nunjuck>endif</nunjuck>
+            </STATICVARIABLES>
+            <TDL>
+                <TDLMESSAGE>
+                    <REPORT NAME="MyTallyLiveReport">
+                        <FORMS>MyForm</FORMS>
+                    </REPORT>
+                    <FORM NAME="MyForm">
+                        <PARTS>MyPart01</PARTS>
+                        <XMLTAG>DATA</XMLTAG>
+                    </FORM>
+                    <PART NAME="MyPart01">
+                        <LINES>MyLine01</LINES>
+                        <REPEAT>MyLine01 : MyCollection</REPEAT>
+                        <SCROLLED>Vertical</SCROLLED>
+                    </PART>
+                    <LINE NAME="MyLine01">
+                        <FIELDS>FldDate,FldVoucherType,FldVoucherNumber,FldPartyName,FldPartyGSTIN,FldPlaceOfSupply,FldTaxableValue,FldCGSTAmount,FldSGSTAmount,FldIGSTAmount,FldCESSAmount,FldInvoiceValue,FldReverseCharge,FldSupplyType</FIELDS>
+                        <XMLTAG>ROW</XMLTAG>
+                    </LINE>
+                    <FIELD NAME="FldDate">
+                        <SET>$Date</SET>
+                        <XMLTAG>F01</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldVoucherType">
+                        <SET>$VoucherTypeName</SET>
+                        <XMLTAG>F02</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldVoucherNumber">
+                        <SET>$VoucherNumber</SET>
+                        <XMLTAG>F03</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldPartyName">
+                        <SET>$PartyLedgerName</SET>
+                        <XMLTAG>F04</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldPartyGSTIN">
+                        <SET>if $$IsEmpty:$PartyGSTIN then $GSTIN:Ledger:$PartyLedgerName else $PartyGSTIN</SET>
+                        <XMLTAG>F05</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldPlaceOfSupply">
+                        <SET>$PlaceOfSupply</SET>
+                        <XMLTAG>F06</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldTaxableValue">
+                        <SET>$$StringFindAndReplace:(if $$IsDebit:$BasicTaxableAmount then -$$NumValue:$BasicTaxableAmount else $$NumValue:$BasicTaxableAmount):"(-)":"-"</SET>
+                        <XMLTAG>F07</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldCGSTAmount">
+                        <SET>$$StringFindAndReplace:(if $$IsDebit:$AllLedgerEntries[Last,@@FilterCGST].Amount then -$$NumValue:$AllLedgerEntries[Last,@@FilterCGST].Amount else $$NumValue:$AllLedgerEntries[Last,@@FilterCGST].Amount):"(-)":"-"</SET>
+                        <XMLTAG>F08</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldSGSTAmount">
+                        <SET>$$StringFindAndReplace:(if $$IsDebit:$AllLedgerEntries[Last,@@FilterSGST].Amount then -$$NumValue:$AllLedgerEntries[Last,@@FilterSGST].Amount else $$NumValue:$AllLedgerEntries[Last,@@FilterSGST].Amount):"(-)":"-"</SET>
+                        <XMLTAG>F09</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldIGSTAmount">
+                        <SET>$$StringFindAndReplace:(if $$IsDebit:$AllLedgerEntries[Last,@@FilterIGST].Amount then -$$NumValue:$AllLedgerEntries[Last,@@FilterIGST].Amount else $$NumValue:$AllLedgerEntries[Last,@@FilterIGST].Amount):"(-)":"-"</SET>
+                        <XMLTAG>F10</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldCESSAmount">
+                        <SET>$$StringFindAndReplace:(if $$IsDebit:$AllLedgerEntries[Last,@@FilterCESS].Amount then -$$NumValue:$AllLedgerEntries[Last,@@FilterCESS].Amount else $$NumValue:$AllLedgerEntries[Last,@@FilterCESS].Amount):"(-)":"-"</SET>
+                        <XMLTAG>F11</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldInvoiceValue">
+                        <SET>$$StringFindAndReplace:(if $$IsDebit:$Amount then -$$NumValue:$Amount else $$NumValue:$Amount):"(-)":"-"</SET>
+                        <XMLTAG>F12</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldReverseCharge">
+                        <SET>if $IsReverseChargeApplicable then "Yes" else "No"</SET>
+                        <XMLTAG>F13</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldSupplyType">
+                        <SET>if $$IsEmpty:$GSTIN:Ledger:$PartyLedgerName AND $$IsEmpty:$PartyGSTIN then "B2C" else "B2B"</SET>
+                        <XMLTAG>F14</XMLTAG>
+                    </FIELD>
+                    <COLLECTION NAME="MyCollection">
+                        <TYPE>Voucher</TYPE>
+                        <FETCH>AllLedgerEntries,PartyLedgerName,BasicTaxableAmount,PlaceOfSupply,PartyGSTIN,IsReverseChargeApplicable</FETCH>
+                        <FILTER>FilterOutwardSupply,FilterCancelledVouchers,FilterOptionalVouchers,FilterHasTaxableAmount</FILTER>
+                    </COLLECTION>
+                    <SYSTEM TYPE="Formulae" NAME="FilterOutwardSupply">$$IsSales:$VoucherTypeName OR $$IsDebitNote:$VoucherTypeName OR $$IsCreditNote:$VoucherTypeName</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="FilterHasTaxableAmount">NOT $$IsEmpty:$BasicTaxableAmount</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="FilterCancelledVouchers">NOT $IsCancelled</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="FilterOptionalVouchers">NOT $IsOptional</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="FilterCGST">$$IsSysNameEqual:$LedgerGSTDutyHead:$$SysName:Central Tax OR $$IsSysNameEqual:$LedgerGSTDutyHead:$$SysName:CGST</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="FilterSGST">$$IsSysNameEqual:$LedgerGSTDutyHead:$$SysName:State Tax OR $$IsSysNameEqual:$LedgerGSTDutyHead:$$SysName:SGST OR $$IsSysNameEqual:$LedgerGSTDutyHead:$$SysName:UTGST</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="FilterIGST">$$IsSysNameEqual:$LedgerGSTDutyHead:$$SysName:Integrated Tax OR $$IsSysNameEqual:$LedgerGSTDutyHead:$$SysName:IGST</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="FilterCESS">$$IsSysNameEqual:$LedgerGSTDutyHead:$$SysName:Cess</SYSTEM>
+                </TDLMESSAGE>
+            </TDL>
+        </DESC>
+    </BODY>
+</ENVELOPE>
