@@ -26,28 +26,15 @@
                         <SCROLLED>Vertical</SCROLLED>
                     </PART>
                     <LINE NAME="MyLine01">
-                        <FIELDS>FldName, FldPath, FldBookFrom, FldBookTo</FIELDS>
+                        <FIELDS>FldName</FIELDS>
                         <XMLTAG>ROW</XMLTAG>
                     </LINE>
                     <FIELD NAME="FldName">
                         <SET>$Name</SET>
                         <XMLTAG>F01</XMLTAG>
                     </FIELD>
-                    <FIELD NAME="FldPath">
-                        <SET>$CompanyMailName</SET>
-                        <XMLTAG>F02</XMLTAG>
-                    </FIELD>
-                    <FIELD NAME="FldBookFrom">
-                        <SET>$BooksFrom</SET>
-                        <XMLTAG>F03</XMLTAG>
-                    </FIELD>
-                    <FIELD NAME="FldBookTo">
-                        <SET>$LastVoucherDate</SET>
-                        <XMLTAG>F04</XMLTAG>
-                    </FIELD>
                     <COLLECTION NAME="MyCollection">
                         <TYPE>company</TYPE>
-                        <BELONGSTO>Yes</BELONGSTO>
                     </COLLECTION>
                 </TDLMESSAGE>
             </TDL>
