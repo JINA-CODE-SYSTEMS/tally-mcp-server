@@ -1,0 +1,212 @@
+{
+    "templates": [
+        {
+            "name": "voucher",
+            "input": [
+                {
+                    "name": "voucherType",
+                    "datatype": "string",
+                    "required": true,
+                    "validation_regex": "^(Sales|Purchase|Payment|Receipt|Contra|Journal|Debit Note|Credit Note)$",
+                    "validation_message": "Invalid voucher type. Must be one of: Sales, Purchase, Payment, Receipt, Contra, Journal, Debit Note, Credit Note"
+                },
+                {
+                    "name": "date",
+                    "datatype": "date",
+                    "required": true
+                },
+                {
+                    "name": "debitLedger",
+                    "datatype": "string",
+                    "required": true
+                },
+                {
+                    "name": "creditLedger",
+                    "datatype": "string",
+                    "required": true
+                },
+                {
+                    "name": "amount",
+                    "datatype": "number",
+                    "required": true
+                },
+                {
+                    "name": "narration",
+                    "datatype": "string",
+                    "required": false
+                },
+                {
+                    "name": "voucherNumber",
+                    "datatype": "string",
+                    "required": false
+                }
+            ]
+        },
+        {
+            "name": "ledger",
+            "input": [
+                {
+                    "name": "name",
+                    "datatype": "string",
+                    "required": true
+                },
+                {
+                    "name": "parentGroup",
+                    "datatype": "string",
+                    "required": true
+                },
+                {
+                    "name": "openingBalance",
+                    "datatype": "number",
+                    "required": false
+                },
+                {
+                    "name": "mailingName",
+                    "datatype": "string",
+                    "required": false
+                },
+                {
+                    "name": "gstRegistrationType",
+                    "datatype": "string",
+                    "required": false,
+                    "validation_regex": "^(Regular|Composition|Unregistered|Consumer|Unknown)?$",
+                    "validation_message": "Invalid GST registration type. Must be one of: Regular, Composition, Unregistered, Consumer, Unknown"
+                },
+                {
+                    "name": "gstin",
+                    "datatype": "string",
+                    "required": false,
+                    "validation_regex": "^([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1})?$",
+                    "validation_message": "Invalid GSTIN format"
+                }
+            ]
+        },
+        {
+            "name": "stock-item",
+            "input": [
+                {
+                    "name": "name",
+                    "datatype": "string",
+                    "required": true
+                },
+                {
+                    "name": "parentGroup",
+                    "datatype": "string",
+                    "required": false
+                },
+                {
+                    "name": "unit",
+                    "datatype": "string",
+                    "required": false
+                },
+                {
+                    "name": "openingQuantity",
+                    "datatype": "number",
+                    "required": false
+                },
+                {
+                    "name": "openingRate",
+                    "datatype": "number",
+                    "required": false
+                },
+                {
+                    "name": "hsnCode",
+                    "datatype": "string",
+                    "required": false
+                },
+                {
+                    "name": "gstRate",
+                    "datatype": "number",
+                    "required": false
+                }
+            ]
+        },
+        {
+            "name": "gst-voucher",
+            "input": [
+                {
+                    "name": "voucherType",
+                    "datatype": "string",
+                    "required": true,
+                    "validation_regex": "^(Sales|Purchase|Debit Note|Credit Note)$",
+                    "validation_message": "Invalid voucher type for GST. Must be one of: Sales, Purchase, Debit Note, Credit Note"
+                },
+                {
+                    "name": "date",
+                    "datatype": "date",
+                    "required": true
+                },
+                {
+                    "name": "partyLedger",
+                    "datatype": "string",
+                    "required": true
+                },
+                {
+                    "name": "salePurchaseLedger",
+                    "datatype": "string",
+                    "required": true
+                },
+                {
+                    "name": "taxableValue",
+                    "datatype": "number",
+                    "required": true
+                },
+                {
+                    "name": "cgstLedger",
+                    "datatype": "string",
+                    "required": false
+                },
+                {
+                    "name": "cgstAmount",
+                    "datatype": "number",
+                    "required": false
+                },
+                {
+                    "name": "sgstLedger",
+                    "datatype": "string",
+                    "required": false
+                },
+                {
+                    "name": "sgstAmount",
+                    "datatype": "number",
+                    "required": false
+                },
+                {
+                    "name": "igstLedger",
+                    "datatype": "string",
+                    "required": false
+                },
+                {
+                    "name": "igstAmount",
+                    "datatype": "number",
+                    "required": false
+                },
+                {
+                    "name": "narration",
+                    "datatype": "string",
+                    "required": false
+                },
+                {
+                    "name": "voucherNumber",
+                    "datatype": "string",
+                    "required": false
+                },
+                {
+                    "name": "placeOfSupply",
+                    "datatype": "string",
+                    "required": false
+                },
+                {
+                    "name": "originalInvoiceNumber",
+                    "datatype": "string",
+                    "required": false
+                },
+                {
+                    "name": "originalInvoiceDate",
+                    "datatype": "date",
+                    "required": false
+                }
+            ]
+        }
+    ]
+}

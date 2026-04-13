@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ENVELOPE>
+    <HEADER>
+        <VERSION>1</VERSION>
+        <TALLYREQUEST>Export</TALLYREQUEST>
+        <TYPE>Data</TYPE>
+        <ID>MyTallyLiveReport</ID>
+    </HEADER>
+    <BODY>
+        <DESC>
+            <STATICVARIABLES>
+                <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+                <SVFROMDATE>{fromDate}</SVFROMDATE>
+                <SVTODATE>{toDate}</SVTODATE>
+                <nunjuck>if targetCompany</nunjuck>
+                <SVCURRENTCOMPANY>{{targetCompany | escape}}</SVCURRENTCOMPANY>
+                <nunjuck>endif</nunjuck>
+            </STATICVARIABLES>
+            <TDL>
+                <TDLMESSAGE>
+                    <REPORT NAME="MyTallyLiveReport">
+                        <FORMS>MyForm</FORMS>
+                    </REPORT>
+                    <FORM NAME="MyForm">
+                        <PARTS>MyPart01</PARTS>
+                        <XMLTAG>DATA</XMLTAG>
+                    </FORM>
+                    <PART NAME="MyPart01">
+                        <LINES>MyLine01</LINES>
+                        <REPEAT>MyLine01 : MyCollection</REPEAT>
+                        <SCROLLED>Vertical</SCROLLED>
+                    </PART>
+                    <LINE NAME="MyLine01">
+                        <FIELDS>FldHSN,FldDescription,FldUQC,FldQuantity,FldTaxableValue,FldCGSTAmount,FldSGSTAmount,FldIGSTAmount,FldCESSAmount,FldTotalTax,FldInvoiceValue</FIELDS>
+                        <XMLTAG>ROW</XMLTAG>
+                    </LINE>
+                    <FIELD NAME="FldHSN">
+                        <SET>$HSNCode</SET>
+                        <XMLTAG>F01</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldDescription">
+                        <SET>$HSNDescription</SET>
+                        <XMLTAG>F02</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldUQC">
+                        <SET>$UQCCode</SET>
+                        <XMLTAG>F03</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldQuantity">
+                        <SET>$$StringFindAndReplace:$$NumValue:$TotalQuantity:"(-)":"-"</SET>
+                        <XMLTAG>F04</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldTaxableValue">
+                        <SET>$$StringFindAndReplace:$$NumValue:$TaxableValue:"(-)":"-"</SET>
+                        <XMLTAG>F05</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldCGSTAmount">
+                        <SET>$$StringFindAndReplace:$$NumValue:$CentralTaxAmount:"(-)":"-"</SET>
+                        <XMLTAG>F06</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldSGSTAmount">
+                        <SET>$$StringFindAndReplace:$$NumValue:$StateTaxAmount:"(-)":"-"</SET>
+                        <XMLTAG>F07</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldIGSTAmount">
+                        <SET>$$StringFindAndReplace:$$NumValue:$IntegratedTaxAmount:"(-)":"-"</SET>
+                        <XMLTAG>F08</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldCESSAmount">
+                        <SET>$$StringFindAndReplace:$$NumValue:$CessAmount:"(-)":"-"</SET>
+                        <XMLTAG>F09</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldTotalTax">
+                        <SET>$$StringFindAndReplace:$$NumValue:$TotalTaxAmount:"(-)":"-"</SET>
+                        <XMLTAG>F10</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldInvoiceValue">
+                        <SET>$$StringFindAndReplace:$$NumValue:$TotalInvoiceValue:"(-)":"-"</SET>
+                        <XMLTAG>F11</XMLTAG>
+                    </FIELD>
+                    <COLLECTION NAME="MyCollection">
+                        <TYPE>GSTRTNAHSNSUMMARY</TYPE>
+                        <FETCH>HSNCode,HSNDescription,UQCCode,TotalQuantity,TaxableValue,CentralTaxAmount,StateTaxAmount,IntegratedTaxAmount,CessAmount,TotalTaxAmount,TotalInvoiceValue</FETCH>
+                    </COLLECTION>
+                </TDLMESSAGE>
+            </TDL>
+        </DESC>
+    </BODY>
+</ENVELOPE>

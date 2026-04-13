@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ENVELOPE>
+    <HEADER>
+        <VERSION>1</VERSION>
+        <TALLYREQUEST>Export</TALLYREQUEST>
+        <TYPE>Data</TYPE>
+        <ID>MyTallyLiveReport</ID>
+    </HEADER>
+    <BODY>
+        <DESC>
+            <STATICVARIABLES>
+                <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+                <nunjuck>if targetCompany</nunjuck>
+                <SVCURRENTCOMPANY>{{targetCompany | escape}}</SVCURRENTCOMPANY>
+                <nunjuck>endif</nunjuck>
+            </STATICVARIABLES>
+            <TDL>
+                <TDLMESSAGE>
+                    <REPORT NAME="MyTallyLiveReport">
+                        <FORMS>MyForm</FORMS>
+                    </REPORT>
+                    <FORM NAME="MyForm">
+                        <PARTS>MyPart01</PARTS>
+                        <XMLTAG>DATA</XMLTAG>
+                    </FORM>
+                    <PART NAME="MyPart01">
+                        <LINES>MyLine01</LINES>
+                        <REPEAT>MyLine01 : MyCollection</REPEAT>
+                        <SCROLLED>Vertical</SCROLLED>
+                    </PART>
+                    <LINE NAME="MyLine01">
+                        <FIELDS>FldName,FldParent,FldHSN,FldGSTApplicability,FldGSTTypeOfSupply,FldTaxClassification,FldIntegratedTax,FldCentralTax,FldStateTax,FldCess</FIELDS>
+                        <XMLTAG>ROW</XMLTAG>
+                    </LINE>
+                    <FIELD NAME="FldName">
+                        <SET>$Name</SET>
+                        <XMLTAG>F01</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldParent">
+                        <SET>$Parent</SET>
+                        <XMLTAG>F02</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldHSN">
+                        <SET>if $$IsEmpty:$HSNCode then "" else $HSNCode</SET>
+                        <XMLTAG>F03</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldGSTApplicability">
+                        <SET>if $$IsEmpty:$GSTApplicable then "Not Set" else $GSTApplicable</SET>
+                        <XMLTAG>F04</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldGSTTypeOfSupply">
+                        <SET>if $$IsEmpty:$GSTTypeOfSupply then "" else $GSTTypeOfSupply</SET>
+                        <XMLTAG>F05</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldTaxClassification">
+                        <SET>if $$IsEmpty:$GSTClassificationNature then "" else $GSTClassificationNature</SET>
+                        <XMLTAG>F06</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldIntegratedTax">
+                        <SET>$$StringFindAndReplace:$$NumValue:$IntegratedTax:"(-)":"-"</SET>
+                        <XMLTAG>F07</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldCentralTax">
+                        <SET>$$StringFindAndReplace:$$NumValue:$CentralTax:"(-)":"-"</SET>
+                        <XMLTAG>F08</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldStateTax">
+                        <SET>$$StringFindAndReplace:$$NumValue:$StateTax:"(-)":"-"</SET>
+                        <XMLTAG>F09</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldCess">
+                        <SET>$$StringFindAndReplace:$$NumValue:$Cess:"(-)":"-"</SET>
+                        <XMLTAG>F10</XMLTAG>
+                    </FIELD>
+                    <COLLECTION NAME="MyCollection">
+                        <TYPE>StockItem</TYPE>
+                        <FETCH>HSNCode,GSTApplicable,GSTTypeOfSupply,GSTClassificationNature,IntegratedTax,CentralTax,StateTax,Cess</FETCH>
+                    </COLLECTION>
+                </TDLMESSAGE>
+            </TDL>
+        </DESC>
+    </BODY>
+</ENVELOPE>

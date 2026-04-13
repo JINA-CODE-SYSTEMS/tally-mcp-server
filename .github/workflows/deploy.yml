@@ -1,0 +1,39 @@
+name: Deploy to Tally MCP Server
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    defaults:
+      run:
+        shell: powershell
+        working-directory: C:\tally-mcp-server
+
+    steps:
+      - name: Pull latest code
+        run: |
+          git reset --hard HEAD
+          git pull origin main
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build TypeScript
+        run: npx tsc
+
+      - name: Restart MCP Server
+        run: |
+          $svc = Get-Service -Name TallyMCP -ErrorAction SilentlyContinue
+          if ($svc) {
+            nssm restart TallyMCP
+            Start-Sleep -Seconds 3
+            $status = nssm status TallyMCP
+            Write-Host "Service status: $status"
+          } else {
+            Write-Error "TallyMCP service not found. Run scripts/setup-windows.ps1 first."
+            exit 1
+          }

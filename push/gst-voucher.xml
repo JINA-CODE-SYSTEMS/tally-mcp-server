@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ENVELOPE>
+    <HEADER>
+        <TALLYREQUEST>Import Data</TALLYREQUEST>
+    </HEADER>
+    <BODY>
+        <IMPORTDATA>
+            <REQUESTDESC>
+                <REPORTNAME>Vouchers</REPORTNAME>
+                <STATICVARIABLES>
+                    <nunjuck>if targetCompany</nunjuck>
+                    <SVCURRENTCOMPANY>{{targetCompany | escape}}</SVCURRENTCOMPANY>
+                    <nunjuck>endif</nunjuck>
+                </STATICVARIABLES>
+            </REQUESTDESC>
+            <REQUESTDATA>
+                <TALLYMESSAGE xmlns:UDF="TallyUDF">
+                    <VOUCHER VCHTYPE="{{voucherType | escape}}" ACTION="Create">
+                        <DATE>{{tallyDate}}</DATE>
+                        <VOUCHERTYPENAME>{{voucherType | escape}}</VOUCHERTYPENAME>
+                        <nunjuck>if voucherNumber</nunjuck>
+                        <VOUCHERNUMBER>{{voucherNumber | escape}}</VOUCHERNUMBER>
+                        <nunjuck>endif</nunjuck>
+                        <nunjuck>if narration</nunjuck>
+                        <NARRATION>{{narration | escape}}</NARRATION>
+                        <nunjuck>endif</nunjuck>
+                        <nunjuck>if partyLedger</nunjuck>
+                        <PARTYLEDGERNAME>{{partyLedger | escape}}</PARTYLEDGERNAME>
+                        <nunjuck>endif</nunjuck>
+                        <nunjuck>if placeOfSupply</nunjuck>
+                        <PLACEOFSUPPLY>{{placeOfSupply | escape}}</PLACEOFSUPPLY>
+                        <nunjuck>endif</nunjuck>
+                        <nunjuck>if isReverseCharge</nunjuck>
+                        <ISREVERSECHARGEAPPLICABLE>Yes</ISREVERSECHARGEAPPLICABLE>
+                        <nunjuck>endif</nunjuck>
+                        <nunjuck>if originalInvoiceNumber</nunjuck>
+                        <BASICORIGINALINVOICEREF>{{originalInvoiceNumber | escape}}</BASICORIGINALINVOICEREF>
+                        <nunjuck>endif</nunjuck>
+                        <nunjuck>if originalInvoiceDate</nunjuck>
+                        <BASICORIGINALINVOICEDATE>{{originalInvoiceDateTallyDate}}</BASICORIGINALINVOICEDATE>
+                        <nunjuck>endif</nunjuck>
+                        <ALLLEDGERENTRIES.LIST>
+                            <LEDGERNAME>{{partyLedger | escape}}</LEDGERNAME>
+                            <nunjuck>if isSalesType</nunjuck>
+                            <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+                            <AMOUNT>{{totalInvoiceValue}}</AMOUNT>
+                            <nunjuck>endif</nunjuck>
+                            <nunjuck>if isPurchaseType</nunjuck>
+                            <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+                            <AMOUNT>-{{totalInvoiceValue}}</AMOUNT>
+                            <nunjuck>endif</nunjuck>
+                        </ALLLEDGERENTRIES.LIST>
+                        <ALLLEDGERENTRIES.LIST>
+                            <LEDGERNAME>{{salePurchaseLedger | escape}}</LEDGERNAME>
+                            <nunjuck>if isSalesType</nunjuck>
+                            <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+                            <AMOUNT>-{{taxableValue}}</AMOUNT>
+                            <nunjuck>endif</nunjuck>
+                            <nunjuck>if isPurchaseType</nunjuck>
+                            <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+                            <AMOUNT>{{taxableValue}}</AMOUNT>
+                            <nunjuck>endif</nunjuck>
+                        </ALLLEDGERENTRIES.LIST>
+                        <nunjuck>if cgstLedger</nunjuck>
+                        <ALLLEDGERENTRIES.LIST>
+                            <LEDGERNAME>{{cgstLedger | escape}}</LEDGERNAME>
+                            <nunjuck>if isSalesType</nunjuck>
+                            <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+                            <AMOUNT>-{{cgstAmount}}</AMOUNT>
+                            <nunjuck>endif</nunjuck>
+                            <nunjuck>if isPurchaseType</nunjuck>
+                            <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+                            <AMOUNT>{{cgstAmount}}</AMOUNT>
+                            <nunjuck>endif</nunjuck>
+                        </ALLLEDGERENTRIES.LIST>
+                        <nunjuck>endif</nunjuck>
+                        <nunjuck>if sgstLedger</nunjuck>
+                        <ALLLEDGERENTRIES.LIST>
+                            <LEDGERNAME>{{sgstLedger | escape}}</LEDGERNAME>
+                            <nunjuck>if isSalesType</nunjuck>
+                            <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+                            <AMOUNT>-{{sgstAmount}}</AMOUNT>
+                            <nunjuck>endif</nunjuck>
+                            <nunjuck>if isPurchaseType</nunjuck>
+                            <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+                            <AMOUNT>{{sgstAmount}}</AMOUNT>
+                            <nunjuck>endif</nunjuck>
+                        </ALLLEDGERENTRIES.LIST>
+                        <nunjuck>endif</nunjuck>
+                        <nunjuck>if igstLedger</nunjuck>
+                        <ALLLEDGERENTRIES.LIST>
+                            <LEDGERNAME>{{igstLedger | escape}}</LEDGERNAME>
+                            <nunjuck>if isSalesType</nunjuck>
+                            <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+                            <AMOUNT>-{{igstAmount}}</AMOUNT>
+                            <nunjuck>endif</nunjuck>
+                            <nunjuck>if isPurchaseType</nunjuck>
+                            <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+                            <AMOUNT>{{igstAmount}}</AMOUNT>
+                            <nunjuck>endif</nunjuck>
+                        </ALLLEDGERENTRIES.LIST>
+                        <nunjuck>endif</nunjuck>
+                    </VOUCHER>
+                </TALLYMESSAGE>
+            </REQUESTDATA>
+        </IMPORTDATA>
+    </BODY>
+</ENVELOPE>

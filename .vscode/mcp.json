@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "tally-prime": {
+      "type": "http",
+      "url": "https://tally-mcp.attention.sh/mcp",
+      "headers": {
+        "Content-Type": "application/json"
+      }
+    }
+  }
+}

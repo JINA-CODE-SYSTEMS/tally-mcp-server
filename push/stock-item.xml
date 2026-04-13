@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ENVELOPE>
+    <HEADER>
+        <TALLYREQUEST>Import Data</TALLYREQUEST>
+    </HEADER>
+    <BODY>
+        <IMPORTDATA>
+            <REQUESTDESC>
+                <REPORTNAME>All Masters</REPORTNAME>
+                <STATICVARIABLES>
+                    <nunjuck>if targetCompany</nunjuck>
+                    <SVCURRENTCOMPANY>{{targetCompany | escape}}</SVCURRENTCOMPANY>
+                    <nunjuck>endif</nunjuck>
+                </STATICVARIABLES>
+            </REQUESTDESC>
+            <REQUESTDATA>
+                <TALLYMESSAGE xmlns:UDF="TallyUDF">
+                    <STOCKITEM NAME="{{name | escape}}" ACTION="Create">
+                        <nunjuck>if parentGroup</nunjuck>
+                        <PARENT>{{parentGroup | escape}}</PARENT>
+                        <nunjuck>endif</nunjuck>
+                        <nunjuck>if unit</nunjuck>
+                        <BASEUNITS>{{unit | escape}}</BASEUNITS>
+                        <nunjuck>endif</nunjuck>
+                        <nunjuck>if openingQuantity and openingRate</nunjuck>
+                        <OPENINGBALANCE>{{openingQuantity}} {{unit | escape}}</OPENINGBALANCE>
+                        <OPENINGRATE>{{openingRate}}</OPENINGRATE>
+                        <OPENINGVALUE>{{openingValue}}</OPENINGVALUE>
+                        <nunjuck>endif</nunjuck>
+                        <nunjuck>if hsnCode</nunjuck>
+                        <HSNCODE>{{hsnCode | escape}}</HSNCODE>
+                        <nunjuck>endif</nunjuck>
+                        <nunjuck>if gstRate</nunjuck>
+                        <GSTRATE>{{gstRate}}</GSTRATE>
+                        <nunjuck>endif</nunjuck>
+                    </STOCKITEM>
+                </TALLYMESSAGE>
+            </REQUESTDATA>
+        </IMPORTDATA>
+    </BODY>
+</ENVELOPE>
