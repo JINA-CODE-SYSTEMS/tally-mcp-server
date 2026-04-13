@@ -167,7 +167,18 @@ export async function registerMcpServer(): Promise<McpServer> {
         // Use a scheduled task to launch Tally in the interactive user session (not Session 0)
         const taskName = 'TallyMCP_OpenCompany';
         try { execSync(`schtasks /Delete /TN "${taskName}" /F`, { timeout: 5000 }); } catch {}
-        execSync(`schtasks /Create /TN "${taskName}" /TR "\\"${tallyExe}\\" /path:\\"${companyPath}\\"" /SC ONCE /ST 00:00 /RL HIGHEST /F`, { timeout: 10000 });
+        // Find active console session user for /RU
+        let sessionUser = 'SYSTEM';
+        try {
+          const quser = execSync('query user 2>nul', { timeout: 5000 }).toString();
+          const activeLine = quser.split('\\n').find((l: string) => l.includes('Active') || l.includes('console'));
+          if (activeLine) {
+            const parts = activeLine.trim().split(/\\s+/);
+            if (parts[0]?.startsWith('>')) sessionUser = parts[0].substring(1);
+            else sessionUser = parts[0];
+          }
+        } catch {}
+        execSync(`schtasks /Create /TN "${taskName}" /TR "\\"${tallyExe}\\" /path:\\"${companyPath}\\"" /SC ONCE /ST 00:00 /RU "${sessionUser}" /IT /F`, { timeout: 10000 });
         execSync(`schtasks /Run /TN "${taskName}"`, { timeout: 10000 });
         try { execSync(`schtasks /Delete /TN "${taskName}" /F`, { timeout: 5000 }); } catch {}
 
