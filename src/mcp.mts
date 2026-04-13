@@ -1,4 +1,5 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { execSync, spawn } from 'node:child_process';
 import dotenv from 'dotenv';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -132,9 +133,9 @@ export async function registerMcpServer(): Promise<McpServer> {
     'open-company',
     {
       title: 'Open Company',
-      description: `loads/opens a company in Tally Prime by company name so other tools can query it. Use list-companies first to find available companies and their names.`,
+      description: `loads a company into Tally Prime by restarting Tally with the company's data path. Use list-companies first to find available folders. This will briefly disconnect Tally (5-10 seconds) while it restarts.`,
       inputSchema: {
-        companyName: z.string().describe('the company name as shown in Tally (e.g. "My Company Name")')
+        companyFolder: z.string().describe('the company folder number from list-companies (e.g. "010000")')
       },
       annotations: {
         readOnlyHint: false,
@@ -144,57 +145,64 @@ export async function registerMcpServer(): Promise<McpServer> {
     async (args) => {
       const start = Date.now();
       try {
-        const escapedName = args.companyName.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-        // Use SVCURRENTCOMPANY to trigger Tally to load the company, then query its name to confirm
-        const xml = `<?xml version="1.0" encoding="utf-8"?>
-<ENVELOPE>
-  <HEADER>
-    <VERSION>1</VERSION>
-    <TALLYREQUEST>Export</TALLYREQUEST>
-    <TYPE>Data</TYPE>
-    <ID>MyOpenCompany</ID>
-  </HEADER>
-  <BODY>
-    <DESC>
-      <STATICVARIABLES>
-        <SVCURRENTCOMPANY>${escapedName}</SVCURRENTCOMPANY>
-        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
-      </STATICVARIABLES>
-      <TDL>
-        <TDLMESSAGE>
-          <REPORT NAME="MyOpenCompany">
-            <FORMS>MyOpenCompanyForm</FORMS>
-          </REPORT>
-          <FORM NAME="MyOpenCompanyForm">
-            <PARTS>MyOpenCompanyPart</PARTS>
-          </FORM>
-          <PART NAME="MyOpenCompanyPart">
-            <LINES>MyOpenCompanyLine</LINES>
-          </PART>
-          <LINE NAME="MyOpenCompanyLine">
-            <FIELDS>MyOpenCompanyField</FIELDS>
-          </LINE>
-          <FIELD NAME="MyOpenCompanyField">
-            <SET>$$CmpName</SET>
-          </FIELD>
-        </TDLMESSAGE>
-      </TDL>
-    </DESC>
-  </BODY>
-</ENVELOPE>`;
-        const resp = await postTallyXML(xml);
-        const loaded = resp && resp.includes(args.companyName);
-        auditLog('open-company', args, loaded ? 'success' : 'error', Date.now() - start);
-        if (loaded) {
-          return { content: [{ type: 'text', text: `Company "${args.companyName}" loaded successfully. You can now use other tools like list-master, balance-sheet, etc.` }] };
+        const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const companyPath = path.join(tallyDataPath, args.companyFolder);
+        const tallyExe = process.env.TALLY_EXE_PATH || 'C:\\Program Files\\TallyPrime\\tally.exe';
+
+        if (!fs.existsSync(companyPath)) {
+          auditLog('open-company', args, 'error', Date.now() - start);
+          return { isError: true, content: [{ type: 'text', text: `Company folder not found: ${companyPath}` }] };
         }
-        return { content: [{ type: 'text', text: `Tally response: ${resp ? resp.substring(0, 500) : 'empty'}. The company may not have loaded — verify the company name is correct.` }] };
+        if (!fs.existsSync(tallyExe)) {
+          auditLog('open-company', args, 'error', Date.now() - start);
+          return { isError: true, content: [{ type: 'text', text: `Tally executable not found at ${tallyExe}. Set TALLY_EXE_PATH env var.` }] };
+        }
+
+        // Kill Tally
+        try { execSync('taskkill /IM tally.exe /F', { timeout: 10000 }); } catch {}
+        
+        // Wait for Tally to fully exit
+        await new Promise(resolve => setTimeout(resolve, 3000));
+
+        // Restart Tally with the company data path
+        const child = spawn(tallyExe, [`/path:${companyPath}`], {
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: false
+        });
+        child.unref();
+
+        // Wait for Tally to start and listen on port
+        const tallyPort = parseInt(process.env.TALLY_PORT || '9000');
+        let connected = false;
+        for (let i = 0; i < 20; i++) {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          try {
+            await postTallyXML('<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>List of Companies</ID></HEADER></ENVELOPE>');
+            connected = true;
+            break;
+          } catch {}
+        }
+
+        if (!connected) {
+          auditLog('open-company', args, 'error', Date.now() - start);
+          return { isError: true, content: [{ type: 'text', text: `Tally restarted but not responding on port ${tallyPort} after 40 seconds.` }] };
+        }
+
+        // Verify the company loaded
+        try {
+          const inputParams = new Map([['collection', 'company']]);
+          const resp = await handlePull('list-master', inputParams);
+          const companies = resp.data?.map((c: any) => c.name).join(', ') || 'unknown';
+          auditLog('open-company', args, 'success', Date.now() - start);
+          return { content: [{ type: 'text', text: `Tally restarted with company folder ${args.companyFolder}. Active companies: ${companies}` }] };
+        } catch {
+          auditLog('open-company', args, 'success', Date.now() - start);
+          return { content: [{ type: 'text', text: `Tally restarted with company folder ${args.companyFolder}. Verify with list-master collection company.` }] };
+        }
       } catch (err) {
         auditLog('open-company', args, 'error', Date.now() - start);
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `Failed to open company: ${err}` }]
-        };
+        return { isError: true, content: [{ type: 'text', text: `Failed to open company: ${err}` }] };
       }
     }
   );
