@@ -7,6 +7,7 @@ on:
 
 jobs:
   deploy:
+    if: github.repository == 'JINA-CODE-SYSTEMS/tally-mcp-server'
     runs-on: self-hosted
     defaults:
       run:
