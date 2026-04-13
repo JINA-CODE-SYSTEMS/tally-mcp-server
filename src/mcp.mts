@@ -1,6 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import dotenv from 'dotenv';
-import { execSync, spawn } from 'node:child_process';
+import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
@@ -164,13 +164,12 @@ export async function registerMcpServer(): Promise<McpServer> {
         // Wait for Tally to fully exit
         await new Promise(resolve => setTimeout(resolve, 3000));
 
-        // Restart Tally with the company data path
-        const child = spawn(tallyExe, [`/path:${companyPath}`], {
-          detached: true,
-          stdio: 'ignore',
-          windowsHide: false
-        });
-        child.unref();
+        // Use a scheduled task to launch Tally in the interactive user session (not Session 0)
+        const taskName = 'TallyMCP_OpenCompany';
+        try { execSync(`schtasks /Delete /TN "${taskName}" /F`, { timeout: 5000 }); } catch {}
+        execSync(`schtasks /Create /TN "${taskName}" /TR "\\"${tallyExe}\\" /path:\\"${companyPath}\\"" /SC ONCE /ST 00:00 /RL HIGHEST /F`, { timeout: 10000 });
+        execSync(`schtasks /Run /TN "${taskName}"`, { timeout: 10000 });
+        try { execSync(`schtasks /Delete /TN "${taskName}" /F`, { timeout: 5000 }); } catch {}
 
         // Wait for Tally to start and listen on port
         const tallyPort = parseInt(process.env.TALLY_PORT || '9000');
