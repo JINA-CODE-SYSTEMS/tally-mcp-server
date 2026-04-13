@@ -134,17 +134,34 @@ export async function registerMcpServer(): Promise<McpServer> {
 <ENVELOPE>
   <HEADER>
     <VERSION>1</VERSION>
-    <TALLYREQUEST>Action</TALLYREQUEST>
-    <TYPE>Function</TYPE>
-    <ID>$$OpenCompany</ID>
+    <TALLYREQUEST>Export</TALLYREQUEST>
+    <TYPE>Data</TYPE>
+    <ID>MyOpenCompany</ID>
   </HEADER>
   <BODY>
     <DESC>
-      <FUNCPARAMETERVALUES>
-        <PARAM>
-          <VALUE TYPE="String">${escapedPath}</VALUE>
-        </PARAM>
-      </FUNCPARAMETERVALUES>
+      <STATICVARIABLES>
+        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+      </STATICVARIABLES>
+      <TDL>
+        <TDLMESSAGE>
+          <REPORT NAME="MyOpenCompany">
+            <FORMS>MyOpenCompanyForm</FORMS>
+          </REPORT>
+          <FORM NAME="MyOpenCompanyForm">
+            <PARTS>MyOpenCompanyPart</PARTS>
+          </FORM>
+          <PART NAME="MyOpenCompanyPart">
+            <LINES>MyOpenCompanyLine</LINES>
+          </PART>
+          <LINE NAME="MyOpenCompanyLine">
+            <FIELDS>MyOpenCompanyField</FIELDS>
+          </LINE>
+          <FIELD NAME="MyOpenCompanyField">
+            <SET>$$CmpLoadCompany:"${escapedPath}"</SET>
+          </FIELD>
+        </TDLMESSAGE>
+      </TDL>
     </DESC>
   </BODY>
 </ENVELOPE>`;
