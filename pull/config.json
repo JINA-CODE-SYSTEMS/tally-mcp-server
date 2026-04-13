@@ -11,21 +11,6 @@
                         "name": "name",
                         "datatype": "string",
                         "identifier": "F01"
-                    },
-                    {
-                        "name": "mail_name",
-                        "datatype": "string",
-                        "identifier": "F02"
-                    },
-                    {
-                        "name": "books_from",
-                        "datatype": "string",
-                        "identifier": "F03"
-                    },
-                    {
-                        "name": "last_voucher_date",
-                        "datatype": "string",
-                        "identifier": "F04"
                     }
                 ]
             }
