@@ -129,19 +129,29 @@ export async function registerMcpServer(): Promise<McpServer> {
     async (args) => {
       const start = Date.now();
       try {
+        const escapedPath = args.companyPath.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
         const xml = `<?xml version="1.0" encoding="utf-8"?>
 <ENVELOPE>
   <HEADER>
     <VERSION>1</VERSION>
     <TALLYREQUEST>Action</TALLYREQUEST>
-    <TYPE>Company</TYPE>
-    <ID>${args.companyPath.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</ID>
+    <TYPE>Function</TYPE>
+    <ID>$$OpenCompany</ID>
   </HEADER>
+  <BODY>
+    <DESC>
+      <FUNCPARAMETERVALUES>
+        <PARAM>
+          <VALUE TYPE="String">${escapedPath}</VALUE>
+        </PARAM>
+      </FUNCPARAMETERVALUES>
+    </DESC>
+  </BODY>
 </ENVELOPE>`;
         const resp = await postTallyXML(xml);
-        if (resp && (resp.includes('<STATUS>1</STATUS>') || resp.includes('Loaded Successfully'))) {
+        if (resp && (resp.includes('<STATUS>1</STATUS>') || resp.includes('Loaded Successfully') || resp.includes('<RESPONSE>'))) {
           auditLog('open-company', args, 'success', Date.now() - start);
-          return { content: [{ type: 'text', text: `Company loaded successfully from ${args.companyPath}. You can now use other tools like list-master, balance-sheet, etc.` }] };
+          return { content: [{ type: 'text', text: `Tally response: ${resp ? resp.substring(0, 500) : 'empty'}. Use list-master with collection company to verify the company is loaded.` }] };
         } else {
           auditLog('open-company', args, 'success', Date.now() - start);
           return { content: [{ type: 'text', text: `Tally response: ${resp ? resp.substring(0, 500) : 'empty'}. The company may or may not have loaded — try list-master with collection company to verify.` }] };
