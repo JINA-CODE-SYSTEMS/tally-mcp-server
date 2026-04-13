@@ -29,6 +29,7 @@ jobs:
       - name: Build TypeScript
         run: npx tsc
 
+        
       - name: Restart MCP Server
         run: |
           $svc = Get-Service -Name TallyMCP -ErrorAction SilentlyContinue
