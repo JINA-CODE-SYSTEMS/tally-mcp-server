@@ -1,23 +1,32 @@
 # Tally Prime MCP Server
-Tally Prime MCP (Model Context Protocol) Server implementation to feed Tally Prime ERP data to popular LLM like Claude, ChatGPT supporting MCP client. This MCP Server helps expose functionalities of Tally to LLM directly.
 
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
+
+An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that bridges **Tally Prime ERP** with AI assistants like Claude, ChatGPT, GitHub Copilot, and any MCP-compatible client. Query financial reports, manage masters, create vouchers, and analyse GST data — all through natural language.
+
+## Features
+
+- **23 MCP tools** — financial reports, master data, stock, GST, voucher creation
+- **DuckDB in-memory analytics** — cached report tables for complex SQL queries
+- **OAuth 2.1 + PKCE** authentication for remote/cloud deployments
+- **Security hardened** — Helmet, CORS, rate limiting, audit logging, read-only mode
+- **Local & remote** — run as a local stdio server or a cloud HTTP server behind a reverse proxy
 
 ## Prerequisites
-* Tally Prime (Silver / Gold)
-* Node JS
 
-Ensure below things are pre-installed and setup:
-* Ensure to [download & install Node JS](https://nodejs.org/en) from official website
-* XML Port of Tally Prime must be enabled (F1 &gt; Settings &gt; Connectivity &gt; Client/Server configuration) with below settings
+- **Tally Prime** (Silver / Gold) with XML Server enabled
+- **Node.js** 20+
+
+Enable the XML server in Tally: **F1 → Settings → Connectivity → Client/Server Configuration**
 ```
 TallyPrime acts as = Server
 Port = 9000
 ```
 
-*Note: Kindly avoid using Educational version of Tally Prime, which has limitations of date range. It will result in invalid / partial data being fed to LLM, leading to highly degraded &amp; incorrect responses.*
+> **Note:** Avoid the Educational edition — its date-range limitations produce incomplete data.
 
 ## Installation
-Clone the repository and install dependencies:
+
 ```bash
 git clone https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server.git
 cd tally-mcp-server
@@ -25,274 +34,164 @@ npm install
 npx tsc
 ```
 
-## Supported Platform
-Implementation was tested on below AI platform
+## Configuration
 
-|Platform|Local|Remote|
-|--|--|--|
-|Claude AI| :heavy_check_mark: | :heavy_check_mark: |
-|ChatGPT|| :heavy_check_mark: |
+Copy `.env.example` to `.env` and configure:
 
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PASSWORD` | *(required for remote)* | OAuth authentication password |
+| `TALLY_HOST` | `localhost` | Tally Prime XML server hostname |
+| `TALLY_PORT` | `9000` | Tally Prime XML server port |
+| `TALLY_DATA_PATH` | `C:\Users\Public\TallyPrime\data` | Tally data directory (for `list-companies`) |
+| `TALLY_EXE_PATH` | `C:\Program Files\TallyPrime\tally.exe` | Tally executable path |
+| `PORT` | `3000` | HTTP server port |
+| `MCP_DOMAIN` | `http://localhost:3000` | Public-facing URL |
+| `BIND_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` only behind reverse proxy) |
+| `CORS_ORIGINS` | *(defaults to MCP_DOMAIN)* | Comma-separated allowed origins |
+| `READONLY_MODE` | `false` | Set `true` to disable all write tools |
+| `ADMIN_SECRET` | | Optional secret for manual client registration |
 
-## Setup (Local)
-This mode of setup is to be used when MCP Client (like Claude Desktop, Perplexity etc.) and Tally Prime both exists in local PC. MCP Client software itself runs the MCP Server internally in such scenario.
+## Setup
 
-Simply clone the repository and build. Assuming that we cloned the repo to below path (folder)
-```
-D:\Software\Tally MCP Server
-```
+### Local (Claude Desktop)
 
-A sample setup for few popular tools is demonstrated.
+Add to your `claude_desktop_config.json` (File → Settings → Developer):
 
-### Claude Desktop
-Desktop version of Claude AI supports loading of local MCP server. Ensure you have Pro / Team / Max / Enterprise subscription of Claude, which supports higher limit compared to Free. MCP makes multiple calls to Tally for validation and inference, which might exhaust free limits quickly. Download Claude Desktop from following link
-[claude.ai/download](https://claude.ai/download)
-
-Go to menu &gt; File &gt; Settings &gt; Developer
-
-This will open My Computer window. Right click and edit **claude_desktop_config.json** file (via Notepad) with as below JSON
 ```json
 {
   "mcpServers": {
-	  "Tally Prime": {
-		  "command": "node",
-		  "args": ["D:\\Software\\Tally MCP Server\\dist\\index.mjs"]
-	  }
+    "Tally Prime": {
+      "command": "node",
+      "args": ["<path-to-repo>/dist/index.mjs"]
+    }
   }
 }
 ```
-*Note: single slash in folder path needs to be substituted with double slash*
 
-Save the file. Close Claude Desktop (menu &gt; File &gt; Exit) and again re-launch it.
+### Local (VS Code / GitHub Copilot)
 
-Verify by clicking on Tools button and check if Tally Prime appears in the list.
+Add to your workspace `.vscode/mcp.json`:
 
-### Perplexity Desktop
-Perplexity Desktop version for MacOS supports connecting to local MCP server. Configuration file (JSON format) is same as demonstrated for Claude Desktop. In absense of MacBook, documentation with screenshot could not be written. Kindly refer to below blog on perplexity website, which explains the steps.
+```json
+{
+  "servers": {
+    "tally-prime": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["<path-to-repo>/dist/index.mjs"]
+    }
+  }
+}
+```
 
-[Perplexity Desktop MCP Connectivity](https://www.perplexity.ai/help-center/en/articles/11502712-local-and-remote-mcps-for-perplexity)
+### Remote / Cloud
 
-## Setup (Cloud)
-This mode of setup is to be used, when using browser-based MCP client like ChatGPT, Claude AI, Copilot, OR mobile-based app for these LLM which cannot access Tally Prime running inside local PC. In this scenario, MCP Server needs to run as web-server, internally connected to Tally securely. Setup is quite complicated, and is covered in detail in **docs** folder of this project.
-* [Linux-based Server](docs/server-setup-linux.md)
-* Windows Server (exploration in-progress)
+For browser-based clients (ChatGPT, Claude web, Copilot) that can't reach a local Tally install, deploy the server on a machine that can access Tally and expose it over HTTPS.
+
+```json
+{
+  "servers": {
+    "tally-prime": {
+      "type": "http",
+      "url": "https://your-domain.example/mcp"
+    }
+  }
+}
+```
+
+The server uses OAuth 2.1 with PKCE for authentication. Detailed setup guides:
+- [Linux-based Server](docs/server-setup-linux.md) (recommended — Tally connects via SSH tunnel)
+- [Windows Server](docs/server-setup-windows.md)
 
 ## Available Tools
 
-### list-master
-Extracts list of specific master for auto-completion and validation if master exists, during inference by LLM
+### Company Management
 
-**Input**
-|Argument|Description|
-|--|--|
-|targetCompany (optional)|Company name of the target company in Tally. Skipping this defaults to Active company|
-|collection|Valid collection of Tally|
+| Tool | Description |
+|------|-------------|
+| `list-companies` | Lists company folders in the Tally data directory (no open company required) |
+| `open-company` | Attempts to load a company into Tally (**[experimental — see #1](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/1)**) |
 
-**Output**
-List (or array) of queries master
+### Financial Reports
 
-Collections that can be queried:
-1. Group
-1. Ledger
-1. VoucherType
-1. Unit
-1. Godown
-1. StockGroup
-1. StockItem
-1. CostCentre
-1. CostCategory
-1. AttendanceType
-1. Company
-1. Currency
-1. GSTIN
-1. GSTClassification
+| Tool | Description |
+|------|-------------|
+| `chart-of-accounts` | Group hierarchy with BS/PL classification, Dr/Cr nature |
+| `trial-balance` | Ledger-wise opening, debit, credit, closing for a period |
+| `balance-sheet` | Balance sheet as on date |
+| `profit-loss` | Profit & Loss statement for a period |
+| `ledger-balance` | Closing balance of a single ledger as on date |
+| `ledger-account` | Voucher-level ledger statement with GST breakup |
+| `bills-outstanding` | Outstanding receivables / payables with overdue days |
 
-### chart-of-accounts
-Extracts Chart of Accounts (or Group hierarchy) useful for preparing Balance Sheet, Profit and Loss, Trial Balance
+### Inventory
 
-**Input**
-|Argument|Description|
-|--|--|
-|targetCompany (optional)|Company name of the target company in Tally. Skipping this defaults to Active company|
+| Tool | Description |
+|------|-------------|
+| `stock-summary` | Stock item summary with opening, inward, outward, closing |
+| `stock-item-balance` | Available quantity of a stock item as on date |
+| `stock-item-account` | Voucher-level stock item statement with tracking numbers |
 
-**Output**
-Tabular output with columns as below
+### GST
 
-|Column|Description|
-|--|--|
-|group|Ledger name|
-|parent|Group under which ledger exists|
-|bs_pl|BS (Balance Sheet) / PL (Profit &amp; Loss)|
-|dr_cr|D (Debit) / C (Credit)|
-|affects_gross_profit|Y (Yes) / N (No)|
+| Tool | Description |
+|------|-------------|
+| `gst-voucher-details` | GST tax breakup of Sales/Purchase vouchers |
+| `stock-item-gst` | GST configuration of all stock items (HSN, rates) |
+| `gst-hsn-summary` | HSN-wise GST summary for return filing |
+| `gstr1-summary` | GSTR-1 outward supplies summary (B2B/B2C) |
+| `gstr2-summary` | GSTR-2 inward supplies summary for ITC reconciliation |
 
+### Master Data
 
-### trial-balance
-Extracts Trial Balance for the specified period
+| Tool | Description |
+|------|-------------|
+| `list-master` | List any master collection (ledger, group, stockitem, vouchertype, etc.) |
 
-**Input**
-|Argument|Description|
-|--|--|
-|targetCompany (optional)|Company name of the target company in Tally. Skipping this defaults to Active company|
-|fromDate|Period start date (useful for opening balance)|
-|toDate|Period end date for closing balance|
+### Write Operations
 
-**Output**
-Tabular output with columns as below
+| Tool | Description |
+|------|-------------|
+| `create-voucher` | Create vouchers (Sales, Purchase, Payment, Receipt, Journal, etc.) |
+| `create-gst-voucher` | Create GST-compliant vouchers with auto tax ledger allocation |
+| `create-ledger` | Create a new GL ledger master |
+| `create-stock-item` | Create a new stock item master |
 
-|Column|Description|
-|--|--|
-|ledger|Ledger name|
-|group|Group under which ledger exists|
-|opening_balance|Opening Balance for the specified fromDate|
-|net_debit|Net Debit during the specified period|
-|net_credit|Net Credit during the specified period|
-|closing_balance|Closing Balance for the specified fromDate|
+> Write tools are disabled when `READONLY_MODE=true`.
 
+### Analytics
 
-### balance-sheet
-Extracts Balance Sheet as on date
+| Tool | Description |
+|------|-------------|
+| `query-database` | Run SQL queries on DuckDB against cached report tables |
 
-**Input**
-|Argument|Description|
-|--|--|
-|targetCompany (optional)|Company name of the target company in Tally. Skipping this defaults to Active company|
-|toDate|as on date of Balance Sheet|
+Most report tools cache their output in a temporary DuckDB table (returned as `tableID`). Use `query-database` to run analytical SQL — aggregate, filter, join, sort — on those cached tables. Tables auto-expire after 15 minutes.
 
-**Output**
-Tabular output with columns as below
+## Security
 
-|Column|Description|
-|--|--|
-|ledger|Ledger name|
-|group|Group under which ledger exists|
-|closing_balance|Closing Balance as on date|
+- **OAuth 2.1 + PKCE** with constant-time token comparison
+- **Helmet** security headers
+- **CORS** restricted to configured origins
+- **Rate limiting** on authentication endpoints (10 req/min)
+- **SQL validation** — only `SELECT` statements allowed in `query-database`
+- **Audit logging** — every tool invocation logged with timestamp, args (secrets redacted), and duration
+- **Read-only mode** — disable all write operations via env var
 
-### profit-loss
-Extracts Profit &amp; Loss for the period
+## Architecture
 
-**Input**
-|Argument|Description|
-|--|--|
-|targetCompany (optional)|Company name of the target company in Tally. Skipping this defaults to Active company|
-|fromDate|Period start date|
-|toDate|Period end date|
-
-**Output**
-Tabular output with columns as below
-
-|Column|Description|
-|--|--|
-|ledger|Ledger name|
-|group|Group under which ledger exists|
-|amount|Amount of net activity (-ve = Expense / +ve = Income)|
-
-
-### ledger-balance
-Returns closing balance of ledger as on specified date
-
-**Input**
-|Argument|Description|
-|--|--|
-|targetCompany (optional)|Company name of the target company in Tally. Skipping this defaults to Active company|
-|ledgerName|Ledger of which to query balance|
-|toDate|specific date for closing balance|
-
-**Output**
-Closing Balance of ledger (if exists)
-
-|Sign|Description|
-|--|--|
-|Negative (-)|Debit|
-|Positive (+)|Credit|
-
-Note: If specified ledger does not exists, LLM might invoke list-master tool to fetch list of ledgers. It will attempt to find closest possible ledger name for this list and re-run this action. This might produce un-predictable response.
-
-### ledger-account
-Extracts ledger account for the specified ledger for the given period
-
-**Input**
-|Argument|Description|
-|--|--|
-|targetCompany (optional)|Company name of the target company in Tally. Skipping this defaults to Active company|
-|ledgerName|Ledger of which to query balance|
-|fromDate|period start date|
-|toDate|period end date|
-
-**Output**
-Tabular output with columns as below
-
-|Column|Description|
-|--|--|
-|date|Date of voucher|
-|voucher_type|Voucher Type|
-|voucher_number|Voucher Number|
-|party_ledger|Party ledger or opposite side ledger|
-|amount|Amount (negative = Debit / positive = Credit)|
-|narration|Narration or Remarks of voucher|
-
-### stock-item-balance
-Returns available quantity of stock item as on specified date
-
-**Input**
-|Argument|Description|
-|--|--|
-|targetCompany (optional)|Company name of the target company in Tally. Skipping this defaults to Active company|
-|itemName|Stock Item of which to query available quantity|
-|toDate|specific date as on which to check quantity|
-
-**Output**
-Available Quantity of stock item (if exists)
-
-
-Note: If specified stock item does not exists, LLM might invoke list-master tool to fetch list of stock items. It will attempt to find closest possible stock item name for this list and re-run this action. This might produce un-predictable response.
-
-
-### stock-item-account
-Extracts account statement for stock item vouchers for the specified item for the given period
-
-**Input**
-|Argument|Description|
-|--|--|
-|targetCompany (optional)|Company name of the target company in Tally. Skipping this defaults to Active company|
-|itemName|Ledger of which to query balance|
-|fromDate|period start date|
-|toDate|period end date|
-
-**Output**
-Tabular output with columns as below
-
-|Column|Description|
-|--|--|
-|date|Date of voucher|
-|voucher_type|Voucher Type|
-|voucher_number|Voucher Number|
-|party_ledger|Party ledger or opposite side ledger|
-|quantity|Quantity (negative = Outward / positive = Inward)|
-|amount|Amount (negative = Debit / positive = Credit)|
-|narration|Narration or Remarks of voucher|
-|tracking_number|Tracking number to reconcile pending quantity received by ignoring excess / missing quantity in actual purchase (against receipt note) and sales (against delivery note)|
-
-### bills-outstanding
-Extracts bill-wise outstanding Receivables / Payables report
-
-**Input**
-|Argument|Description|
-|--|--|
-|targetCompany (optional)|Company name of the target company in Tally. Skipping this defaults to Active company|
-|nature|receivable / payable|
-|toDate|Date on which outstanding position to fetch|
-
-**Output**
-Tabular output with columns as below
-
-|Column|Description|
-|--|--|
-|date|Date of purchase / sales invoice|
-|reference_number|Invoice number of purchase / sales invoice|
-|outstanding_amount|Pending amount as on date|
-|party_name|Ledger name of the party|
-|overdue_days|Count of days by which invoice is overdue|
+```
+┌─────────────┐     ┌──────────────────────┐     ┌─────────────┐
+│  MCP Client │────▶│   Tally MCP Server   │────▶│ Tally Prime │
+│  (Claude,   │ MCP │  Express + MCP SDK   │ XML │  Port 9000  │
+│  Copilot…)  │◀────│  DuckDB · OAuth 2.1  │◀────│             │
+└─────────────┘     └──────────────────────┘     └─────────────┘
+```
 
 ## Credits
+
 Originally created by [Dhananjay Gokhale](https://github.com/dhananjay1405/tally-mcp-server). This fork is maintained by [Jinacode Systems](https://github.com/JINA-CODE-SYSTEMS).
+
+## License
+
+[AGPL-3.0-or-later](LICENSE)
