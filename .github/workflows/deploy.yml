@@ -15,6 +15,9 @@ jobs:
         working-directory: C:\tally-mcp-server
 
     steps:
+      - name: Trust working directory
+        run: git config --global --add safe.directory C:/tally-mcp-server
+
       - name: Pull latest code
         run: |
           git reset --hard HEAD
