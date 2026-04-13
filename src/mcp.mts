@@ -65,6 +65,42 @@ export async function registerMcpServer(): Promise<McpServer> {
   );
 
   mcpServer.registerTool(
+    'list-companies',
+    {
+      title: 'List Companies',
+      description: `fetches list of all companies available in Tally Prime (does not require a company to be open). Returns company name, mail name, books from date, and last voucher date in tab separated format`,
+      inputSchema: {},
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      try {
+        let inputParams = new Map<string, any>();
+        const resp = await handlePull('list-companies', inputParams);
+        if (resp.error) {
+          auditLog('list-companies', args, 'error', Date.now() - start);
+          return {
+            isError: true,
+            content: [{ type: 'text', text: resp.error }]
+          };
+        }
+        else {
+          auditLog('list-companies', args, 'success', Date.now() - start);
+          return {
+            content: [{ type: 'text', text: jsonToTSV(resp.data) }]
+          };
+        }
+      } catch (err) {
+        auditLog('list-companies', args, 'error', Date.now() - start);
+        throw err;
+      }
+    }
+  );
+
+  mcpServer.registerTool(
     'list-master',
     {
       title: 'List Masters',
