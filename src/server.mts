@@ -522,7 +522,6 @@ app.post('/token', authRateLimiter, (req, res) => {
 
   // Generate access token and separate refresh token
   const accessToken = generateSecureToken(32);
-  const refreshToken = generateSecureToken(32);
   const expiresIn = 3600; // 1 hour
 
   accessTokens[accessToken] = {
@@ -534,8 +533,7 @@ app.post('/token', authRateLimiter, (req, res) => {
   res.json({
     access_token: accessToken,
     token_type: 'Bearer',
-    expires_in: expiresIn,
-    refresh_token: refreshToken
+    expires_in: expiresIn
   });
 });
 
