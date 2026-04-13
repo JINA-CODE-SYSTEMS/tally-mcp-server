@@ -1,8 +1,10 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import dotenv from 'dotenv';
+import fs from 'node:fs';
+import path from 'node:path';
 import { z } from 'zod';
 import { cacheTable, executeSQL, validateSQL } from './database.mjs';
-import { handlePull, handlePush, jsonToTSV, resolveGSTLedgers } from './tally.mjs';
+import { handlePull, handlePush, jsonToTSV, postTallyXML, resolveGSTLedgers } from './tally.mjs';
 
 dotenv.config({ override: true, quiet: true });
 
@@ -68,7 +70,7 @@ export async function registerMcpServer(): Promise<McpServer> {
     'list-companies',
     {
       title: 'List Companies',
-      description: `fetches list of all companies available in Tally Prime (does not require a company to be open). Returns company name, mail name, books from date, and last voucher date in tab separated format`,
+      description: `lists all company data folders found in the Tally Prime data directory. Does NOT require any company to be open. Returns folder numbers. Use open-company tool to load a company before querying it.`,
       inputSchema: {},
       annotations: {
         readOnlyHint: true,
@@ -78,24 +80,78 @@ export async function registerMcpServer(): Promise<McpServer> {
     async (args) => {
       const start = Date.now();
       try {
-        let inputParams = new Map<string, any>();
-        const resp = await handlePull('list-companies', inputParams);
-        if (resp.error) {
+        const tallyDataPath = process.env.TALLY_DATA_PATH || '';
+        if (!tallyDataPath) {
           auditLog('list-companies', args, 'error', Date.now() - start);
           return {
             isError: true,
-            content: [{ type: 'text', text: resp.error }]
+            content: [{ type: 'text', text: 'TALLY_DATA_PATH environment variable is not configured. Set it to the Tally Prime data directory (e.g. C:\\Users\\Public\\TallyPrimeEditLog\\data).' }]
           };
         }
-        else {
-          auditLog('list-companies', args, 'success', Date.now() - start);
+        if (!fs.existsSync(tallyDataPath)) {
+          auditLog('list-companies', args, 'error', Date.now() - start);
           return {
-            content: [{ type: 'text', text: jsonToTSV(resp.data) }]
+            isError: true,
+            content: [{ type: 'text', text: `Data directory not found: ${tallyDataPath}` }]
           };
         }
+        const entries = fs.readdirSync(tallyDataPath, { withFileTypes: true });
+        const folders = entries
+          .filter(e => e.isDirectory() && /^\d+$/.test(e.name))
+          .map(e => ({ folder: e.name, path: path.join(tallyDataPath, e.name) }));
+        if (folders.length === 0) {
+          auditLog('list-companies', args, 'success', Date.now() - start);
+          return { content: [{ type: 'text', text: 'No company folders found in the data directory.' }] };
+        }
+        const tsv = 'folder\tpath\n' + folders.map(f => `${f.folder}\t${f.path}`).join('\n');
+        auditLog('list-companies', args, 'success', Date.now() - start);
+        return { content: [{ type: 'text', text: tsv }] };
       } catch (err) {
         auditLog('list-companies', args, 'error', Date.now() - start);
         throw err;
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'open-company',
+    {
+      title: 'Open Company',
+      description: `loads/opens a company in Tally Prime by its data folder path so other tools can query it. Use list-companies first to find available company folders.`,
+      inputSchema: {
+        companyPath: z.string().describe('full path to the company data folder (e.g. C:\\Users\\Public\\TallyPrimeEditLog\\data\\010000)')
+      },
+      annotations: {
+        readOnlyHint: false,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      try {
+        const xml = `<?xml version="1.0" encoding="utf-8"?>
+<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Action</TALLYREQUEST>
+    <TYPE>Company</TYPE>
+    <ID>${args.companyPath.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</ID>
+  </HEADER>
+</ENVELOPE>`;
+        const resp = await postTallyXML(xml);
+        if (resp && (resp.includes('<STATUS>1</STATUS>') || resp.includes('Loaded Successfully'))) {
+          auditLog('open-company', args, 'success', Date.now() - start);
+          return { content: [{ type: 'text', text: `Company loaded successfully from ${args.companyPath}. You can now use other tools like list-master, balance-sheet, etc.` }] };
+        } else {
+          auditLog('open-company', args, 'success', Date.now() - start);
+          return { content: [{ type: 'text', text: `Tally response: ${resp ? resp.substring(0, 500) : 'empty'}. The company may or may not have loaded — try list-master with collection company to verify.` }] };
+        }
+      } catch (err) {
+        auditLog('open-company', args, 'error', Date.now() - start);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `Failed to open company: ${err}` }]
+        };
       }
     }
   );
