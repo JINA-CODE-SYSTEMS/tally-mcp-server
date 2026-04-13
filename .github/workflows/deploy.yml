@@ -32,13 +32,7 @@ jobs:
 
       - name: Restart MCP Server
         run: |
-          try {
-            nssm restart TallyMCP
-            Start-Sleep -Seconds 3
-            $status = nssm status TallyMCP
-            Write-Host "Service status: $status"
-          } catch {
-            Write-Host "Warning: Could not restart TallyMCP service via nssm. Trying net stop/start..."
-            net stop TallyMCP 2>$null
-            net start TallyMCP
-          }
+          # Kill the node process - nssm will auto-restart the service
+          taskkill /F /FI "SERVICES eq TallyMCP" 2>$null
+          Start-Sleep -Seconds 5
+          Write-Host "MCP server restarting via nssm..."
