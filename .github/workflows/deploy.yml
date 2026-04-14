@@ -32,8 +32,16 @@ jobs:
       - name: Compile TallyUI DLL
         run: |
           $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-          & $csc /nologo /target:library /reference:System.Drawing.dll /out:scripts\TallyUI.dll scripts\TallyUI.cs
+          $tmpDll = "scripts\TallyUI.tmp.dll"
+          $finalDll = "scripts\TallyUI.dll"
+          & $csc /nologo /target:library /reference:System.Drawing.dll /out:$tmpDll scripts\TallyUI.cs
           if ($LASTEXITCODE -ne 0) { throw "Failed to compile TallyUI.dll" }
+          # Kill any agent locking the old DLL
+          Get-Process powershell -ErrorAction SilentlyContinue | Where-Object {
+            try { (Get-WmiObject Win32_Process -Filter "ProcessId=$($_.Id)").CommandLine -match 'tally-gui-agent' } catch { $false }
+          } | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep 2
+          Move-Item $tmpDll $finalDll -Force
           Write-Host "TallyUI.dll compiled successfully"
 
       - name: Restart MCP Server
