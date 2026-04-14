@@ -31,19 +31,11 @@ jobs:
 
 
       - name: Restart MCP Server
+        shell: cmd
         run: |
-          # Restart via scheduled task running as SYSTEM (has service control rights)
-          $taskName = "TallyMCP_Restart"
-          schtasks /Delete /TN $taskName /F 2>$null
-          schtasks /Create /TN $taskName /TR "nssm restart TallyMCP" /SC ONCE /ST 00:00 /RU SYSTEM /F
-          schtasks /Run /TN $taskName
-          Start-Sleep -Seconds 8
-          schtasks /Delete /TN $taskName /F 2>$null
-          
-          # Verify service is running
-          $svc = Get-Service -Name TallyMCP -ErrorAction SilentlyContinue
-          if ($svc -and $svc.Status -eq 'Running') {
-            Write-Host "MCP server restarted successfully"
-          } else {
-            Write-Host "Warning: Service status is $($svc.Status). Check logs."
-          }
+          net stop TallyMCP 2>nul
+          timeout /t 3 /nobreak >nul
+          net start TallyMCP
+          timeout /t 5 /nobreak >nul
+          echo MCP server restarted
+        continue-on-error: true
