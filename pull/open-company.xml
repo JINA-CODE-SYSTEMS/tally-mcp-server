@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ENVELOPE>
+    <HEADER>
+        <VERSION>1</VERSION>
+        <TALLYREQUEST>Export</TALLYREQUEST>
+        <TYPE>Data</TYPE>
+        <ID>MCPOpenCompanyReport</ID>
+    </HEADER>
+    <BODY>
+        <DESC>
+            <STATICVARIABLES>
+                <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+                <MCPTARGETCOMPANY>{companyName}</MCPTARGETCOMPANY>
+            </STATICVARIABLES>
+            <TDL>
+                <TDLMESSAGE>
+                    <REPORT NAME="MCPOpenCompanyReport">
+                        <FORMS>MCPOpenCompanyForm</FORMS>
+                    </REPORT>
+                    <FORM NAME="MCPOpenCompanyForm">
+                        <PARTS>MCPOpenCompanyPart</PARTS>
+                        <XMLTAG>DATA</XMLTAG>
+                    </FORM>
+                    <PART NAME="MCPOpenCompanyPart">
+                        <LINES>MCPOpenCompanyLine</LINES>
+                    </PART>
+                    <LINE NAME="MCPOpenCompanyLine">
+                        <FIELDS>MCPResultField</FIELDS>
+                        <XMLTAG>ROW</XMLTAG>
+                    </LINE>
+                    <FIELD NAME="MCPResultField">
+                        <SET>$$CmpLoadCompany:##MCPTargetCompany</SET>
+                        <XMLTAG>RESULT</XMLTAG>
+                    </FIELD>
+                </TDLMESSAGE>
+            </TDL>
+        </DESC>
+    </BODY>
+</ENVELOPE>

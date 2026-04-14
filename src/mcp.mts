@@ -133,9 +133,10 @@ export async function registerMcpServer(): Promise<McpServer> {
     'open-company',
     {
       title: 'Open Company',
-      description: `loads a company into Tally Prime by restarting Tally with the company's data path. Use list-companies first to find available folders. This will briefly disconnect Tally (5-10 seconds) while it restarts.`,
+      description: `loads a company into Tally Prime. Tries multiple strategies in order: (1) TDL $$CmpLoadCompany via XML API (no restart needed), (2) TDL $$CmpConnect via XML API (no restart needed), (3) Restart Tally with enhanced UI automation. Use list-companies first to find available company names.`,
       inputSchema: {
-        companyName: z.string().describe('the company folder number from list-companies (e.g. "010000")')
+        companyName: z.string().describe('exact company name as shown in Tally (e.g. "My Company Pvt Ltd"). Use list-companies or list-master with collection=company to find names.'),
+        strategy: z.enum(['auto', 'tdl-load', 'tdl-connect', 'restart-ui']).optional().describe('which strategy to use. "auto" tries all in order (default). "tdl-load" uses $$CmpLoadCompany. "tdl-connect" uses $$CmpConnect. "restart-ui" restarts Tally with Win32 UI automation.')
       },
       annotations: {
         readOnlyHint: false,
@@ -144,88 +145,293 @@ export async function registerMcpServer(): Promise<McpServer> {
     },
     async (args) => {
       const start = Date.now();
-      try {
-        const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
-        const companyPath = path.join(tallyDataPath, args.companyName);
-        const tallyExe = process.env.TALLY_EXE_PATH || 'C:\\Program Files\\TallyPrimeEditLog\\tally.exe';
+      const strategy = args.strategy || 'auto';
+      const companyName = args.companyName;
+      const logs: string[] = [];
 
-        if (!fs.existsSync(companyPath)) {
-          auditLog('open-company', args, 'error', Date.now() - start);
-          return { isError: true, content: [{ type: 'text', text: `Company folder not found: ${companyPath}` }] };
-        }
-        if (!fs.existsSync(tallyExe)) {
-          auditLog('open-company', args, 'error', Date.now() - start);
-          return { isError: true, content: [{ type: 'text', text: `Tally executable not found at ${tallyExe}. Set TALLY_EXE_PATH env var.` }] };
-        }
-
-        // Kill Tally
-        try { execSync('taskkill /IM tally.exe /F', { timeout: 10000 }); } catch {}
-        
-        // Wait for Tally to fully exit
-        await new Promise(resolve => setTimeout(resolve, 3000));
-
-        // Create a helper script that launches Tally, waits, then sends Enter to select the company
-        const scriptPath = path.join(tallyDataPath, '_open_company.ps1');
-        const ps1 = `
-Add-Type -AssemblyName System.Windows.Forms
-Start-Process -FilePath '${tallyExe.replace(/'/g, "''")}' -ArgumentList '/path:${companyPath.replace(/'/g, "''")}'
-Start-Sleep -Seconds 8
-[System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
-`;
-        fs.writeFileSync(scriptPath, ps1, 'utf-8');
-
-        // Use a scheduled task to run the script in the interactive user session
-        const taskName = 'TallyMCP_OpenCompany';
-        try { execSync(`schtasks /Delete /TN "${taskName}" /F`, { timeout: 5000 }); } catch {}
-        // Find active console session user for /RU
-        let sessionUser = 'SYSTEM';
-        try {
-          const quser = execSync('query user 2>nul', { timeout: 5000 }).toString();
-          const activeLine = quser.split('\\n').find((l: string) => l.includes('Active') || l.includes('console'));
-          if (activeLine) {
-            const parts = activeLine.trim().split(/\\s+/);
-            if (parts[0]?.startsWith('>')) sessionUser = parts[0].substring(1);
-            else sessionUser = parts[0];
-          }
-        } catch {}
-        execSync(`schtasks /Create /TN "${taskName}" /TR "powershell -ExecutionPolicy Bypass -File \\"${scriptPath}\\"" /SC ONCE /ST 00:00 /RU "${sessionUser}" /IT /F`, { timeout: 10000 });
-        execSync(`schtasks /Run /TN "${taskName}"`, { timeout: 10000 });
-        try { execSync(`schtasks /Delete /TN "${taskName}" /F`, { timeout: 5000 }); } catch {}
-
-        // Wait extra time for Tally to start + SendKeys to select company
-        await new Promise(resolve => setTimeout(resolve, 10000));
-
-        // Wait for Tally to start and listen on port
-        const tallyPort = parseInt(process.env.TALLY_PORT || '9000');
-        let connected = false;
-        for (let i = 0; i < 20; i++) {
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          try {
-            await postTallyXML('<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>List of Companies</ID></HEADER></ENVELOPE>');
-            connected = true;
-            break;
-          } catch {}
-        }
-
-        if (!connected) {
-          auditLog('open-company', args, 'error', Date.now() - start);
-          return { isError: true, content: [{ type: 'text', text: `Tally restarted but not responding on port ${tallyPort} after 40 seconds.` }] };
-        }
-
-        // Verify the company loaded
+      // --- Helper: verify company is loaded ---
+      const verifyCompanyLoaded = async (targetName: string): Promise<boolean> => {
         try {
           const inputParams = new Map([['collection', 'company']]);
           const resp = await handlePull('list-master', inputParams);
-          const companies = resp.data?.map((c: any) => c.name).join(', ') || 'unknown';
-          auditLog('open-company', args, 'success', Date.now() - start);
-          return { content: [{ type: 'text', text: `Tally restarted with company folder ${args.companyName}. Active companies: ${companies}` }] };
+          if (resp.data && resp.data.length > 0) {
+            const loadedNames = resp.data.map((c: any) => (c.name || '').toLowerCase());
+            return loadedNames.includes(targetName.toLowerCase());
+          }
+          return false;
         } catch {
-          auditLog('open-company', args, 'success', Date.now() - start);
-          return { content: [{ type: 'text', text: `Tally restarted with company folder ${args.companyName}. Verify with list-master collection company.` }] };
+          return false;
         }
+      };
+
+      // --- Strategy 1: TDL $$CmpLoadCompany via inline XML ---
+      const tryTdlLoad = async (): Promise<boolean> => {
+        logs.push('[Strategy 1: $$CmpLoadCompany] Attempting...');
+        try {
+          const xml = `<?xml version="1.0" encoding="utf-8"?>
+<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Export</TALLYREQUEST>
+    <TYPE>Data</TYPE>
+    <ID>MCPOpenCompanyReport</ID>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <STATICVARIABLES>
+        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+        <MCPTARGETCOMPANY>${companyName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</MCPTARGETCOMPANY>
+      </STATICVARIABLES>
+      <TDL>
+        <TDLMESSAGE>
+          <REPORT NAME="MCPOpenCompanyReport">
+            <FORMS>MCPOpenCompanyForm</FORMS>
+          </REPORT>
+          <FORM NAME="MCPOpenCompanyForm">
+            <PARTS>MCPOpenCompanyPart</PARTS>
+            <XMLTAG>DATA</XMLTAG>
+          </FORM>
+          <PART NAME="MCPOpenCompanyPart">
+            <LINES>MCPOpenCompanyLine</LINES>
+          </PART>
+          <LINE NAME="MCPOpenCompanyLine">
+            <FIELDS>MCPResultField</FIELDS>
+            <XMLTAG>ROW</XMLTAG>
+          </LINE>
+          <FIELD NAME="MCPResultField">
+            <SET>$$CmpLoadCompany:##MCPTargetCompany</SET>
+            <XMLTAG>RESULT</XMLTAG>
+          </FIELD>
+        </TDLMESSAGE>
+      </TDL>
+    </DESC>
+  </BODY>
+</ENVELOPE>`;
+          const resp = await postTallyXML(xml);
+          logs.push(`  Response: ${resp.substring(0, 200)}`);
+
+          if (resp.includes('Unknown Request') || resp.includes('Could not find')) {
+            logs.push('  $$CmpLoadCompany not available or failed.');
+            return false;
+          }
+
+          // Wait a moment for company to load
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          const loaded = await verifyCompanyLoaded(companyName);
+          logs.push(`  Verification: ${loaded ? 'SUCCESS' : 'company not detected in active list'}`);
+          return loaded;
+        } catch (err) {
+          logs.push(`  Error: ${err}`);
+          return false;
+        }
+      };
+
+      // --- Strategy 2: TDL $$CmpConnect via inline XML ---
+      const tryTdlConnect = async (): Promise<boolean> => {
+        logs.push('[Strategy 2: $$CmpConnect] Attempting...');
+        try {
+          const xml = `<?xml version="1.0" encoding="utf-8"?>
+<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Export</TALLYREQUEST>
+    <TYPE>Data</TYPE>
+    <ID>MCPConnectCompanyReport</ID>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <STATICVARIABLES>
+        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+        <MCPTARGETCOMPANY>${companyName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</MCPTARGETCOMPANY>
+      </STATICVARIABLES>
+      <TDL>
+        <TDLMESSAGE>
+          <REPORT NAME="MCPConnectCompanyReport">
+            <FORMS>MCPConnectCompanyForm</FORMS>
+          </REPORT>
+          <FORM NAME="MCPConnectCompanyForm">
+            <PARTS>MCPConnectCompanyPart</PARTS>
+            <XMLTAG>DATA</XMLTAG>
+          </FORM>
+          <PART NAME="MCPConnectCompanyPart">
+            <LINES>MCPConnectCompanyLine</LINES>
+          </PART>
+          <LINE NAME="MCPConnectCompanyLine">
+            <FIELDS>MCPConnectResultField</FIELDS>
+            <XMLTAG>ROW</XMLTAG>
+          </LINE>
+          <FIELD NAME="MCPConnectResultField">
+            <SET>$$CmpConnect:##MCPTargetCompany</SET>
+            <XMLTAG>RESULT</XMLTAG>
+          </FIELD>
+        </TDLMESSAGE>
+      </TDL>
+    </DESC>
+  </BODY>
+</ENVELOPE>`;
+          const resp = await postTallyXML(xml);
+          logs.push(`  Response: ${resp.substring(0, 200)}`);
+
+          if (resp.includes('Unknown Request') || resp.includes('Could not find')) {
+            logs.push('  $$CmpConnect not available or failed.');
+            return false;
+          }
+
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          const loaded = await verifyCompanyLoaded(companyName);
+          logs.push(`  Verification: ${loaded ? 'SUCCESS' : 'company not detected in active list'}`);
+          return loaded;
+        } catch (err) {
+          logs.push(`  Error: ${err}`);
+          return false;
+        }
+      };
+
+      // --- Strategy 3: Restart Tally with enhanced Win32 UI automation ---
+      const tryRestartUI = async (): Promise<boolean> => {
+        logs.push('[Strategy 3: Restart + UI Automation] Attempting...');
+        try {
+          const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+          const tallyExe = process.env.TALLY_EXE_PATH || 'C:\\Program Files\\TallyPrimeEditLog\\tally.exe';
+
+          if (!fs.existsSync(tallyExe)) {
+            logs.push(`  Tally executable not found at ${tallyExe}`);
+            return false;
+          }
+
+          // Resolve company folder from name by scanning data directories
+          let companyPath = '';
+          const entries = fs.readdirSync(tallyDataPath, { withFileTypes: true });
+          for (const e of entries) {
+            if (!e.isDirectory() || !/^\d+$/.test(e.name)) continue;
+            const companyFile = path.join(tallyDataPath, e.name, 'Company.900');
+            if (!fs.existsSync(companyFile)) continue;
+            try {
+              const buf = fs.readFileSync(companyFile);
+              const text = buf.toString('utf16le').replace(/[^\x20-\x7E\u0900-\u097F]/g, ' ').trim();
+              if (text.toLowerCase().includes(companyName.toLowerCase())) {
+                companyPath = path.join(tallyDataPath, e.name);
+                break;
+              }
+            } catch {}
+          }
+
+          // If no name match, check if companyName looks like a folder number
+          if (!companyPath && /^\d+$/.test(companyName)) {
+            const directPath = path.join(tallyDataPath, companyName);
+            if (fs.existsSync(directPath)) companyPath = directPath;
+          }
+
+          if (!companyPath) {
+            logs.push(`  Could not resolve company folder for "${companyName}"`);
+            return false;
+          }
+
+          logs.push(`  Resolved company path: ${companyPath}`);
+
+          // Kill Tally
+          try { execSync('taskkill /IM tally.exe /F', { timeout: 10000 }); } catch {}
+          await new Promise(resolve => setTimeout(resolve, 3000));
+
+          // Use the enhanced UI automation PowerShell script
+          const scriptDir = path.join(__dirname, '../scripts');
+          const uiScriptPath = path.join(scriptDir, 'open-company-ui.ps1');
+
+          if (fs.existsSync(uiScriptPath)) {
+            // Run via scheduled task in interactive session for UI access
+            const taskName = 'TallyMCP_OpenCompany';
+            try { execSync(`schtasks /Delete /TN "${taskName}" /F`, { timeout: 5000 }); } catch {}
+
+            let sessionUser = 'SYSTEM';
+            try {
+              const quser = execSync('query user 2>nul', { timeout: 5000 }).toString();
+              const activeLine = quser.split('\n').find((l: string) => l.includes('Active') || l.includes('console'));
+              if (activeLine) {
+                const parts = activeLine.trim().split(/\s+/);
+                if (parts[0]?.startsWith('>')) sessionUser = parts[0].substring(1);
+                else sessionUser = parts[0];
+              }
+            } catch {}
+
+            const cmd = `powershell -ExecutionPolicy Bypass -File "${uiScriptPath}" -TallyExePath "${tallyExe}" -CompanyDataPath "${companyPath}"`;
+            execSync(`schtasks /Create /TN "${taskName}" /TR "${cmd.replace(/"/g, '\\"')}" /SC ONCE /ST 00:00 /RU "${sessionUser}" /IT /F`, { timeout: 10000 });
+            execSync(`schtasks /Run /TN "${taskName}"`, { timeout: 10000 });
+            try { execSync(`schtasks /Delete /TN "${taskName}" /F`, { timeout: 5000 }); } catch {}
+          } else {
+            // Fallback: basic restart with /path: (no UI automation script available)
+            logs.push('  UI automation script not found, using basic restart...');
+            execSync(`start "" "${tallyExe}" /path:"${companyPath}"`, { timeout: 10000, shell: 'cmd' });
+          }
+
+          // Wait for Tally to start and respond
+          logs.push('  Waiting for Tally to start...');
+          await new Promise(resolve => setTimeout(resolve, 15000));
+
+          let connected = false;
+          for (let i = 0; i < 20; i++) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            try {
+              await postTallyXML('<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>List of Companies</ID></HEADER></ENVELOPE>');
+              connected = true;
+              break;
+            } catch {}
+          }
+
+          if (!connected) {
+            logs.push('  Tally not responding after restart.');
+            return false;
+          }
+
+          await new Promise(resolve => setTimeout(resolve, 3000));
+          const loaded = await verifyCompanyLoaded(companyName);
+          logs.push(`  Verification: ${loaded ? 'SUCCESS' : 'company not detected (UI automation may not have focused window)'}`);
+          return loaded;
+        } catch (err) {
+          logs.push(`  Error: ${err}`);
+          return false;
+        }
+      };
+
+      // --- Execute strategies ---
+      try {
+        let success = false;
+
+        if (strategy === 'auto' || strategy === 'tdl-load') {
+          success = await tryTdlLoad();
+          if (success || strategy === 'tdl-load') {
+            auditLog('open-company', args, success ? 'success' : 'error', Date.now() - start);
+            return {
+              isError: !success,
+              content: [{ type: 'text', text: logs.join('\n') + (success ? `\n\nCompany "${companyName}" loaded successfully via $$CmpLoadCompany.` : '') }]
+            };
+          }
+        }
+
+        if (strategy === 'auto' || strategy === 'tdl-connect') {
+          success = await tryTdlConnect();
+          if (success || strategy === 'tdl-connect') {
+            auditLog('open-company', args, success ? 'success' : 'error', Date.now() - start);
+            return {
+              isError: !success,
+              content: [{ type: 'text', text: logs.join('\n') + (success ? `\n\nCompany "${companyName}" loaded successfully via $$CmpConnect.` : '') }]
+            };
+          }
+        }
+
+        if (strategy === 'auto' || strategy === 'restart-ui') {
+          success = await tryRestartUI();
+          auditLog('open-company', args, success ? 'success' : 'error', Date.now() - start);
+          return {
+            isError: !success,
+            content: [{ type: 'text', text: logs.join('\n') + (success ? `\n\nCompany "${companyName}" loaded successfully via Tally restart + UI automation.` : '\n\nAll strategies failed. Please load the company manually in Tally Prime GUI.') }]
+          };
+        }
+
+        auditLog('open-company', args, 'error', Date.now() - start);
+        return { isError: true, content: [{ type: 'text', text: logs.join('\n') + '\n\nAll strategies exhausted.' }] };
       } catch (err) {
         auditLog('open-company', args, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: `Failed to open company: ${err}` }] };
+        return { isError: true, content: [{ type: 'text', text: `Failed to open company: ${err}\n\n${logs.join('\n')}` }] };
       }
     }
   );
