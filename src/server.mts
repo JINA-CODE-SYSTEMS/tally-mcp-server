@@ -14,6 +14,24 @@ const mcpPort = parseInt(process.env.PORT || '3000');
 const mcpDomain = process.env.MCP_DOMAIN || 'http://localhost:3000';
 const __dirname = import.meta.dirname;
 
+// Cleanup old rotated log files on startup — keep only the 10 most recent
+try {
+  const logsDir = path.join(__dirname, '../logs');
+  if (fs.existsSync(logsDir)) {
+    const logFiles = fs.readdirSync(logsDir)
+      .filter(f => /^service-\d{8}T\d{6}\.\d+\.log$/.test(f))
+      .sort()
+      .reverse();
+    const maxKeep = parseInt(process.env.LOG_RETAIN_COUNT || '10');
+    for (const f of logFiles.slice(maxKeep)) {
+      fs.unlinkSync(path.join(logsDir, f));
+    }
+    if (logFiles.length > maxKeep) {
+      console.log(`[startup] Cleaned up ${logFiles.length - maxKeep} old log files`);
+    }
+  }
+} catch {}
+
 const app = express();
 app.set('trust proxy', 1); // Trust first proxy (nginx/caddy)
 app.use(express.json());
