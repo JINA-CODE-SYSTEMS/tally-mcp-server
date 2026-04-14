@@ -340,13 +340,20 @@ Write-Host "Max steps per command: $MaxSteps"
 Write-Host "Agent started. Polling every 500ms for commands..."
 
 while ($true) {
-    if (Test-Path $CommandFile) {
+    try {
+        # Atomically try to read and delete — avoids TOCTOU race with MCP server
+        $cmdText = $null
         try {
-            Start-Sleep -Milliseconds 200
             $cmdText = [System.IO.File]::ReadAllText($CommandFile, [System.Text.Encoding]::UTF8)
-            $cmd = $cmdText | ConvertFrom-Json
             Remove-Item $CommandFile -Force -ErrorAction SilentlyContinue
+        } catch [System.IO.FileNotFoundException] {
+            # File doesn't exist — normal, just keep polling
+        } catch [System.IO.DirectoryNotFoundException] {
+            # Directory doesn't exist yet
+        }
 
+        if ($cmdText) {
+            $cmd = $cmdText | ConvertFrom-Json
             Write-Host "`n=== Received command: $($cmd.action) ==="
 
             switch ($cmd.action) {
@@ -368,11 +375,11 @@ while ($true) {
                 }
             }
         }
-        catch {
-            Write-Host "Error: $_"
-            Write-Result -Status "error" -Message "Exception: $_" -Strategy "error"
-            Remove-Item $CommandFile -Force -ErrorAction SilentlyContinue
-        }
+    }
+    catch {
+        Write-Host "Error processing command: $_"
+        Write-Result -Status "error" -Message "Exception: $_" -Strategy "error"
+        Remove-Item $CommandFile -Force -ErrorAction SilentlyContinue
     }
     Start-Sleep -Milliseconds 500
 }
