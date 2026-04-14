@@ -29,6 +29,12 @@ jobs:
       - name: Build TypeScript
         run: npx tsc
 
+      - name: Compile TallyUI DLL
+        run: |
+          $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          & $csc /nologo /target:library /reference:System.Drawing.dll /out:scripts\TallyUI.dll scripts\TallyUI.cs
+          if ($LASTEXITCODE -ne 0) { throw "Failed to compile TallyUI.dll" }
+          Write-Host "TallyUI.dll compiled successfully"
 
       - name: Restart MCP Server
         shell: cmd
