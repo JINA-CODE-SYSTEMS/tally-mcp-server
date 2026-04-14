@@ -376,7 +376,6 @@ export async function registerMcpServer(): Promise<McpServer> {
             tallyRunning = false;
           }
 
-          // Determine action: if Tally is running with no company, use startup load; otherwise use select-company
           const action = tallyRunning ? 'select-company' : 'load-on-startup';
           logs.push(`  Tally running: ${tallyRunning}, action: ${action}`);
 
@@ -390,21 +389,38 @@ export async function registerMcpServer(): Promise<McpServer> {
             }
           }
 
-          // Delete any old result file
+          // --- First, ping the agent to check if it's alive ---
           try { fs.unlinkSync(resultFile); } catch {}
+          fs.writeFileSync(commandFile, JSON.stringify({ action: 'ping', timestamp: new Date().toISOString() }), 'utf-8');
+          let agentAlive = false;
+          for (let i = 0; i < 5; i++) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            if (fs.existsSync(resultFile)) {
+              agentAlive = true;
+              try { fs.unlinkSync(resultFile); } catch {}
+              break;
+            }
+          }
 
-          // Write command for the GUI agent
+          if (!agentAlive) {
+            logs.push('  GUI agent not running. Please start scripts/tally-gui-agent-v2.ps1 in the interactive desktop session.');
+            return false;
+          }
+          logs.push('  GUI agent is alive.');
+
+          // --- Send the actual command ---
+          try { fs.unlinkSync(resultFile); } catch {}
           const command = JSON.stringify({
             action: action,
             companyName: companyName,
             timestamp: new Date().toISOString()
           });
           fs.writeFileSync(commandFile, command, 'utf-8');
-          logs.push('  Command file written, waiting for GUI agent to process...');
+          logs.push('  Command sent, waiting for GUI agent (up to 90 seconds for LLM-guided actions)...');
 
-          // Wait for the GUI agent to pick up and process (poll for result file)
+          // Poll for result — 90 seconds max (LLM agent takes screenshots + API calls per step)
           let agentResponded = false;
-          for (let i = 0; i < 30; i++) {
+          for (let i = 0; i < 90; i++) {
             await new Promise(resolve => setTimeout(resolve, 1000));
             if (fs.existsSync(resultFile)) {
               try {
@@ -412,73 +428,15 @@ export async function registerMcpServer(): Promise<McpServer> {
                 const result = JSON.parse(resultText);
                 logs.push(`  Agent response: ${result.status} - ${result.message}`);
                 agentResponded = true;
-                fs.unlinkSync(resultFile);
+                try { fs.unlinkSync(resultFile); } catch {}
+                if (result.status !== 'success') return false;
                 break;
               } catch {}
             }
           }
 
           if (!agentResponded) {
-            // GUI agent not running — fall back to scheduled task one-shot
-            logs.push('  GUI agent not responding. Falling back to scheduled task one-shot...');
-            
-            const scriptDir = path.join(import.meta.dirname, '../scripts');
-            const guiAgentScript = path.join(scriptDir, 'tally-gui-agent.ps1');
-            
-            if (!fs.existsSync(guiAgentScript)) {
-              logs.push('  GUI agent script not found.');
-              return false;
-            }
-
-            // Write command file again
-            try { fs.unlinkSync(resultFile); } catch {}
-            fs.writeFileSync(commandFile, command, 'utf-8');
-
-            // Run the agent as a one-shot via scheduled task - it will pick up the command, execute, then we kill it
-            const taskName = 'TallyMCP_GuiAgent';
-            try { execSync(`schtasks /Delete /TN "${taskName}" /F`, { timeout: 5000 }); } catch {}
-
-            let sessionUser = 'SYSTEM';
-            try {
-              const quser = execSync('query user 2>nul', { timeout: 5000 }).toString();
-              const activeLine = quser.split('\n').find((l: string) => l.includes('Active') || l.includes('console'));
-              if (activeLine) {
-                const parts = activeLine.trim().split(/\s+/);
-                if (parts[0]?.startsWith('>')) sessionUser = parts[0].substring(1);
-                else sessionUser = parts[0];
-              }
-            } catch {}
-
-            const cmd = `powershell -ExecutionPolicy Bypass -File "${guiAgentScript}" -WatchDir "${tallyDataPath}"`;
-            try {
-              execSync(`schtasks /Create /TN "${taskName}" /TR "${cmd.replace(/"/g, '\\"')}" /SC ONCE /ST 00:00 /RU "${sessionUser}" /IT /F`, { timeout: 10000 });
-              execSync(`schtasks /Run /TN "${taskName}"`, { timeout: 10000 });
-            } catch (err) {
-              logs.push(`  Failed to create/run scheduled task: ${err}`);
-              return false;
-            }
-
-            // Wait for agent to process
-            for (let i = 0; i < 30; i++) {
-              await new Promise(resolve => setTimeout(resolve, 1000));
-              if (fs.existsSync(resultFile)) {
-                try {
-                  const resultText = fs.readFileSync(resultFile, 'utf-8');
-                  const result = JSON.parse(resultText);
-                  logs.push(`  Agent response: ${result.status} - ${result.message}`);
-                  agentResponded = true;
-                  fs.unlinkSync(resultFile);
-                  break;
-                } catch {}
-              }
-            }
-
-            // Cleanup
-            try { execSync(`schtasks /Delete /TN "${taskName}" /F`, { timeout: 5000 }); } catch {}
-          }
-
-          if (!agentResponded) {
-            logs.push('  GUI agent did not respond within 30 seconds.');
+            logs.push('  Agent did not respond within 90 seconds.');
             return false;
           }
 
