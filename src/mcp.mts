@@ -133,10 +133,10 @@ export async function registerMcpServer(): Promise<McpServer> {
     'open-company',
     {
       title: 'Open Company',
-      description: `loads a company into Tally Prime. Tries multiple strategies in order: (1) TDL $$CmpLoadCompany via XML API (no restart needed), (2) TDL $$CmpConnect via XML API (no restart needed), (3) Restart Tally with enhanced UI automation. Use list-companies first to find available company names.`,
+      description: `loads a company into Tally Prime without restarting. Tries multiple strategies in order: (1) TDL $$CmpLoadCompany via XML API, (2) TDL $$CmpConnect via XML API, (3) GUI automation agent that controls Tally's UI (Alt+F3 → Select Company → type name → Enter). Strategy 3 requires the GUI agent script (tally-gui-agent.ps1) to be running in the interactive desktop session. Use list-companies first to find available company names.`,
       inputSchema: {
         companyName: z.string().describe('exact company name as shown in Tally (e.g. "My Company Pvt Ltd"). Use list-companies or list-master with collection=company to find names.'),
-        strategy: z.enum(['auto', 'tdl-load', 'tdl-connect', 'restart-ui']).optional().describe('which strategy to use. "auto" tries all in order (default). "tdl-load" uses $$CmpLoadCompany. "tdl-connect" uses $$CmpConnect. "restart-ui" restarts Tally with Win32 UI automation.')
+        strategy: z.enum(['auto', 'tdl-load', 'tdl-connect', 'gui-agent']).optional().describe('which strategy to use. "auto" tries all in order (default). "tdl-load" uses $$CmpLoadCompany. "tdl-connect" uses $$CmpConnect. "gui-agent" uses GUI automation via companion agent running in the interactive desktop session.')
       },
       annotations: {
         readOnlyHint: false,
@@ -360,59 +360,82 @@ export async function registerMcpServer(): Promise<McpServer> {
         }
       };
 
-      // --- Strategy 3: Restart Tally with enhanced Win32 UI automation ---
-      const tryRestartUI = async (): Promise<boolean> => {
-        logs.push('[Strategy 3: Restart + UI Automation] Attempting...');
+      // --- Strategy 3: GUI Agent - sends commands to the companion agent running in the interactive session ---
+      const tryGuiAgent = async (): Promise<boolean> => {
+        logs.push('[Strategy 3: GUI Agent] Attempting...');
         try {
           const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
-          const tallyExe = process.env.TALLY_EXE_PATH || 'C:\\Program Files\\TallyPrimeEditLog\\tally.exe';
+          const commandFile = path.join(tallyDataPath, '_mcp_gui_command.json');
+          const resultFile = path.join(tallyDataPath, '_mcp_gui_result.json');
 
-          if (!fs.existsSync(tallyExe)) {
-            logs.push(`  Tally executable not found at ${tallyExe}`);
-            return false;
+          // Check if Tally is running at all
+          let tallyRunning = true;
+          try {
+            await postTallyXML('<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>List of Companies</ID></HEADER></ENVELOPE>');
+          } catch {
+            tallyRunning = false;
           }
 
-          // Resolve company folder from name by scanning data directories
-          let companyPath = '';
-          const entries = fs.readdirSync(tallyDataPath, { withFileTypes: true });
-          for (const e of entries) {
-            if (!e.isDirectory() || !/^\d+$/.test(e.name)) continue;
-            const companyFile = path.join(tallyDataPath, e.name, 'Company.900');
-            if (!fs.existsSync(companyFile)) continue;
-            try {
-              const buf = fs.readFileSync(companyFile);
-              const text = buf.toString('utf16le').replace(/[^\x20-\x7E\u0900-\u097F]/g, ' ').trim();
-              if (text.toLowerCase().includes(companyName.toLowerCase())) {
-                companyPath = path.join(tallyDataPath, e.name);
+          // Determine action: if Tally is running with no company, use startup load; otherwise use select-company
+          const action = tallyRunning ? 'select-company' : 'load-on-startup';
+          logs.push(`  Tally running: ${tallyRunning}, action: ${action}`);
+
+          // If Tally isn't running, try to start it first
+          if (!tallyRunning) {
+            const tallyExe = process.env.TALLY_EXE_PATH || 'C:\\Program Files\\TallyPrimeEditLog\\tally.exe';
+            if (fs.existsSync(tallyExe)) {
+              logs.push('  Starting Tally...');
+              try { execSync(`start "" "${tallyExe}"`, { timeout: 5000, shell: 'cmd' }); } catch {}
+              await new Promise(resolve => setTimeout(resolve, 10000));
+            }
+          }
+
+          // Delete any old result file
+          try { fs.unlinkSync(resultFile); } catch {}
+
+          // Write command for the GUI agent
+          const command = JSON.stringify({
+            action: action,
+            companyName: companyName,
+            timestamp: new Date().toISOString()
+          });
+          fs.writeFileSync(commandFile, command, 'utf-8');
+          logs.push('  Command file written, waiting for GUI agent to process...');
+
+          // Wait for the GUI agent to pick up and process (poll for result file)
+          let agentResponded = false;
+          for (let i = 0; i < 30; i++) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            if (fs.existsSync(resultFile)) {
+              try {
+                const resultText = fs.readFileSync(resultFile, 'utf-8');
+                const result = JSON.parse(resultText);
+                logs.push(`  Agent response: ${result.status} - ${result.message}`);
+                agentResponded = true;
+                fs.unlinkSync(resultFile);
                 break;
-              }
-            } catch {}
+              } catch {}
+            }
           }
 
-          // If no name match, check if companyName looks like a folder number
-          if (!companyPath && /^\d+$/.test(companyName)) {
-            const directPath = path.join(tallyDataPath, companyName);
-            if (fs.existsSync(directPath)) companyPath = directPath;
-          }
+          if (!agentResponded) {
+            // GUI agent not running — fall back to scheduled task one-shot
+            logs.push('  GUI agent not responding. Falling back to scheduled task one-shot...');
+            
+            const scriptDir = path.join(import.meta.dirname, '../scripts');
+            const guiAgentScript = path.join(scriptDir, 'tally-gui-agent.ps1');
+            
+            if (!fs.existsSync(guiAgentScript)) {
+              logs.push('  GUI agent script not found.');
+              return false;
+            }
 
-          if (!companyPath) {
-            logs.push(`  Could not resolve company folder for "${companyName}"`);
-            return false;
-          }
+            // Write command file again
+            try { fs.unlinkSync(resultFile); } catch {}
+            fs.writeFileSync(commandFile, command, 'utf-8');
 
-          logs.push(`  Resolved company path: ${companyPath}`);
-
-          // Kill Tally
-          try { execSync('taskkill /IM tally.exe /F', { timeout: 10000 }); } catch {}
-          await new Promise(resolve => setTimeout(resolve, 3000));
-
-          // Use the enhanced UI automation PowerShell script
-          const scriptDir = path.join(import.meta.dirname, '../scripts');
-          const uiScriptPath = path.join(scriptDir, 'open-company-ui.ps1');
-
-          if (fs.existsSync(uiScriptPath)) {
-            // Run via scheduled task in interactive session for UI access
-            const taskName = 'TallyMCP_OpenCompany';
+            // Run the agent as a one-shot via scheduled task - it will pick up the command, execute, then we kill it
+            const taskName = 'TallyMCP_GuiAgent';
             try { execSync(`schtasks /Delete /TN "${taskName}" /F`, { timeout: 5000 }); } catch {}
 
             let sessionUser = 'SYSTEM';
@@ -426,38 +449,44 @@ export async function registerMcpServer(): Promise<McpServer> {
               }
             } catch {}
 
-            const cmd = `powershell -ExecutionPolicy Bypass -File "${uiScriptPath}" -TallyExePath "${tallyExe}" -CompanyDataPath "${companyPath}"`;
-            execSync(`schtasks /Create /TN "${taskName}" /TR "${cmd.replace(/"/g, '\\"')}" /SC ONCE /ST 00:00 /RU "${sessionUser}" /IT /F`, { timeout: 10000 });
-            execSync(`schtasks /Run /TN "${taskName}"`, { timeout: 10000 });
-            try { execSync(`schtasks /Delete /TN "${taskName}" /F`, { timeout: 5000 }); } catch {}
-          } else {
-            // Fallback: basic restart with /path: (no UI automation script available)
-            logs.push('  UI automation script not found, using basic restart...');
-            execSync(`start "" "${tallyExe}" /path:"${companyPath}"`, { timeout: 10000, shell: 'cmd' });
-          }
-
-          // Wait for Tally to start and respond
-          logs.push('  Waiting for Tally to start...');
-          await new Promise(resolve => setTimeout(resolve, 15000));
-
-          let connected = false;
-          for (let i = 0; i < 20; i++) {
-            await new Promise(resolve => setTimeout(resolve, 2000));
+            const cmd = `powershell -ExecutionPolicy Bypass -File "${guiAgentScript}" -WatchDir "${tallyDataPath}"`;
             try {
-              await postTallyXML('<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>List of Companies</ID></HEADER></ENVELOPE>');
-              connected = true;
-              break;
-            } catch {}
+              execSync(`schtasks /Create /TN "${taskName}" /TR "${cmd.replace(/"/g, '\\"')}" /SC ONCE /ST 00:00 /RU "${sessionUser}" /IT /F`, { timeout: 10000 });
+              execSync(`schtasks /Run /TN "${taskName}"`, { timeout: 10000 });
+            } catch (err) {
+              logs.push(`  Failed to create/run scheduled task: ${err}`);
+              return false;
+            }
+
+            // Wait for agent to process
+            for (let i = 0; i < 30; i++) {
+              await new Promise(resolve => setTimeout(resolve, 1000));
+              if (fs.existsSync(resultFile)) {
+                try {
+                  const resultText = fs.readFileSync(resultFile, 'utf-8');
+                  const result = JSON.parse(resultText);
+                  logs.push(`  Agent response: ${result.status} - ${result.message}`);
+                  agentResponded = true;
+                  fs.unlinkSync(resultFile);
+                  break;
+                } catch {}
+              }
+            }
+
+            // Cleanup
+            try { execSync(`schtasks /Delete /TN "${taskName}" /F`, { timeout: 5000 }); } catch {}
           }
 
-          if (!connected) {
-            logs.push('  Tally not responding after restart.');
+          if (!agentResponded) {
+            logs.push('  GUI agent did not respond within 30 seconds.');
             return false;
           }
 
-          await new Promise(resolve => setTimeout(resolve, 3000));
+          // Wait for Tally to process the company load
+          await new Promise(resolve => setTimeout(resolve, 5000));
+
           const loaded = await verifyCompanyLoaded(companyName);
-          logs.push(`  Verification: ${loaded ? 'SUCCESS' : 'company not detected (UI automation may not have focused window)'}`);
+          logs.push(`  Verification: ${loaded ? 'SUCCESS' : 'company not detected in active list'}`);
           return loaded;
         } catch (err) {
           logs.push(`  Error: ${err}`);
@@ -491,12 +520,12 @@ export async function registerMcpServer(): Promise<McpServer> {
           }
         }
 
-        if (strategy === 'auto' || strategy === 'restart-ui') {
-          success = await tryRestartUI();
+        if (strategy === 'auto' || strategy === 'gui-agent') {
+          success = await tryGuiAgent();
           auditLog('open-company', args, success ? 'success' : 'error', Date.now() - start);
           return {
             isError: !success,
-            content: [{ type: 'text', text: logs.join('\n') + (success ? `\n\nCompany "${companyName}" loaded successfully via Tally restart + UI automation.` : '\n\nAll strategies failed. Please load the company manually in Tally Prime GUI.') }]
+            content: [{ type: 'text', text: logs.join('\n') + (success ? `\n\nCompany "${companyName}" loaded successfully via GUI automation.` : '\n\nAll strategies failed. Ensure the GUI agent is running (scripts/tally-gui-agent.ps1) in the interactive desktop session, then retry.') }]
           };
         }
 
