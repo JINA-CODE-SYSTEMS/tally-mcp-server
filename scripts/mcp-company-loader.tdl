@@ -1,0 +1,87 @@
+;; ============================================================
+;; MCP Company Loader - TDL Add-on for Tally Prime
+;; ============================================================
+;; PURPOSE: Enables programmatic company loading via XML API
+;;
+;; INSTALLATION:
+;;   1. Copy this file to your Tally Prime directory
+;;      (e.g. C:\Program Files\TallyPrimeEditLog\)
+;;   2. Edit tally.ini and add this line under [Tally]:
+;;      TDL = yes
+;;      Default TDL = mcp-company-loader.tdl
+;;   3. Restart Tally Prime
+;;
+;; USAGE via XML API:
+;;   Send an Export request with ID=MCPLoadCompanyReport
+;;   and set <MCPTARGETCOMPANY> in STATICVARIABLES
+;; ============================================================
+
+;; --- Strategy 1: $$CmpLoadCompany via dedicated report ---
+[Report: MCPLoadCompanyReport]
+    Form : MCPLoadCompanyForm
+
+[Form: MCPLoadCompanyForm]
+    Parts  : MCPLoadCompanyPart
+    XMLTag : "DATA"
+    On     : Form Accept : Yes : Call : MCPDoLoadCompany
+
+[Part: MCPLoadCompanyPart]
+    Lines : MCPLoadCompanyLine
+
+[Line: MCPLoadCompanyLine]
+    Fields : MCPLoadCompanyResult
+    XMLTag : "ROW"
+
+[Field: MCPLoadCompanyResult]
+    Set    : $$CmpLoadCompany:##MCPTargetCompany
+    XMLTag : "RESULT"
+
+;; --- Strategy 2: Procedure-based LOAD COMPANY action ---
+;; This uses the internal LOAD COMPANY action which has
+;; higher privileges when running from a loaded TDL add-on
+
+[Report: MCPLoadCompanyActionReport]
+    Form : MCPLoadCompanyActionForm
+
+[Form: MCPLoadCompanyActionForm]
+    Parts  : MCPLoadCompanyActionPart
+    XMLTag : "DATA"
+
+[Part: MCPLoadCompanyActionPart]
+    Lines : MCPLoadCompanyActionLine
+
+[Line: MCPLoadCompanyActionLine]
+    Fields : MCPLoadCompanyActionField
+    XMLTag : "ROW"
+
+[Field: MCPLoadCompanyActionField]
+    Set    : $$CmpConnect:##MCPTargetCompany
+    XMLTag : "RESULT"
+
+;; --- Helper: List all companies (loaded and unloaded) ---
+[Report: MCPListAllCompaniesReport]
+    Form : MCPListAllCompaniesForm
+
+[Form: MCPListAllCompaniesForm]
+    Parts  : MCPListAllCompaniesPart
+    XMLTag : "DATA"
+
+[Part: MCPListAllCompaniesPart]
+    Lines  : MCPListAllCompaniesLine
+    Repeat : MCPListAllCompaniesLine : MCPAllCompaniesCollection
+    Scroll : Vertical
+
+[Line: MCPListAllCompaniesLine]
+    Fields : MCPCompanyNameField, MCPCompanyLoadedField
+    XMLTag : "ROW"
+
+[Field: MCPCompanyNameField]
+    Set    : $Name
+    XMLTag : "NAME"
+
+[Field: MCPCompanyLoadedField]
+    Set    : $$CmpIsLoaded:$Name
+    XMLTag : "LOADED"
+
+[Collection: MCPAllCompaniesCollection]
+    Type : Company
