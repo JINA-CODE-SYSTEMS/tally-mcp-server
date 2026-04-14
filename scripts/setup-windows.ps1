@@ -58,10 +58,14 @@ nssm install $ServiceName $NodePath "$InstallDir\dist\server.mjs"
 nssm set $ServiceName AppDirectory $InstallDir
 nssm set $ServiceName Description "Tally Prime MCP Server - Model Context Protocol"
 nssm set $ServiceName Start SERVICE_AUTO_START
-nssm set $ServiceName AppStdout "$InstallDir\logs\service-stdout.log"
-nssm set $ServiceName AppStderr "$InstallDir\logs\service-stderr.log"
+nssm set $ServiceName AppStdout "$InstallDir\logs\service.log"
+nssm set $ServiceName AppStderr "$InstallDir\logs\service.log"
 nssm set $ServiceName AppRotateFiles 1
+nssm set $ServiceName AppRotateOnline 1
+nssm set $ServiceName AppRotateSeconds 86400
 nssm set $ServiceName AppRotateBytes 5242880
+nssm set $ServiceName AppStdoutCreationDisposition 4
+nssm set $ServiceName AppStderrCreationDisposition 4
 
 # Create logs directory
 New-Item -ItemType Directory -Force -Path "$InstallDir\logs" | Out-Null
