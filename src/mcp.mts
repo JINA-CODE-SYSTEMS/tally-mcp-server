@@ -146,8 +146,83 @@ export async function registerMcpServer(): Promise<McpServer> {
     async (args) => {
       const start = Date.now();
       const strategy = args.strategy || 'auto';
-      const companyName = args.companyName;
+      let companyName = args.companyName;
       const logs: string[] = [];
+
+      // --- Resolve folder number to company name if needed ---
+      // If input looks like a folder number, try to get the real company name from Tally's own company list
+      if (/^\d+$/.test(companyName)) {
+        logs.push(`[Pre-check] Input "${companyName}" looks like a folder number, trying to resolve company name...`);
+        try {
+          // Ask Tally for all company names (from its data directory)
+          const listXml = `<?xml version="1.0" encoding="utf-8"?>
+<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Export</TALLYREQUEST>
+    <TYPE>Data</TYPE>
+    <ID>MCPListCompaniesReport</ID>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <STATICVARIABLES>
+        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+      </STATICVARIABLES>
+      <TDL>
+        <TDLMESSAGE>
+          <REPORT NAME="MCPListCompaniesReport">
+            <FORMS>MCPListCompaniesForm</FORMS>
+          </REPORT>
+          <FORM NAME="MCPListCompaniesForm">
+            <PARTS>MCPListCompaniesPart</PARTS>
+            <XMLTAG>DATA</XMLTAG>
+          </FORM>
+          <PART NAME="MCPListCompaniesPart">
+            <LINES>MCPListCompaniesLine</LINES>
+            <REPEAT>MCPListCompaniesLine : MCPAllCompaniesCol</REPEAT>
+            <SCROLLED>Vertical</SCROLLED>
+          </PART>
+          <LINE NAME="MCPListCompaniesLine">
+            <FIELDS>MCPCompanyNameFld, MCPCompanyNumFld</FIELDS>
+            <XMLTAG>ROW</XMLTAG>
+          </LINE>
+          <FIELD NAME="MCPCompanyNameFld">
+            <SET>$Name</SET>
+            <XMLTAG>NAME</XMLTAG>
+          </FIELD>
+          <FIELD NAME="MCPCompanyNumFld">
+            <SET>$$FolderName:$CompanyMailName</SET>
+            <XMLTAG>NUMBER</XMLTAG>
+          </FIELD>
+          <COLLECTION NAME="MCPAllCompaniesCol">
+            <TYPE>Company</TYPE>
+          </COLLECTION>
+        </TDLMESSAGE>
+      </TDL>
+    </DESC>
+  </BODY>
+</ENVELOPE>`;
+          const listResp = await postTallyXML(listXml);
+          logs.push(`  Tally company list response received (${listResp.length} chars)`);
+          // Extract company names from response
+          const nameMatches = listResp.match(/<NAME>([^<]+)<\/NAME>/g);
+          if (nameMatches && nameMatches.length > 0) {
+            const names = nameMatches.map(m => m.replace(/<\/?NAME>/g, ''));
+            logs.push(`  Found companies: ${names.join(', ')}`);
+            // If there's only one company, use it; otherwise keep the folder number for later strategies
+            if (names.length === 1) {
+              companyName = names[0];
+              logs.push(`  Resolved to: "${companyName}"`);
+            } else if (names.length > 1) {
+              // Use first company as best guess
+              companyName = names[0];
+              logs.push(`  Multiple companies found, using first: "${companyName}"`);
+            }
+          }
+        } catch (err) {
+          logs.push(`  Could not resolve company name from Tally: ${err}`);
+        }
+      }
 
       // --- Helper: verify company is loaded ---
       const verifyCompanyLoaded = async (targetName: string): Promise<boolean> => {
@@ -180,7 +255,6 @@ export async function registerMcpServer(): Promise<McpServer> {
     <DESC>
       <STATICVARIABLES>
         <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
-        <MCPTARGETCOMPANY>${companyName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</MCPTARGETCOMPANY>
       </STATICVARIABLES>
       <TDL>
         <TDLMESSAGE>
@@ -199,7 +273,7 @@ export async function registerMcpServer(): Promise<McpServer> {
             <XMLTAG>ROW</XMLTAG>
           </LINE>
           <FIELD NAME="MCPResultField">
-            <SET>$$CmpLoadCompany:##MCPTargetCompany</SET>
+            <SET>$$CmpLoadCompany:"${companyName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')}"</SET>
             <XMLTAG>RESULT</XMLTAG>
           </FIELD>
         </TDLMESSAGE>
@@ -242,7 +316,6 @@ export async function registerMcpServer(): Promise<McpServer> {
     <DESC>
       <STATICVARIABLES>
         <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
-        <MCPTARGETCOMPANY>${companyName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</MCPTARGETCOMPANY>
       </STATICVARIABLES>
       <TDL>
         <TDLMESSAGE>
@@ -261,7 +334,7 @@ export async function registerMcpServer(): Promise<McpServer> {
             <XMLTAG>ROW</XMLTAG>
           </LINE>
           <FIELD NAME="MCPConnectResultField">
-            <SET>$$CmpConnect:##MCPTargetCompany</SET>
+            <SET>$$CmpConnect:"${companyName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')}"</SET>
             <XMLTAG>RESULT</XMLTAG>
           </FIELD>
         </TDLMESSAGE>
@@ -334,7 +407,7 @@ export async function registerMcpServer(): Promise<McpServer> {
           await new Promise(resolve => setTimeout(resolve, 3000));
 
           // Use the enhanced UI automation PowerShell script
-          const scriptDir = path.join(__dirname, '../scripts');
+          const scriptDir = path.join(import.meta.dirname, '../scripts');
           const uiScriptPath = path.join(scriptDir, 'open-company-ui.ps1');
 
           if (fs.existsSync(uiScriptPath)) {
