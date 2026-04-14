@@ -34,6 +34,20 @@ if (-not $nssmPath) {
 }
 Write-Host "[OK] NSSM found at $nssmPath" -ForegroundColor Green
 
+# --- Step 2b: Compile TallyUI.dll (Win32 interop for GUI agent) ---
+$cscPath = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+$csFile = Join-Path $InstallDir "scripts\TallyUI.cs"
+$dllFile = Join-Path $InstallDir "scripts\TallyUI.dll"
+if (Test-Path $csFile) {
+    Write-Host "[*] Compiling TallyUI.dll..." -ForegroundColor Yellow
+    & $cscPath /nologo /target:library /reference:System.Drawing.dll /out:$dllFile $csFile
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "[OK] TallyUI.dll compiled" -ForegroundColor Green
+    } else {
+        Write-Host "[WARN] TallyUI.dll compilation failed" -ForegroundColor Red
+    }
+}
+
 # --- Step 3: Verify repo exists ---
 if (-not (Test-Path "$InstallDir\dist\server.mjs")) {
     Write-Error "Server entry point not found at $InstallDir\dist\server.mjs. Clone the repo and build first:
