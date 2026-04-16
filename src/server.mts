@@ -37,6 +37,10 @@ app.set('trust proxy', 1); // Trust first proxy (nginx/caddy)
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+app.get('/healthz', (_req, res) => {
+  res.status(200).json({ status: 'ok' });
+});
+
 // Security headers — allow inline scripts for authorize.html
 app.use(helmet({
   contentSecurityPolicy: {
