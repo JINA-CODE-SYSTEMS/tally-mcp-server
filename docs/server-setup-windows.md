@@ -18,7 +18,7 @@ Push to main → GitHub Actions → Self-hosted runner on VM → git pull + buil
 ### 1. Clone the repo & build
 ```powershell
 cd C:\
-git clone https://github.com/jain-t/tally-mcp-server.git
+git clone https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server.git
 cd tally-mcp-server
 npm install
 npx tsc
@@ -53,7 +53,7 @@ mkdir C:\actions-runner && cd C:\actions-runner
 # Download and extract the runner (URL from GitHub settings page)
 Invoke-WebRequest -Uri https://github.com/actions/runner/releases/download/v2.XXX.X/actions-runner-win-x64-2.XXX.X.zip -OutFile runner.zip
 Expand-Archive -Path runner.zip -DestinationPath .
-./config.cmd --url https://github.com/jain-t/tally-mcp-server --token YOUR_TOKEN
+./config.cmd --url https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server --token YOUR_TOKEN
 ./run.cmd  # or install as service: ./svc.cmd install && ./svc.cmd start
 ```
 

@@ -52,7 +52,7 @@ if (Test-Path $csFile) {
 if (-not (Test-Path "$InstallDir\dist\server.mjs")) {
     Write-Error "Server entry point not found at $InstallDir\dist\server.mjs. Clone the repo and build first:
     cd C:\
-    git clone https://github.com/jain-t/tally-mcp-server.git
+    git clone https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server.git
     cd tally-mcp-server
     npm install
     npx tsc"

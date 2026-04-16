@@ -2,7 +2,7 @@
 
 **Prepared for:** CTO Review  
 
-**Repo:** `jain-t/tally-mcp-server` (branch: `kuwar-dev`)  
+**Repo:** `JINA-CODE-SYSTEMS/tally-mcp-server` (branch: `main`)  
 **Stack:** Node.js / Express 5 / TypeScript / DuckDB / MCP SDK  
 
 ---
