@@ -198,14 +198,23 @@ export async function registerMcpServer(): Promise<McpServer> {
           .map(e => {
             const folderPath = path.join(tallyDataPath, e.name);
             let companyName = '';
-            let hexDump = '';
+            let diagInfo = '';
             try {
+              // List all files in the folder for diagnostics
+              const allFiles = fs.readdirSync(folderPath);
+              const fileDetails = allFiles.slice(0, 30).map(f => {
+                try {
+                  const st = fs.statSync(path.join(folderPath, f));
+                  return `${f}(${st.size})`;
+                } catch { return f; }
+              });
+              diagInfo = `${allFiles.length} files: [${fileDetails.join(', ')}]`;
+
               // Try to read company name from Company.900 file
               const companyFile = path.join(folderPath, 'Company.900');
               if (fs.existsSync(companyFile)) {
                 const buf = fs.readFileSync(companyFile);
-                // Include hex dump of first 256 bytes for diagnostics
-                hexDump = buf.subarray(0, Math.min(256, buf.length)).toString('hex');
+                diagInfo += ` | Company.900=${buf.length}b hex:${buf.subarray(0, Math.min(128, buf.length)).toString('hex')}`;
                 // Try UTF-16LE first
                 const text16 = buf.toString('utf16le').replace(/[^\x20-\x7E\u0900-\u097F]/g, ' ').trim();
                 const match16 = text16.match(/[A-Za-z\u0900-\u097F][\w\s\u0900-\u097F.&(),'"-]{2,}/);
@@ -217,16 +226,30 @@ export async function registerMcpServer(): Promise<McpServer> {
                   const match8 = text8.match(/[A-Za-z][\w\s.&(),'"-]{2,}/);
                   if (match8) companyName = match8[0].trim();
                 }
-                // Also try reading file list in folder for other name hints
-                if (!companyName) {
-                  const files = fs.readdirSync(folderPath).filter(f => /\.(900|tsf)$/i.test(f)).slice(0, 10);
-                  hexDump += ` files:[${files.join(',')}]`;
+              }
+              // Try reading other candidate files for company name
+              if (!companyName) {
+                for (const candFile of allFiles.filter(f => /\.(900|tsf|xml|ini|txt)$/i.test(f)).slice(0, 5)) {
+                  const candPath = path.join(folderPath, candFile);
+                  try {
+                    const candBuf = fs.readFileSync(candPath);
+                    if (candBuf.length > 0) {
+                      const candText = candBuf.toString('utf-8').replace(/[^\x20-\x7E]/g, ' ').substring(0, 300);
+                      diagInfo += ` | ${candFile}(${candBuf.length}b)="${candText.substring(0, 100)}"`;
+                      const nameMatch = candText.match(/[A-Za-z][\w\s.&(),'"-]{3,}/);
+                      if (nameMatch) {
+                        companyName = nameMatch[0].trim();
+                        break;
+                      }
+                    }
+                  } catch {}
                 }
               }
-            } catch {}
-            // If Company.900 parsing failed, try matching from Tally's company list
+            } catch (err) {
+              diagInfo += ` error:${err}`;
+            }
+            // If local parsing failed, try matching from Tally's company list
             if (!companyName && tallyCompanyNames.size > 0) {
-              // Assign names in order of Tally list to folder number order
               const sortedFolders = entries.filter(e2 => e2.isDirectory() && /^\d+$/.test(e2.name)).map(e2 => e2.name).sort();
               const idx = sortedFolders.indexOf(e.name);
               const nameArray = Array.from(tallyCompanyNames.values());
@@ -234,7 +257,7 @@ export async function registerMcpServer(): Promise<McpServer> {
                 companyName = nameArray[idx];
               }
             }
-            return { folder: e.name, name: companyName, path: folderPath, hexDump };
+            return { folder: e.name, name: companyName, path: folderPath, diagInfo };
           });
         if (folders.length === 0) {
           auditLog('list-companies', args, 'success', Date.now() - start);
@@ -242,9 +265,9 @@ export async function registerMcpServer(): Promise<McpServer> {
         }
         const tsv = 'folder\tname\tpath\n' + folders.map(f => `${f.folder}\t${f.name}\t${f.path}`).join('\n');
         const tallyNames = tallyCompanyNames.size > 0 ? `\n\nTally known companies: ${Array.from(tallyCompanyNames.values()).join(', ')}` : '';
-        const diag = `\n\n--- Diagnostics ---\nRaw "List of Companies" (${rawTallyResponse.length} chars): ${rawTallyResponse.substring(0, 500)}` +
-          (rawCollectionResponse ? `\nRaw Collection response (${rawCollectionResponse.length} chars): ${rawCollectionResponse.substring(0, 500)}` : '') +
-          folders.map(f => `\n${f.folder} hex(256): ${f.hexDump}`).join('');
+        const diag = `\n\n--- Diagnostics ---\nRaw "List of Companies" (${rawTallyResponse.length} chars): ${rawTallyResponse}` +
+          (rawCollectionResponse ? `\nRaw Collection (${rawCollectionResponse.length} chars): ${rawCollectionResponse}` : '') +
+          folders.map(f => `\n\n[${f.folder}] ${f.diagInfo}`).join('');
         auditLog('list-companies', args, 'success', Date.now() - start);
         return { content: [{ type: 'text', text: tsv + tallyNames + diag }] };
       } catch (err) {
