@@ -4,7 +4,8 @@
   "description": "Tally Prime MCP (Model Context Protocol) Server implementation to feed Tally Prime ERP data to popular LLM like Claude, ChatGPT supporting MCP",
   "main": "dist/server.mjs",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "tsc",
+    "test": "npm run build && node --test \"dist/**/*.test.mjs\""
   },
   "repository": {
     "type": "git",
