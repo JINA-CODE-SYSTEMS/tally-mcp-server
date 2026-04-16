@@ -23,6 +23,47 @@ function auditLog(toolName: string, args: Record<string, any>, status: 'success'
   console.log(`[audit] ${JSON.stringify(entry)}`);
 }
 
+export function getOpenCompanyGuiTimeoutSeconds(rawValue: string | undefined = process.env.OPEN_COMPANY_GUI_TIMEOUT_SEC): number {
+  const parsed = Number(rawValue);
+  if (!Number.isFinite(parsed)) return 180;
+  if (parsed < 90) return 180;
+  return Math.floor(parsed);
+}
+
+export function getOpenCompanyGuiMaxSteps(rawValue: string | undefined = process.env.OPEN_COMPANY_GUI_MAX_STEPS): number {
+  const parsed = Number(rawValue);
+  if (!Number.isFinite(parsed)) return 25;
+  if (parsed < 12) return 12;
+  return Math.floor(parsed);
+}
+
+export function createGuiAgentCommandId(prefix: string): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+export function isMatchingGuiAgentCommand(result: any, commandId: string): boolean {
+  return !!result && typeof result.commandId === 'string' && result.commandId === commandId;
+}
+
+// Tracks the last company successfully opened via open-company within this server session.
+let activeCompany: string | null = null;
+
+// Wraps handlePull — injects activeCompany as targetCompany fallback when the caller did not specify one.
+async function pull(reportName: string, inputParams: Map<string, any>) {
+  if (!inputParams.has('targetCompany') && activeCompany) {
+    inputParams.set('targetCompany', activeCompany);
+  }
+  return handlePull(reportName, inputParams);
+}
+
+// Wraps handlePush — injects activeCompany as targetCompany fallback when the caller did not specify one.
+async function push(templateName: string, inputParams: Map<string, any>) {
+  if (!inputParams.has('targetCompany') && activeCompany) {
+    inputParams.set('targetCompany', activeCompany);
+  }
+  return handlePush(templateName, inputParams);
+}
+
 export async function registerMcpServer(): Promise<McpServer> {
   const mcpServer = new McpServer({
     name: 'Tally Prime MCP Server',
@@ -133,7 +174,7 @@ export async function registerMcpServer(): Promise<McpServer> {
     'open-company',
     {
       title: 'Open Company',
-      description: `loads a company into Tally Prime without restarting. Tries multiple strategies in order: (1) TDL $$CmpLoadCompany via XML API, (2) TDL $$CmpConnect via XML API, (3) GUI automation agent that controls Tally's UI (Alt+F3 → Select Company → type name → Enter). Strategy 3 requires the GUI agent script (tally-gui-agent.ps1) to be running in the interactive desktop session. Use list-companies first to find available company names.`,
+      description: `loads a company into Tally Prime and sets it as the active company for all subsequent queries. Tries strategies in order: (1) SVCURRENTCOMPANY probe — verifies company is directly accessible (works in Tally server/multi-company mode), (2) open company list check — detects if company is already loaded in Tally UI, (3) GUI automation agent that controls Tally UI via Alt+F3 → Select Company → type name → Enter (requires tally-gui-agent-v2.ps1 to be running in the interactive desktop session). Once open-company succeeds, all other tools automatically target this company unless targetCompany is specified explicitly. Use list-companies first to find available company names.`,
       inputSchema: {
         companyName: z.string().describe('exact company name as shown in Tally (e.g. "My Company Pvt Ltd"). Use list-companies or list-master with collection=company to find names.'),
         strategy: z.enum(['auto', 'tdl-load', 'tdl-connect', 'gui-agent']).optional().describe('which strategy to use. "auto" tries all in order (default). "tdl-load" uses $$CmpLoadCompany. "tdl-connect" uses $$CmpConnect. "gui-agent" uses GUI automation via companion agent running in the interactive desktop session.')
@@ -224,136 +265,43 @@ export async function registerMcpServer(): Promise<McpServer> {
         }
       }
 
-      // --- Helper: verify company is loaded ---
+      // --- Helper: verify company is accessible via SVCURRENTCOMPANY ---
       const verifyCompanyLoaded = async (targetName: string): Promise<boolean> => {
         try {
-          const inputParams = new Map([['collection', 'company']]);
-          const resp = await handlePull('list-master', inputParams);
-          if (resp.data && resp.data.length > 0) {
-            const loadedNames = resp.data.map((c: any) => (c.name || '').toLowerCase());
-            return loadedNames.includes(targetName.toLowerCase());
-          }
-          return false;
+          const escaped = targetName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+          const xml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPVerifyCompanyReport</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>${escaped}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><REPORT NAME="MCPVerifyCompanyReport"><FORMS>MCPVerifyForm</FORMS></REPORT><FORM NAME="MCPVerifyForm"><PARTS>MCPVerifyPart</PARTS><XMLTAG>DATA</XMLTAG></FORM><PART NAME="MCPVerifyPart"><LINES>MCPVerifyLine</LINES></PART><LINE NAME="MCPVerifyLine"><FIELDS>MCPVerifyField</FIELDS><XMLTAG>ROW</XMLTAG></LINE><FIELD NAME="MCPVerifyField"><SET>##SVCurrentCompany</SET><XMLTAG>NAME</XMLTAG></FIELD></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+          const resp = await postTallyXML(xml);
+          // Tally echoes back the current company name — match confirms the company is accessible
+          return resp.toLowerCase().includes(`<name>${targetName.toLowerCase()}`);
         } catch {
           return false;
         }
       };
 
-      // --- Strategy 1: TDL $$CmpLoadCompany via inline XML ---
+      // --- Strategy 1: SVCURRENTCOMPANY probe — works in Tally server/multi-company mode ---
       const tryTdlLoad = async (): Promise<boolean> => {
-        logs.push('[Strategy 1: $$CmpLoadCompany] Attempting...');
-        try {
-          const xml = `<?xml version="1.0" encoding="utf-8"?>
-<ENVELOPE>
-  <HEADER>
-    <VERSION>1</VERSION>
-    <TALLYREQUEST>Export</TALLYREQUEST>
-    <TYPE>Data</TYPE>
-    <ID>MCPOpenCompanyReport</ID>
-  </HEADER>
-  <BODY>
-    <DESC>
-      <STATICVARIABLES>
-        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
-      </STATICVARIABLES>
-      <TDL>
-        <TDLMESSAGE>
-          <REPORT NAME="MCPOpenCompanyReport">
-            <FORMS>MCPOpenCompanyForm</FORMS>
-          </REPORT>
-          <FORM NAME="MCPOpenCompanyForm">
-            <PARTS>MCPOpenCompanyPart</PARTS>
-            <XMLTAG>DATA</XMLTAG>
-          </FORM>
-          <PART NAME="MCPOpenCompanyPart">
-            <LINES>MCPOpenCompanyLine</LINES>
-          </PART>
-          <LINE NAME="MCPOpenCompanyLine">
-            <FIELDS>MCPResultField</FIELDS>
-            <XMLTAG>ROW</XMLTAG>
-          </LINE>
-          <FIELD NAME="MCPResultField">
-            <SET>$$CmpLoadCompany:"${companyName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')}"</SET>
-            <XMLTAG>RESULT</XMLTAG>
-          </FIELD>
-        </TDLMESSAGE>
-      </TDL>
-    </DESC>
-  </BODY>
-</ENVELOPE>`;
-          const resp = await postTallyXML(xml);
-          logs.push(`  Response: ${resp.substring(0, 200)}`);
-
-          if (resp.includes('Unknown Request') || resp.includes('Could not find')) {
-            logs.push('  $$CmpLoadCompany not available or failed.');
-            return false;
-          }
-
-          // Wait a moment for company to load
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          const loaded = await verifyCompanyLoaded(companyName);
-          logs.push(`  Verification: ${loaded ? 'SUCCESS' : 'company not detected in active list'}`);
-          return loaded;
-        } catch (err) {
-          logs.push(`  Error: ${err}`);
-          return false;
-        }
+        logs.push('[Strategy 1: SVCURRENTCOMPANY probe] Checking if company is directly accessible...');
+        const accessible = await verifyCompanyLoaded(companyName);
+        logs.push(`  ${accessible ? 'Company is accessible in Tally (server mode or already open).' : 'Company not accessible via SVCURRENTCOMPANY.'}`);
+        return accessible;
       };
 
-      // --- Strategy 2: TDL $$CmpConnect via inline XML ---
+      // --- Strategy 2: open company list check — detects if company is already loaded in Tally UI ---
       const tryTdlConnect = async (): Promise<boolean> => {
-        logs.push('[Strategy 2: $$CmpConnect] Attempting...');
+        logs.push('[Strategy 2: open company list] Checking if company is in Tally open company list...');
         try {
-          const xml = `<?xml version="1.0" encoding="utf-8"?>
-<ENVELOPE>
-  <HEADER>
-    <VERSION>1</VERSION>
-    <TALLYREQUEST>Export</TALLYREQUEST>
-    <TYPE>Data</TYPE>
-    <ID>MCPConnectCompanyReport</ID>
-  </HEADER>
-  <BODY>
-    <DESC>
-      <STATICVARIABLES>
-        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
-      </STATICVARIABLES>
-      <TDL>
-        <TDLMESSAGE>
-          <REPORT NAME="MCPConnectCompanyReport">
-            <FORMS>MCPConnectCompanyForm</FORMS>
-          </REPORT>
-          <FORM NAME="MCPConnectCompanyForm">
-            <PARTS>MCPConnectCompanyPart</PARTS>
-            <XMLTAG>DATA</XMLTAG>
-          </FORM>
-          <PART NAME="MCPConnectCompanyPart">
-            <LINES>MCPConnectCompanyLine</LINES>
-          </PART>
-          <LINE NAME="MCPConnectCompanyLine">
-            <FIELDS>MCPConnectResultField</FIELDS>
-            <XMLTAG>ROW</XMLTAG>
-          </LINE>
-          <FIELD NAME="MCPConnectResultField">
-            <SET>$$CmpConnect:"${companyName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')}"</SET>
-            <XMLTAG>RESULT</XMLTAG>
-          </FIELD>
-        </TDLMESSAGE>
-      </TDL>
-    </DESC>
-  </BODY>
-</ENVELOPE>`;
-          const resp = await postTallyXML(xml);
-          logs.push(`  Response: ${resp.substring(0, 200)}`);
-
-          if (resp.includes('Unknown Request') || resp.includes('Could not find')) {
-            logs.push('  $$CmpConnect not available or failed.');
-            return false;
+          // Use handlePull directly — must NOT inject activeCompany here; we want ALL open companies
+          const inputParams = new Map([['collection', 'company']]);
+          const resp = await handlePull('list-master', inputParams);
+          if (resp.data && resp.data.length > 0) {
+            const openNames = resp.data.map((c: any) => String(c.F01 || c.name || '').toLowerCase().trim());
+            logs.push(`  Open companies in Tally: ${openNames.join(', ')}`);
+            const found = openNames.includes(companyName.toLowerCase().trim());
+            logs.push(`  ${found ? 'Company found in open list.' : 'Company not in open list.'}`);
+            return found;
           }
-
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          const loaded = await verifyCompanyLoaded(companyName);
-          logs.push(`  Verification: ${loaded ? 'SUCCESS' : 'company not detected in active list'}`);
-          return loaded;
+          logs.push('  No companies returned from Tally.');
+          return false;
         } catch (err) {
           logs.push(`  Error: ${err}`);
           return false;
@@ -364,6 +312,8 @@ export async function registerMcpServer(): Promise<McpServer> {
       const tryGuiAgent = async (): Promise<boolean> => {
         logs.push('[Strategy 3: GUI Agent] Attempting...');
         try {
+          const guiTimeoutSeconds = getOpenCompanyGuiTimeoutSeconds();
+          const guiMaxSteps = getOpenCompanyGuiMaxSteps();
           const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
           const commandFile = path.join(tallyDataPath, '_mcp_gui_command.json');
           const resultFile = path.join(tallyDataPath, '_mcp_gui_result.json');
@@ -390,15 +340,25 @@ export async function registerMcpServer(): Promise<McpServer> {
           }
 
           // --- First, ping the agent to check if it's alive ---
+          const pingCommandId = createGuiAgentCommandId('ping');
           try { fs.unlinkSync(resultFile); } catch {}
-          fs.writeFileSync(commandFile, JSON.stringify({ action: 'ping', timestamp: new Date().toISOString() }), 'utf-8');
+          fs.writeFileSync(commandFile, JSON.stringify({ action: 'ping', commandId: pingCommandId, timestamp: new Date().toISOString() }), 'utf-8');
           let agentAlive = false;
           for (let i = 0; i < 5; i++) {
             await new Promise(resolve => setTimeout(resolve, 1000));
             if (fs.existsSync(resultFile)) {
-              agentAlive = true;
-              try { fs.unlinkSync(resultFile); } catch {}
-              break;
+              try {
+                const pingResult = JSON.parse(fs.readFileSync(resultFile, 'utf-8'));
+                if (isMatchingGuiAgentCommand(pingResult, pingCommandId)) {
+                  agentAlive = true;
+                  try { fs.unlinkSync(resultFile); } catch {}
+                  break;
+                }
+                logs.push(`  Ignoring stale ping response for commandId ${pingResult?.commandId || 'unknown'}.`);
+                try { fs.unlinkSync(resultFile); } catch {}
+              } catch {
+                try { fs.unlinkSync(resultFile); } catch {}
+              }
             }
           }
 
@@ -409,23 +369,31 @@ export async function registerMcpServer(): Promise<McpServer> {
           logs.push('  GUI agent is alive.');
 
           // --- Send the actual command ---
+          const commandId = createGuiAgentCommandId('open-company');
           try { fs.unlinkSync(resultFile); } catch {}
           const command = JSON.stringify({
             action: action,
             companyName: companyName,
+            commandId: commandId,
+            maxSteps: guiMaxSteps,
             timestamp: new Date().toISOString()
           });
           fs.writeFileSync(commandFile, command, 'utf-8');
-          logs.push('  Command sent, waiting for GUI agent (up to 90 seconds for LLM-guided actions)...');
+          logs.push(`  Command sent (commandId=${commandId}, maxSteps=${guiMaxSteps}), waiting for GUI agent (up to ${guiTimeoutSeconds} seconds for LLM-guided actions)...`);
 
-          // Poll for result — 90 seconds max (LLM agent takes screenshots + API calls per step)
+          // Poll for result — timeout is configurable because LLM-guided actions can take longer.
           let agentResponded = false;
-          for (let i = 0; i < 90; i++) {
+          for (let i = 0; i < guiTimeoutSeconds; i++) {
             await new Promise(resolve => setTimeout(resolve, 1000));
             if (fs.existsSync(resultFile)) {
               try {
                 const resultText = fs.readFileSync(resultFile, 'utf-8');
                 const result = JSON.parse(resultText);
+                if (!isMatchingGuiAgentCommand(result, commandId)) {
+                  logs.push(`  Ignoring stale response for commandId ${result?.commandId || 'unknown'}.`);
+                  try { fs.unlinkSync(resultFile); } catch {}
+                  continue;
+                }
                 logs.push(`  Agent response: ${result.status} - ${result.message}`);
                 agentResponded = true;
                 try { fs.unlinkSync(resultFile); } catch {}
@@ -436,7 +404,7 @@ export async function registerMcpServer(): Promise<McpServer> {
           }
 
           if (!agentResponded) {
-            logs.push('  Agent did not respond within 90 seconds.');
+            logs.push(`  Agent did not respond within ${guiTimeoutSeconds} seconds.`);
             return false;
           }
 
@@ -459,10 +427,11 @@ export async function registerMcpServer(): Promise<McpServer> {
         if (strategy === 'auto' || strategy === 'tdl-load') {
           success = await tryTdlLoad();
           if (success || strategy === 'tdl-load') {
+            if (success) activeCompany = companyName;
             auditLog('open-company', args, success ? 'success' : 'error', Date.now() - start);
             return {
               isError: !success,
-              content: [{ type: 'text', text: logs.join('\n') + (success ? `\n\nCompany "${companyName}" loaded successfully via $$CmpLoadCompany.` : '') }]
+              content: [{ type: 'text', text: logs.join('\n') + (success ? `\n\nCompany "${companyName}" is now active. Subsequent tools will automatically target this company.` : '') }]
             };
           }
         }
@@ -470,20 +439,22 @@ export async function registerMcpServer(): Promise<McpServer> {
         if (strategy === 'auto' || strategy === 'tdl-connect') {
           success = await tryTdlConnect();
           if (success || strategy === 'tdl-connect') {
+            if (success) activeCompany = companyName;
             auditLog('open-company', args, success ? 'success' : 'error', Date.now() - start);
             return {
               isError: !success,
-              content: [{ type: 'text', text: logs.join('\n') + (success ? `\n\nCompany "${companyName}" loaded successfully via $$CmpConnect.` : '') }]
+              content: [{ type: 'text', text: logs.join('\n') + (success ? `\n\nCompany "${companyName}" is now active. Subsequent tools will automatically target this company.` : '') }]
             };
           }
         }
 
         if (strategy === 'auto' || strategy === 'gui-agent') {
           success = await tryGuiAgent();
+          if (success) activeCompany = companyName;
           auditLog('open-company', args, success ? 'success' : 'error', Date.now() - start);
           return {
             isError: !success,
-            content: [{ type: 'text', text: logs.join('\n') + (success ? `\n\nCompany "${companyName}" loaded successfully via GUI automation.` : '\n\nAll strategies failed. Ensure the GUI agent is running (scripts/tally-gui-agent.ps1) in the interactive desktop session, then retry.') }]
+            content: [{ type: 'text', text: logs.join('\n') + (success ? `\n\nCompany "${companyName}" is now active. Subsequent tools will automatically target this company.` : '\n\nAll strategies failed. Ensure tally-gui-agent-v2.ps1 is running in the interactive desktop session, then retry.') }]
           };
         }
 
@@ -492,6 +463,88 @@ export async function registerMcpServer(): Promise<McpServer> {
       } catch (err) {
         auditLog('open-company', args, 'error', Date.now() - start);
         return { isError: true, content: [{ type: 'text', text: `Failed to open company: ${err}\n\n${logs.join('\n')}` }] };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'open-company-debug',
+    {
+      title: 'Open Company Debug',
+      description: `checks open-company readiness (paths, agent files, env flags, process status) and optionally includes the latest GUI agent result payload for troubleshooting.`,
+      inputSchema: {
+        includeRecentResult: z.boolean().optional().describe('include parsed contents of latest _mcp_gui_result.json if available'),
+        watchDir: z.string().optional().describe('optional explicit watch/data directory override')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      try {
+        const tallyDataPath = args.watchDir || process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const tallyExePath = process.env.TALLY_EXE_PATH || 'C:\\Program Files\\TallyPrimeEditLog\\tally.exe';
+        const commandFile = path.join(tallyDataPath, '_mcp_gui_command.json');
+        const resultFile = path.join(tallyDataPath, '_mcp_gui_result.json');
+        const guiScriptPath = path.join(process.cwd(), 'scripts', 'tally-gui-agent-v2.ps1');
+        const guiDllPath = path.join(process.cwd(), 'scripts', 'TallyUI.dll');
+
+        const report: Record<string, any> = {
+          timestamp: new Date().toISOString(),
+          tallyDataPath,
+          tallyDataPathExists: fs.existsSync(tallyDataPath),
+          tallyExePath,
+          tallyExeExists: fs.existsSync(tallyExePath),
+          guiScriptPath,
+          guiScriptExists: fs.existsSync(guiScriptPath),
+          guiDllPath,
+          guiDllExists: fs.existsSync(guiDllPath),
+          commandFile,
+          commandFileExists: fs.existsSync(commandFile),
+          resultFile,
+          resultFileExists: fs.existsSync(resultFile),
+          openAiKeySet: !!process.env.OPENAI_API_KEY,
+          anthropicKeySet: !!process.env.ANTHROPIC_API_KEY,
+          configuredTimeoutSeconds: getOpenCompanyGuiTimeoutSeconds(),
+          configuredMaxSteps: getOpenCompanyGuiMaxSteps(),
+          activeCompany: activeCompany || null
+        };
+
+        try {
+          // Fast probe that does not require external commands.
+          const pingEnvelope = '<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>List of Companies</ID></HEADER></ENVELOPE>';
+          const pingResp = await postTallyXML(pingEnvelope);
+          report.tallyXmlProbe = {
+            reachable: true,
+            sample: pingResp.substring(0, 160)
+          };
+        } catch (err) {
+          report.tallyXmlProbe = {
+            reachable: false,
+            error: String(err)
+          };
+        }
+
+        if (args.includeRecentResult && fs.existsSync(resultFile)) {
+          try {
+            report.recentResult = JSON.parse(fs.readFileSync(resultFile, 'utf-8'));
+          } catch (err) {
+            report.recentResult = { parseError: String(err) };
+          }
+        }
+
+        auditLog('open-company-debug', args, 'success', Date.now() - start);
+        return {
+          content: [{ type: 'text', text: JSON.stringify(report, null, 2) }]
+        };
+      } catch (err) {
+        auditLog('open-company-debug', args, 'error', Date.now() - start);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `open-company-debug failed: ${err}` }]
+        };
       }
     }
   );
@@ -515,7 +568,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (args.targetCompany) {
         inputParams.set('targetCompany', args.targetCompany);
       }
-      const resp = await handlePull('list-master', inputParams);
+      const resp = await pull('list-master', inputParams);
       if (resp.error) {
         return {
           isError: true,
@@ -548,7 +601,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (args.targetCompany) {
         inputParams.set('targetCompany', args.targetCompany);
       }
-      const resp = await handlePull('chart-of-accounts', inputParams);
+      const resp = await pull('chart-of-accounts', inputParams);
       const tableId = await cacheTable('chart-of-accounts', resp.data);
       if (resp.error) {
         return {
@@ -584,7 +637,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (args.targetCompany) {
         inputParams.set('targetCompany', args.targetCompany);
       }
-      const resp = await handlePull('trial-balance', inputParams);
+      const resp = await pull('trial-balance', inputParams);
       const tableId = await cacheTable('trial-balance', resp.data);
       if (resp.error) {
         return {
@@ -620,7 +673,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (args.targetCompany) {
         inputParams.set('targetCompany', args.targetCompany);
       }
-      const resp = await handlePull('profit-loss', inputParams);
+      const resp = await pull('profit-loss', inputParams);
       const tableId = await cacheTable('profit-loss', resp.data);
       if (resp.error) {
         return {
@@ -655,7 +708,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (args.targetCompany) {
         inputParams.set('targetCompany', args.targetCompany);
       }
-      const resp = await handlePull('balance-sheet', inputParams);
+      const resp = await pull('balance-sheet', inputParams);
       const tableId = await cacheTable('balance-sheet', resp.data);
       if (resp.error) {
         return {
@@ -691,7 +744,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (args.targetCompany) {
         inputParams.set('targetCompany', args.targetCompany);
       }
-      const resp = await handlePull('stock-summary', inputParams);
+      const resp = await pull('stock-summary', inputParams);
       const tableId = await cacheTable('stock-summary', resp.data);
       if (resp.error) {
         return {
@@ -727,7 +780,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (args.targetCompany) {
         inputParams.set('targetCompany', args.targetCompany);
       }
-      const resp = await handlePull('ledger-balance', inputParams);
+      const resp = await pull('ledger-balance', inputParams);
       if (resp.error) {
         return {
           isError: true,
@@ -762,7 +815,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (args.targetCompany) {
         inputParams.set('targetCompany', args.targetCompany);
       }
-      const resp = await handlePull('stock-item-balance', inputParams);
+      const resp = await pull('stock-item-balance', inputParams);
       if (resp.error) {
         return {
           isError: true,
@@ -797,7 +850,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (args.targetCompany) {
         inputParams.set('targetCompany', args.targetCompany);
       }
-      const resp = await handlePull('bills-outstanding', inputParams);
+      const resp = await pull('bills-outstanding', inputParams);
       const tableId = await cacheTable('bills-outstanding', resp.data);
       if (resp.error) {
         return {
@@ -835,7 +888,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         inputParams.set('targetCompany', args.targetCompany);
       }
 
-      const resp = await handlePull('ledger-account', inputParams);
+      const resp = await pull('ledger-account', inputParams);
       const tableId = await cacheTable('ledger-account', resp.data);
       if (resp.error) {
         return {
@@ -880,7 +933,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         inputParams.set('targetCompany', args.targetCompany);
       }
 
-      const resp = await handlePull('stock-item-account', inputParams);
+      const resp = await pull('stock-item-account', inputParams);
       const tableId = await cacheTable('stock-item-account', resp.data);
       if (resp.error) {
         return {
@@ -923,7 +976,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (args.targetCompany) {
         inputParams.set('targetCompany', args.targetCompany);
       }
-      const resp = await handlePull('gst-voucher-details', inputParams);
+      const resp = await pull('gst-voucher-details', inputParams);
       const tableId = await cacheTable('gst-voucher-details', resp.data);
       if (resp.error) {
         return {
@@ -957,7 +1010,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (args.targetCompany) {
         inputParams.set('targetCompany', args.targetCompany);
       }
-      const resp = await handlePull('stock-item-gst', inputParams);
+      const resp = await pull('stock-item-gst', inputParams);
       const tableId = await cacheTable('stock-item-gst', resp.data);
       if (resp.error) {
         return {
@@ -993,7 +1046,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (args.targetCompany) {
         inputParams.set('targetCompany', args.targetCompany);
       }
-      const resp = await handlePull('gst-hsn-summary', inputParams);
+      const resp = await pull('gst-hsn-summary', inputParams);
       const tableId = await cacheTable('gst-hsn-summary', resp.data);
       if (resp.error) {
         return {
@@ -1029,7 +1082,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (args.targetCompany) {
         inputParams.set('targetCompany', args.targetCompany);
       }
-      const resp = await handlePull('gstr1-summary', inputParams);
+      const resp = await pull('gstr1-summary', inputParams);
       const tableId = await cacheTable('gstr1-summary', resp.data);
       if (resp.error) {
         return {
@@ -1065,7 +1118,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (args.targetCompany) {
         inputParams.set('targetCompany', args.targetCompany);
       }
-      const resp = await handlePull('gstr2-summary', inputParams);
+      const resp = await pull('gstr2-summary', inputParams);
       const tableId = await cacheTable('gstr2-summary', resp.data);
       if (resp.error) {
         return {
@@ -1137,7 +1190,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (args.narration) inputParams.set('narration', args.narration);
       if (args.voucherNumber) inputParams.set('voucherNumber', args.voucherNumber);
 
-      const resp = await handlePush('voucher', inputParams);
+      const resp = await push('voucher', inputParams);
       if (!resp.success) {
         auditLog('create-voucher', args, 'error', Date.now() - start);
         return { isError: true, content: [{ type: 'text', text: resp.error || 'Failed to create voucher' }] };
@@ -1190,7 +1243,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (args.gstRegistrationType) inputParams.set('gstRegistrationType', args.gstRegistrationType);
       if (args.gstin) inputParams.set('gstin', args.gstin);
 
-      const resp = await handlePush('ledger', inputParams);
+      const resp = await push('ledger', inputParams);
       if (!resp.success) {
         auditLog('create-ledger', args, 'error', Date.now() - start);
         return { isError: true, content: [{ type: 'text', text: resp.error || 'Failed to create ledger' }] };
@@ -1248,7 +1301,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (args.hsnCode) inputParams.set('hsnCode', args.hsnCode);
       if (args.gstRate !== undefined) inputParams.set('gstRate', args.gstRate);
 
-      const resp = await handlePush('stock-item', inputParams);
+      const resp = await push('stock-item', inputParams);
       if (!resp.success) {
         auditLog('create-stock-item', args, 'error', Date.now() - start);
         return { isError: true, content: [{ type: 'text', text: resp.error || 'Failed to create stock item' }] };
@@ -1324,7 +1377,8 @@ export async function registerMcpServer(): Promise<McpServer> {
 
       if ((!args.isInterState && (!cgstLedger || !sgstLedger)) || (args.isInterState && !igstLedger)) {
         const resolveParams = new Map<string, any>();
-        if (args.targetCompany) resolveParams.set('targetCompany', args.targetCompany);
+        const _gtc = args.targetCompany || activeCompany;
+        if (_gtc) resolveParams.set('targetCompany', _gtc);
         const gstLedgers = await resolveGSTLedgers(resolveParams);
 
         if (!args.isInterState) {
@@ -1387,7 +1441,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         inputParams.set('igstAmount', igstAmount);
       }
 
-      const resp = await handlePush('gst-voucher', inputParams);
+      const resp = await push('gst-voucher', inputParams);
       if (!resp.success) {
         auditLog('create-gst-voucher', args, 'error', Date.now() - start);
         return { isError: true, content: [{ type: 'text', text: resp.error || 'Failed to create GST voucher' }] };
