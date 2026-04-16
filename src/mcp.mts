@@ -141,9 +141,11 @@ export async function registerMcpServer(): Promise<McpServer> {
 
         // Try to get company names from Tally's built-in "List of Companies" request
         let tallyCompanyNames: Map<string, string> = new Map();
+        let rawTallyResponse = '';
         try {
           const builtinXml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>List of Companies</ID></HEADER></ENVELOPE>`;
           const builtinResp = await postTallyXML(builtinXml);
+          rawTallyResponse = builtinResp;
           // Try parsing COMPANYNAME tags
           const companyMatches = builtinResp.match(/<COMPANYNAME[^>]*>([^<]+)<\/COMPANYNAME>/gi);
           if (companyMatches) {
@@ -162,18 +164,48 @@ export async function registerMcpServer(): Promise<McpServer> {
               }
             }
           }
+          // Also try COMPANY tags (Tally may use <COMPANY> wrapper)
+          if (tallyCompanyNames.size === 0) {
+            const compTags = builtinResp.match(/<COMPANY[^/>]*>[\s\S]*?<\/COMPANY>/gi);
+            if (compTags) {
+              for (const tag of compTags) {
+                // Extract any text content
+                const inner = tag.replace(/<\/?[^>]+>/g, '').trim();
+                if (inner && inner.length > 1) tallyCompanyNames.set(inner.toLowerCase(), inner);
+              }
+            }
+          }
         } catch {}
+
+        // Also try Collection-type export which may work differently
+        let rawCollectionResponse = '';
+        if (tallyCompanyNames.size === 0) {
+          try {
+            const collXml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>ListOfCompanies</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME="ListOfCompanies"><TYPE>Company</TYPE><NATIVEMETHOD>Name</NATIVEMETHOD><NATIVEMETHOD>CompanyNumber</NATIVEMETHOD></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+            rawCollectionResponse = await postTallyXML(collXml);
+            const nameMatches = rawCollectionResponse.match(/<NAME[^>]*>([^<]+)<\/NAME>/gi);
+            if (nameMatches) {
+              for (const m of nameMatches) {
+                const name = m.replace(/<\/?NAME[^>]*>/gi, '').trim();
+                if (name && name.length > 1) tallyCompanyNames.set(name.toLowerCase(), name);
+              }
+            }
+          } catch {}
+        }
 
         const folders = entries
           .filter(e => e.isDirectory() && /^\d+$/.test(e.name))
           .map(e => {
             const folderPath = path.join(tallyDataPath, e.name);
             let companyName = '';
+            let hexDump = '';
             try {
               // Try to read company name from Company.900 file
               const companyFile = path.join(folderPath, 'Company.900');
               if (fs.existsSync(companyFile)) {
                 const buf = fs.readFileSync(companyFile);
+                // Include hex dump of first 256 bytes for diagnostics
+                hexDump = buf.subarray(0, Math.min(256, buf.length)).toString('hex');
                 // Try UTF-16LE first
                 const text16 = buf.toString('utf16le').replace(/[^\x20-\x7E\u0900-\u097F]/g, ' ').trim();
                 const match16 = text16.match(/[A-Za-z\u0900-\u097F][\w\s\u0900-\u097F.&(),'"-]{2,}/);
@@ -184,6 +216,11 @@ export async function registerMcpServer(): Promise<McpServer> {
                   const text8 = buf.toString('utf-8').replace(/[^\x20-\x7E]/g, ' ').trim();
                   const match8 = text8.match(/[A-Za-z][\w\s.&(),'"-]{2,}/);
                   if (match8) companyName = match8[0].trim();
+                }
+                // Also try reading file list in folder for other name hints
+                if (!companyName) {
+                  const files = fs.readdirSync(folderPath).filter(f => /\.(900|tsf)$/i.test(f)).slice(0, 10);
+                  hexDump += ` files:[${files.join(',')}]`;
                 }
               }
             } catch {}
@@ -197,7 +234,7 @@ export async function registerMcpServer(): Promise<McpServer> {
                 companyName = nameArray[idx];
               }
             }
-            return { folder: e.name, name: companyName, path: folderPath };
+            return { folder: e.name, name: companyName, path: folderPath, hexDump };
           });
         if (folders.length === 0) {
           auditLog('list-companies', args, 'success', Date.now() - start);
@@ -205,8 +242,11 @@ export async function registerMcpServer(): Promise<McpServer> {
         }
         const tsv = 'folder\tname\tpath\n' + folders.map(f => `${f.folder}\t${f.name}\t${f.path}`).join('\n');
         const tallyNames = tallyCompanyNames.size > 0 ? `\n\nTally known companies: ${Array.from(tallyCompanyNames.values()).join(', ')}` : '';
+        const diag = `\n\n--- Diagnostics ---\nRaw "List of Companies" (${rawTallyResponse.length} chars): ${rawTallyResponse.substring(0, 500)}` +
+          (rawCollectionResponse ? `\nRaw Collection response (${rawCollectionResponse.length} chars): ${rawCollectionResponse.substring(0, 500)}` : '') +
+          folders.map(f => `\n${f.folder} hex(256): ${f.hexDump}`).join('');
         auditLog('list-companies', args, 'success', Date.now() - start);
-        return { content: [{ type: 'text', text: tsv + tallyNames }] };
+        return { content: [{ type: 'text', text: tsv + tallyNames + diag }] };
       } catch (err) {
         auditLog('list-companies', args, 'error', Date.now() - start);
         throw err;
