@@ -249,7 +249,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         for (const folder of foldersWithData) {
           try {
             // Try $$CmpLoadOnPath to load company and get its name
-            const escapedPath = folder.fullPath.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\\/g, '\\\\');
+            const escapedPath = folder.fullPath.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
             const loadXml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPLoadOnPathReport</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE><REPORT NAME="MCPLoadOnPathReport"><FORMS>MCPLoadOnPathForm</FORMS></REPORT><FORM NAME="MCPLoadOnPathForm"><PARTS>MCPLoadOnPathPart</PARTS><XMLTAG>DATA</XMLTAG></FORM><PART NAME="MCPLoadOnPathPart"><LINES>MCPLoadOnPathLine</LINES></PART><LINE NAME="MCPLoadOnPathLine"><FIELDS>MCPLoadResult,MCPCurrentCompany</FIELDS><XMLTAG>ROW</XMLTAG></LINE><FIELD NAME="MCPLoadResult"><SET>$$CmpLoadOnPath:"${escapedPath}"</SET><XMLTAG>LOADRESULT</XMLTAG></FIELD><FIELD NAME="MCPCurrentCompany"><SET>##SVCurrentCompany</SET><XMLTAG>CURRENTCOMPANY</XMLTAG></FIELD></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
             const resp = await postTallyXML(loadXml);
             logs.push(`  [${folder.folder}] $$CmpLoadOnPath response: ${resp.substring(0, 300)}`);
@@ -270,7 +270,7 @@ export async function registerMcpServer(): Promise<McpServer> {
           logs.push('[Fallback] No folders have data files. Trying all folders via Tally...');
           for (const folder of foldersWithoutData) {
             try {
-              const escapedPath = folder.fullPath.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\\/g, '\\\\');
+              const escapedPath = folder.fullPath.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
               const loadXml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPLoadOnPathReport</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE><REPORT NAME="MCPLoadOnPathReport"><FORMS>MCPLoadOnPathForm</FORMS></REPORT><FORM NAME="MCPLoadOnPathForm"><PARTS>MCPLoadOnPathPart</PARTS><XMLTAG>DATA</XMLTAG></FORM><PART NAME="MCPLoadOnPathPart"><LINES>MCPLoadOnPathLine</LINES></PART><LINE NAME="MCPLoadOnPathLine"><FIELDS>MCPLoadResult,MCPCurrentCompany</FIELDS><XMLTAG>ROW</XMLTAG></LINE><FIELD NAME="MCPLoadResult"><SET>$$CmpLoadOnPath:"${escapedPath}"</SET><XMLTAG>LOADRESULT</XMLTAG></FIELD><FIELD NAME="MCPCurrentCompany"><SET>##SVCurrentCompany</SET><XMLTAG>CURRENTCOMPANY</XMLTAG></FIELD></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
               const resp = await postTallyXML(loadXml);
               logs.push(`  [${folder.folder}] $$CmpLoadOnPath response: ${resp.substring(0, 300)}`);
@@ -286,7 +286,58 @@ export async function registerMcpServer(): Promise<McpServer> {
           }
         }
 
-        // --- Step 4: Build output ---
+        // --- Step 4: Post-load name resolution — query Tally for all loaded companies ---
+        // After attempting to load all folders, query company list to map names to any unresolved folders
+        try {
+          const builtinXml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>List of Companies</ID></HEADER></ENVELOPE>`;
+          const builtinResp = await postTallyXML(builtinXml);
+          const loadedNames: string[] = [];
+          const companyMatches = builtinResp.match(/<COMPANYNAME[^>]*>([^<]+)<\/COMPANYNAME>/gi);
+          if (companyMatches) {
+            for (const m of companyMatches) {
+              const name = m.replace(/<\/?COMPANYNAME[^>]*>/gi, '').trim();
+              if (name) loadedNames.push(name);
+            }
+          }
+          if (loadedNames.length === 0) {
+            const nameMatches = builtinResp.match(/<NAME[^>]*>([^<]+)<\/NAME>/gi);
+            if (nameMatches) {
+              for (const m of nameMatches) {
+                const name = m.replace(/<\/?NAME[^>]*>/gi, '').trim();
+                if (name && name.length > 1) loadedNames.push(name);
+              }
+            }
+          }
+          logs.push(`[Post-load] Loaded companies in Tally: ${loadedNames.join(', ') || '(none)'}`);
+
+          // For each loaded company, try to get its folder number via TDL
+          for (const cname of loadedNames) {
+            const unresolved = allFolders.filter(f => !f.name);
+            if (unresolved.length === 0) break;
+            try {
+              const escaped = cname.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+              const folderXml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPFolderLookup</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>${escaped}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><REPORT NAME="MCPFolderLookup"><FORMS>MCPFolderForm</FORMS></REPORT><FORM NAME="MCPFolderForm"><PARTS>MCPFolderPart</PARTS><XMLTAG>DATA</XMLTAG></FORM><PART NAME="MCPFolderPart"><LINES>MCPFolderLine</LINES></PART><LINE NAME="MCPFolderLine"><FIELDS>MCPFolderNameFld,MCPCompanyNumFld</FIELDS><XMLTAG>ROW</XMLTAG></LINE><FIELD NAME="MCPFolderNameFld"><SET>$CompanyMailName</SET><XMLTAG>FOLDERNAME</XMLTAG></FIELD><FIELD NAME="MCPCompanyNumFld"><SET>$CompanyNumber</SET><XMLTAG>NUMBER</XMLTAG></FIELD></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+              const folderResp = await postTallyXML(folderXml);
+              const folderMatch = folderResp.match(/<NUMBER>([^<]+)<\/NUMBER>/i);
+              const folderNameMatch = folderResp.match(/<FOLDERNAME>([^<]+)<\/FOLDERNAME>/i);
+              const folderNum = folderMatch ? folderMatch[1].trim() : '';
+              const folderName = folderNameMatch ? folderNameMatch[1].trim() : '';
+              logs.push(`  [${cname}] folder=${folderNum || folderName}, raw: ${folderResp.substring(0, 200)}`);
+              // Match folder number to our discovered folders
+              const matchingFolder = allFolders.find(f => !f.name && (f.folder === folderNum || f.folder === folderName));
+              if (matchingFolder) {
+                matchingFolder.name = cname;
+                logs.push(`  Mapped "${cname}" → folder ${matchingFolder.folder}`);
+              }
+            } catch (err) {
+              logs.push(`  [${cname}] Error getting folder: ${err}`);
+            }
+          }
+        } catch (err) {
+          logs.push(`[Post-load] Error querying company list: ${err}`);
+        }
+
+        // --- Step 5: Build output ---
         const allResults = [...foldersWithData, ...foldersWithoutData.filter(f => f.name)];
         if (allResults.length === 0 && allFolders.length === 0) {
           auditLog('list-companies', args, 'success', Date.now() - start);
@@ -418,7 +469,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         for (const folderPath of fullPaths) {
           logs.push(`[Strategy 0: Path Load] Trying $$CmpLoadOnPath: ${folderPath}`);
           try {
-            const escapedPath = folderPath.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\\/g, '\\\\');
+            const escapedPath = folderPath.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
             const loadXml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPPathLoadReport</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE><REPORT NAME="MCPPathLoadReport"><FORMS>MCPPathLoadForm</FORMS></REPORT><FORM NAME="MCPPathLoadForm"><PARTS>MCPPathLoadPart</PARTS><XMLTAG>DATA</XMLTAG></FORM><PART NAME="MCPPathLoadPart"><LINES>MCPPathLoadLine</LINES></PART><LINE NAME="MCPPathLoadLine"><FIELDS>MCPPathLoadResult,MCPPathCurrentCompany</FIELDS><XMLTAG>ROW</XMLTAG></LINE><FIELD NAME="MCPPathLoadResult"><SET>$$CmpLoadOnPath:"${escapedPath}"</SET><XMLTAG>LOADRESULT</XMLTAG></FIELD><FIELD NAME="MCPPathCurrentCompany"><SET>##SVCurrentCompany</SET><XMLTAG>CURRENTCOMPANY</XMLTAG></FIELD></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
             const resp = await postTallyXML(loadXml);
             logs.push(`  Response: ${resp.substring(0, 300)}`);
@@ -431,9 +482,27 @@ export async function registerMcpServer(): Promise<McpServer> {
               return true;
             }
 
+            // Check LOADRESULT — non-empty means the function executed
+            const loadResult = resp.match(/<LOADRESULT>([^<]*)<\/LOADRESULT>/i);
+            logs.push(`  LOADRESULT: ${loadResult ? loadResult[1] : '(not found)'}`);
+
             // Wait and retry — loading might take a moment
             await new Promise(resolve => setTimeout(resolve, 3000));
-            // Query current company
+
+            // After load attempt, check all companies — a new one may have appeared
+            try {
+              const postLoadNames = await getAllCompanyNames();
+              logs.push(`  Companies after load attempt: ${postLoadNames.join(', ') || '(none)'}`);
+              // If there are now companies that weren't there before, one of them is the newly loaded one
+              if (postLoadNames.length > 0) {
+                // Set to the last company (newly loaded companies appear at end)
+                companyName = postLoadNames[postLoadNames.length - 1];
+                logs.push(`  Setting active company to: "${companyName}"`);
+                return true;
+              }
+            } catch {}
+
+            // Also query current company directly
             try {
               const checkXml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPCheckCurrent</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE><REPORT NAME="MCPCheckCurrent"><FORMS>MCPCheckForm</FORMS></REPORT><FORM NAME="MCPCheckForm"><PARTS>MCPCheckPart</PARTS><XMLTAG>DATA</XMLTAG></FORM><PART NAME="MCPCheckPart"><LINES>MCPCheckLine</LINES></PART><LINE NAME="MCPCheckLine"><FIELDS>MCPCheckField</FIELDS><XMLTAG>ROW</XMLTAG></LINE><FIELD NAME="MCPCheckField"><SET>##SVCurrentCompany</SET><XMLTAG>NAME</XMLTAG></FIELD></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
               const checkResp = await postTallyXML(checkXml);
@@ -455,7 +524,10 @@ export async function registerMcpServer(): Promise<McpServer> {
 
       // --- Resolve folder number to company name if needed (for name-based strategies) ---
       // If input looks like a folder number and path load isn't being used, try to get the real name
-      if (/^\d+$/.test(companyName)) {
+      // IMPORTANT: Skip pre-check when strategy is 'path-load' or 'auto' — folder numbers must be 
+      // preserved so tryPathLoad can use $$CmpLoadOnPath with the actual folder path.
+      const originalInput = companyName;
+      if (/^\d+$/.test(companyName) && strategy !== 'path-load' && strategy !== 'auto') {
         logs.push(`[Pre-check] Input "${companyName}" looks like a folder number, trying to resolve company name...`);
         try {
           const names = await getAllCompanyNames();
