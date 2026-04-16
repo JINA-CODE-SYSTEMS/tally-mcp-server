@@ -5,3 +5,4 @@ data
 .oauth-clients.json
 .DS_Store
 scripts/TallyUI.dll
+.vscode/
