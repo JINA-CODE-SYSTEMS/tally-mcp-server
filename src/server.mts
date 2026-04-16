@@ -64,8 +64,8 @@ app.use(cors({
 
 // Rate limiting on auth endpoints
 const authRateLimiter = rateLimit({
-  windowMs: 60 * 1000,   // 1 minute
-  max: 10,                // 10 attempts per minute
+  windowMs: parseInt(process.env.AUTH_RATE_LIMIT_WINDOW_MS || '60000'),
+  max: parseInt(process.env.AUTH_RATE_LIMIT_MAX || '10'),
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests, try again later' }
@@ -172,7 +172,7 @@ setInterval(() => {
     }
   }
 
-}, 60000); // Run every minute
+}, parseInt(process.env.TOKEN_CLEANUP_INTERVAL_MS || '60000')); // default every minute
 
 
 // Handle POST requests for client-to-server communication
@@ -382,7 +382,7 @@ app.post('/authorize', authRateLimiter, (req, res) => {
       redirect_uri: redirectUri,
       code_challenge: codeChallenge,
       code_challenge_method: codeChallengeMethod,
-      expires_at: Date.now() + 600000 // 10 minutes
+      expires_at: Date.now() + parseInt(process.env.AUTH_CODE_EXPIRY_MS || '600000') // default 10 minutes
     };
     res.status(200).json({ status: isValidated, code });
     
@@ -539,7 +539,7 @@ app.post('/token', authRateLimiter, (req, res) => {
 
   // Generate access token and separate refresh token
   const accessToken = generateSecureToken(32);
-  const expiresIn = 3600; // 1 hour
+  const expiresIn = parseInt(process.env.ACCESS_TOKEN_EXPIRY_SEC || '3600'); // default 1 hour
 
   accessTokens[accessToken] = {
     token: accessToken,

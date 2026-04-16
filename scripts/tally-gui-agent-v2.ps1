@@ -31,6 +31,13 @@ if (-not $LLMProvider) {
 }
 Write-Host "LLM Provider: $LLMProvider"
 
+# --- Configurable LLM settings (override via environment variables) ---
+$ClaudeModel   = if ($env:CLAUDE_MODEL)        { $env:CLAUDE_MODEL }        else { "claude-sonnet-4-20250514" }
+$OpenAIModel   = if ($env:OPENAI_MODEL)        { $env:OPENAI_MODEL }        else { "gpt-4o" }
+$LLMMaxTokens  = if ($env:LLM_MAX_TOKENS)      { [int]$env:LLM_MAX_TOKENS } else { 300 }
+$LLMTimeoutSec = if ($env:LLM_TIMEOUT_SEC)     { [int]$env:LLM_TIMEOUT_SEC } else { 30 }
+$AnthropicVer  = if ($env:ANTHROPIC_API_VERSION){ $env:ANTHROPIC_API_VERSION } else { "2023-06-01" }
+
 # --- Load precompiled Win32 interop DLL (avoids AMSI/Defender false positives from inline Add-Type) ---
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $dllPath = Join-Path $scriptDir "TallyUI.dll"
@@ -115,8 +122,8 @@ function Invoke-Claude {
     param([string]$SystemPrompt, [string]$UserMessage, [string]$Base64Image)
 
     $body = @{
-        model = "claude-sonnet-4-20250514"
-        max_tokens = 300
+        model = $ClaudeModel
+        max_tokens = $LLMMaxTokens
         system = $SystemPrompt
         messages = @(
             @{
@@ -141,12 +148,12 @@ function Invoke-Claude {
 
     $headers = @{
         "x-api-key" = $env:ANTHROPIC_API_KEY
-        "anthropic-version" = "2023-06-01"
+        "anthropic-version" = $AnthropicVer
         "content-type" = "application/json"
     }
 
     try {
-        $response = Invoke-RestMethod -Uri "https://api.anthropic.com/v1/messages" -Method POST -Headers $headers -Body $body -TimeoutSec 30
+        $response = Invoke-RestMethod -Uri "https://api.anthropic.com/v1/messages" -Method POST -Headers $headers -Body $body -TimeoutSec $LLMTimeoutSec
         $text = $response.content[0].text
         Write-Host "  LLM response: $text"
         return Convert-LLMTextToAction -Text $text
@@ -190,8 +197,8 @@ function Invoke-OpenAI {
     param([string]$SystemPrompt, [string]$UserMessage, [string]$Base64Image)
 
     $body = @{
-        model = "gpt-4o"
-        max_tokens = 300
+        model = $OpenAIModel
+        max_tokens = $LLMMaxTokens
         messages = @(
             @{ role = "system"; content = $SystemPrompt },
             @{
@@ -213,7 +220,7 @@ function Invoke-OpenAI {
     }
 
     try {
-        $response = Invoke-RestMethod -Uri "https://api.openai.com/v1/chat/completions" -Method POST -Headers $headers -Body $body -TimeoutSec 30
+        $response = Invoke-RestMethod -Uri "https://api.openai.com/v1/chat/completions" -Method POST -Headers $headers -Body $body -TimeoutSec $LLMTimeoutSec
         $text = $response.choices[0].message.content
         Write-Host "  LLM response: $text"
         return Convert-LLMTextToAction -Text $text

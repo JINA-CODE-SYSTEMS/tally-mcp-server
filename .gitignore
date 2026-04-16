@@ -1,7 +1,13 @@
 node_modules/
 dist/
 .env
-data
+.env.*
+!.env.example
+data/
 .oauth-clients.json
 .DS_Store
 scripts/TallyUI.dll
+*.log
+.runtime/
+.vscode/
+deploy-diagnostics.txt

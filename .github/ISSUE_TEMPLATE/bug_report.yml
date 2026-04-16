@@ -1,0 +1,72 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please fill in as much detail as you can.
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Deployment Mode
+      options:
+        - Local / stdio (Claude Desktop, VS Code)
+        - Remote / HTTP (Cloud server)
+    validations:
+      required: true
+
+  - type: input
+    id: tally-version
+    attributes:
+      label: Tally Prime Version
+      placeholder: "e.g. Tally Prime 5.0 Release 2.1"
+    validations:
+      required: true
+
+  - type: input
+    id: node-version
+    attributes:
+      label: Node.js Version
+      placeholder: "e.g. 20.15.0"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating System
+      placeholder: "e.g. Windows 11, Windows Server 2022"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      placeholder: Describe the bug clearly.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: What did you expect to happen?
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run tool '...'
+        2. With args '...'
+        3. See error
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: "**Remove any passwords, GSTINs, or financial data before pasting.**"
+      render: shell

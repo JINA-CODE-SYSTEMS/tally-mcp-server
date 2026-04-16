@@ -556,7 +556,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       description: `fetches list of masters from Tally Prime collection e.g. group, ledger, vouchertype, unit, godown, stockgroup, stockitem, costcategory, costcentre, attendancetype, company, currency, gstin, gstclassification returns output in tab separated format`,
       inputSchema: {
         targetCompany: z.string().optional().describe('optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified'),
-        collection: z.string(z.enum(['group', 'ledger', 'vouchertype', 'unit', 'godown', 'stockgroup', 'stockitem', 'costcategory', 'costcentre', 'attendancetype', 'company', 'currency', 'gstin', 'gstclassification']))
+        collection: z.enum(['group', 'ledger', 'vouchertype', 'unit', 'godown', 'stockgroup', 'stockitem', 'costcategory', 'costcentre', 'attendancetype', 'company', 'currency', 'gstin', 'gstclassification'])
       },
       annotations: {
         readOnlyHint: true,
@@ -564,7 +564,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
     },
     async (args) => {
-      let inputParams = new Map([['collection', args.collection]]);
+      let inputParams = new Map<string, any>([['collection', args.collection]]);
       if (args.targetCompany) {
         inputParams.set('targetCompany', args.targetCompany);
       }

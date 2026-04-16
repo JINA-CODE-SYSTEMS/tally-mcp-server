@@ -13,6 +13,19 @@
   },
   "author": "Jinacode Systems",
   "license": "AGPL-3.0-or-later",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "keywords": [
+    "tally",
+    "tally-prime",
+    "mcp",
+    "model-context-protocol",
+    "erp",
+    "gst",
+    "accounting",
+    "ai"
+  ],
   "bugs": {
     "url": "https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues"
   },
