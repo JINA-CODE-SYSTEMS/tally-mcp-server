@@ -12,6 +12,7 @@ jobs:
   deploy:
     if: github.repository == 'JINA-CODE-SYSTEMS/tally-mcp-server'
     runs-on: self-hosted
+    timeout-minutes: 10
     defaults:
       run:
         shell: powershell
@@ -56,37 +57,41 @@ jobs:
             throw "Service '$serviceName' does not exist on the runner host."
           }
 
-          # 1. Force-stop: kill any node processes owned by the service
-          Write-Host "Stopping service and killing node processes..."
-          Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 2
-
-          # Kill ALL node processes running server.mjs to free port 3000
+          # 1. Kill ALL node server.mjs processes FIRST (non-blocking, frees port 3000)
+          Write-Host "Killing node server.mjs processes..."
           Get-Process node -ErrorAction SilentlyContinue | ForEach-Object {
             try {
               $cmdline = (Get-WmiObject Win32_Process -Filter "ProcessId=$($_.Id)").CommandLine
               if ($cmdline -match 'server\.mjs') {
-                Write-Host "Killing node PID $($_.Id): $cmdline"
+                Write-Host "  Killing node PID $($_.Id)"
                 Stop-Process -Id $_.Id -Force
               }
             } catch {}
           }
           Start-Sleep -Seconds 2
 
-          # 2. If service is stuck in StopPending/StartPending, force reset via sc.exe
+          # 2. Non-blocking service stop via sc.exe (does NOT wait like Stop-Service)
+          Write-Host "Issuing sc.exe stop..."
+          sc.exe stop $serviceName 2>&1 | Out-String | Write-Host
+          Start-Sleep -Seconds 3
+
+          # 3. Force-kill if service is stuck in any pending state
           $service.Refresh()
-          if ($service.Status -match 'Pending') {
+          Write-Host "Service status: $($service.Status)"
+          if ($service.Status -notin @('Stopped', 'Running')) {
             Write-Host "Service stuck in $($service.Status), force-killing service PID..."
             $svcPid = (Get-WmiObject Win32_Service -Filter "Name='$serviceName'").ProcessId
             if ($svcPid -and $svcPid -ne 0) {
-              Stop-Process -Id $svcPid -Force -ErrorAction SilentlyContinue
+              taskkill /F /PID $svcPid 2>&1 | Out-String | Write-Host
             }
+            # Also kill any remaining node processes
+            Get-Process node -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 3
             $service.Refresh()
             Write-Host "Service status after kill: $($service.Status)"
           }
 
-          # 3. Start the service
+          # 4. Start the service
           Write-Host "Starting service..."
           Start-Service -Name $serviceName -ErrorAction Stop
 
