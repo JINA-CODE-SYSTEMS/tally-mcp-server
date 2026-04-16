@@ -2,6 +2,8 @@
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
 
+> **Note:** Git history was rewritten on 16 Apr 2026 to remove accidentally committed auth tokens. All leaked credentials have been rotated. Thanks to [@Journeyman1987](https://github.com/Journeyman1987) for flagging this.
+
 An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that bridges **Tally Prime ERP** with AI assistants like Claude, ChatGPT, GitHub Copilot, and any MCP-compatible client. Query financial reports, manage masters, create vouchers, and analyse GST data — all through natural language.
 
 ## Features
