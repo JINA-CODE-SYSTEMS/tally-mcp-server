@@ -1,5 +1,8 @@
 name: Deploy to Tally MCP Server
 
+permissions:
+  contents: write
+
 on:
   push:
     branches: [main]
@@ -97,3 +100,64 @@ jobs:
           } while ((Get-Date) -lt $deadline)
 
           throw "Health check failed for $uri. Last error: $lastError"
+
+      - name: Capture diagnostics on failure
+        if: failure()
+        shell: powershell
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          $lines = @()
+          $lines += "timestamp=$(Get-Date -Format o)"
+
+          $service = Get-Service -Name TallyMCP -ErrorAction SilentlyContinue
+          if ($service) {
+            $lines += "service_name=$($service.Name)"
+            $lines += "service_status=$($service.Status)"
+          } else {
+            $lines += 'service_name=TallyMCP'
+            $lines += 'service_status=missing'
+          }
+
+          $lines += ''
+          $lines += '[nssm status]'
+          try {
+            $lines += (& nssm status TallyMCP 2>&1 | Out-String)
+          } catch {
+            $lines += $_.Exception.Message
+          }
+
+          $lines += ''
+          $lines += '[node processes]'
+          try {
+            $lines += (Get-Process node -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, StartTime | Format-Table -AutoSize | Out-String)
+          } catch {
+            $lines += $_.Exception.Message
+          }
+
+          $lines += ''
+          $lines += '[port 3000]'
+          try {
+            $lines += (netstat -ano | Select-String ':3000' | Out-String)
+          } catch {
+            $lines += $_.Exception.Message
+          }
+
+          $lines += ''
+          $lines += '[logs/service.log tail]'
+          try {
+            $lines += (Get-Content .\logs\service.log -Tail 200 -ErrorAction Stop | Out-String)
+          } catch {
+            $lines += $_.Exception.Message
+          }
+
+          Set-Content -Path .\deploy-diagnostics.txt -Value ($lines -join "`r`n") -Encoding UTF8
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -B runner-diagnostics
+          git add deploy-diagnostics.txt
+          git commit -m 'chore: update runner diagnostics' --allow-empty
+          git remote set-url origin "https://x-access-token:$env:GITHUB_TOKEN@github.com/$env:GITHUB_REPOSITORY.git"
+          git push origin HEAD:runner-diagnostics --force
