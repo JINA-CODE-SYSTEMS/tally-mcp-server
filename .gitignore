@@ -6,3 +6,6 @@ data
 .DS_Store
 scripts/TallyUI.dll
 .vscode/
+tallyhttp.log
+*.log
+.runtime/

@@ -225,24 +225,14 @@ jobs:
           Set-Content -Path $diagFile -Value ($out -join "`r`n") -Encoding UTF8
           Write-Host "Diagnostic output saved to $diagFile ($($out.Count) lines)"
 
-      - name: Commit diagnostic results
+      - name: Upload diagnostic results
         if: always()
-        shell: powershell
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: |
-          $diagFile = 'tally-folder-diagnostic.txt'
-          if (Test-Path $diagFile) {
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git checkout -B diag-results
-            git add $diagFile
-            git commit -m "diag: folder scan results $(Get-Date -Format 'yyyy-MM-dd HH:mm')" --allow-empty
-            git remote set-url origin "https://x-access-token:$env:GITHUB_TOKEN@github.com/$env:GITHUB_REPOSITORY.git"
-            git push origin HEAD:diag-results --force
-            Write-Host "Diagnostic results pushed to diag-results branch"
-          } else { Write-Host "No diagnostic file found" }
+        uses: actions/upload-artifact@v4
+        with:
+          name: tally-folder-diagnostic-${{ github.run_number }}
+          path: C:\tally-mcp-server\tally-folder-diagnostic.txt
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Restart MCP Server
         shell: powershell
