@@ -112,7 +112,7 @@ export async function registerMcpServer(): Promise<McpServer> {
     'list-companies',
     {
       title: 'List Companies',
-      description: `lists all company data folders found in the Tally Prime data directory. Does NOT require any company to be open. Returns folder numbers. Use open-company tool to load a company before querying it.`,
+      description: `lists all company data folders found in Tally Prime data directories. Scans tally.ini for configured data path, plus common default paths. For each folder with actual data, attempts to load the company via Tally XML API to retrieve its name. Does NOT require any company to be already open. Use open-company tool to load a company before querying it.`,
       inputSchema: {},
       annotations: {
         readOnlyHint: true,
@@ -122,154 +122,168 @@ export async function registerMcpServer(): Promise<McpServer> {
     async (args) => {
       const start = Date.now();
       try {
-        const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
-        if (!tallyDataPath) {
-          auditLog('list-companies', args, 'error', Date.now() - start);
-          return {
-            isError: true,
-            content: [{ type: 'text', text: 'TALLY_DATA_PATH environment variable is not configured. Set it to the Tally Prime data directory (e.g. C:\\Users\\Public\\TallyPrimeEditLog\\data).' }]
-          };
-        }
-        if (!fs.existsSync(tallyDataPath)) {
-          auditLog('list-companies', args, 'error', Date.now() - start);
-          return {
-            isError: true,
-            content: [{ type: 'text', text: `Data directory not found: ${tallyDataPath}` }]
-          };
-        }
-        const entries = fs.readdirSync(tallyDataPath, { withFileTypes: true });
+        const logs: string[] = [];
 
-        // Try to get company names from Tally's built-in "List of Companies" request
-        let tallyCompanyNames: Map<string, string> = new Map();
-        let rawTallyResponse = '';
-        try {
-          const builtinXml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>List of Companies</ID></HEADER></ENVELOPE>`;
-          const builtinResp = await postTallyXML(builtinXml);
-          rawTallyResponse = builtinResp;
-          // Try parsing COMPANYNAME tags
-          const companyMatches = builtinResp.match(/<COMPANYNAME[^>]*>([^<]+)<\/COMPANYNAME>/gi);
-          if (companyMatches) {
-            for (const m of companyMatches) {
-              const name = m.replace(/<\/?COMPANYNAME[^>]*>/gi, '').trim();
-              if (name) tallyCompanyNames.set(name.toLowerCase(), name);
-            }
-          }
-          // Also try NAME tags
-          if (tallyCompanyNames.size === 0) {
-            const nameMatches = builtinResp.match(/<NAME[^>]*>([^<]+)<\/NAME>/gi);
-            if (nameMatches) {
-              for (const m of nameMatches) {
-                const name = m.replace(/<\/?NAME[^>]*>/gi, '').trim();
-                if (name && name.length > 1) tallyCompanyNames.set(name.toLowerCase(), name);
-              }
-            }
-          }
-          // Also try COMPANY tags (Tally may use <COMPANY> wrapper)
-          if (tallyCompanyNames.size === 0) {
-            const compTags = builtinResp.match(/<COMPANY[^/>]*>[\s\S]*?<\/COMPANY>/gi);
-            if (compTags) {
-              for (const tag of compTags) {
-                // Extract any text content
-                const inner = tag.replace(/<\/?[^>]+>/g, '').trim();
-                if (inner && inner.length > 1) tallyCompanyNames.set(inner.toLowerCase(), inner);
-              }
-            }
-          }
-        } catch {}
+        // --- Step 1: Discover all candidate Tally data paths ---
+        const candidatePaths = new Set<string>();
+        const configuredPath = process.env.TALLY_DATA_PATH || '';
+        if (configuredPath) candidatePaths.add(configuredPath);
 
-        // Also try Collection-type export which may work differently
-        let rawCollectionResponse = '';
-        if (tallyCompanyNames.size === 0) {
+        // Read tally.ini to find configured data path
+        const tallyExeDir = path.dirname(process.env.TALLY_EXE_PATH || 'C:\\Program Files\\TallyPrimeEditLog\\tally.exe');
+        const tallyIniCandidates = [
+          path.join(tallyExeDir, 'tally.ini'),
+          path.join(tallyExeDir, 'Tally.ini'),
+          'C:\\Program Files\\TallyPrimeEditLog\\tally.ini',
+          'C:\\Program Files\\TallyPrime\\tally.ini',
+          'C:\\Program Files (x86)\\TallyPrime\\tally.ini',
+          'C:\\Tally\\tally.ini',
+          'C:\\TallyPrime\\tally.ini',
+        ];
+        for (const iniPath of tallyIniCandidates) {
           try {
-            const collXml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>ListOfCompanies</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME="ListOfCompanies"><TYPE>Company</TYPE><NATIVEMETHOD>Name</NATIVEMETHOD><NATIVEMETHOD>CompanyNumber</NATIVEMETHOD></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
-            rawCollectionResponse = await postTallyXML(collXml);
-            const nameMatches = rawCollectionResponse.match(/<NAME[^>]*>([^<]+)<\/NAME>/gi);
-            if (nameMatches) {
-              for (const m of nameMatches) {
-                const name = m.replace(/<\/?NAME[^>]*>/gi, '').trim();
-                if (name && name.length > 1) tallyCompanyNames.set(name.toLowerCase(), name);
+            if (fs.existsSync(iniPath)) {
+              const iniContent = fs.readFileSync(iniPath, 'utf-8');
+              logs.push(`[tally.ini] Found: ${iniPath}`);
+              logs.push(`  Content: ${iniContent.substring(0, 500)}`);
+              // Parse "Data Path = ..." or "DataPath = ..." lines
+              const dataPathMatch = iniContent.match(/^[\\s]*Data\\s*Path\\s*[=:]\\s*(.+)$/mi)
+                || iniContent.match(/^[\\s]*DataPath\\s*[=:]\\s*(.+)$/mi);
+              if (dataPathMatch) {
+                const dp = dataPathMatch[1].trim().replace(/[\\r\\n]/g, '');
+                candidatePaths.add(dp);
+                logs.push(`  Parsed Data Path: ${dp}`);
+              }
+              // Also parse any path-like values
+              for (const line of iniContent.split(/\\r?\\n/)) {
+                const m = line.match(/(?:path|directory|data)\\s*[=:]\\s*(.+)/i);
+                if (m) {
+                  const p = m[1].trim();
+                  if (p && p.includes('\\\\')) candidatePaths.add(p);
+                }
               }
             }
           } catch {}
         }
 
-        const folders = entries
-          .filter(e => e.isDirectory() && /^\d+$/.test(e.name))
-          .map(e => {
-            const folderPath = path.join(tallyDataPath, e.name);
-            let companyName = '';
-            let diagInfo = '';
-            try {
-              // List all files in the folder for diagnostics
-              const allFiles = fs.readdirSync(folderPath);
-              const fileDetails = allFiles.slice(0, 30).map(f => {
+        // Add common default data paths
+        const commonPaths = [
+          'C:\\Users\\Public\\TallyPrimeEditLog\\data',
+          'C:\\Users\\Public\\Tally.ERP9\\Data',
+          'C:\\Users\\Public\\TallyPrime\\Data',
+          'C:\\TallyPrime\\Data',
+          'C:\\Tally\\Data',
+          'C:\\Users\\Public\\TallyPrimeEditLog\\Data',
+          'D:\\TallyData',
+          'D:\\Tally\\Data',
+        ];
+        for (const p of commonPaths) candidatePaths.add(p);
+
+        logs.push(`[Paths] Scanning ${candidatePaths.size} candidate paths`);
+
+        // --- Step 2: Scan all paths for company folders ---
+        interface CompanyFolder {
+          folder: string;
+          dataPath: string;
+          fullPath: string;
+          fileCount: number;
+          hasData: boolean;
+          name: string;
+        }
+        const allFolders: CompanyFolder[] = [];
+        const seenFolderPaths = new Set<string>();
+
+        for (const dataPath of candidatePaths) {
+          if (!fs.existsSync(dataPath)) continue;
+          logs.push(`[Scan] ${dataPath}`);
+          try {
+            const entries = fs.readdirSync(dataPath, { withFileTypes: true });
+            for (const entry of entries) {
+              if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+              const folderPath = path.join(dataPath, entry.name);
+              if (seenFolderPaths.has(folderPath)) continue;
+              seenFolderPaths.add(folderPath);
+
+              const files = fs.readdirSync(folderPath);
+              const hasData = files.some(f => {
                 try {
                   const st = fs.statSync(path.join(folderPath, f));
-                  return `${f}(${st.size})`;
-                } catch { return f; }
+                  return st.size > 0;
+                } catch { return false; }
               });
-              diagInfo = `${allFiles.length} files: [${fileDetails.join(', ')}]`;
+              const fileCount = files.length;
+              logs.push(`  ${entry.name}: ${fileCount} files, hasData=${hasData}`);
 
-              // Try to read company name from Company.900 file
-              const companyFile = path.join(folderPath, 'Company.900');
-              if (fs.existsSync(companyFile)) {
-                const buf = fs.readFileSync(companyFile);
-                diagInfo += ` | Company.900=${buf.length}b hex:${buf.subarray(0, Math.min(128, buf.length)).toString('hex')}`;
-                // Try UTF-16LE first
-                const text16 = buf.toString('utf16le').replace(/[^\x20-\x7E\u0900-\u097F]/g, ' ').trim();
-                const match16 = text16.match(/[A-Za-z\u0900-\u097F][\w\s\u0900-\u097F.&(),'"-]{2,}/);
-                if (match16) {
-                  companyName = match16[0].trim();
-                } else {
-                  // Try ASCII/UTF-8 as fallback
-                  const text8 = buf.toString('utf-8').replace(/[^\x20-\x7E]/g, ' ').trim();
-                  const match8 = text8.match(/[A-Za-z][\w\s.&(),'"-]{2,}/);
-                  if (match8) companyName = match8[0].trim();
-                }
-              }
-              // Try reading other candidate files for company name
-              if (!companyName) {
-                for (const candFile of allFiles.filter(f => /\.(900|tsf|xml|ini|txt)$/i.test(f)).slice(0, 5)) {
-                  const candPath = path.join(folderPath, candFile);
-                  try {
-                    const candBuf = fs.readFileSync(candPath);
-                    if (candBuf.length > 0) {
-                      const candText = candBuf.toString('utf-8').replace(/[^\x20-\x7E]/g, ' ').substring(0, 300);
-                      diagInfo += ` | ${candFile}(${candBuf.length}b)="${candText.substring(0, 100)}"`;
-                      const nameMatch = candText.match(/[A-Za-z][\w\s.&(),'"-]{3,}/);
-                      if (nameMatch) {
-                        companyName = nameMatch[0].trim();
-                        break;
-                      }
-                    }
-                  } catch {}
-                }
+              allFolders.push({
+                folder: entry.name,
+                dataPath,
+                fullPath: folderPath,
+                fileCount,
+                hasData,
+                name: ''
+              });
+            }
+          } catch (err) {
+            logs.push(`  Error scanning ${dataPath}: ${err}`);
+          }
+        }
+
+        // --- Step 3: For folders with data, try loading via Tally to get company name ---
+        const foldersWithData = allFolders.filter(f => f.hasData);
+        const foldersWithoutData = allFolders.filter(f => !f.hasData);
+
+        for (const folder of foldersWithData) {
+          try {
+            // Try $$CmpLoadOnPath to load company and get its name
+            const escapedPath = folder.fullPath.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\\/g, '\\\\');
+            const loadXml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPLoadOnPathReport</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE><REPORT NAME="MCPLoadOnPathReport"><FORMS>MCPLoadOnPathForm</FORMS></REPORT><FORM NAME="MCPLoadOnPathForm"><PARTS>MCPLoadOnPathPart</PARTS><XMLTAG>DATA</XMLTAG></FORM><PART NAME="MCPLoadOnPathPart"><LINES>MCPLoadOnPathLine</LINES></PART><LINE NAME="MCPLoadOnPathLine"><FIELDS>MCPLoadResult,MCPCurrentCompany</FIELDS><XMLTAG>ROW</XMLTAG></LINE><FIELD NAME="MCPLoadResult"><SET>$$CmpLoadOnPath:"${escapedPath}"</SET><XMLTAG>LOADRESULT</XMLTAG></FIELD><FIELD NAME="MCPCurrentCompany"><SET>##SVCurrentCompany</SET><XMLTAG>CURRENTCOMPANY</XMLTAG></FIELD></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+            const resp = await postTallyXML(loadXml);
+            logs.push(`  [${folder.folder}] $$CmpLoadOnPath response: ${resp.substring(0, 300)}`);
+
+            // Extract company name from response
+            const nameMatch = resp.match(/<CURRENTCOMPANY>([^<]+)<\/CURRENTCOMPANY>/i);
+            if (nameMatch && nameMatch[1].trim()) {
+              folder.name = nameMatch[1].trim();
+              logs.push(`  [${folder.folder}] Company name: "${folder.name}"`);
+            }
+          } catch (err) {
+            logs.push(`  [${folder.folder}] Error: ${err}`);
+          }
+        }
+
+        // If no folders have data, try loading ALL folders anyway (maybe Tally keeps data internally)
+        if (foldersWithData.length === 0 && foldersWithoutData.length > 0) {
+          logs.push('[Fallback] No folders have data files. Trying all folders via Tally...');
+          for (const folder of foldersWithoutData) {
+            try {
+              const escapedPath = folder.fullPath.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\\/g, '\\\\');
+              const loadXml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPLoadOnPathReport</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE><REPORT NAME="MCPLoadOnPathReport"><FORMS>MCPLoadOnPathForm</FORMS></REPORT><FORM NAME="MCPLoadOnPathForm"><PARTS>MCPLoadOnPathPart</PARTS><XMLTAG>DATA</XMLTAG></FORM><PART NAME="MCPLoadOnPathPart"><LINES>MCPLoadOnPathLine</LINES></PART><LINE NAME="MCPLoadOnPathLine"><FIELDS>MCPLoadResult,MCPCurrentCompany</FIELDS><XMLTAG>ROW</XMLTAG></LINE><FIELD NAME="MCPLoadResult"><SET>$$CmpLoadOnPath:"${escapedPath}"</SET><XMLTAG>LOADRESULT</XMLTAG></FIELD><FIELD NAME="MCPCurrentCompany"><SET>##SVCurrentCompany</SET><XMLTAG>CURRENTCOMPANY</XMLTAG></FIELD></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+              const resp = await postTallyXML(loadXml);
+              logs.push(`  [${folder.folder}] $$CmpLoadOnPath response: ${resp.substring(0, 300)}`);
+              const nameMatch = resp.match(/<CURRENTCOMPANY>([^<]+)<\/CURRENTCOMPANY>/i);
+              if (nameMatch && nameMatch[1].trim()) {
+                folder.name = nameMatch[1].trim();
+                folder.hasData = true; // Tally loaded it, so it has data
+                logs.push(`  [${folder.folder}] Company name: "${folder.name}"`);
               }
             } catch (err) {
-              diagInfo += ` error:${err}`;
+              logs.push(`  [${folder.folder}] Error: ${err}`);
             }
-            // If local parsing failed, try matching from Tally's company list
-            if (!companyName && tallyCompanyNames.size > 0) {
-              const sortedFolders = entries.filter(e2 => e2.isDirectory() && /^\d+$/.test(e2.name)).map(e2 => e2.name).sort();
-              const idx = sortedFolders.indexOf(e.name);
-              const nameArray = Array.from(tallyCompanyNames.values());
-              if (idx >= 0 && idx < nameArray.length) {
-                companyName = nameArray[idx];
-              }
-            }
-            return { folder: e.name, name: companyName, path: folderPath, diagInfo };
-          });
-        if (folders.length === 0) {
-          auditLog('list-companies', args, 'success', Date.now() - start);
-          return { content: [{ type: 'text', text: 'No company folders found in the data directory.' }] };
+          }
         }
-        const tsv = 'folder\tname\tpath\n' + folders.map(f => `${f.folder}\t${f.name}\t${f.path}`).join('\n');
-        const tallyNames = tallyCompanyNames.size > 0 ? `\n\nTally known companies: ${Array.from(tallyCompanyNames.values()).join(', ')}` : '';
-        const diag = `\n\n--- Diagnostics ---\nRaw "List of Companies" (${rawTallyResponse.length} chars): ${rawTallyResponse}` +
-          (rawCollectionResponse ? `\nRaw Collection (${rawCollectionResponse.length} chars): ${rawCollectionResponse}` : '') +
-          folders.map(f => `\n\n[${f.folder}] ${f.diagInfo}`).join('');
+
+        // --- Step 4: Build output ---
+        const allResults = [...foldersWithData, ...foldersWithoutData.filter(f => f.name)];
+        if (allResults.length === 0 && allFolders.length === 0) {
+          auditLog('list-companies', args, 'success', Date.now() - start);
+          return { content: [{ type: 'text', text: 'No company folders found in any scanned data directory.\n\n' + logs.join('\n') }] };
+        }
+
+        const tsv = 'folder\tname\tpath\tfiles\n' +
+          allFolders.map(f => `${f.folder}\t${f.name}\t${f.fullPath}\t${f.fileCount}`).join('\n');
+
         auditLog('list-companies', args, 'success', Date.now() - start);
-        return { content: [{ type: 'text', text: tsv + tallyNames + diag }] };
+        return { content: [{ type: 'text', text: tsv + '\n\n--- Discovery Log ---\n' + logs.join('\n') }] };
       } catch (err) {
         auditLog('list-companies', args, 'error', Date.now() - start);
         throw err;
@@ -281,10 +295,10 @@ export async function registerMcpServer(): Promise<McpServer> {
     'open-company',
     {
       title: 'Open Company',
-      description: `loads a company into Tally Prime and sets it as the active company for all subsequent queries. Tries strategies in order: (1) SVCURRENTCOMPANY probe — verifies company is directly accessible (works in Tally server/multi-company mode), (2) open company list check — detects if company is already loaded in Tally UI, (3) GUI automation agent that controls Tally UI via Alt+F3 → Select Company → type name → Enter (requires tally-gui-agent-v2.ps1 to be running in the interactive desktop session). Once open-company succeeds, all other tools automatically target this company unless targetCompany is specified explicitly. Use list-companies first to find available company names.`,
+      description: `loads a company into Tally Prime and sets it as the active company for all subsequent queries. Accepts company name OR folder number (e.g. "010000"). When given a folder number, loads via $$CmpLoadOnPath directly (no name resolution needed). Tries strategies: (0) path-based $$CmpLoadOnPath for folder numbers, (1) $$CmpLoadCompany / $$CmpConnect by name, (2) open company list check, (3) GUI automation. Use list-companies to find folder numbers.`,
       inputSchema: {
-        companyName: z.string().describe('exact company name as shown in Tally (e.g. "My Company Pvt Ltd"). Use list-companies or list-master with collection=company to find names.'),
-        strategy: z.enum(['auto', 'tdl-load', 'tdl-connect', 'gui-agent']).optional().describe('which strategy to use. "auto" tries all in order (default). "tdl-load" uses $$CmpLoadCompany. "tdl-connect" uses $$CmpConnect. "gui-agent" uses GUI automation via companion agent running in the interactive desktop session.')
+        companyName: z.string().describe('company name as shown in Tally OR a folder number (e.g. "010000") from list-companies output.'),
+        strategy: z.enum(['auto', 'path-load', 'tdl-load', 'tdl-connect', 'gui-agent']).optional().describe('which strategy to use. "auto" tries all in order (default). "path-load" uses $$CmpLoadOnPath with folder path. "tdl-load" uses $$CmpLoadCompany. "tdl-connect" uses $$CmpConnect. "gui-agent" uses GUI automation.')
       },
       annotations: {
         readOnlyHint: false,
@@ -355,8 +369,78 @@ export async function registerMcpServer(): Promise<McpServer> {
         return names;
       };
 
-      // --- Resolve folder number to company name if needed ---
-      // If input looks like a folder number, try to get the real company name from Tally's own company list
+      // --- Strategy 0: Path-based loading for folder numbers ---
+      const tryPathLoad = async (): Promise<boolean> => {
+        // Find the folder path for this input
+        const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const commonPaths = [
+          tallyDataPath,
+          'C:\\Users\\Public\\TallyPrimeEditLog\\data',
+          'C:\\Users\\Public\\Tally.ERP9\\Data',
+          'C:\\Users\\Public\\TallyPrime\\Data',
+          'C:\\TallyPrime\\Data',
+          'C:\\Tally\\Data',
+          'D:\\TallyData',
+          'D:\\Tally\\Data',
+        ];
+        // If input is a folder number, search all data paths for it
+        const isFolder = /^\d+$/.test(companyName);
+        const fullPaths: string[] = [];
+        if (isFolder) {
+          for (const dp of commonPaths) {
+            const fp = path.join(dp, companyName);
+            if (fs.existsSync(fp)) fullPaths.push(fp);
+          }
+          // Also check if it's a direct path
+        } else if (fs.existsSync(companyName)) {
+          fullPaths.push(companyName);
+        }
+
+        if (fullPaths.length === 0) {
+          logs.push(`[Strategy 0: Path Load] No folder found for "${companyName}"`);
+          return false;
+        }
+
+        for (const folderPath of fullPaths) {
+          logs.push(`[Strategy 0: Path Load] Trying $$CmpLoadOnPath: ${folderPath}`);
+          try {
+            const escapedPath = folderPath.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\\/g, '\\\\');
+            const loadXml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPPathLoadReport</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE><REPORT NAME="MCPPathLoadReport"><FORMS>MCPPathLoadForm</FORMS></REPORT><FORM NAME="MCPPathLoadForm"><PARTS>MCPPathLoadPart</PARTS><XMLTAG>DATA</XMLTAG></FORM><PART NAME="MCPPathLoadPart"><LINES>MCPPathLoadLine</LINES></PART><LINE NAME="MCPPathLoadLine"><FIELDS>MCPPathLoadResult,MCPPathCurrentCompany</FIELDS><XMLTAG>ROW</XMLTAG></LINE><FIELD NAME="MCPPathLoadResult"><SET>$$CmpLoadOnPath:"${escapedPath}"</SET><XMLTAG>LOADRESULT</XMLTAG></FIELD><FIELD NAME="MCPPathCurrentCompany"><SET>##SVCurrentCompany</SET><XMLTAG>CURRENTCOMPANY</XMLTAG></FIELD></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+            const resp = await postTallyXML(loadXml);
+            logs.push(`  Response: ${resp.substring(0, 300)}`);
+
+            // Check if company was loaded
+            const nameMatch = resp.match(/<CURRENTCOMPANY>([^<]+)<\/CURRENTCOMPANY>/i);
+            if (nameMatch && nameMatch[1].trim()) {
+              companyName = nameMatch[1].trim();
+              logs.push(`  Company loaded: "${companyName}"`);
+              return true;
+            }
+
+            // Wait and retry — loading might take a moment
+            await new Promise(resolve => setTimeout(resolve, 3000));
+            // Query current company
+            try {
+              const checkXml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPCheckCurrent</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE><REPORT NAME="MCPCheckCurrent"><FORMS>MCPCheckForm</FORMS></REPORT><FORM NAME="MCPCheckForm"><PARTS>MCPCheckPart</PARTS><XMLTAG>DATA</XMLTAG></FORM><PART NAME="MCPCheckPart"><LINES>MCPCheckLine</LINES></PART><LINE NAME="MCPCheckLine"><FIELDS>MCPCheckField</FIELDS><XMLTAG>ROW</XMLTAG></LINE><FIELD NAME="MCPCheckField"><SET>##SVCurrentCompany</SET><XMLTAG>NAME</XMLTAG></FIELD></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+              const checkResp = await postTallyXML(checkXml);
+              const checkMatch = checkResp.match(/<NAME>([^<]+)<\/NAME>/i);
+              if (checkMatch && checkMatch[1].trim()) {
+                companyName = checkMatch[1].trim();
+                logs.push(`  After wait, current company: "${companyName}"`);
+                return true;
+              }
+            } catch {}
+
+            logs.push(`  $$CmpLoadOnPath did not return a company name.`);
+          } catch (err) {
+            logs.push(`  Error: ${err}`);
+          }
+        }
+        return false;
+      };
+
+      // --- Resolve folder number to company name if needed (for name-based strategies) ---
+      // If input looks like a folder number and path load isn't being used, try to get the real name
       if (/^\d+$/.test(companyName)) {
         logs.push(`[Pre-check] Input "${companyName}" looks like a folder number, trying to resolve company name...`);
         try {
@@ -582,6 +666,19 @@ export async function registerMcpServer(): Promise<McpServer> {
       // --- Execute strategies ---
       try {
         let success = false;
+
+        // --- Strategy 0: Path-based loading (best for folder numbers) ---
+        if (strategy === 'auto' || strategy === 'path-load') {
+          success = await tryPathLoad();
+          if (success || strategy === 'path-load') {
+            if (success) activeCompany = companyName;
+            auditLog('open-company', args, success ? 'success' : 'error', Date.now() - start);
+            return {
+              isError: !success,
+              content: [{ type: 'text', text: logs.join('\n') + (success ? `\n\nCompany "${companyName}" is now active.` : '') }]
+            };
+          }
+        }
 
         if (strategy === 'auto' || strategy === 'tdl-load') {
           success = await tryTdlLoad();
