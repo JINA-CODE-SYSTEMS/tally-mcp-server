@@ -138,6 +138,32 @@ export async function registerMcpServer(): Promise<McpServer> {
           };
         }
         const entries = fs.readdirSync(tallyDataPath, { withFileTypes: true });
+
+        // Try to get company names from Tally's built-in "List of Companies" request
+        let tallyCompanyNames: Map<string, string> = new Map();
+        try {
+          const builtinXml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>List of Companies</ID></HEADER></ENVELOPE>`;
+          const builtinResp = await postTallyXML(builtinXml);
+          // Try parsing COMPANYNAME tags
+          const companyMatches = builtinResp.match(/<COMPANYNAME[^>]*>([^<]+)<\/COMPANYNAME>/gi);
+          if (companyMatches) {
+            for (const m of companyMatches) {
+              const name = m.replace(/<\/?COMPANYNAME[^>]*>/gi, '').trim();
+              if (name) tallyCompanyNames.set(name.toLowerCase(), name);
+            }
+          }
+          // Also try NAME tags
+          if (tallyCompanyNames.size === 0) {
+            const nameMatches = builtinResp.match(/<NAME[^>]*>([^<]+)<\/NAME>/gi);
+            if (nameMatches) {
+              for (const m of nameMatches) {
+                const name = m.replace(/<\/?NAME[^>]*>/gi, '').trim();
+                if (name && name.length > 1) tallyCompanyNames.set(name.toLowerCase(), name);
+              }
+            }
+          }
+        } catch {}
+
         const folders = entries
           .filter(e => e.isDirectory() && /^\d+$/.test(e.name))
           .map(e => {
@@ -148,12 +174,29 @@ export async function registerMcpServer(): Promise<McpServer> {
               const companyFile = path.join(folderPath, 'Company.900');
               if (fs.existsSync(companyFile)) {
                 const buf = fs.readFileSync(companyFile);
-                // Extract readable ASCII/Unicode text for the company name
-                const text = buf.toString('utf16le').replace(/[^\x20-\x7E\u0900-\u097F]/g, ' ').trim();
-                const match = text.match(/[A-Za-z\u0900-\u097F][\w\s\u0900-\u097F.&(),-]{2,}/);
-                if (match) companyName = match[0].trim();
+                // Try UTF-16LE first
+                const text16 = buf.toString('utf16le').replace(/[^\x20-\x7E\u0900-\u097F]/g, ' ').trim();
+                const match16 = text16.match(/[A-Za-z\u0900-\u097F][\w\s\u0900-\u097F.&(),'"-]{2,}/);
+                if (match16) {
+                  companyName = match16[0].trim();
+                } else {
+                  // Try ASCII/UTF-8 as fallback
+                  const text8 = buf.toString('utf-8').replace(/[^\x20-\x7E]/g, ' ').trim();
+                  const match8 = text8.match(/[A-Za-z][\w\s.&(),'"-]{2,}/);
+                  if (match8) companyName = match8[0].trim();
+                }
               }
             } catch {}
+            // If Company.900 parsing failed, try matching from Tally's company list
+            if (!companyName && tallyCompanyNames.size > 0) {
+              // Assign names in order of Tally list to folder number order
+              const sortedFolders = entries.filter(e2 => e2.isDirectory() && /^\d+$/.test(e2.name)).map(e2 => e2.name).sort();
+              const idx = sortedFolders.indexOf(e.name);
+              const nameArray = Array.from(tallyCompanyNames.values());
+              if (idx >= 0 && idx < nameArray.length) {
+                companyName = nameArray[idx];
+              }
+            }
             return { folder: e.name, name: companyName, path: folderPath };
           });
         if (folders.length === 0) {
@@ -161,8 +204,9 @@ export async function registerMcpServer(): Promise<McpServer> {
           return { content: [{ type: 'text', text: 'No company folders found in the data directory.' }] };
         }
         const tsv = 'folder\tname\tpath\n' + folders.map(f => `${f.folder}\t${f.name}\t${f.path}`).join('\n');
+        const tallyNames = tallyCompanyNames.size > 0 ? `\n\nTally known companies: ${Array.from(tallyCompanyNames.values()).join(', ')}` : '';
         auditLog('list-companies', args, 'success', Date.now() - start);
-        return { content: [{ type: 'text', text: tsv }] };
+        return { content: [{ type: 'text', text: tsv + tallyNames }] };
       } catch (err) {
         auditLog('list-companies', args, 'error', Date.now() - start);
         throw err;
@@ -190,75 +234,81 @@ export async function registerMcpServer(): Promise<McpServer> {
       let companyName = args.companyName;
       const logs: string[] = [];
 
+      // --- Helper: get all company names known to Tally (works even from Select Company screen) ---
+      const getAllCompanyNames = async (): Promise<string[]> => {
+        const names: string[] = [];
+        try {
+          // Method 1: Use Tally's built-in "List of Companies" request (works without any company loaded)
+          const builtinXml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>List of Companies</ID></HEADER></ENVELOPE>`;
+          const builtinResp = await postTallyXML(builtinXml);
+          logs.push(`  Built-in "List of Companies" response (${builtinResp.length} chars)`);
+          // Parse COMPANYNAME tags from built-in response
+          const companyMatches = builtinResp.match(/<COMPANYNAME[^>]*>([^<]+)<\/COMPANYNAME>/gi);
+          if (companyMatches && companyMatches.length > 0) {
+            for (const m of companyMatches) {
+              const name = m.replace(/<\/?COMPANYNAME[^>]*>/gi, '').trim();
+              if (name && !names.includes(name)) names.push(name);
+            }
+          }
+          // Also try <NAME> tags (some Tally versions use different format)
+          if (names.length === 0) {
+            const nameMatches = builtinResp.match(/<NAME[^>]*>([^<]+)<\/NAME>/gi);
+            if (nameMatches && nameMatches.length > 0) {
+              for (const m of nameMatches) {
+                const name = m.replace(/<\/?NAME[^>]*>/gi, '').trim();
+                if (name && name.length > 1 && !names.includes(name)) names.push(name);
+              }
+            }
+          }
+          if (names.length > 0) return names;
+        } catch (err) {
+          logs.push(`  Built-in request failed: ${err}`);
+        }
+        try {
+          // Method 2: Custom TDL with Company collection (works when at least one company is loaded)
+          const listXml = `<?xml version="1.0" encoding="utf-8"?>
+<ENVELOPE>
+  <HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPListCompaniesReport</ID></HEADER>
+  <BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES>
+    <TDL><TDLMESSAGE>
+      <REPORT NAME="MCPListCompaniesReport"><FORMS>MCPListCompaniesForm</FORMS></REPORT>
+      <FORM NAME="MCPListCompaniesForm"><PARTS>MCPListCompaniesPart</PARTS><XMLTAG>DATA</XMLTAG></FORM>
+      <PART NAME="MCPListCompaniesPart"><LINES>MCPListCompaniesLine</LINES><REPEAT>MCPListCompaniesLine : MCPAllCompaniesCol</REPEAT><SCROLLED>Vertical</SCROLLED></PART>
+      <LINE NAME="MCPListCompaniesLine"><FIELDS>MCPCompanyNameFld, MCPCompanyNumFld</FIELDS><XMLTAG>ROW</XMLTAG></LINE>
+      <FIELD NAME="MCPCompanyNameFld"><SET>$Name</SET><XMLTAG>NAME</XMLTAG></FIELD>
+      <FIELD NAME="MCPCompanyNumFld"><SET>$$FolderName:$CompanyMailName</SET><XMLTAG>NUMBER</XMLTAG></FIELD>
+      <COLLECTION NAME="MCPAllCompaniesCol"><TYPE>Company</TYPE></COLLECTION>
+    </TDLMESSAGE></TDL></DESC></BODY>
+</ENVELOPE>`;
+          const listResp = await postTallyXML(listXml);
+          const nameMatches = listResp.match(/<NAME>([^<]+)<\/NAME>/g);
+          if (nameMatches && nameMatches.length > 0) {
+            for (const m of nameMatches) {
+              const name = m.replace(/<\/?NAME>/g, '').trim();
+              if (name && !names.includes(name)) names.push(name);
+            }
+          }
+        } catch {}
+        return names;
+      };
+
       // --- Resolve folder number to company name if needed ---
       // If input looks like a folder number, try to get the real company name from Tally's own company list
       if (/^\d+$/.test(companyName)) {
         logs.push(`[Pre-check] Input "${companyName}" looks like a folder number, trying to resolve company name...`);
         try {
-          // Ask Tally for all company names (from its data directory)
-          const listXml = `<?xml version="1.0" encoding="utf-8"?>
-<ENVELOPE>
-  <HEADER>
-    <VERSION>1</VERSION>
-    <TALLYREQUEST>Export</TALLYREQUEST>
-    <TYPE>Data</TYPE>
-    <ID>MCPListCompaniesReport</ID>
-  </HEADER>
-  <BODY>
-    <DESC>
-      <STATICVARIABLES>
-        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
-      </STATICVARIABLES>
-      <TDL>
-        <TDLMESSAGE>
-          <REPORT NAME="MCPListCompaniesReport">
-            <FORMS>MCPListCompaniesForm</FORMS>
-          </REPORT>
-          <FORM NAME="MCPListCompaniesForm">
-            <PARTS>MCPListCompaniesPart</PARTS>
-            <XMLTAG>DATA</XMLTAG>
-          </FORM>
-          <PART NAME="MCPListCompaniesPart">
-            <LINES>MCPListCompaniesLine</LINES>
-            <REPEAT>MCPListCompaniesLine : MCPAllCompaniesCol</REPEAT>
-            <SCROLLED>Vertical</SCROLLED>
-          </PART>
-          <LINE NAME="MCPListCompaniesLine">
-            <FIELDS>MCPCompanyNameFld, MCPCompanyNumFld</FIELDS>
-            <XMLTAG>ROW</XMLTAG>
-          </LINE>
-          <FIELD NAME="MCPCompanyNameFld">
-            <SET>$Name</SET>
-            <XMLTAG>NAME</XMLTAG>
-          </FIELD>
-          <FIELD NAME="MCPCompanyNumFld">
-            <SET>$$FolderName:$CompanyMailName</SET>
-            <XMLTAG>NUMBER</XMLTAG>
-          </FIELD>
-          <COLLECTION NAME="MCPAllCompaniesCol">
-            <TYPE>Company</TYPE>
-          </COLLECTION>
-        </TDLMESSAGE>
-      </TDL>
-    </DESC>
-  </BODY>
-</ENVELOPE>`;
-          const listResp = await postTallyXML(listXml);
-          logs.push(`  Tally company list response received (${listResp.length} chars)`);
-          // Extract company names from response
-          const nameMatches = listResp.match(/<NAME>([^<]+)<\/NAME>/g);
-          if (nameMatches && nameMatches.length > 0) {
-            const names = nameMatches.map(m => m.replace(/<\/?NAME>/g, ''));
+          const names = await getAllCompanyNames();
+          if (names.length > 0) {
             logs.push(`  Found companies: ${names.join(', ')}`);
-            // If there's only one company, use it; otherwise keep the folder number for later strategies
             if (names.length === 1) {
               companyName = names[0];
               logs.push(`  Resolved to: "${companyName}"`);
-            } else if (names.length > 1) {
-              // Use first company as best guess
+            } else {
               companyName = names[0];
               logs.push(`  Multiple companies found, using first: "${companyName}"`);
             }
+          } else {
+            logs.push(`  No company names resolved from Tally.`);
           }
         } catch (err) {
           logs.push(`  Could not resolve company name from Tally: ${err}`);
@@ -278,12 +328,58 @@ export async function registerMcpServer(): Promise<McpServer> {
         }
       };
 
-      // --- Strategy 1: SVCURRENTCOMPANY probe — works in Tally server/multi-company mode ---
+      // --- Strategy 1: SVCURRENTCOMPANY probe + $$CmpLoadCompany attempt ---
       const tryTdlLoad = async (): Promise<boolean> => {
-        logs.push('[Strategy 1: SVCURRENTCOMPANY probe] Checking if company is directly accessible...');
+        logs.push('[Strategy 1: TDL Load] Checking if company is directly accessible...');
+        // First check if already accessible
         const accessible = await verifyCompanyLoaded(companyName);
-        logs.push(`  ${accessible ? 'Company is accessible in Tally (server mode or already open).' : 'Company not accessible via SVCURRENTCOMPANY.'}`);
-        return accessible;
+        if (accessible) {
+          logs.push('  Company is accessible in Tally (server mode or already open).');
+          return true;
+        }
+        logs.push('  Company not accessible via SVCURRENTCOMPANY. Attempting $$CmpLoadCompany via inline TDL...');
+
+        // Try to load company using $$CmpLoadCompany (works if Tally has the company in its data directory)
+        try {
+          const escaped = companyName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+          const loadXml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPTdlLoadReport</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><MCPTARGETCOMPANY>${escaped}</MCPTARGETCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><REPORT NAME="MCPTdlLoadReport"><FORMS>MCPTdlLoadForm</FORMS></REPORT><FORM NAME="MCPTdlLoadForm"><PARTS>MCPTdlLoadPart</PARTS><XMLTAG>DATA</XMLTAG></FORM><PART NAME="MCPTdlLoadPart"><LINES>MCPTdlLoadLine</LINES></PART><LINE NAME="MCPTdlLoadLine"><FIELDS>MCPTdlLoadResult</FIELDS><XMLTAG>ROW</XMLTAG></LINE><FIELD NAME="MCPTdlLoadResult"><SET>$$CmpLoadCompany:##MCPTargetCompany</SET><XMLTAG>RESULT</XMLTAG></FIELD></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+          const loadResp = await postTallyXML(loadXml);
+          logs.push(`  $$CmpLoadCompany response (${loadResp.length} chars): ${loadResp.substring(0, 200)}`);
+
+          // Wait for company to load
+          await new Promise(resolve => setTimeout(resolve, 3000));
+
+          // Verify
+          const loaded = await verifyCompanyLoaded(companyName);
+          if (loaded) {
+            logs.push('  $$CmpLoadCompany succeeded! Company is now accessible.');
+            return true;
+          }
+          logs.push('  $$CmpLoadCompany did not make company accessible.');
+        } catch (err) {
+          logs.push(`  $$CmpLoadCompany failed: ${err}`);
+        }
+
+        // Try $$CmpConnect as alternative
+        try {
+          const escaped = companyName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+          const connectXml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPTdlConnectReport</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><MCPTARGETCOMPANY>${escaped}</MCPTARGETCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><REPORT NAME="MCPTdlConnectReport"><FORMS>MCPTdlConnectForm</FORMS></REPORT><FORM NAME="MCPTdlConnectForm"><PARTS>MCPTdlConnectPart</PARTS><XMLTAG>DATA</XMLTAG></FORM><PART NAME="MCPTdlConnectPart"><LINES>MCPTdlConnectLine</LINES></PART><LINE NAME="MCPTdlConnectLine"><FIELDS>MCPTdlConnectResult</FIELDS><XMLTAG>ROW</XMLTAG></LINE><FIELD NAME="MCPTdlConnectResult"><SET>$$CmpConnect:##MCPTargetCompany</SET><XMLTAG>RESULT</XMLTAG></FIELD></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+          const connectResp = await postTallyXML(connectXml);
+          logs.push(`  $$CmpConnect response (${connectResp.length} chars): ${connectResp.substring(0, 200)}`);
+
+          await new Promise(resolve => setTimeout(resolve, 3000));
+
+          const loaded = await verifyCompanyLoaded(companyName);
+          if (loaded) {
+            logs.push('  $$CmpConnect succeeded! Company is now accessible.');
+            return true;
+          }
+          logs.push('  $$CmpConnect did not make company accessible.');
+        } catch (err) {
+          logs.push(`  $$CmpConnect failed: ${err}`);
+        }
+
+        return false;
       };
 
       // --- Strategy 2: open company list check — detects if company is already loaded in Tally UI ---
