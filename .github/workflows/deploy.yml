@@ -50,160 +50,199 @@ jobs:
 
       - name: Diagnose Tally data folders and force-load all companies
         shell: powershell
+        continue-on-error: true
         run: |
+          $ErrorActionPreference = 'Continue'
+          $diagFile = 'tally-folder-diagnostic.txt'
+          $out = [System.Collections.ArrayList]@()
+          function Log($msg) { Write-Host $msg; [void]$out.Add($msg) }
+
           $dataPath = 'C:\Users\Public\TallyPrimeEditLog\data'
           $tallyDir = 'C:\Program Files\TallyPrimeEditLog'
           $iniPath = "$tallyDir\tally.ini"
 
-          Write-Host "=== 1. DEEP SCAN: All files inside data folders ==="
+          Log "=== 1. DEEP SCAN: All files inside data folders ==="
           if (Test-Path $dataPath) {
-            Get-ChildItem -Path $dataPath -Recurse -Force -ErrorAction SilentlyContinue |
-              Select-Object FullName, Length, LastWriteTime, Attributes, @{N='IsDir';E={$_.PSIsContainer}} |
-              Format-Table -AutoSize -Wrap | Out-String | Write-Host
-          } else {
-            Write-Host "Data path NOT FOUND: $dataPath"
-          }
+            Get-ChildItem -Path $dataPath -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+              $info = "$($_.FullName) | Size=$($_.Length) | Modified=$($_.LastWriteTime) | Attrs=$($_.Attributes) | IsDir=$($_.PSIsContainer)"
+              Log $info
+            }
+          } else { Log "Data path NOT FOUND: $dataPath" }
 
-          Write-Host "=== 2. SEARCH: Company.900, Manager.900, *.tsf, *.900 on C: ==="
-          @('Company.900', 'Manager.900', '*.900', '*.500', 'TALLYSAV.tsf') | ForEach-Object {
-            Write-Host "--- Searching for $_ ---"
-            Get-ChildItem -Path C:\ -Recurse -Force -Filter $_ -ErrorAction SilentlyContinue |
-              Select-Object FullName, Length, LastWriteTime |
-              Format-Table -AutoSize | Out-String | Write-Host
-          }
-
-          Write-Host "=== 3. HEX DUMP: First 256 bytes of each file in data subfolders ==="
+          Log "=== 2. HEX DUMP: First 512 bytes of each file in data subfolders ==="
           Get-ChildItem -Path $dataPath -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
-            Write-Host "`nFile: $($_.FullName) | Size: $($_.Length) bytes"
+            Log "File: $($_.FullName) | Size: $($_.Length) bytes"
             if ($_.Length -gt 0) {
-              $raw = [System.IO.File]::ReadAllBytes($_.FullName)
-              $len = [Math]::Min($raw.Length, 256)
-              $hex = ($raw[0..($len-1)] | ForEach-Object { $_.ToString('X2') }) -join ' '
-              $ascii = [System.Text.Encoding]::ASCII.GetString($raw, 0, $len) -replace '[^\x20-\x7E]','.'
-              Write-Host "  HEX: $hex"
-              Write-Host "  ASCII: $ascii"
-            } else {
-              Write-Host "  (empty / 0 bytes)"
+              try {
+                $raw = [System.IO.File]::ReadAllBytes($_.FullName)
+                $len = [Math]::Min($raw.Length, 512)
+                $hex = ($raw[0..($len-1)] | ForEach-Object { $_.ToString('X2') }) -join ' '
+                $ascii = [System.Text.Encoding]::ASCII.GetString($raw, 0, $len) -replace '[^\x20-\x7E]','.'
+                Log "  HEX: $hex"
+                Log "  ASCII: $ascii"
+                # Also try UTF-16LE (Tally's native encoding)
+                if ($len -ge 2) {
+                  $utf16 = [System.Text.Encoding]::Unicode.GetString($raw, 0, $len) -replace '[^\x20-\x7E]','.'
+                  Log "  UTF16: $utf16"
+                }
+              } catch { Log "  Read error: $_" }
+            } else { Log "  (empty / 0 bytes)" }
+          }
+
+          Log "=== 3. TARGETED SEARCH: Tally data files in known locations ==="
+          $searchPaths = @(
+            'C:\Users\Public\TallyPrimeEditLog',
+            'C:\Users\Public\TallyPrime',
+            'C:\Users\Public\Tally.ERP9',
+            $tallyDir,
+            'C:\ProgramData\TallyPrime',
+            'C:\TallyPrime',
+            'D:\TallyData',
+            'D:\Tally'
+          )
+          foreach ($sp in $searchPaths) {
+            if (Test-Path $sp) {
+              Log "--- $sp ---"
+              Get-ChildItem -Path $sp -Recurse -Force -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match '\.(900|500|tsf)$' -or $_.Name -eq 'Company.900' -or $_.Name -eq 'Manager.900' } |
+                ForEach-Object { Log "  $($_.FullName) ($($_.Length) bytes, $($_.LastWriteTime))" }
             }
           }
 
-          Write-Host "=== 4. OTHER TALLY INSTALLATIONS ==="
-          @('C:\Program Files', 'C:\Program Files (x86)', 'C:\', 'D:\') | ForEach-Object {
+          Log "=== 4. OTHER TALLY INSTALLATIONS ==="
+          @('C:\Program Files', 'C:\Program Files (x86)') | ForEach-Object {
             if (Test-Path $_) {
               Get-ChildItem -Path $_ -Filter "Tally*" -Directory -ErrorAction SilentlyContinue |
-                Select-Object FullName | Out-String | Write-Host
+                ForEach-Object { Log "  $($_.FullName)" }
             }
           }
 
-          Write-Host "=== 5. ALL Tally*.exe PROCESSES ==="
+          Log "=== 5. TALLY PROCESSES ==="
           Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match 'tally' } |
             ForEach-Object {
               $cmd = try { (Get-WmiObject Win32_Process -Filter "ProcessId=$($_.Id)").CommandLine } catch { 'N/A' }
-              Write-Host "PID=$($_.Id) Name=$($_.ProcessName) Path=$($_.Path) CMD=$cmd"
+              Log "PID=$($_.Id) Name=$($_.ProcessName) Path=$($_.Path) CMD=$cmd"
             }
 
-          Write-Host "=== 6. NUMERIC FOLDERS: Everywhere under Tally dirs ==="
-          @($dataPath, $tallyDir, 'C:\Users\Public\TallyPrime', 'C:\Users\Public\Tally.ERP9') | ForEach-Object {
+          Log "=== 6. NUMERIC FOLDERS summary ==="
+          @($dataPath, $tallyDir) | ForEach-Object {
             if (Test-Path $_) {
               Get-ChildItem -Path $_ -Directory -Force -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -match '^\d+$' } | ForEach-Object {
-                  $fc = (Get-ChildItem -Path $_.FullName -Recurse -Force -File -ErrorAction SilentlyContinue).Count
-                  $sz = (Get-ChildItem -Path $_.FullName -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
-                  Write-Host "  $($_.FullName) => $fc files, $sz bytes total"
+                  $files = Get-ChildItem -Path $_.FullName -Recurse -Force -File -ErrorAction SilentlyContinue
+                  $fc = ($files | Measure-Object).Count
+                  $sz = ($files | Measure-Object -Property Length -Sum).Sum
+                  Log "  $($_.FullName) => $fc files, $sz bytes total"
                 }
             }
           }
 
-          Write-Host "=== 7. TALLY.INI: current content ==="
-          if (Test-Path $iniPath) { Get-Content $iniPath | Write-Host }
+          Log "=== 7. TALLY.INI current ==="
+          if (Test-Path $iniPath) { Get-Content $iniPath | ForEach-Object { Log $_ } }
 
-          Write-Host "=== 8. MODIFY tally.ini => Load ALL numeric folders ==="
+          Log "=== 8. MODIFY tally.ini => Load ALL numeric folders ==="
           if (Test-Path $iniPath) {
             $ini = Get-Content $iniPath -Raw
-            # Collect all numeric folders
             $folders = @()
             if (Test-Path $dataPath) {
               $folders = Get-ChildItem -Path $dataPath -Directory -Force -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -match '^\d+$' } | Select-Object -ExpandProperty Name
             }
-            Write-Host "Numeric folders to load: $($folders -join ', ')"
-            # Remove all existing Load= lines
+            Log "Numeric folders to load: $($folders -join ', ')"
             $lines = $ini -split "`r?`n" | Where-Object { $_ -notmatch '^\s*Load\s*=' }
-            # Insert Load= for each folder after Default Companies=Yes
             $newLines = @()
             foreach ($line in $lines) {
               $newLines += $line
               if ($line -match '^\s*Default Companies\s*=') {
                 foreach ($f in $folders) {
                   $newLines += "Load=$f"
-                  Write-Host "  Added: Load=$f"
+                  Log "  Added: Load=$f"
                 }
               }
             }
-            Set-Content $iniPath -Value ($newLines -join "`r`n") -Encoding ASCII
-            Write-Host "Updated tally.ini written."
+            try {
+              Set-Content $iniPath -Value ($newLines -join "`r`n") -Encoding ASCII -Force
+              Log "Updated tally.ini written."
+            } catch { Log "FAILED to write tally.ini: $_" }
           }
 
-          Write-Host "=== 9. RESTART TALLY PRIME ==="
+          Log "=== 9. RESTART TALLY PRIME ==="
           $tallyExe = "$tallyDir\tally.exe"
-          $tp = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match 'tally' -and $_.Path -match 'TallyPrime' }
+          $tp = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match 'tally' -and $_.Path -match 'Tally' }
           if ($tp) {
-            Write-Host "Killing existing Tally process(es): $($tp.Id -join ', ')"
+            Log "Killing Tally process(es): $($tp.Id -join ', ')"
             $tp | Stop-Process -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 5
           }
           if (Test-Path $tallyExe) {
-            Write-Host "Starting Tally: $tallyExe"
+            Log "Starting Tally: $tallyExe"
             Start-Process $tallyExe -WorkingDirectory $tallyDir
-            Write-Host "Waiting 20s for Tally to start and load companies..."
-            Start-Sleep -Seconds 20
-          } else {
-            Write-Host "Tally exe not found at $tallyExe"
-          }
+            Log "Waiting 25s for Tally to start..."
+            Start-Sleep -Seconds 25
+          } else { Log "Tally exe not found at $tallyExe" }
 
-          Write-Host "=== 10. QUERY TALLY XML API: List of Companies ==="
+          Log "=== 10. QUERY TALLY: List of Companies ==="
           try {
             $xml = '<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>List of Companies</ID></HEADER></ENVELOPE>'
             $bytes = [System.Text.Encoding]::GetEncoding('utf-16').GetBytes($xml)
             $response = Invoke-WebRequest -Uri 'http://localhost:9000' -Method POST -Body $bytes -ContentType 'text/xml; charset=utf-16' -TimeoutSec 15
             $text = [System.Text.Encoding]::GetEncoding('utf-16').GetString($response.Content)
-            Write-Host "Tally response ($($text.Length) chars):"
-            Write-Host $text
-          } catch {
-            Write-Host "Tally API error: $($_.Exception.Message)"
-            Write-Host "Tally may still be loading. Will check again after MCP restart."
-          }
+            Log "Tally response ($($text.Length) chars): $text"
+          } catch { Log "Tally API error: $($_.Exception.Message)" }
 
-          Write-Host "=== 11. TDL QUERY: Company collection with details ==="
+          Log "=== 11. TDL QUERY: Company details ==="
           try {
             $tdlXml = @'
-          <?xml version="1.0" encoding="utf-8"?>
-          <ENVELOPE>
-            <HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPCompanyDiag</ID></HEADER>
-            <BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES>
-              <TDL><TDLMESSAGE>
-                <REPORT NAME="MCPCompanyDiag"><FORMS>MCPCompDiagForm</FORMS></REPORT>
-                <FORM NAME="MCPCompDiagForm"><PARTS>MCPCompDiagPart</PARTS><XMLTAG>DATA</XMLTAG></FORM>
-                <PART NAME="MCPCompDiagPart"><LINES>MCPCompDiagLine</LINES><REPEAT>MCPCompDiagLine : MCPCompDiagCol</REPEAT><SCROLLED>Vertical</SCROLLED></PART>
-                <LINE NAME="MCPCompDiagLine"><FIELDS>CDName,CDNumber,CDGuid,CDLoaded,CDPath,CDMail</FIELDS><XMLTAG>ROW</XMLTAG></LINE>
-                <FIELD NAME="CDName"><SET>$Name</SET><XMLTAG>NAME</XMLTAG></FIELD>
-                <FIELD NAME="CDNumber"><SET>$CompanyNumber</SET><XMLTAG>NUMBER</XMLTAG></FIELD>
-                <FIELD NAME="CDGuid"><SET>$GUID</SET><XMLTAG>GUID</XMLTAG></FIELD>
-                <FIELD NAME="CDLoaded"><SET>$$CmpIsLoaded:$Name</SET><XMLTAG>LOADED</XMLTAG></FIELD>
-                <FIELD NAME="CDPath"><SET>$CompanyMailName</SET><XMLTAG>MAILNAME</XMLTAG></FIELD>
-                <FIELD NAME="CDMail"><SET>$FormalName</SET><XMLTAG>FORMALNAME</XMLTAG></FIELD>
-                <COLLECTION NAME="MCPCompDiagCol"><TYPE>Company</TYPE></COLLECTION>
-              </TDLMESSAGE></TDL></DESC></BODY>
-          </ENVELOPE>
-          '@
+<?xml version="1.0" encoding="utf-8"?>
+<ENVELOPE>
+  <HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPCompanyDiag</ID></HEADER>
+  <BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES>
+    <TDL><TDLMESSAGE>
+      <REPORT NAME="MCPCompanyDiag"><FORMS>MCPCompDiagForm</FORMS></REPORT>
+      <FORM NAME="MCPCompDiagForm"><PARTS>MCPCompDiagPart</PARTS><XMLTAG>DATA</XMLTAG></FORM>
+      <PART NAME="MCPCompDiagPart"><LINES>MCPCompDiagLine</LINES><REPEAT>MCPCompDiagLine : MCPCompDiagCol</REPEAT><SCROLLED>Vertical</SCROLLED></PART>
+      <LINE NAME="MCPCompDiagLine"><FIELDS>CDName,CDNumber,CDGuid,CDLoaded,CDPath,CDMail</FIELDS><XMLTAG>ROW</XMLTAG></LINE>
+      <FIELD NAME="CDName"><SET>$Name</SET><XMLTAG>NAME</XMLTAG></FIELD>
+      <FIELD NAME="CDNumber"><SET>$CompanyNumber</SET><XMLTAG>NUMBER</XMLTAG></FIELD>
+      <FIELD NAME="CDGuid"><SET>$GUID</SET><XMLTAG>GUID</XMLTAG></FIELD>
+      <FIELD NAME="CDLoaded"><SET>$$CmpIsLoaded:$Name</SET><XMLTAG>LOADED</XMLTAG></FIELD>
+      <FIELD NAME="CDPath"><SET>$CompanyMailName</SET><XMLTAG>MAILNAME</XMLTAG></FIELD>
+      <FIELD NAME="CDMail"><SET>$FormalName</SET><XMLTAG>FORMALNAME</XMLTAG></FIELD>
+      <COLLECTION NAME="MCPCompDiagCol"><TYPE>Company</TYPE></COLLECTION>
+    </TDLMESSAGE></TDL></DESC></BODY>
+</ENVELOPE>
+'@
             $bytes = [System.Text.Encoding]::GetEncoding('utf-16').GetBytes($tdlXml)
             $response = Invoke-WebRequest -Uri 'http://localhost:9000' -Method POST -Body $bytes -ContentType 'text/xml; charset=utf-16' -TimeoutSec 15
             $text = [System.Text.Encoding]::GetEncoding('utf-16').GetString($response.Content)
-            Write-Host "TDL Company details ($($text.Length) chars):"
-            Write-Host $text
-          } catch {
-            Write-Host "TDL query error: $($_.Exception.Message)"
-          }
+            Log "TDL Company details ($($text.Length) chars): $text"
+          } catch { Log "TDL query error: $($_.Exception.Message)" }
+
+          Log "=== 12. TALLY.INI after update ==="
+          if (Test-Path $iniPath) { Get-Content $iniPath | ForEach-Object { Log $_ } }
+
+          # Save diagnostic output to file for commit
+          Set-Content -Path $diagFile -Value ($out -join "`r`n") -Encoding UTF8
+          Write-Host "Diagnostic output saved to $diagFile ($($out.Count) lines)"
+
+      - name: Commit diagnostic results
+        if: always()
+        shell: powershell
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          $diagFile = 'tally-folder-diagnostic.txt'
+          if (Test-Path $diagFile) {
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git checkout -B diag-results
+            git add $diagFile
+            git commit -m "diag: folder scan results $(Get-Date -Format 'yyyy-MM-dd HH:mm')" --allow-empty
+            git remote set-url origin "https://x-access-token:$env:GITHUB_TOKEN@github.com/$env:GITHUB_REPOSITORY.git"
+            git push origin HEAD:diag-results --force
+            Write-Host "Diagnostic results pushed to diag-results branch"
+          } else { Write-Host "No diagnostic file found" }
 
       - name: Restart MCP Server
         shell: powershell
