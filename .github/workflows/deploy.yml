@@ -56,17 +56,41 @@ jobs:
             throw "Service '$serviceName' does not exist on the runner host."
           }
 
-          try {
-            nssm restart $serviceName
-          } catch {
-            Write-Host "nssm restart failed, falling back to Stop-Service/Start-Service"
-            if ($service.Status -ne 'Stopped') {
-              Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
-              Start-Sleep -Seconds 3
+          # 1. Force-stop: kill any node processes owned by the service
+          Write-Host "Stopping service and killing node processes..."
+          Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+
+          # Kill ALL node processes running server.mjs to free port 3000
+          Get-Process node -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+              $cmdline = (Get-WmiObject Win32_Process -Filter "ProcessId=$($_.Id)").CommandLine
+              if ($cmdline -match 'server\.mjs') {
+                Write-Host "Killing node PID $($_.Id): $cmdline"
+                Stop-Process -Id $_.Id -Force
+              }
+            } catch {}
+          }
+          Start-Sleep -Seconds 2
+
+          # 2. If service is stuck in StopPending/StartPending, force reset via sc.exe
+          $service.Refresh()
+          if ($service.Status -match 'Pending') {
+            Write-Host "Service stuck in $($service.Status), force-killing service PID..."
+            $svcPid = (Get-WmiObject Win32_Service -Filter "Name='$serviceName'").ProcessId
+            if ($svcPid -and $svcPid -ne 0) {
+              Stop-Process -Id $svcPid -Force -ErrorAction SilentlyContinue
             }
-            Start-Service -Name $serviceName
+            Start-Sleep -Seconds 3
+            $service.Refresh()
+            Write-Host "Service status after kill: $($service.Status)"
           }
 
+          # 3. Start the service
+          Write-Host "Starting service..."
+          Start-Service -Name $serviceName -ErrorAction Stop
+
+          # 4. Wait for Running state
           $deadline = (Get-Date).AddSeconds(30)
           do {
             $service.Refresh()
@@ -75,8 +99,9 @@ jobs:
           } while ((Get-Date) -lt $deadline)
 
           if ($service.Status -ne 'Running') {
-            throw "Service '$serviceName' is not running after restart."
+            throw "Service '$serviceName' is '$($service.Status)' after restart attempt."
           }
+          Write-Host "Service is Running."
 
       - name: Verify local health endpoint
         shell: powershell
