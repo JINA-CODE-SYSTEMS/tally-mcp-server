@@ -5,7 +5,7 @@
   "main": "dist/server.mjs",
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node --test \"dist/**/*.test.mjs\""
+    "test": "npm run build && find dist -name '*.test.mjs' -exec node --test {} +"
   },
   "repository": {
     "type": "git",
