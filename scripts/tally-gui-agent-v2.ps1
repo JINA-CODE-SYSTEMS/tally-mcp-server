@@ -149,10 +149,40 @@ function Invoke-Claude {
         $response = Invoke-RestMethod -Uri "https://api.anthropic.com/v1/messages" -Method POST -Headers $headers -Body $body -TimeoutSec 30
         $text = $response.content[0].text
         Write-Host "  LLM response: $text"
-        return $text | ConvertFrom-Json
+        return Convert-LLMTextToAction -Text $text
     } catch {
         Write-Host "  Claude API error: $_"
         return @{ action = "fail"; reason = "API error: $_" }
+    }
+}
+
+function Convert-LLMTextToAction {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return @{ action = "fail"; reason = "Empty LLM response" }
+    }
+
+    $trimmed = $Text.Trim()
+
+    # Strip fenced code blocks if present.
+    if ($trimmed.StartsWith('```')) {
+        $trimmed = $trimmed -replace '^```(?:json)?\s*', ''
+        $trimmed = $trimmed -replace '\s*```$', ''
+        $trimmed = $trimmed.Trim()
+    }
+
+    # Extract first JSON object from verbose replies.
+    $firstBrace = $trimmed.IndexOf('{')
+    $lastBrace = $trimmed.LastIndexOf('}')
+    if ($firstBrace -ge 0 -and $lastBrace -gt $firstBrace) {
+        $trimmed = $trimmed.Substring($firstBrace, $lastBrace - $firstBrace + 1)
+    }
+
+    try {
+        return $trimmed | ConvertFrom-Json
+    } catch {
+        return @{ action = "fail"; reason = "Unparseable LLM JSON response" }
     }
 }
 
@@ -186,7 +216,7 @@ function Invoke-OpenAI {
         $response = Invoke-RestMethod -Uri "https://api.openai.com/v1/chat/completions" -Method POST -Headers $headers -Body $body -TimeoutSec 30
         $text = $response.choices[0].message.content
         Write-Host "  LLM response: $text"
-        return $text | ConvertFrom-Json
+        return Convert-LLMTextToAction -Text $text
     } catch {
         Write-Host "  OpenAI API error: $_"
         return @{ action = "fail"; reason = "API error: $_" }
@@ -247,23 +277,24 @@ function Execute-Action {
 }
 
 function Write-Result {
-    param([string]$Status, [string]$Message, [string]$Strategy)
+    param([string]$Status, [string]$Message, [string]$Strategy, [string]$CommandId = "")
     $result = @{
         status    = $Status
         message   = $Message
         strategy  = $Strategy
+        commandId = $CommandId
         timestamp = (Get-Date -Format "o")
     } | ConvertTo-Json -Depth 3
     [System.IO.File]::WriteAllText($ResultFile, $result, [System.Text.Encoding]::UTF8)
-    Write-Host "[$Status] $Message"
+    Write-Host "[$Status] $Message (commandId: $CommandId)"
 }
 
 function Invoke-LLMGuidedAction {
-    param([string]$CompanyName, [string]$Action)
+    param([string]$CompanyName, [string]$Action, [string]$CommandId = "", [int]$MaxStepsOverride = 0)
 
     $hwnd = Find-TallyWindow
     if ($hwnd -eq [IntPtr]::Zero) {
-        Write-Result -Status "error" -Message "Tally window not found. Is Tally running?" -Strategy "llm-gui"
+        Write-Result -Status "error" -Message "Tally window not found. Is Tally running?" -Strategy "llm-gui" -CommandId $CommandId
         return
     }
 
@@ -281,11 +312,14 @@ function Invoke-LLMGuidedAction {
 
     $actionHistory = ""
     $stepCount = 0
+    $effectiveMaxSteps = if ($MaxStepsOverride -gt 0) { $MaxStepsOverride } else { $MaxSteps }
+    $typedSearchFallbackUsed = $false
+    $consecutiveNavActions = 0
 
     Write-Host "  Goal: $goal"
-    Write-Host "  Starting LLM-guided loop (max $MaxSteps steps)..."
+    Write-Host "  Starting LLM-guided loop (max $effectiveMaxSteps steps)..."
 
-    for ($step = 0; $step -lt $MaxSteps; $step++) {
+    for ($step = 0; $step -lt $effectiveMaxSteps; $step++) {
         $stepCount++
         Write-Host "`n  --- Step $stepCount ---"
 
@@ -313,12 +347,12 @@ function Invoke-LLMGuidedAction {
         # Check if done or failed
         if ($llmAction.action -eq "done") {
             Write-Host "  LLM says DONE: $($llmAction.reason)"
-            Write-Result -Status "success" -Message "Company '$CompanyName' loaded. LLM: $($llmAction.reason)" -Strategy "llm-gui"
+            Write-Result -Status "success" -Message "Company '$CompanyName' loaded. LLM: $($llmAction.reason)" -Strategy "llm-gui" -CommandId $CommandId
             return
         }
         if ($llmAction.action -eq "fail") {
             Write-Host "  LLM says FAIL: $($llmAction.reason)"
-            Write-Result -Status "error" -Message "LLM could not achieve goal: $($llmAction.reason)" -Strategy "llm-gui"
+            Write-Result -Status "error" -Message "LLM could not achieve goal: $($llmAction.reason)" -Strategy "llm-gui" -CommandId $CommandId
             return
         }
 
@@ -326,9 +360,31 @@ function Invoke-LLMGuidedAction {
         $actionDesc = "$($llmAction.action): $($llmAction.value) ($($llmAction.reason))"
         $actionHistory += "Step ${stepCount}: $actionDesc`n"
         Execute-Action -Action $llmAction
+
+        $keyValue = if ($llmAction.value) { [string]$llmAction.value } else { "" }
+        if ($llmAction.action -eq "key" -and ($keyValue.ToLower() -in @("down", "up", "enter"))) {
+            $consecutiveNavActions++
+        } else {
+            $consecutiveNavActions = 0
+        }
+
+        if (-not $typedSearchFallbackUsed -and $Action -eq "select-company" -and -not [string]::IsNullOrWhiteSpace($CompanyName) -and $consecutiveNavActions -ge 4) {
+            Write-Host "  Fallback: trying direct company name search by typing '$CompanyName'"
+            [TallyUI2]::PressCombo([TallyUI2]::VK_MENU, [TallyUI2]::VK_F3)
+            Start-Sleep -Milliseconds 600
+            [TallyUI2]::PressKey([TallyUI2]::VK_F1)
+            Start-Sleep -Milliseconds 600
+            [TallyUI2]::TypeString($CompanyName)
+            Start-Sleep -Milliseconds 400
+            [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
+            Start-Sleep -Milliseconds 700
+            $typedSearchFallbackUsed = $true
+            $consecutiveNavActions = 0
+            $actionHistory += "Fallback: typed company name search executed`n"
+        }
     }
 
-    Write-Result -Status "error" -Message "Reached max steps ($MaxSteps) without achieving goal" -Strategy "llm-gui"
+    Write-Result -Status "error" -Message "Reached max steps ($effectiveMaxSteps) without achieving goal" -Strategy "llm-gui" -CommandId $CommandId
 }
 
 # --- Main watch loop ---
@@ -354,24 +410,26 @@ while ($true) {
 
         if ($cmdText) {
             $cmd = $cmdText | ConvertFrom-Json
+            $cmdId = if ($cmd.commandId) { [string]$cmd.commandId } else { "" }
+            $cmdMaxSteps = if ($cmd.maxSteps) { [int]$cmd.maxSteps } else { 0 }
             Write-Host "`n=== Received command: $($cmd.action) ==="
 
             switch ($cmd.action) {
                 "select-company" {
-                    Invoke-LLMGuidedAction -CompanyName $cmd.companyName -Action "select-company"
+                    Invoke-LLMGuidedAction -CompanyName $cmd.companyName -Action "select-company" -CommandId $cmdId -MaxStepsOverride $cmdMaxSteps
                 }
                 "load-on-startup" {
-                    Invoke-LLMGuidedAction -CompanyName $cmd.companyName -Action "load-on-startup"
+                    Invoke-LLMGuidedAction -CompanyName $cmd.companyName -Action "load-on-startup" -CommandId $cmdId -MaxStepsOverride $cmdMaxSteps
                 }
                 "ping" {
-                    Write-Result -Status "success" -Message "Agent v2 is alive (LLM: $LLMProvider)" -Strategy "ping"
+                    Write-Result -Status "success" -Message "Agent v2 is alive (LLM: $LLMProvider)" -Strategy "ping" -CommandId $cmdId
                 }
                 "exit" {
-                    Write-Result -Status "success" -Message "Shutting down" -Strategy "exit"
+                    Write-Result -Status "success" -Message "Shutting down" -Strategy "exit" -CommandId $cmdId
                     exit 0
                 }
                 default {
-                    Write-Result -Status "error" -Message "Unknown action: $($cmd.action)" -Strategy "unknown"
+                    Write-Result -Status "error" -Message "Unknown action: $($cmd.action)" -Strategy "unknown" -CommandId $cmdId
                 }
             }
         }
