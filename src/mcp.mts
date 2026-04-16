@@ -145,35 +145,44 @@ export async function registerMcpServer(): Promise<McpServer> {
             if (fs.existsSync(iniPath)) {
               const iniContent = fs.readFileSync(iniPath, 'utf-8');
               logs.push(`[tally.ini] Found: ${iniPath}`);
-              logs.push(`  Content: ${iniContent.substring(0, 500)}`);
-              // Parse "Data Path = ..." or "DataPath = ..." lines
-              const dataPathMatch = iniContent.match(/^[\\s]*Data\\s*Path\\s*[=:]\\s*(.+)$/mi)
-                || iniContent.match(/^[\\s]*DataPath\\s*[=:]\\s*(.+)$/mi);
-              if (dataPathMatch) {
-                const dp = dataPathMatch[1].trim().replace(/[\\r\\n]/g, '');
-                candidatePaths.add(dp);
-                logs.push(`  Parsed Data Path: ${dp}`);
-              }
-              // Also parse any path-like values
-              for (const line of iniContent.split(/\\r?\\n/)) {
-                const m = line.match(/(?:path|directory|data)\\s*[=:]\\s*(.+)/i);
+              logs.push(`  Content (full):\n${iniContent}`);
+              // Parse data-path-like settings from tally.ini
+              for (const line of iniContent.split(/\r?\n/)) {
+                const trimmed = line.trim();
+                // Match: Data Path = ..., DataPath = ..., Data = ... (with a path value)
+                const m = trimmed.match(/^(?:Data\s*Path|DataPath|Data)\s*[=:]\s*(.+)/i);
                 if (m) {
-                  const p = m[1].trim();
-                  if (p && p.includes('\\\\')) candidatePaths.add(p);
+                  const dp = m[1].trim();
+                  if (dp && (dp.includes('\\') || dp.includes('/'))) {
+                    candidatePaths.add(dp);
+                    logs.push(`  Parsed Data Path: ${dp}`);
+                  }
+                }
+                // Also catch any line with path/directory
+                const m2 = trimmed.match(/(?:path|directory)\s*[=:]\s*(.+)/i);
+                if (m2) {
+                  const p = m2[1].trim();
+                  if (p && (p.includes('\\') || p.includes('/'))) {
+                    candidatePaths.add(p);
+                    logs.push(`  Parsed path setting: ${p}`);
+                  }
                 }
               }
             }
           } catch {}
         }
 
-        // Add common default data paths
+        // Add common default data paths + Tally install directory
         const commonPaths = [
           'C:\\Users\\Public\\TallyPrimeEditLog\\data',
+          'C:\\Users\\Public\\TallyPrimeEditLog\\Data',
           'C:\\Users\\Public\\Tally.ERP9\\Data',
           'C:\\Users\\Public\\TallyPrime\\Data',
+          path.join(tallyExeDir, 'Data'),
+          path.join(tallyExeDir, 'data'),
+          'C:\\Program Files\\TallyPrimeEditLog\\Data',
           'C:\\TallyPrime\\Data',
           'C:\\Tally\\Data',
-          'C:\\Users\\Public\\TallyPrimeEditLog\\Data',
           'D:\\TallyData',
           'D:\\Tally\\Data',
         ];
@@ -212,7 +221,12 @@ export async function registerMcpServer(): Promise<McpServer> {
                 } catch { return false; }
               });
               const fileCount = files.length;
-              logs.push(`  ${entry.name}: ${fileCount} files, hasData=${hasData}`);
+              // Report file names and sizes for debugging
+              const fileDetails = files.map(f => {
+                try { return `${f}(${fs.statSync(path.join(folderPath, f)).size})`; }
+                catch { return f; }
+              }).join(', ');
+              logs.push(`  ${entry.name}: ${fileCount} files [${fileDetails}], hasData=${hasData}`);
 
               allFolders.push({
                 folder: entry.name,
