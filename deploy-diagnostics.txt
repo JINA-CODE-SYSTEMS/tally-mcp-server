@@ -1,15 +1,28 @@
-﻿timestamp=2026-04-16T07:09:46.9673818+00:00
+﻿timestamp=2026-04-16T08:37:53.3160895+00:00
 service_name=TallyMCP
-service_status=StopPending
+service_status=Running
 
 [nssm status]
-SERVICE_STOP_PENDING
+SERVICE_RUNNING
 
 
 [node processes]
 
+  Id ProcessName StartTime           
+  -- ----------- ---------           
+7736 node        4/16/2026 7:54:57 AM
+
+
+
 
 [port 3000]
+
+  TCP    127.0.0.1:3000         0.0.0.0:0              LISTENING       7736
+  TCP    127.0.0.1:3000         127.0.0.1:54766        ESTABLISHED     7736
+  TCP    127.0.0.1:54664        127.0.0.1:3000         TIME_WAIT       0
+  TCP    127.0.0.1:54766        127.0.0.1:3000         ESTABLISHED     3520
+
+
 
 
 [logs/service.log tail]
@@ -92,4 +105,77 @@ MCP Server started on 127.0.0.1:3000
 [audit] {"timestamp":"2026-04-16T06:42:51.242Z","tool":"open-company","args":{"companyName":"010000","strategy":"auto"},"status":"error","durationMs":5074}
 [audit] {"timestamp":"2026-04-16T06:51:28.261Z","tool":"query-database","args":{"sql":"SELECT content FROM read_blob('C:/Users/Public/TallyPrimeEditLog/data/010000/Company.900')"},"status":"denied"}
 [audit] {"timestamp":"2026-04-16T06:51:34.706Z","tool":"query-database","args":{"sql":"SELECT * FROM read_csv('C:/Users/Public/TallyPrimeEditLog/data/010000/Company.900', delim=NULL, columns={'content': 'VARCHAR'}, header=false)"},"status":"denied"}
+[oauth] Loaded 57 persisted client(s)
+MCP Server started on 127.0.0.1:3000
+[register] New client registered: R8yGJxbOD2hZ9HXqDfsvGw (recovery-test)
+[authorize] client_id=R8yGJxbOD2hZ9HXqDfsvGw, password_match=true
+[register] New client registered: uMsQesOwWYfRFKtsWVrf6w (Visual Studio Code)
+[authorize GET] client_id=uMsQesOwWYfRFKtsWVrf6w, found=true
+[authorize] client_id=uMsQesOwWYfRFKtsWVrf6w, password_match=true
+[audit] {"timestamp":"2026-04-16T07:18:53.688Z","tool":"list-companies","args":{},"status":"success","durationMs":19}
+[audit] {"timestamp":"2026-04-16T07:18:59.954Z","tool":"open-company-debug","args":{"includeRecentResult":true},"status":"success","durationMs":35}
+[audit] {"timestamp":"2026-04-16T07:21:43.708Z","tool":"open-company","args":{"companyName":"010000","strategy":"auto"},"status":"error","durationMs":11060}
+[oauth] Loaded 59 persisted client(s)
+MCP Server started on 127.0.0.1:3000
+[register] New client registered: oX0JB2G5_RDVq7a04Dex2w (Visual Studio Code)
+[authorize GET] client_id=oX0JB2G5_RDVq7a04Dex2w, found=true
+[authorize] client_id=oX0JB2G5_RDVq7a04Dex2w, password_match=true
+[audit] {"timestamp":"2026-04-16T07:33:47.319Z","tool":"list-companies","args":{},"status":"success","durationMs":35}
+[oauth] Loaded 60 persisted client(s)
+MCP Server started on 127.0.0.1:3000
+[register] New client registered: 5J2iegc4SolQxW4CoW87Hw (Visual Studio Code)
+[authorize GET] client_id=5J2iegc4SolQxW4CoW87Hw, found=true
+[authorize] client_id=5J2iegc4SolQxW4CoW87Hw, password_match=true
+[audit] {"timestamp":"2026-04-16T07:42:30.246Z","tool":"list-companies","args":{},"status":"success","durationMs":17}
+[oauth] Loaded 61 persisted client(s)
+MCP Server started on 127.0.0.1:3000
+[register] New client registered: sIYE3-9VfWmwJWK8WteQUQ (Visual Studio Code)
+[authorize GET] client_id=sIYE3-9VfWmwJWK8WteQUQ, found=true
+[authorize] client_id=sIYE3-9VfWmwJWK8WteQUQ, password_match=true
+[audit] {"timestamp":"2026-04-16T07:51:17.637Z","tool":"list-companies","args":{},"status":"success","durationMs":63}
+[audit] {"timestamp":"2026-04-16T07:52:06.338Z","tool":"open-company-debug","args":{"includeRecentResult":true},"status":"success","durationMs":6}
+[oauth] Loaded 62 persisted client(s)
+MCP Server started on 127.0.0.1:3000
+[register] New client registered: ZrwMm8fAeslJtwizJQZ5GQ (Visual Studio Code)
+[authorize GET] client_id=ZrwMm8fAeslJtwizJQZ5GQ, found=true
+[authorize] client_id=ZrwMm8fAeslJtwizJQZ5GQ, password_match=true
+[audit] {"timestamp":"2026-04-16T07:55:40.973Z","tool":"list-companies","args":{},"status":"success","durationMs":60}
+[audit] {"timestamp":"2026-04-16T07:58:35.048Z","tool":"open-company-debug","args":{"includeRecentResult":true},"status":"success","durationMs":11}
+[audit] {"timestamp":"2026-04-16T07:58:43.848Z","tool":"open-company-debug","args":{"includeRecentResult":true},"status":"success","durationMs":4}
+[audit] {"timestamp":"2026-04-16T07:58:48.563Z","tool":"open-company-debug","args":{"includeRecentResult":false},"status":"success","durationMs":4}
+[audit] {"timestamp":"2026-04-16T07:58:54.782Z","tool":"open-company-debug","args":{"includeRecentResult":true},"status":"success","durationMs":7}
+[audit] {"timestamp":"2026-04-16T07:59:38.448Z","tool":"open-company-debug","args":{"includeRecentResult":true},"status":"success","durationMs":6}
+[audit] {"timestamp":"2026-04-16T07:59:42.624Z","tool":"open-company-debug","args":{"includeRecentResult":false},"status":"success","durationMs":4}
+[audit] {"timestamp":"2026-04-16T08:00:15.778Z","tool":"open-company-debug","args":{"includeRecentResult":false},"status":"success","durationMs":5}
+[audit] {"timestamp":"2026-04-16T08:00:30.450Z","tool":"query-database","args":{"sql":"select 1 as ok"},"status":"success","durationMs":19}
+[audit] {"timestamp":"2026-04-16T08:00:35.804Z","tool":"query-database","args":{"sql":"SELECT current_date"},"status":"success","durationMs":11}
+[audit] {"timestamp":"2026-04-16T08:01:26.506Z","tool":"query-database","args":{"sql":"SELECT * FROM t_c73c05eaa18f4015bc97d5d97d8c757a ORDER BY overdue_days DESC LIMIT 20"},"status":"success","durationMs":53}
+{}
+[audit] {"timestamp":"2026-04-16T08:03:14.029Z","tool":"query-database","args":{"sql":"SELECT parent_group, ROUND(SUM(amount),2) AS net_amount FROM t_88f4cc10a5bf442fa461f4c56a77088d GROUP BY parent_group ORDER BY ABS(SUM(amount)) DESC"},"status":"error","durationMs":25}
+[audit] {"timestamp":"2026-04-16T08:03:14.044Z","tool":"query-database","args":{"sql":"SELECT group_name, ROUND(SUM(closing_balance),2) AS total_balance FROM t_f0f65e939e4845a78c91ac8c38613224 GROUP BY group_name ORDER BY ABS(SUM(closing_balance)) DESC LIMIT 15"},"status":"success","durationMs":38}
+[audit] {"timestamp":"2026-04-16T08:03:14.046Z","tool":"query-database","args":{"sql":"SELECT COUNT(*) AS ledger_count, ROUND(SUM(ABS(closing_balance)),2) AS total_abs_closing FROM t_84c0b7c2a6f2441e940544f3802d4044"},"status":"success","durationMs":38}
+[audit] {"timestamp":"2026-04-16T08:03:21.990Z","tool":"query-database","args":{"sql":"DESCRIBE t_88f4cc10a5bf442fa461f4c56a77088d"},"status":"denied"}
+[audit] {"timestamp":"2026-04-16T08:03:26.268Z","tool":"query-database","args":{"sql":"SELECT * FROM t_88f4cc10a5bf442fa461f4c56a77088d LIMIT 5"},"status":"success","durationMs":2}
+[audit] {"timestamp":"2026-04-16T08:03:37.472Z","tool":"query-database","args":{"sql":"SELECT ledger_name, group_name, ROUND(amount,2) AS amount FROM t_88f4cc10a5bf442fa461f4c56a77088d ORDER BY ABS(amount) DESC LIMIT 15"},"status":"success","durationMs":10}
+[audit] {"timestamp":"2026-04-16T08:03:37.487Z","tool":"query-database","args":{"sql":"SELECT group_name, ROUND(SUM(amount),2) AS net_amount FROM t_88f4cc10a5bf442fa461f4c56a77088d GROUP BY group_name ORDER BY ABS(SUM(amount)) DESC LIMIT 12"},"status":"success","durationMs":9}
+[audit] {"timestamp":"2026-04-16T08:03:37.496Z","tool":"query-database","args":{"sql":"SELECT ROUND(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END),2) AS total_income, ROUND(SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END),2) AS total_expense, ROUND(SUM(amount),2) AS net_result FROM t_88f4cc10a5bf442fa461f4c56a77088d"},"status":"success","durationMs":16}
+[audit] {"timestamp":"2026-04-16T08:07:28.987Z","tool":"open-company-debug","args":{"includeRecentResult":true},"status":"success","durationMs":7}
+[audit] {"timestamp":"2026-04-16T08:07:33.881Z","tool":"open-company-debug","args":{"includeRecentResult":false},"status":"success","durationMs":5}
+[audit] {"timestamp":"2026-04-16T08:07:47.921Z","tool":"open-company-debug","args":{"includeRecentResult":true},"status":"success","durationMs":8}
+[audit] {"timestamp":"2026-04-16T08:07:51.736Z","tool":"open-company-debug","args":{"includeRecentResult":false},"status":"success","durationMs":4}
+[audit] {"timestamp":"2026-04-16T08:07:56.314Z","tool":"open-company-debug","args":{"includeRecentResult":true},"status":"success","durationMs":6}
+[audit] {"timestamp":"2026-04-16T08:08:32.272Z","tool":"open-company","args":{"companyName":"Ross Computers Pvt. LTD","strategy":"auto"},"status":"error","durationMs":11117}
+[audit] {"timestamp":"2026-04-16T08:08:32.274Z","tool":"open-company","args":{"companyName":"ROSS COMPUTERS PVT. LTD","strategy":"auto"},"status":"error","durationMs":11117}
+[audit] {"timestamp":"2026-04-16T08:08:32.275Z","tool":"open-company","args":{"companyName":"Ross Computers Pvt Ltd","strategy":"auto"},"status":"error","durationMs":11116}
+[audit] {"timestamp":"2026-04-16T08:08:38.037Z","tool":"list-companies","args":{},"status":"success","durationMs":67}
+[register] New client registered: cBzMLUPRD7GJahAnzpa1DA (approach-check)
+[authorize] client_id=cBzMLUPRD7GJahAnzpa1DA, password_match=true
+[register] New client registered: 2rNh2-uoimhXhem9ttdxtg (check2)
+[authorize] client_id=2rNh2-uoimhXhem9ttdxtg, password_match=true
+[audit] {"timestamp":"2026-04-16T08:23:27.110Z","tool":"list-companies","args":{},"status":"success","durationMs":65}
+[register] New client registered: jrhKYajjXafgeuHPC1Gm6A (check3)
+[authorize] client_id=jrhKYajjXafgeuHPC1Gm6A, password_match=true
+[audit] {"timestamp":"2026-04-16T08:23:40.659Z","tool":"list-companies","args":{},"status":"success","durationMs":50}
+[register] New client registered: pjZLsJG9tYL6fUuzGIp7EA (crack1)
+[authorize] client_id=pjZLsJG9tYL6fUuzGIp7EA, password_match=true
 
