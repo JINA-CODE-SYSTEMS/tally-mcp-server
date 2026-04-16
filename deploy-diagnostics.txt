@@ -1,0 +1,95 @@
+﻿timestamp=2026-04-16T07:09:46.9673818+00:00
+service_name=TallyMCP
+service_status=StopPending
+
+[nssm status]
+SERVICE_STOP_PENDING
+
+
+[node processes]
+
+
+[port 3000]
+
+
+[logs/service.log tail]
+[oauth] Loaded 28 persisted client(s)
+MCP Server started on 127.0.0.1:3000
+[oauth] Loaded 28 persisted client(s)
+MCP Server started on 127.0.0.1:3000
+[register] New client registered: 5gHWjMGj4puW9-8HLn8zWg (Visual Studio Code)
+[register] New client registered: CeUrBUO2zysgJTo4YyTSmg (copilot-cli-check)
+[authorize] client_id=CeUrBUO2zysgJTo4YyTSmg, password_match=true
+[register] New client registered: YYO_XukbmMPW1xcIRrhQPw (test-client-850910748)
+[authorize] client_id=YYO_XukbmMPW1xcIRrhQPw, password_match=true
+[register] New client registered: OT4e6qcKjb19OVYKUqf5Dg (test-1919074506)
+[authorize] client_id=OT4e6qcKjb19OVYKUqf5Dg, password_match=true
+[register] New client registered: eDIaa3iS-ppzz3qBX-7BCw (test-663957071)
+[authorize] client_id=eDIaa3iS-ppzz3qBX-7BCw, password_match=true
+[register] New client registered: v8mXI2Kpg7gpuupnKR93sg (test-386498771)
+[authorize] client_id=v8mXI2Kpg7gpuupnKR93sg, password_match=true
+[register] New client registered: gkU2JO4wKZp-Qlpmsym4mg (test-309339447)
+[register] New client registered: ZOO0dGDQkXJGgh9kFWZT4g (copilot-check)
+[authorize] client_id=ZOO0dGDQkXJGgh9kFWZT4g, password_match=true
+[register] New client registered: oxwXWpCgV06bZ1Z-PNbF8A (copilot-check)
+[authorize] client_id=oxwXWpCgV06bZ1Z-PNbF8A, password_match=true
+[register] New client registered: xSsV6cKAaiJcyXzXTF6Nyg (copilot-check)
+[authorize] client_id=xSsV6cKAaiJcyXzXTF6Nyg, password_match=true
+[register] New client registered: MRLljhMoYfrM_8GIrRhdJA (copilot-check)
+[register] New client registered: swLCtSPymygGbDu0g1ku_A (copilot-check)
+[authorize] client_id=swLCtSPymygGbDu0g1ku_A, password_match=true
+[register] New client registered: _BBGwNBCGxct6t_7Y_SLuw (copilot-check)
+[authorize] client_id=_BBGwNBCGxct6t_7Y_SLuw, password_match=true
+[register] New client registered: Xj1iLR7Cq8exqMCV99_rZg (copilot-check)
+[authorize] client_id=Xj1iLR7Cq8exqMCV99_rZg, password_match=true
+[register] New client registered: N0h-3oeHkKEjaA-y9mZNzg (copilot-check)
+[register] New client registered: lMptbBpclut8j2ISLbrvPg (copilot-check)
+[authorize] client_id=lMptbBpclut8j2ISLbrvPg, password_match=true
+[register] New client registered: pJ9bW5XUzmpoonnKYleAcg (copilot-check)
+[authorize] client_id=pJ9bW5XUzmpoonnKYleAcg, password_match=true
+[oauth] Loaded 45 persisted client(s)
+MCP Server started on 127.0.0.1:3000
+[authorize GET] client_id=1QTHMwDkmbN-M3KJpBGsIA, found=true
+[authorize] client_id=1QTHMwDkmbN-M3KJpBGsIA, password_match=true
+[audit] {"timestamp":"2026-04-16T05:38:40.908Z","tool":"list-companies","args":{},"status":"success","durationMs":1}
+[audit] {"timestamp":"2026-04-16T05:38:53.378Z","tool":"open-company","args":{"companyName":"010000"},"status":"error","durationMs":5087}
+[audit] {"timestamp":"2026-04-16T05:39:23.855Z","tool":"open-company","args":{"companyName":"010000"},"status":"error","durationMs":5065}
+[audit] {"timestamp":"2026-04-16T05:41:44.035Z","tool":"open-company-debug","args":{"includeRecentResult":true},"status":"success","durationMs":8}
+[audit] {"timestamp":"2026-04-16T05:41:55.850Z","tool":"open-company","args":{"companyName":"010000"},"status":"error","durationMs":5066}
+[register] New client registered: faS9y0i_vShtPlBl3o3diA (vscode-copilot-remote)
+[authorize] client_id=faS9y0i_vShtPlBl3o3diA, password_match=true
+[register] New client registered: 0crwWlga-9CJrlFQQTb_vw (list-companies-query)
+[authorize] client_id=0crwWlga-9CJrlFQQTb_vw, password_match=true
+[register] New client registered: FISpdOz29iylx2m-hvhM1A (copilot-debug)
+[authorize] client_id=FISpdOz29iylx2m-hvhM1A, password_match=true
+[register] New client registered: mFM4MrIEnhC7ykA9KCjVTg (copilot-debug)
+[authorize] client_id=mFM4MrIEnhC7ykA9KCjVTg, password_match=true
+[register] New client registered: B48XGaxVRP3F45O9UrSY3w (copilot-ssefix)
+[authorize] client_id=B48XGaxVRP3F45O9UrSY3w, password_match=true
+[authorize GET] client_id=5gHWjMGj4puW9-8HLn8zWg, found=true
+[authorize] client_id=5gHWjMGj4puW9-8HLn8zWg, password_match=true
+[register] New client registered: RceG88QYYuXLkkB0gQYpCw (vs-code-check)
+[authorize] client_id=RceG88QYYuXLkkB0gQYpCw, password_match=true
+[register] New client registered: HeZ5rM2n5AMRFQASAhvn7Q (tools-list)
+[authorize] client_id=HeZ5rM2n5AMRFQASAhvn7Q, password_match=true
+[register] New client registered: CEr_Yph4z2cFN-NLcAK13Q (list-companies-query)
+[authorize] client_id=CEr_Yph4z2cFN-NLcAK13Q, password_match=true
+[oauth] Loaded 54 persisted client(s)
+MCP Server started on 127.0.0.1:3000
+[register] New client registered: qkkP2KbZdLLAnx4Uy4TBRw (final-test2)
+[authorize] client_id=qkkP2KbZdLLAnx4Uy4TBRw, password_match=true
+[register] New client registered: dxSpSUb243G4npEl-waqHw (debug-sid)
+[authorize] client_id=dxSpSUb243G4npEl-waqHw, password_match=true
+[audit] {"timestamp":"2026-04-16T06:32:18.902Z","tool":"list-companies","args":{},"status":"success","durationMs":1}
+[register] New client registered: t7v84kVncfXidAAkNkftmQ (Visual Studio Code)
+[authorize GET] client_id=t7v84kVncfXidAAkNkftmQ, found=true
+[authorize] client_id=t7v84kVncfXidAAkNkftmQ, password_match=true
+[audit] {"timestamp":"2026-04-16T06:36:47.510Z","tool":"list-companies","args":{},"status":"success","durationMs":0}
+[audit] {"timestamp":"2026-04-16T06:36:57.231Z","tool":"open-company","args":{"companyName":"010000"},"status":"error","durationMs":5043}
+[audit] {"timestamp":"2026-04-16T06:38:55.379Z","tool":"open-company","args":{"companyName":"010000"},"status":"error","durationMs":5045}
+[audit] {"timestamp":"2026-04-16T06:40:30.291Z","tool":"open-company-debug","args":{},"status":"success","durationMs":7}
+[audit] {"timestamp":"2026-04-16T06:41:16.352Z","tool":"list-companies","args":{},"status":"success","durationMs":1}
+[audit] {"timestamp":"2026-04-16T06:42:51.242Z","tool":"open-company","args":{"companyName":"010000","strategy":"auto"},"status":"error","durationMs":5074}
+[audit] {"timestamp":"2026-04-16T06:51:28.261Z","tool":"query-database","args":{"sql":"SELECT content FROM read_blob('C:/Users/Public/TallyPrimeEditLog/data/010000/Company.900')"},"status":"denied"}
+[audit] {"timestamp":"2026-04-16T06:51:34.706Z","tool":"query-database","args":{"sql":"SELECT * FROM read_csv('C:/Users/Public/TallyPrimeEditLog/data/010000/Company.900', delim=NULL, columns={'content': 'VARCHAR'}, header=false)"},"status":"denied"}
+
