@@ -556,4 +556,13 @@ app.post('/token', authRateLimiter, (req, res) => {
 
 // Bind to 127.0.0.1 — use reverse proxy for external access
 const bindHost = process.env.BIND_HOST || '127.0.0.1';
-app.listen(mcpPort, bindHost, () => console.log(`MCP Server started on ${bindHost}:${mcpPort}`));
+const httpServer = app.listen(mcpPort, bindHost, () => console.log(`MCP Server started on ${bindHost}:${mcpPort}`));
+
+// Graceful shutdown — without this, NSSM/systemd hang in StopPending until force-killed
+const shutdown = (signal: string) => {
+  console.log(`[shutdown] received ${signal}, closing server`);
+  const force = setTimeout(() => { console.error('[shutdown] forced exit after 10s'); process.exit(1); }, 10000).unref();
+  httpServer.close(() => { clearTimeout(force); process.exit(0); });
+};
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
