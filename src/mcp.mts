@@ -48,6 +48,30 @@ export function isMatchingGuiAgentCommand(result: any, commandId: string): boole
 // Tracks the last company successfully opened via open-company within this server session.
 let activeCompany: string | null = null;
 
+// Verifies that a company is currently loaded in Tally by probing SVCURRENTCOMPANY.
+// Tally echoes the current company name back; a match confirms the company is accessible.
+async function verifyCompanyLoaded(targetName: string): Promise<boolean> {
+  try {
+    const escaped = targetName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const xml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPVerifyCompanyReport</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>${escaped}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><REPORT NAME="MCPVerifyCompanyReport"><FORMS>MCPVerifyForm</FORMS></REPORT><FORM NAME="MCPVerifyForm"><PARTS>MCPVerifyPart</PARTS><XMLTAG>DATA</XMLTAG></FORM><PART NAME="MCPVerifyPart"><LINES>MCPVerifyLine</LINES></PART><LINE NAME="MCPVerifyLine"><FIELDS>MCPVerifyField</FIELDS><XMLTAG>ROW</XMLTAG></LINE><FIELD NAME="MCPVerifyField"><SET>##SVCurrentCompany</SET><XMLTAG>NAME</XMLTAG></FIELD></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+    const resp = await postTallyXML(xml);
+    return resp.toLowerCase().includes(`<name>${targetName.toLowerCase()}`);
+  } catch {
+    return false;
+  }
+}
+
+// Returns the names of companies currently loaded in Tally's UI.
+// Uses handlePull directly (not the wrapper) so SVCURRENTCOMPANY isn't injected — we want all open companies.
+async function listLoadedCompanies(): Promise<string[]> {
+  const inputParams = new Map<string, any>([['collection', 'company']]);
+  const resp = await handlePull('list-master', inputParams);
+  if (!resp?.data) return [];
+  return resp.data
+    .map((c: any) => String(c.F01 || c.name || '').trim())
+    .filter((n: string) => n.length > 0);
+}
+
 // Wraps handlePull — injects activeCompany as targetCompany fallback when the caller did not specify one.
 async function pull(reportName: string, inputParams: Map<string, any>) {
   if (!inputParams.has('targetCompany') && activeCompany) {
@@ -265,19 +289,6 @@ export async function registerMcpServer(): Promise<McpServer> {
         }
       }
 
-      // --- Helper: verify company is accessible via SVCURRENTCOMPANY ---
-      const verifyCompanyLoaded = async (targetName: string): Promise<boolean> => {
-        try {
-          const escaped = targetName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-          const xml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPVerifyCompanyReport</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVCURRENTCOMPANY>${escaped}</SVCURRENTCOMPANY></STATICVARIABLES><TDL><TDLMESSAGE><REPORT NAME="MCPVerifyCompanyReport"><FORMS>MCPVerifyForm</FORMS></REPORT><FORM NAME="MCPVerifyForm"><PARTS>MCPVerifyPart</PARTS><XMLTAG>DATA</XMLTAG></FORM><PART NAME="MCPVerifyPart"><LINES>MCPVerifyLine</LINES></PART><LINE NAME="MCPVerifyLine"><FIELDS>MCPVerifyField</FIELDS><XMLTAG>ROW</XMLTAG></LINE><FIELD NAME="MCPVerifyField"><SET>##SVCurrentCompany</SET><XMLTAG>NAME</XMLTAG></FIELD></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
-          const resp = await postTallyXML(xml);
-          // Tally echoes back the current company name — match confirms the company is accessible
-          return resp.toLowerCase().includes(`<name>${targetName.toLowerCase()}`);
-        } catch {
-          return false;
-        }
-      };
-
       // --- Strategy 1: SVCURRENTCOMPANY probe — works in Tally server/multi-company mode ---
       const tryTdlLoad = async (): Promise<boolean> => {
         logs.push('[Strategy 1: SVCURRENTCOMPANY probe] Checking if company is directly accessible...');
@@ -290,18 +301,16 @@ export async function registerMcpServer(): Promise<McpServer> {
       const tryTdlConnect = async (): Promise<boolean> => {
         logs.push('[Strategy 2: open company list] Checking if company is in Tally open company list...');
         try {
-          // Use handlePull directly — must NOT inject activeCompany here; we want ALL open companies
-          const inputParams = new Map([['collection', 'company']]);
-          const resp = await handlePull('list-master', inputParams);
-          if (resp.data && resp.data.length > 0) {
-            const openNames = resp.data.map((c: any) => String(c.F01 || c.name || '').toLowerCase().trim());
-            logs.push(`  Open companies in Tally: ${openNames.join(', ')}`);
-            const found = openNames.includes(companyName.toLowerCase().trim());
-            logs.push(`  ${found ? 'Company found in open list.' : 'Company not in open list.'}`);
-            return found;
+          const openNames = await listLoadedCompanies();
+          if (openNames.length === 0) {
+            logs.push('  No companies returned from Tally.');
+            return false;
           }
-          logs.push('  No companies returned from Tally.');
-          return false;
+          logs.push(`  Open companies in Tally: ${openNames.join(', ')}`);
+          const target = companyName.toLowerCase().trim();
+          const found = openNames.some(n => n.toLowerCase().trim() === target);
+          logs.push(`  ${found ? 'Company found in open list.' : 'Company not in open list.'}`);
+          return found;
         } catch (err) {
           logs.push(`  Error: ${err}`);
           return false;
@@ -544,6 +553,77 @@ export async function registerMcpServer(): Promise<McpServer> {
         return {
           isError: true,
           content: [{ type: 'text', text: `open-company-debug failed: ${err}` }]
+        };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'list-loaded-companies',
+    {
+      title: 'List Loaded Companies',
+      description: `lists companies currently loaded in Tally Prime (i.e. accessible right now without an open-company call). Use this before set-active-company to confirm the target is loaded. Different from list-companies, which enumerates company folders on disk regardless of whether they are loaded.`,
+      inputSchema: {},
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      try {
+        const names = await listLoadedCompanies();
+        if (names.length === 0) {
+          auditLog('list-loaded-companies', args, 'success', Date.now() - start);
+          return { content: [{ type: 'text', text: 'No companies are currently loaded in Tally. Use open-company to load one.' }] };
+        }
+        const tsv = 'name\tactive\n' + names.map(n => `${n}\t${activeCompany && n.toLowerCase() === activeCompany.toLowerCase() ? 'yes' : 'no'}`).join('\n');
+        auditLog('list-loaded-companies', args, 'success', Date.now() - start);
+        return { content: [{ type: 'text', text: tsv }] };
+      } catch (err) {
+        auditLog('list-loaded-companies', args, 'error', Date.now() - start);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `list-loaded-companies failed: ${err}` }]
+        };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'set-active-company',
+    {
+      title: 'Set Active Company',
+      description: `sets the active company for subsequent tool calls without invoking the Tally UI. Cheap pointer flip — use this to switch between companies that are already loaded in Tally (e.g. for cross-referencing subsidiaries). Verifies the company is actually loaded via SVCURRENTCOMPANY probe; returns an error suggesting open-company if not. After this succeeds, every subsequent tool call automatically targets this company unless targetCompany is specified explicitly.`,
+      inputSchema: {
+        companyName: z.string().describe('exact company name as shown in Tally. Use list-loaded-companies to see what is currently loaded.')
+      },
+      annotations: {
+        readOnlyHint: false,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      try {
+        const loaded = await verifyCompanyLoaded(args.companyName);
+        if (!loaded) {
+          auditLog('set-active-company', args, 'error', Date.now() - start);
+          return {
+            isError: true,
+            content: [{ type: 'text', text: `Company "${args.companyName}" is not currently loaded in Tally. Use list-loaded-companies to see available companies, or open-company to load it first.` }]
+          };
+        }
+        activeCompany = args.companyName;
+        auditLog('set-active-company', args, 'success', Date.now() - start);
+        return {
+          content: [{ type: 'text', text: `Active company set to "${args.companyName}". Subsequent tools will target this company unless targetCompany is specified explicitly.` }]
+        };
+      } catch (err) {
+        auditLog('set-active-company', args, 'error', Date.now() - start);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `set-active-company failed: ${err}` }]
         };
       }
     }
