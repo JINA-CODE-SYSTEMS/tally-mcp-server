@@ -273,6 +273,53 @@ powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1 [-InstallDir 
 
 One-time setup to register the MCP server as a Windows service via [NSSM](https://nssm.cc/). Configures auto-start, log rotation, and loads `.env` variables. See [Windows Server Setup](docs/server-setup-windows.md) for the full guide.
 
+### Deploy a New Version
+
+After pushing changes to `origin/main`, refresh the running service on the Windows box.
+
+**One command (recommended):**
+
+```powershell
+# From an admin PowerShell on the Tally box
+cd C:\tally-mcp-server
+.\scripts\deploy.ps1
+```
+
+The script halts on any failure rather than leaving a half-deployed state. It runs:
+
+1. `git pull origin main`
+2. `npm install` (skip with `-SkipInstall` when `package.json` hasn't changed)
+3. `npm run build`
+4. `Restart-Service TallyMCP` and verifies the service is `Running` afterwards
+
+**Useful flags:**
+
+| Flag | Purpose |
+| ---- | ------- |
+| `-SkipInstall` | Skip `npm install` (~10s faster) — use when only source files changed |
+| `-NoRestart` | Pull and build, but don't restart — for staging a deploy |
+| `-ServiceName` | Override service name (default `TallyMCP`) |
+| `-InstallDir` | Override repo path (default `C:\tally-mcp-server`) |
+
+**Smoke test after deploy** (from anywhere):
+
+```bash
+curl -sS https://<your-domain>/.well-known/oauth-protected-resource
+```
+
+A JSON body with `resource` confirms the server is up. A `502` means the upstream Node process didn't come back — tail `logs\service-*.log` for the cause (most often a missing env var or a port collision).
+
+**Manual fallback** — if `deploy.ps1` ever misbehaves, the equivalent five-step recipe is:
+
+```powershell
+cd C:\tally-mcp-server
+git pull origin main
+npm install
+npm run build
+Restart-Service TallyMCP
+Get-Service TallyMCP
+```
+
 ## Development
 
 ```bash
