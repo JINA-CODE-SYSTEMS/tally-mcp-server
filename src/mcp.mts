@@ -72,6 +72,120 @@ async function listLoadedCompanies(): Promise<string[]> {
     .filter((n: string) => n.length > 0);
 }
 
+// Parses tally.ini content and returns the list of company IDs in `Load=` directives under [TALLY].
+// Tally Prime auto-loads each Load=<id> entry on startup when Default Companies=Yes.
+export function parseTallyIniLoads(iniContent: string): string[] {
+  const matches = iniContent.matchAll(/^[ \t]*Load[ \t]*=[ \t]*([^\r\n;]+?)[ \t]*$/gim);
+  return Array.from(matches, m => m[1].trim()).filter(s => s.length > 0);
+}
+
+// Returns the value of the `Data=<path>` directive from tally.ini, or null if absent.
+// This is Tally Prime's canonical setting for where company folders live — preferred over
+// any external assumption about paths.
+export function parseTallyIniDataPath(iniContent: string): string | null {
+  const m = iniContent.match(/^[ \t]*Data[ \t]*=[ \t]*([^\r\n;]+?)[ \t]*$/im);
+  return m ? m[1].trim() : null;
+}
+
+// Returns a new tally.ini string with the Load= lines replaced by exactly `companyIds`.
+// Preserves all other content; inserts new lines after `Default Companies=` (or [TALLY] header) to keep grouping clean.
+// Preserves the original line ending style (CRLF vs LF).
+export function rewriteTallyIniLoads(iniContent: string, companyIds: string[]): string {
+  const eol = iniContent.includes('\r\n') ? '\r\n' : '\n';
+  const lines = iniContent.split(/\r?\n/);
+  const filtered = lines.filter(l => !/^[ \t]*Load[ \t]*=/i.test(l));
+  const dcIdx = filtered.findIndex(l => /^[ \t]*Default Companies[ \t]*=/i.test(l));
+  let insertAt: number;
+  if (dcIdx >= 0) {
+    insertAt = dcIdx + 1;
+  } else {
+    const tallyIdx = filtered.findIndex(l => /^[ \t]*\[TALLY\][ \t]*$/i.test(l));
+    insertAt = tallyIdx >= 0 ? tallyIdx + 1 : filtered.length;
+  }
+  filtered.splice(insertAt, 0, ...companyIds.map(id => `Load=${id}`));
+  return filtered.join(eol);
+}
+
+// Atomically writes content to filePath using a temp-file + rename pattern (no torn writes if the process dies mid-write).
+function atomicWriteFile(filePath: string, content: string): void {
+  const tmp = `${filePath}.tmp.${process.pid}.${Date.now()}`;
+  fs.writeFileSync(tmp, content, 'utf-8');
+  fs.renameSync(tmp, filePath);
+}
+
+const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+// Scans a Tally data directory and returns one entry per digit-named folder, with the company name extracted from Company.900 when present.
+// Returns [] if dataPath does not exist. Folders without a parseable Company.900 still appear with name=''.
+export function scanCompanyFolders(dataPath: string): Array<{ folder: string; name: string }> {
+  if (!fs.existsSync(dataPath)) return [];
+  const entries = fs.readdirSync(dataPath, { withFileTypes: true });
+  return entries
+    .filter(e => e.isDirectory() && /^\d+$/.test(e.name))
+    .map(e => {
+      let name = '';
+      try {
+        const companyFile = path.join(dataPath, e.name, 'Company.900');
+        if (fs.existsSync(companyFile)) {
+          const buf = fs.readFileSync(companyFile);
+          const text = buf.toString('utf16le').replace(/[^\x20-\x7Eऀ-ॿ]/g, ' ').trim();
+          const match = text.match(/[A-Za-zऀ-ॿ][\w\sऀ-ॿ.&(),-]{2,}/);
+          if (match) name = match[0].trim();
+        }
+      } catch {}
+      return { folder: e.name, name };
+    });
+}
+
+// Resolves a user-supplied company identifier (folder id like "100000", or company name like "Ross Industries") to a unique folder id.
+// Pure function — no filesystem access. Caller passes the folder list from scanCompanyFolders().
+//
+// Match rules:
+//   - If input is digit-only, treat it as a folder id; success only if a folder with that id exists in `folders`.
+//   - Otherwise, do a case-insensitive name match against folders[].name.
+//   - 0 matches → not-found.
+//   - 1 match → ok.
+//   - 2+ matches by name → ambiguous (caller must surface the folder ids and ask the user to disambiguate).
+export type ResolveCompanyResult =
+  | { kind: 'ok'; folderId: string; companyName: string; matchedBy: 'id' | 'name' }
+  | { kind: 'ambiguous'; matches: Array<{ folder: string; name: string }> }
+  | { kind: 'not-found'; available: Array<{ folder: string; name: string }> };
+
+export function resolveCompanyInput(input: string, folders: Array<{ folder: string; name: string }>): ResolveCompanyResult {
+  const trimmed = input.trim();
+  if (trimmed.length === 0) return { kind: 'not-found', available: folders };
+  if (/^\d+$/.test(trimmed)) {
+    const found = folders.find(f => f.folder === trimmed);
+    if (found) return { kind: 'ok', folderId: found.folder, companyName: found.name, matchedBy: 'id' };
+    return { kind: 'not-found', available: folders };
+  }
+  const lc = trimmed.toLowerCase();
+  const nameMatches = folders.filter(f => f.name.length > 0 && f.name.toLowerCase() === lc);
+  if (nameMatches.length === 1) {
+    return { kind: 'ok', folderId: nameMatches[0].folder, companyName: nameMatches[0].name, matchedBy: 'name' };
+  }
+  if (nameMatches.length > 1) return { kind: 'ambiguous', matches: nameMatches };
+  return { kind: 'not-found', available: folders };
+}
+
+// Polls the Tally XML server until it responds successfully, or timeout elapses.
+async function waitForTallyReady(timeoutMs: number, logs: string[]): Promise<boolean> {
+  const ping = '<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>List of Companies</ID></HEADER></ENVELOPE>';
+  const start = Date.now();
+  let attempt = 0;
+  while (Date.now() - start < timeoutMs) {
+    attempt++;
+    try {
+      await postTallyXML(ping);
+      logs.push(`  Tally XML server ready after ${Math.round((Date.now() - start) / 1000)}s (attempt ${attempt})`);
+      return true;
+    } catch {}
+    await sleep(2000);
+  }
+  logs.push(`  Tally XML server did not respond within ${Math.round(timeoutMs / 1000)}s (${attempt} attempts)`);
+  return false;
+}
+
 // Wraps handlePull — injects activeCompany as targetCompany fallback when the caller did not specify one.
 async function pull(reportName: string, inputParams: Map<string, any>) {
   if (!inputParams.has('targetCompany') && activeCompany) {
@@ -624,6 +738,148 @@ export async function registerMcpServer(): Promise<McpServer> {
         return {
           isError: true,
           content: [{ type: 'text', text: `set-active-company failed: ${err}` }]
+        };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'load-company',
+    {
+      title: 'Load Company (via Tally Restart)',
+      description: `loads a company into Tally Prime by editing tally.ini and restarting Tally. Use this when the target company is NOT in list-loaded-companies. Slow (~10-30s for restart) but reliable — bypasses the XML-API limitation that no company-load verb exists. Accepts either a folder ID (e.g. "100000") or a company name (e.g. "Ross Industries"); resolves names by reading Company.900 from each folder. If multiple folders share a name, returns an ambiguity error listing folder IDs so you can re-call with the specific ID. Existing loaded companies are preserved by default (additive). Once loaded, use set-active-company to switch cheaply between loaded companies. Requires the MCP service process to have write access to tally.ini and permission to start tally.exe in the user's desktop session.`,
+      inputSchema: {
+        company: z.string().describe('folder ID (digits only, e.g. "100000") OR company name as stored in Company.900 (e.g. "Ross Industries"). Use list-companies to see both.'),
+        waitTimeoutSec: z.number().optional().describe('seconds to wait for the Tally XML server to come back up after restart. Default 60.'),
+        replace: z.boolean().optional().describe('if true, only this company is loaded — all other Load= lines are removed from tally.ini. Default false (additive).'),
+        dataPath: z.string().optional().describe('override the data path to scan for company folders. By default, this is read from tally.ini\'s Data= directive (the same path Tally itself uses). Pass this only when you know the data lives somewhere different — e.g. a backup folder or a secondary drive.')
+      },
+      annotations: {
+        readOnlyHint: false,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      const logs: string[] = [];
+      const company = args.company;
+      const timeoutMs = (args.waitTimeoutSec ?? 60) * 1000;
+      const replace = !!args.replace;
+      const tallyIniPath = process.env.TALLY_INI_PATH || 'C:\\Program Files\\TallyPrimeEditLog\\tally.ini';
+      const tallyExePath = process.env.TALLY_EXE_PATH || 'C:\\Program Files\\TallyPrimeEditLog\\tally.exe';
+      try {
+        if (!fs.existsSync(tallyIniPath)) {
+          auditLog('load-company', args, 'error', Date.now() - start);
+          return { isError: true, content: [{ type: 'text', text: `tally.ini not found at ${tallyIniPath}. Set TALLY_INI_PATH env var if it lives elsewhere.` }] };
+        }
+        if (!fs.existsSync(tallyExePath)) {
+          auditLog('load-company', args, 'error', Date.now() - start);
+          return { isError: true, content: [{ type: 'text', text: `tally.exe not found at ${tallyExePath}. Set TALLY_EXE_PATH env var if it lives elsewhere.` }] };
+        }
+
+        // Resolve data path: explicit override > tally.ini Data= > env var > built-in default.
+        // Tally.ini is the canonical source — Tally itself reads from there.
+        const ini = fs.readFileSync(tallyIniPath, 'utf-8');
+        const iniDataPath = parseTallyIniDataPath(ini);
+        const tallyDataPath = args.dataPath
+          || iniDataPath
+          || process.env.TALLY_DATA_PATH
+          || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const dataPathSource = args.dataPath ? 'argument'
+          : iniDataPath ? 'tally.ini'
+          : process.env.TALLY_DATA_PATH ? 'TALLY_DATA_PATH env'
+          : 'built-in default';
+
+        // Resolve company input → folder id
+        const folders = scanCompanyFolders(tallyDataPath);
+        const resolved = resolveCompanyInput(company, folders);
+        if (resolved.kind === 'not-found') {
+          auditLog('load-company', args, 'error', Date.now() - start);
+          const list = resolved.available.length === 0
+            ? '(no folders found in data path)'
+            : resolved.available.map(f => `  ${f.folder}\t${f.name || '(no name)'}`).join('\n');
+          return { isError: true, content: [{ type: 'text', text: `Company "${company}" not found.\nData path: ${tallyDataPath} (from ${dataPathSource})\nAvailable folders:\n${list}\n\nProvide either an exact folder id (digits) or a name that matches Company.900 exactly. If the data lives elsewhere, pass dataPath="<absolute path>".` }] };
+        }
+        if (resolved.kind === 'ambiguous') {
+          auditLog('load-company', args, 'error', Date.now() - start);
+          const list = resolved.matches.map(f => `  ${f.folder}\t${f.name}`).join('\n');
+          return { isError: true, content: [{ type: 'text', text: `Multiple companies match the name "${company}":\n${list}\n\nRe-call load-company with the specific folder id (e.g. company: "${resolved.matches[0].folder}") to disambiguate.` }] };
+        }
+        const companyId = resolved.folderId;
+        logs.push(`[load-company] input="${company}" matchedBy=${resolved.matchedBy} folderId=${companyId} companyName="${resolved.companyName}" replace=${replace}`);
+        logs.push(`  tallyIni=${tallyIniPath}`);
+        logs.push(`  dataPath=${tallyDataPath} (source: ${dataPathSource})`);
+
+        const currentLoads = parseTallyIniLoads(ini);
+        logs.push(`  Current Load= entries: ${currentLoads.length === 0 ? '(none)' : currentLoads.join(', ')}`);
+
+        const newLoads = replace ? [companyId] : Array.from(new Set([...currentLoads, companyId]));
+        const noChange = newLoads.length === currentLoads.length && newLoads.every((id, i) => id === currentLoads[i]);
+
+        if (!noChange) {
+          const updated = rewriteTallyIniLoads(ini, newLoads);
+          atomicWriteFile(tallyIniPath, updated);
+          logs.push(`  Updated tally.ini Load= to: ${newLoads.join(', ')}`);
+        } else {
+          logs.push('  tally.ini already has the requested Load= entries — skipping rewrite.');
+        }
+
+        // Stop Tally
+        logs.push('  Stopping Tally (taskkill /F /IM tally.exe)...');
+        try {
+          execSync('taskkill /F /IM tally.exe', { timeout: 10000, windowsHide: true });
+          logs.push('    Tally stopped.');
+        } catch (err: any) {
+          // taskkill returns non-zero when process not found — that's fine, means Tally wasn't running
+          logs.push(`    taskkill: ${String(err?.stderr || err?.message || err).trim().split('\n')[0]} (proceeding)`);
+        }
+        await sleep(2000);
+
+        // Start Tally — uses cmd /c start so the process is detached from this Node process.
+        // Caveat: if the MCP service runs in Windows Session 0, the spawned tally.exe will also be in Session 0
+        // and have no desktop. The service must run in the user's interactive session for the GUI to appear.
+        logs.push(`  Starting Tally (${tallyExePath})...`);
+        try {
+          execSync(`cmd /c start "" "${tallyExePath}"`, { timeout: 5000, windowsHide: true });
+          logs.push('    Spawn command issued.');
+        } catch (err) {
+          logs.push(`    Spawn failed: ${err}`);
+        }
+
+        // Poll XML server until ready (or timeout)
+        logs.push(`  Polling Tally XML server (timeout ${args.waitTimeoutSec ?? 60}s)...`);
+        const ready = await waitForTallyReady(timeoutMs, logs);
+        if (!ready) {
+          auditLog('load-company', args, 'error', Date.now() - start);
+          return {
+            isError: true,
+            content: [{ type: 'text', text: logs.join('\n') + '\n\nTally did not become reachable. The MCP service may be in Session 0 (no desktop) — Tally will not show a window in that case. Run the service in the user session, or have a companion process in the user session start tally.exe.' }]
+          };
+        }
+
+        // Verify the company actually loaded — match by id substring against loaded company names
+        const loaded = await listLoadedCompanies();
+        logs.push(`  Loaded companies after restart: ${loaded.length === 0 ? '(none)' : loaded.join(', ')}`);
+        // We don't know the company *name* from just the folder id, so we accept "any company loaded" as success here.
+        // The caller should follow up with list-loaded-companies + set-active-company to pick the right one by name.
+
+        if (loaded.length > 0 && newLoads.includes(companyId)) {
+          // Best-effort: if there's only one loaded company and we requested only one, set it active.
+          if (loaded.length === 1) {
+            activeCompany = loaded[0];
+            logs.push(`  Set activeCompany = "${loaded[0]}".`);
+          }
+        }
+
+        auditLog('load-company', args, 'success', Date.now() - start);
+        return {
+          content: [{ type: 'text', text: logs.join('\n') + `\n\nTally is back up with ${loaded.length} loaded company/companies. Use list-loaded-companies to see names, then set-active-company to target the one you want.` }]
+        };
+      } catch (err) {
+        auditLog('load-company', args, 'error', Date.now() - start);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: logs.join('\n') + `\n\nload-company failed: ${err}` }]
         };
       }
     }
