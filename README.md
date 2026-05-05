@@ -290,7 +290,7 @@ The script halts on any failure rather than leaving a half-deployed state. It ru
 1. `git pull origin main`
 2. `npm install` (skip with `-SkipInstall` when `package.json` hasn't changed)
 3. `npm run build`
-4. `Restart-Service TallyMCP` and verifies the service is `Running` afterwards
+4. Force-stops the service (kills the `node.exe` process — graceful stop is unreliable under NSSM on Windows), then `Start-Service TallyMCP` and verifies the service is `Running` afterwards
 
 **Useful flags:**
 

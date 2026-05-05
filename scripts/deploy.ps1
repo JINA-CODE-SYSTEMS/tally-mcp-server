@@ -83,11 +83,43 @@ Step "npm run build" {
 }
 
 if ($NoRestart) {
-    Write-Host "==> Restart-Service (skipped, -NoRestart)" -ForegroundColor DarkGray
+    Write-Host "==> Restart (skipped, -NoRestart)" -ForegroundColor DarkGray
 } else {
-    Step "Restart-Service $ServiceName" {
-        Restart-Service -Name $ServiceName -Force
-        # Wait briefly for the new process to bind, then confirm
+    # Restart strategy: don't trust Restart-Service / Stop-Service on Windows + NSSM + Node.
+    # Graceful stop hangs reliably (NSSM's console-event dispatch and Node's SIGINT handling
+    # don't agree under a service context). The reliable path is: kill node, Start-Service,
+    # let NSSM bring up a fresh process.
+    Step "Force-stop $ServiceName (kill node, then start fresh)" {
+        # Try Stop-Service with a short timeout first; ignore failure
+        $stopJob = Start-Job -ScriptBlock { param($n) Stop-Service -Name $n -Force -ErrorAction SilentlyContinue } -ArgumentList $ServiceName
+        if (Wait-Job $stopJob -Timeout 5) {
+            Receive-Job $stopJob | Out-Null
+        } else {
+            Stop-Job $stopJob -ErrorAction SilentlyContinue | Out-Null
+        }
+        Remove-Job $stopJob -Force -ErrorAction SilentlyContinue | Out-Null
+
+        # Whether or not Stop-Service succeeded, kill any lingering node.exe.
+        # NSSM's wrapper will detect process exit and the service should reach STOPPED.
+        Get-Process -Name node -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
+
+        # If SCM still reports anything other than Stopped, give NSSM a beat to settle.
+        $svc = Get-Service -Name $ServiceName
+        $waited = 0
+        while ($svc.Status -ne 'Stopped' -and $waited -lt 10) {
+            Start-Sleep -Seconds 1
+            $waited++
+            $svc = Get-Service -Name $ServiceName
+        }
+
+        if ($svc.Status -eq 'Running') {
+            # NSSM may have auto-restarted on exit. That's fine — service is already running with new code.
+            Write-Host "    NSSM auto-restarted the service after process kill (status: Running)." -ForegroundColor DarkGray
+        } else {
+            Start-Service -Name $ServiceName
+        }
+
         Start-Sleep -Seconds 3
         $svc = Get-Service -Name $ServiceName
         if ($svc.Status -ne 'Running') {
