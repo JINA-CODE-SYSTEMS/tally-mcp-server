@@ -212,50 +212,18 @@ Most report tools cache their output in a temporary DuckDB table (returned as `t
 
 The `scripts/` directory contains Windows-specific automation tools used by the `open-company` feature and server deployment.
 
-### GUI Agent v1 — Keystroke Automation
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\tally-gui-agent.ps1 [-WatchDir <path>]
-```
-
-Runs in the **interactive desktop session** where Tally is visible. Watches for command files from the MCP server and injects keystrokes (F-keys, Enter, Escape, menu navigation) into the Tally window to load companies.
-
-- **Install:** Add to Windows Startup folder or Task Scheduler (run at user logon)
-- `-WatchDir` defaults to `$env:TALLY_DATA_PATH` or `C:\Users\Public\TallyPrimeEditLog\data`
-
-### GUI Agent v2 — LLM-Guided (Computer Use)
+### GUI Agent — Companion Script for Cross-Session Operations
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\tally-gui-agent-v2.ps1 [-LLMProvider anthropic|openai] [-MaxSteps 15]
 ```
 
-Advanced agent that takes **screenshots** of the Tally window, sends them to an LLM (Claude or GPT-4o) for visual analysis, executes the recommended action, and loops until the goal is achieved. Requires `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`.
+Runs in the **interactive desktop session** where Tally is visible. The MCP server (which typically runs in Windows Session 0 with no desktop) communicates with this agent via JSON file IPC to perform actions that need a real desktop — most importantly **launching `tally.exe`** for `load-company` and **automating Alt+F3 → Select Company** for the optional LLM-guided fallback.
 
-- **Install:** Same as v1 — run in interactive session
+- **Install:** Add to Windows Startup folder or Task Scheduler (run at user logon)
 - Requires `TallyUI.dll` (see below)
+- **LLM key is OPTIONAL.** Deterministic actions (`ping`, `start-tally`) work without one. Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` only if you need the LLM-guided UI navigation fallback (`open-company` Strategy 3).
 - LLM model, tokens, and timeout are configurable via env vars (see [Configuration](#configuration))
-
-### Company Loader UI Script
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\open-company-ui.ps1 -TallyExePath "..." -CompanyDataPath "..."
-```
-
-Standalone script to load a specific company into Tally via Win32 keystroke injection. Used internally by the `open-company` tool's Strategy 2.
-
-### TDL Add-on — Programmatic Company Loading
-
-```
-scripts/mcp-company-loader.tdl
-```
-
-A Tally TDL add-on that enables company loading via the XML server API (Strategy 1 of `open-company`). Install by copying to the Tally directory and adding to `tally.ini`:
-
-```ini
-[Tally]
-TDL = yes
-Default TDL = mcp-company-loader.tdl
-```
 
 ### TallyUI.dll — Win32 Interop Library
 

@@ -28,6 +28,8 @@ Branch: `experiment/tally-internals`. Goal: find an XML/TDL request shape that *
 
 **Theory:** Import-type requests run procedural TDL on the server side (handling masters/vouchers data ingestion), so they may have privileges Export doesn't — including triggering company-load side effects.
 
+#### H1A: Minimal Import variant (ID="List of Companies", SVCURRENTCOMPANY=ROSS)
+
 **Payload:**
 ```xml
 <?xml version="1.0" encoding="utf-8"?>
@@ -35,22 +37,48 @@ Branch: `experiment/tally-internals`. Goal: find an XML/TDL request shape that *
   <HEADER>
     <VERSION>1</VERSION>
     <TALLYREQUEST>Import</TALLYREQUEST>
-    <TYPE>Action</TYPE>
-    <ID>Cmp Load Company</ID>
+    <TYPE>Data</TYPE>
+    <ID>List of Companies</ID>
   </HEADER>
   <BODY>
     <DESC>
       <STATICVARIABLES>
-        <SVCURRENTCOMPANY>SPECTRUM</SVCURRENTCOMPANY>
+        <SVCURRENTCOMPANY>ROSS</SVCURRENTCOMPANY>
       </STATICVARIABLES>
     </DESC>
   </BODY>
 </ENVELOPE>
 ```
 
-**Result:** _(pending)_
+**Result:**
+- HTTP request hung indefinitely until user dismissed a Tally modal.
+- Tally surfaced a modal: `TDL Error! - Description not found ( Description: Report - 'List of Companies')`
+- After modal dismissed, response was empty/unparseable (likely token-expired by then).
+- `list-loaded-companies` AFTER: still empty — no company was loaded.
 
-**Conclusion:** _(pending)_
+**Conclusions:**
+- **`TALLYREQUEST=Import` is fundamentally different from Export**: Import dispatches the `<ID>` as something to *execute* in Tally's runtime, not just read.
+- **Import requests block on UI state** — if the dispatch surfaces a modal (error or otherwise), the HTTP response hangs until a human dismisses it.
+- "List of Companies" is NOT a known report name in this Tally Prime build (Silver edition seen in the screenshot). Would need to find the actual report/action ID for company loading.
+- We confirmed the bootstrap goal is unchanged (no company loaded after attempt) — so H1A doesn't load a company, but the failure mode tells us we're hitting the right *codepath*.
+
+**Important environmental finding:**
+- Test box runs **Tally Prime SILVER edition** (visible in title bar from screenshot).
+- Silver = single-user, single-company. Multi-company loading is a Gold-edition feature.
+- This may invalidate the entire "load multiple subsidiaries" use case on Silver — no XML trick will bypass an engine-level edition restriction.
+- **Action item:** confirm Silver vs Gold via `Help → About`; if Silver, decide whether the production target is Silver (load = swap, not add) or Gold (multi-load works).
+
+#### H1B: try a known-valid report ID
+
+_(pending — needs user to confirm Silver/Gold and approve more modal-blocking probes)_
+
+Candidate IDs to try once we resume:
+- `Open Company` (engine action name)
+- `Cmp Load Company`
+- `Load Company`
+- `Select Company`
+- `Company Info`
+- `Open Existing Company`
 
 ---
 
@@ -142,4 +170,44 @@ For each, vary `<TALLYREQUEST>` between `Export`, `Import`, `Action`, `Update`.
 
 (populated as hypotheses fail — useful so we don't re-test)
 
-- _(none yet)_
+### Dispatch surface mapped (2026-05-06)
+
+| `<TYPE>` | Verdict | Notes |
+| --- | --- | --- |
+| `Data` | valid | Looks up Report by `<ID>`; with Import, executes Report (can pop UI modals) |
+| `Function` | valid | **Built-ins NOT exposed** (`$$CmpLoadCompany`, `$$CmpIsLoaded`, `$$SysInfo` all "Could not find"); inline TDL definitions in body are NOT processed; only PRE-installed user functions are callable |
+| `Object` | valid | Already-loaded only; does NOT auto-load to satisfy a query; folder ID treated as a name |
+| `Collection` | valid | Already-loaded only; returns CMPINFO stats |
+| `Report` | INVALID | "Unknown Request, cannot be processed" |
+| `Action` | INVALID | "Unknown Request, cannot be processed" |
+
+| `<TALLYREQUEST>` | Verdict | Notes |
+| --- | --- | --- |
+| `Export` | valid | Returns data |
+| `Import` | valid | Dispatches Report execution as a side effect (UI-visible) |
+| `Action`, `Update`, `Receive`, `Service` | accepted by parser | All routed to Description (Report) lookup; no special verb privilege over Import |
+
+### `$$CmpLoadCompany` is NOT a loader
+
+- Tested via inline TDL Report with `Form Accept` action body (H3A) and engine-action `Action: Cmp Load Company` clause (H3B).
+- Both invocations DID fire the function — confirmed by getting Tally's standard "Could not find Company `''`" error message.
+- The function searches the in-memory Company collection by name. With no companies loaded, the collection is empty, so any lookup fails with the empty-string error.
+- **Conclusion**: `$$CmpLoadCompany` is a "select among already-loaded companies" function, not a "load from disk" function. Its name misled prior implementations (`scripts/mcp-company-loader.tdl`).
+
+### Architectural conclusion
+
+**Tally Prime has no XML or TDL primitive that loads a company from disk.** Loading is exclusively initiated by:
+
+1. Tally process startup (via `Load=` directives in `tally.ini`)
+2. Tally UI (Alt+F3 → Select Company)
+
+This is an engine-level constraint, not a protocol limitation. **Path A (tally.ini rewrite + Tally restart) is the only restart-based mechanism; the GUI agent (Strategy 3 of `open-company`) is the only restart-free mechanism.** No XML envelope can route around either.
+
+### What's deprecated
+
+- `scripts/mcp-company-loader.tdl` — the TDL add-on never could have worked. Safe to remove or leave as a historical artifact.
+- `open-company` Strategy 1 (`tdl-load`) and Strategy 2 (`tdl-connect`) — these test for accessibility, not load. They should be renamed for clarity (e.g. `verify-loaded`, `check-open-list`) since they cannot bootstrap.
+
+### Edition note
+
+Test box was Tally Prime SILVER (single-user, single-company). Even if a load primitive existed, multi-load wouldn't work on Silver. For multi-subsidiary cross-reference workflows, **Gold is required at the engine level** — no MCP-side trick fixes this.
