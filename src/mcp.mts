@@ -168,6 +168,47 @@ export function resolveCompanyInput(input: string, folders: Array<{ folder: stri
   return { kind: 'not-found', available: folders };
 }
 
+// Sends a command to the GUI agent (running in the user's desktop session) via the JSON file IPC pattern,
+// and waits for a matching response. Returns the agent's response or null on timeout.
+// Used to bridge Session 0 isolation — the MCP service can't spawn GUI apps directly when running as a service.
+async function callGuiAgent(
+  action: string,
+  payload: Record<string, any>,
+  timeoutSec: number,
+  dataPath: string,
+  logs: string[]
+): Promise<{ status: string; message: string } | null> {
+  const commandFile = path.join(dataPath, '_mcp_gui_command.json');
+  const resultFile = path.join(dataPath, '_mcp_gui_result.json');
+  const commandId = createGuiAgentCommandId(action);
+
+  try { fs.unlinkSync(resultFile); } catch {}
+  const command = JSON.stringify({ action, ...payload, commandId, timestamp: new Date().toISOString() });
+  fs.writeFileSync(commandFile, command, 'utf-8');
+  logs.push(`  [gui-agent] sent action=${action} commandId=${commandId}, waiting up to ${timeoutSec}s`);
+
+  for (let i = 0; i < timeoutSec; i++) {
+    await sleep(1000);
+    if (!fs.existsSync(resultFile)) continue;
+    try {
+      const resultText = fs.readFileSync(resultFile, 'utf-8');
+      const result = JSON.parse(resultText);
+      if (!isMatchingGuiAgentCommand(result, commandId)) {
+        logs.push(`  [gui-agent] ignoring stale response for commandId ${result?.commandId || 'unknown'}`);
+        try { fs.unlinkSync(resultFile); } catch {}
+        continue;
+      }
+      logs.push(`  [gui-agent] response: status=${result.status} message=${result.message}`);
+      try { fs.unlinkSync(resultFile); } catch {}
+      return { status: String(result.status || ''), message: String(result.message || '') };
+    } catch {
+      try { fs.unlinkSync(resultFile); } catch {}
+    }
+  }
+  logs.push(`  [gui-agent] no response within ${timeoutSec}s`);
+  return null;
+}
+
 // Polls the Tally XML server until it responds successfully, or timeout elapses.
 async function waitForTallyReady(timeoutMs: number, logs: string[]): Promise<boolean> {
   const ping = '<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>List of Companies</ID></HEADER></ENVELOPE>';
@@ -673,6 +714,48 @@ export async function registerMcpServer(): Promise<McpServer> {
   );
 
   mcpServer.registerTool(
+    'tally-raw-xml-probe',
+    {
+      title: 'Tally Raw XML Probe (debug only)',
+      description: `Posts a raw XML envelope to the Tally XML server and returns the raw response — bypasses all wrapper logic. Used for protocol reverse-engineering and undocumented verb discovery. NOT for normal use; the wrapped tools (list-master, trial-balance, etc.) construct XML safely. Disabled unless TALLY_DEBUG_XML=1 is set in the server env.`,
+      inputSchema: {
+        xml: z.string().describe('raw XML envelope to POST to the Tally XML server. Standard structure: <ENVELOPE><HEADER>...</HEADER><BODY>...</BODY></ENVELOPE>.'),
+        label: z.string().optional().describe('optional label included in the audit log so probes can be correlated to experiment notes (e.g. "H1-import-variant").')
+      },
+      annotations: {
+        readOnlyHint: false,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      const auditArgs = { xmlLength: args.xml.length, label: args.label };
+      if (process.env.TALLY_DEBUG_XML !== '1') {
+        auditLog('tally-raw-xml-probe', auditArgs, 'denied', Date.now() - start);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: 'Disabled. Set TALLY_DEBUG_XML=1 in the server env to enable raw XML probes.' }]
+        };
+      }
+      try {
+        const resp = await postTallyXML(args.xml);
+        auditLog('tally-raw-xml-probe', { ...auditArgs, respLength: resp.length }, 'success', Date.now() - start);
+        const cap = 50000;
+        const body = resp.length > cap ? `${resp.slice(0, cap)}\n\n[TRUNCATED — full length ${resp.length} chars]` : resp;
+        return {
+          content: [{ type: 'text', text: `[response: ${resp.length} chars in ${Date.now() - start}ms${args.label ? `, label="${args.label}"` : ''}]\n\n${body}` }]
+        };
+      } catch (err) {
+        auditLog('tally-raw-xml-probe', auditArgs, 'error', Date.now() - start);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `tally-raw-xml-probe failed: ${err}` }]
+        };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
     'list-loaded-companies',
     {
       title: 'List Loaded Companies',
@@ -835,15 +918,20 @@ export async function registerMcpServer(): Promise<McpServer> {
         }
         await sleep(2000);
 
-        // Start Tally — uses cmd /c start so the process is detached from this Node process.
-        // Caveat: if the MCP service runs in Windows Session 0, the spawned tally.exe will also be in Session 0
-        // and have no desktop. The service must run in the user's interactive session for the GUI to appear.
-        logs.push(`  Starting Tally (${tallyExePath})...`);
-        try {
-          execSync(`cmd /c start "" "${tallyExePath}"`, { timeout: 5000, windowsHide: true });
-          logs.push('    Spawn command issued.');
-        } catch (err) {
-          logs.push(`    Spawn failed: ${err}`);
+        // Start Tally via the GUI agent IPC. The MCP service typically runs in Windows Session 0 (no desktop),
+        // so it can't spawn GUI apps directly. The agent (tally-gui-agent-v2.ps1) runs in the interactive
+        // user session and does the Start-Process on our behalf.
+        // The agent's watch directory comes from TALLY_DATA_PATH env (same as the agent's startup logic) —
+        // it must match what the agent is watching, NOT what tally.ini's Data= says (those can differ).
+        logs.push(`  Starting Tally via GUI agent (${tallyExePath})...`);
+        const agentWatchDir = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const agentResp = await callGuiAgent('start-tally', { exePath: tallyExePath, waitSec: 30 }, 35, agentWatchDir, logs);
+        if (!agentResp) {
+          logs.push('    GUI agent did not respond — is tally-gui-agent-v2.ps1 running in the user session?');
+        } else if (agentResp.status !== 'success') {
+          logs.push(`    GUI agent reported failure: ${agentResp.message}`);
+        } else {
+          logs.push(`    GUI agent reports Tally window detected.`);
         }
 
         // Poll XML server until ready (or timeout)

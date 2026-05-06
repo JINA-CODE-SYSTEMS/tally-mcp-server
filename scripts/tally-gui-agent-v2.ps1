@@ -20,16 +20,16 @@ if (-not $WatchDir) {
 $CommandFile = Join-Path $WatchDir "_mcp_gui_command.json"
 $ResultFile  = Join-Path $WatchDir "_mcp_gui_result.json"
 
-# --- Detect LLM provider ---
+# --- Detect LLM provider (optional) ---
+# Deterministic actions (ping, start-tally, exit) work without any LLM key.
+# Only LLM-guided actions (select-company, load-on-startup) require a key — those error at dispatch time
+# if the key is missing, instead of refusing to start the agent.
 if (-not $LLMProvider) {
     if ($env:ANTHROPIC_API_KEY) { $LLMProvider = "anthropic" }
     elseif ($env:OPENAI_API_KEY) { $LLMProvider = "openai" }
-    else {
-        Write-Host "[ERROR] Set ANTHROPIC_API_KEY or OPENAI_API_KEY environment variable."
-        exit 1
-    }
+    else { $LLMProvider = "none" }
 }
-Write-Host "LLM Provider: $LLMProvider"
+Write-Host "LLM Provider: $LLMProvider$(if ($LLMProvider -eq 'none') { ' (LLM-guided actions disabled — set ANTHROPIC_API_KEY or OPENAI_API_KEY to enable)' })"
 
 # --- Configurable LLM settings (override via environment variables) ---
 $ClaudeModel   = if ($env:CLAUDE_MODEL)        { $env:CLAUDE_MODEL }        else { "claude-sonnet-4-20250514" }
@@ -423,13 +423,49 @@ while ($true) {
 
             switch ($cmd.action) {
                 "select-company" {
-                    Invoke-LLMGuidedAction -CompanyName $cmd.companyName -Action "select-company" -CommandId $cmdId -MaxStepsOverride $cmdMaxSteps
+                    if ($LLMProvider -eq "none") {
+                        Write-Result -Status "error" -Message "select-company requires an LLM key (ANTHROPIC_API_KEY or OPENAI_API_KEY). Use load-company (tally.ini-driven) for LLM-free company loading." -Strategy "select-company" -CommandId $cmdId
+                    } else {
+                        Invoke-LLMGuidedAction -CompanyName $cmd.companyName -Action "select-company" -CommandId $cmdId -MaxStepsOverride $cmdMaxSteps
+                    }
                 }
                 "load-on-startup" {
-                    Invoke-LLMGuidedAction -CompanyName $cmd.companyName -Action "load-on-startup" -CommandId $cmdId -MaxStepsOverride $cmdMaxSteps
+                    if ($LLMProvider -eq "none") {
+                        Write-Result -Status "error" -Message "load-on-startup requires an LLM key. Use load-company (tally.ini-driven) instead." -Strategy "load-on-startup" -CommandId $cmdId
+                    } else {
+                        Invoke-LLMGuidedAction -CompanyName $cmd.companyName -Action "load-on-startup" -CommandId $cmdId -MaxStepsOverride $cmdMaxSteps
+                    }
                 }
                 "ping" {
                     Write-Result -Status "success" -Message "Agent v2 is alive (LLM: $LLMProvider)" -Strategy "ping" -CommandId $cmdId
+                }
+                "start-tally" {
+                    # Spawn tally.exe in this agent's session (which is the user's interactive desktop session).
+                    # The MCP service can't do this directly when running in Session 0 — that's why it delegates here.
+                    $exe = if ($cmd.exePath) { [string]$cmd.exePath } else { "C:\Program Files\TallyPrimeEditLog\tally.exe" }
+                    $waitSec = if ($cmd.waitSec) { [int]$cmd.waitSec } else { 30 }
+                    if (-not (Test-Path $exe)) {
+                        Write-Result -Status "error" -Message "tally.exe not found at $exe" -Strategy "start-tally" -CommandId $cmdId
+                    } else {
+                        try {
+                            Start-Process -FilePath $exe | Out-Null
+                            # Poll for the Tally window to appear — confirms the GUI is up before declaring success
+                            $deadline = (Get-Date).AddSeconds($waitSec)
+                            $hwnd = [IntPtr]::Zero
+                            while ((Get-Date) -lt $deadline) {
+                                $hwnd = Find-TallyWindow
+                                if ($hwnd -ne [IntPtr]::Zero) { break }
+                                Start-Sleep -Milliseconds 500
+                            }
+                            if ($hwnd -ne [IntPtr]::Zero) {
+                                Write-Result -Status "success" -Message "Tally started; window detected within timeout" -Strategy "start-tally" -CommandId $cmdId
+                            } else {
+                                Write-Result -Status "error" -Message "Tally process spawned but no window appeared within ${waitSec}s" -Strategy "start-tally" -CommandId $cmdId
+                            }
+                        } catch {
+                            Write-Result -Status "error" -Message "Start-Process failed: $_" -Strategy "start-tally" -CommandId $cmdId
+                        }
+                    }
                 }
                 "exit" {
                     Write-Result -Status "success" -Message "Shutting down" -Strategy "exit" -CommandId $cmdId
