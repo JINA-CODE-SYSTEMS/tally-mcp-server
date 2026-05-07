@@ -476,7 +476,10 @@ while ($true) {
                                 [TallyUI2]::TypeString($companyId)
                                 Start-Sleep -Milliseconds 800
 
-                                # Press Enter to select the highlighted match - opens the credential prompt if protected
+                                # Tally Prime Edit Log requires TWO Enters: first confirms the search/selection,
+                                # second opens the company (and brings up the credential prompt if protected).
+                                [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
+                                Start-Sleep -Milliseconds 600
                                 [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
                                 Start-Sleep -Milliseconds $waitMsAfterEnter
 
