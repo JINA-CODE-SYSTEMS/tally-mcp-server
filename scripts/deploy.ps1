@@ -63,8 +63,9 @@ Set-Location $InstallDir
 Write-Host "Deploying $ServiceName from $InstallDir"
 Write-Host ""
 
-Step "git pull origin main" {
-    git pull origin main
+$currentBranch = (git rev-parse --abbrev-ref HEAD).Trim()
+Step "git pull origin $currentBranch" {
+    git pull origin $currentBranch
     if ($LASTEXITCODE -ne 0) { throw "git pull failed (exit $LASTEXITCODE)" }
 }
 
