@@ -94,7 +94,7 @@ Name: "{group}\Uninstall {#MyAppName}";  Filename: "{uninstallexe}"
 [Run]
 ; --- 1. First-run wizard: writes .env from collected wizard inputs and registers the NSSM service ---
 Filename: "powershell.exe"; \
-  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -Password ""{code:GetWizardPassword}"" -TallyEdition ""{code:GetWizardEdition}"" -TallyExePath ""{code:GetWizardExePath}"" -TallyDataPath ""{code:GetWizardDataPath}"" -TallyIniPath ""{code:GetWizardIniPath}"" -McpDomain ""{code:GetWizardDomain}"" -AgentTaskUser ""{code:GetWizardAgentUser}"""; \
+  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -CredentialsFile ""{code:GetCredentialsFilePath}"" -TallyEdition ""{code:GetWizardEdition}"" -TallyExePath ""{code:GetWizardExePath}"" -TallyDataPath ""{code:GetWizardDataPath}"" -TallyIniPath ""{code:GetWizardIniPath}"" -McpDomain ""{code:GetWizardDomain}"" -AgentTaskUser ""{code:GetWizardAgentUser}"""; \
   WorkingDir: "{app}"; \
   StatusMsg: "Configuring service and writing .env..."; \
   Flags: runhidden waituntilterminated
@@ -194,9 +194,38 @@ begin
   end;
 end;
 
-function GetWizardPassword(Param: string): string;
+// Path to the temporary credentials file the installer writes before invoking firstrun-config.ps1.
+// Lives in {tmp} (the installer's per-user temp folder, ACL'd to the installing user). The PowerShell
+// script reads it and immediately deletes it, so the password never appears on a process command line
+// where Get-CimInstance Win32_Process / wmic could observe it during the install window.
+function GetCredentialsFilePath(Param: string): string;
 begin
-  Result := ConfigPage.Values[0];
+  Result := ExpandConstant('{tmp}\tally-mcp-firstrun-creds.json');
+end;
+
+// Hook: called by Inno Setup as the install transitions through phases. We write the credentials
+// JSON just before the [Run] section fires (ssInstall = "files have been copied; now running [Run]
+// entries"). Inno auto-cleans {tmp} at end-of-install, but firstrun-config.ps1 also deletes the
+// file as soon as it has read the password.
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  CredsPath, Json, Password, Escaped: string;
+begin
+  if CurStep = ssInstall then
+  begin
+    CredsPath := GetCredentialsFilePath('');
+    Password := ConfigPage.Values[0];
+    // Minimal JSON-string escaping for the password — backslash and double-quote only.
+    // Pascal Script doesn't have a JSON encoder; this is enough for the only field we write.
+    Escaped := StringChange(Password, '\', '\\');
+    Escaped := StringChange(Escaped, '"', '\"');
+    Json := '{"password":"' + Escaped + '"}';
+    if not SaveStringToFile(CredsPath, Json, False) then
+    begin
+      MsgBox('Failed to write installer credentials file at ' + CredsPath + '. Install cannot continue.', mbError, MB_OK);
+      Abort;
+    end;
+  end;
 end;
 
 function GetWizardExePath(Param: string): string;

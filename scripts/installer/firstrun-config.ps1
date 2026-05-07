@@ -42,7 +42,11 @@ param(
     [Parameter(Mandatory=$true)] [string]$InstallDir,
     [string]$ServiceName    = 'TallyMCP',
     [string]$AgentTaskName  = 'TallyMCPAgent',
-    [Parameter(Mandatory=$true)] [string]$Password,
+    # The OAuth password is read from a JSON credentials file (written by Inno Setup into the
+    # installer's user-only temp folder). Avoids exposing the password on the command line where
+    # it would be visible to any local process via Get-CimInstance Win32_Process / wmic during
+    # the ~30s install window. The file is deleted immediately after read.
+    [Parameter(Mandatory=$true)] [string]$CredentialsFile,
     [string]$TallyEdition   = 'silver',
     [string]$TallyExePath   = 'C:\Program Files\TallyPrimeEditLog\tally.exe',
     [string]$TallyDataPath  = 'C:\Users\Public\TallyPrimeEditLog\data',
@@ -50,6 +54,40 @@ param(
     [string]$McpDomain      = '',
     [string]$AgentTaskUser  = $env:USERNAME
 )
+
+# --- Read + delete credentials file before any other work ---
+# Even if anything below throws, the credentials file should not survive.
+if (-not (Test-Path -LiteralPath $CredentialsFile)) {
+    throw "Credentials file not found at '$CredentialsFile'. Inno Setup should have written it before invoking this script."
+}
+$credsRaw = $null
+try {
+    $credsRaw = [System.IO.File]::ReadAllText($CredentialsFile, [System.Text.Encoding]::UTF8)
+} finally {
+    # Best-effort secure delete: overwrite with zeros, then unlink. Even on a power loss between
+    # those two ops, the file is in the user's temp folder (auto-cleaned by Inno); residual
+    # exposure is bounded.
+    try {
+        $size = (Get-Item -LiteralPath $CredentialsFile -ErrorAction SilentlyContinue).Length
+        if ($size -gt 0) {
+            $zeros = New-Object byte[] $size
+            [System.IO.File]::WriteAllBytes($CredentialsFile, $zeros)
+        }
+    } catch {}
+    Remove-Item -LiteralPath $CredentialsFile -Force -ErrorAction SilentlyContinue
+}
+$creds = $null
+try {
+    $creds = $credsRaw | ConvertFrom-Json
+} catch {
+    throw "Credentials file '$CredentialsFile' is not valid JSON: $_"
+}
+if (-not $creds.password) {
+    throw "Credentials file did not contain a 'password' field."
+}
+$Password = [string]$creds.password
+# Hint to GC: drop the raw JSON string from memory once we've extracted the field.
+$credsRaw = $null
 
 $ErrorActionPreference = 'Stop'
 $transcript = Join-Path $InstallDir 'logs\firstrun-config.log'
