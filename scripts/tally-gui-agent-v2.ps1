@@ -5,13 +5,21 @@
 # RUN: In the interactive desktop session where Tally is visible
 #   powershell -ExecutionPolicy Bypass -File tally-gui-agent-v2.ps1
 #
-# REQUIRES: ANTHROPIC_API_KEY or OPENAI_API_KEY in environment
+# REQUIRES: ANTHROPIC_API_KEY or OPENAI_API_KEY in environment (optional - only for LLM-guided actions)
 
 param(
     [string]$WatchDir = $null,
     [string]$LLMProvider = $null,   # "anthropic" or "openai" (auto-detected from available API key)
-    [int]$MaxSteps = 15             # Safety limit per command
+    [int]$MaxSteps = 15,            # Safety limit per command
+    [switch]$NoSelfRestart          # Disable self-watching auto-restart (for debugging)
 )
+
+# --- Agent version (bumped whenever the IPC contract or script behavior changes) ---
+# The MCP server reads this from the ping response and refuses load-company calls
+# against an agent older than its required minimum (issue #15 - version handshake).
+# Format: MAJOR.MINOR.PATCH. Bump MINOR on any new IPC action or response field;
+# bump PATCH on internal fixes that callers can ignore.
+$Script:AgentVersion = "1.1.0"
 
 if (-not $WatchDir) {
     $WatchDir = if ($env:TALLY_DATA_PATH) { $env:TALLY_DATA_PATH } else { "C:\Users\Public\TallyPrimeEditLog\data" }
@@ -284,18 +292,64 @@ function Execute-Action {
 }
 
 function Write-Result {
-    param([string]$Status, [string]$Message, [string]$Strategy, [string]$CommandId = "")
-    $result = @{
-        status    = $Status
-        message   = $Message
-        strategy  = $Strategy
-        commandId = $CommandId
-        timestamp = (Get-Date -Format "o")
-    } | ConvertTo-Json -Depth 3
+    param(
+        [string]$Status,
+        [string]$Message,
+        [string]$Strategy,
+        [string]$CommandId = "",
+        [hashtable]$Extra = $null
+    )
+    $payload = [ordered]@{
+        status       = $Status
+        message      = $Message
+        strategy     = $Strategy
+        commandId    = $CommandId
+        timestamp    = (Get-Date -Format "o")
+        agentVersion = $Script:AgentVersion
+    }
+    if ($Extra) {
+        foreach ($k in $Extra.Keys) { $payload[$k] = $Extra[$k] }
+    }
+    $result = $payload | ConvertTo-Json -Depth 3
     # Write UTF-8 WITHOUT BOM. .NET's [Encoding]::UTF8 prepends a BOM, which breaks Node's JSON.parse on the read side.
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($ResultFile, $result, $utf8NoBom)
     Write-Host "[$Status] $Message (commandId: $CommandId)"
+}
+
+# Self-update detection: tracks the script's mtime at startup. If the file changes on disk
+# (e.g. a deploy.ps1 git pull replaced it), Test-ScriptUpdated returns true and the main
+# loop calls Restart-Self before the next command. Combined with Task Scheduler at-logon,
+# this is the agent-update story from issue #15.
+$Script:AgentScriptPath  = $PSCommandPath
+$Script:AgentScriptMTime = if (Test-Path -LiteralPath $Script:AgentScriptPath) {
+    (Get-Item -LiteralPath $Script:AgentScriptPath).LastWriteTimeUtc
+} else { $null }
+
+function Test-ScriptUpdated {
+    if ($NoSelfRestart) { return $false }
+    if (-not $Script:AgentScriptPath) { return $false }
+    if (-not (Test-Path -LiteralPath $Script:AgentScriptPath)) { return $false }
+    $current = (Get-Item -LiteralPath $Script:AgentScriptPath).LastWriteTimeUtc
+    if (-not $Script:AgentScriptMTime) { return $false }
+    return ($current -ne $Script:AgentScriptMTime)
+}
+
+function Restart-Self {
+    Write-Host "[self-restart] script changed on disk; re-launching new version..."
+    # Re-launch under the same powershell host with the same arguments. We pass -NoSelfRestart NOT,
+    # so the new process picks up its own mtime and watches from there.
+    $argList = @('-ExecutionPolicy', 'Bypass', '-NoProfile', '-File', $Script:AgentScriptPath)
+    if ($WatchDir)    { $argList += @('-WatchDir',    $WatchDir) }
+    if ($LLMProvider) { $argList += @('-LLMProvider', $LLMProvider) }
+    if ($MaxSteps)    { $argList += @('-MaxSteps',    [string]$MaxSteps) }
+    try {
+        Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -WindowStyle Normal | Out-Null
+    } catch {
+        Write-Host "[self-restart] Start-Process failed: $_  (this instance will keep running)"
+        return
+    }
+    exit 0
 }
 
 function Invoke-LLMGuidedAction {
@@ -398,13 +452,18 @@ function Invoke-LLMGuidedAction {
 
 # --- Main watch loop ---
 Write-Host "=== MCP Tally GUI Agent v2 (LLM-Guided) ==="
+Write-Host "Version:  $Script:AgentVersion"
 Write-Host "Watching: $CommandFile"
 Write-Host "Results:  $ResultFile"
 Write-Host "Provider: $LLMProvider"
 Write-Host "Max steps per command: $MaxSteps"
+Write-Host "Self-restart on script change: $(-not $NoSelfRestart)"
 Write-Host "Agent started. Polling every 500ms for commands..."
 
 while ($true) {
+    # Check if our own script file changed on disk between iterations. If so, the user/deploy
+    # has shipped a new agent version; re-launch into the new version and exit this process.
+    if (Test-ScriptUpdated) { Restart-Self }
     try {
         # Atomically try to read and delete - avoids TOCTOU race with MCP server
         $cmdText = $null
@@ -439,7 +498,13 @@ while ($true) {
                     }
                 }
                 "ping" {
-                    Write-Result -Status "success" -Message "Agent v2 is alive (LLM: $LLMProvider)" -Strategy "ping" -CommandId $cmdId
+                    $extra = @{
+                        llmProvider = $LLMProvider
+                        scriptPath  = $Script:AgentScriptPath
+                        scriptMTime = if ($Script:AgentScriptMTime) { $Script:AgentScriptMTime.ToString('o') } else { $null }
+                        pid         = $PID
+                    }
+                    Write-Result -Status "success" -Message "Agent v2 is alive (LLM: $LLMProvider, version: $Script:AgentVersion)" -Strategy "ping" -CommandId $cmdId -Extra $extra
                 }
                 "select-and-unlock-company" {
                     # Deterministic keystroke flow: type company id (already at Select Company) -> Enter -> type credentials -> Enter.
