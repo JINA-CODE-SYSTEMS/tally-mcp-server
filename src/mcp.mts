@@ -168,6 +168,13 @@ export function resolveCompanyInput(input: string, folders: Array<{ folder: stri
   return { kind: 'not-found', available: folders };
 }
 
+// Resolves the configured Tally edition from env var. Defaults to "silver" — safer assumption since
+// Silver is more restrictive (single company resident); Gold treated as Silver still works, just slower than necessary.
+// Anything other than "gold" (case-insensitive) is treated as Silver.
+export function getTallyEdition(rawValue: string | undefined = process.env.TALLY_EDITION): 'silver' | 'gold' {
+  return String(rawValue || '').trim().toLowerCase() === 'gold' ? 'gold' : 'silver';
+}
+
 // Sends a command to the GUI agent (running in the user's desktop session) via the JSON file IPC pattern,
 // and waits for a matching response. Returns the agent's response or null on timeout.
 // Used to bridge Session 0 isolation — the MCP service can't spawn GUI apps directly when running as a service.
@@ -207,6 +214,13 @@ async function callGuiAgent(
   }
   logs.push(`  [gui-agent] no response within ${timeoutSec}s`);
   return null;
+}
+
+// Lightweight ping to confirm the GUI agent is alive. Returns true if the agent answers within timeoutSec.
+// Used as a pre-flight in load-company so we never kill Tally without confirming we can bring it back.
+async function pingGuiAgent(dataPath: string, timeoutSec = 4, logs: string[] = []): Promise<boolean> {
+  const resp = await callGuiAgent('ping', {}, timeoutSec, dataPath, logs);
+  return !!resp && resp.status === 'success';
 }
 
 // Polls the Tally XML server until it responds successfully, or timeout elapses.
@@ -673,6 +687,7 @@ export async function registerMcpServer(): Promise<McpServer> {
           anthropicKeySet: !!process.env.ANTHROPIC_API_KEY,
           configuredTimeoutSeconds: getOpenCompanyGuiTimeoutSeconds(),
           configuredMaxSteps: getOpenCompanyGuiMaxSteps(),
+          tallyEdition: getTallyEdition(),
           activeCompany: activeCompany || null
         };
 
@@ -690,6 +705,13 @@ export async function registerMcpServer(): Promise<McpServer> {
             error: String(err)
           };
         }
+
+        // Live probe of the GUI agent — separate from "is the script file present" since the agent could
+        // be installed but not running (the most common Session 0 misconfiguration).
+        const guiAgentLogs: string[] = [];
+        const agentResponding = await pingGuiAgent(tallyDataPath, 4, guiAgentLogs);
+        report.guiAgentResponding = agentResponding;
+        if (!agentResponding) report.guiAgentHint = 'Agent did not respond to ping. Start tally-gui-agent-v2.ps1 in the user session (Task Scheduler at logon is recommended).';
 
         if (args.includeRecentResult && fs.existsSync(resultFile)) {
           try {
@@ -759,7 +781,7 @@ export async function registerMcpServer(): Promise<McpServer> {
     'list-loaded-companies',
     {
       title: 'List Loaded Companies',
-      description: `lists companies currently loaded in Tally Prime (i.e. accessible right now without an open-company call). Use this before set-active-company to confirm the target is loaded. Different from list-companies, which enumerates company folders on disk regardless of whether they are loaded.`,
+      description: `lists companies currently loaded in Tally Prime (i.e. accessible right now without an open-company call). Use this before set-active-company to confirm the target is loaded. Different from list-companies, which enumerates company folders on disk regardless of whether they are loaded. NOTE: on Silver edition (TALLY_EDITION=silver), Tally allows only one company resident at any time — this list will have at most 1 entry. On Gold, multiple entries can coexist.`,
       inputSchema: {},
       annotations: {
         readOnlyHint: true,
@@ -830,7 +852,7 @@ export async function registerMcpServer(): Promise<McpServer> {
     'load-company',
     {
       title: 'Load Company (via Tally Restart)',
-      description: `loads a company into Tally Prime by editing tally.ini and restarting Tally. Use this when the target company is NOT in list-loaded-companies. Slow (~10-30s for restart) but reliable — bypasses the XML-API limitation that no company-load verb exists. Accepts either a folder ID (e.g. "100000") or a company name (e.g. "Ross Industries"); resolves names by reading Company.900 from each folder. If multiple folders share a name, returns an ambiguity error listing folder IDs so you can re-call with the specific ID. Existing loaded companies are preserved by default (additive). Once loaded, use set-active-company to switch cheaply between loaded companies. Requires the MCP service process to have write access to tally.ini and permission to start tally.exe in the user's desktop session.`,
+      description: `loads a company into Tally Prime by editing tally.ini and restarting Tally. Use this when the target company is NOT in list-loaded-companies. Slow (~10-30s for restart) but reliable — Tally has no XML primitive for loading from disk, so a restart is the only option. Accepts either a folder ID (e.g. "100000") or a company name (e.g. "Ross Industries"); resolves names by reading Company.900 from each folder. If multiple folders share a name, returns an ambiguity error listing folder IDs so you can re-call with the specific ID. EDITION-AWARE: on Silver (set TALLY_EDITION=silver), this is always a SWAP — the new company replaces any current one (Silver allows only one company resident). On Gold (TALLY_EDITION=gold), additive by default; pass replace=true to force a swap. Requires the GUI agent (tally-gui-agent-v2.ps1) running in the user's interactive session — the tool pings it before doing anything destructive and refuses to kill Tally if the agent is unreachable. After the restart, the tool verifies the requested company actually appears in the loaded list before reporting success.`,
       inputSchema: {
         company: z.string().describe('folder ID (digits only, e.g. "100000") OR company name as stored in Company.900 (e.g. "Ross Industries"). Use list-companies to see both.'),
         waitTimeoutSec: z.number().optional().describe('seconds to wait for the Tally XML server to come back up after restart. Default 60.'),
@@ -847,7 +869,9 @@ export async function registerMcpServer(): Promise<McpServer> {
       const logs: string[] = [];
       const company = args.company;
       const timeoutMs = (args.waitTimeoutSec ?? 60) * 1000;
-      const replace = !!args.replace;
+      const edition = getTallyEdition();
+      // Silver allows only one company resident, so any "add" semantics are meaningless — force replace.
+      const replace = edition === 'silver' ? true : !!args.replace;
       const tallyIniPath = process.env.TALLY_INI_PATH || 'C:\\Program Files\\TallyPrimeEditLog\\tally.ini';
       const tallyExePath = process.env.TALLY_EXE_PATH || 'C:\\Program Files\\TallyPrimeEditLog\\tally.exe';
       try {
@@ -889,9 +913,23 @@ export async function registerMcpServer(): Promise<McpServer> {
           return { isError: true, content: [{ type: 'text', text: `Multiple companies match the name "${company}":\n${list}\n\nRe-call load-company with the specific folder id (e.g. company: "${resolved.matches[0].folder}") to disambiguate.` }] };
         }
         const companyId = resolved.folderId;
-        logs.push(`[load-company] input="${company}" matchedBy=${resolved.matchedBy} folderId=${companyId} companyName="${resolved.companyName}" replace=${replace}`);
+        logs.push(`[load-company] input="${company}" matchedBy=${resolved.matchedBy} folderId=${companyId} companyName="${resolved.companyName}" edition=${edition} replace=${replace}${edition === 'silver' && args.replace === false ? ' (Silver: replace forced true)' : ''}`);
         logs.push(`  tallyIni=${tallyIniPath}`);
         logs.push(`  dataPath=${tallyDataPath} (source: ${dataPathSource})`);
+
+        // Pre-flight: confirm the GUI agent is alive BEFORE we kill Tally. If we kill without an agent
+        // to bring it back, the box is left in a worse state than it started.
+        const agentWatchDir = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        logs.push('  Pinging GUI agent (must be alive before we kill Tally)...');
+        const agentAlive = await pingGuiAgent(agentWatchDir, 4, logs);
+        if (!agentAlive) {
+          auditLog('load-company', args, 'error', Date.now() - start);
+          return {
+            isError: true,
+            content: [{ type: 'text', text: logs.join('\n') + `\n\nGUI agent did not respond at ${agentWatchDir}. Refusing to kill Tally without confirming we can restart it.\n\nTo fix: start tally-gui-agent-v2.ps1 in the user's interactive session (e.g. via Task Scheduler "At logon"). Then retry.` }]
+          };
+        }
+        logs.push('    GUI agent is alive.');
 
         const currentLoads = parseTallyIniLoads(ini);
         logs.push(`  Current Load= entries: ${currentLoads.length === 0 ? '(none)' : currentLoads.join(', ')}`);
@@ -924,7 +962,6 @@ export async function registerMcpServer(): Promise<McpServer> {
         // The agent's watch directory comes from TALLY_DATA_PATH env (same as the agent's startup logic) —
         // it must match what the agent is watching, NOT what tally.ini's Data= says (those can differ).
         logs.push(`  Starting Tally via GUI agent (${tallyExePath})...`);
-        const agentWatchDir = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
         const agentResp = await callGuiAgent('start-tally', { exePath: tallyExePath, waitSec: 30 }, 35, agentWatchDir, logs);
         if (!agentResp) {
           logs.push('    GUI agent did not respond — is tally-gui-agent-v2.ps1 running in the user session?');
@@ -945,23 +982,41 @@ export async function registerMcpServer(): Promise<McpServer> {
           };
         }
 
-        // Verify the company actually loaded — match by id substring against loaded company names
-        const loaded = await listLoadedCompanies();
-        logs.push(`  Loaded companies after restart: ${loaded.length === 0 ? '(none)' : loaded.join(', ')}`);
-        // We don't know the company *name* from just the folder id, so we accept "any company loaded" as success here.
-        // The caller should follow up with list-loaded-companies + set-active-company to pick the right one by name.
-
-        if (loaded.length > 0 && newLoads.includes(companyId)) {
-          // Best-effort: if there's only one loaded company and we requested only one, set it active.
-          if (loaded.length === 1) {
-            activeCompany = loaded[0];
-            logs.push(`  Set activeCompany = "${loaded[0]}".`);
-          }
+        // Verify load: Tally silently skips auto-load when data is missing/empty, so XML reachability
+        // alone isn't proof of success. We need the requested company to appear in the loaded list.
+        // We have a name (from Company.900 scan) for some folders; for unnamed folders we fall back to
+        // "at least one company loaded" since we can't match by id from XML alone.
+        const expectedName = resolved.companyName.trim();
+        let loaded = await listLoadedCompanies();
+        // Retry once after a short wait — guards against the engine still finishing its load
+        if (expectedName && !loaded.some(n => n.toLowerCase() === expectedName.toLowerCase())) {
+          await sleep(2000);
+          loaded = await listLoadedCompanies();
         }
+        logs.push(`  Loaded companies after restart: ${loaded.length === 0 ? '(none)' : loaded.join(', ')}`);
+
+        const verified = expectedName
+          ? loaded.some(n => n.toLowerCase() === expectedName.toLowerCase())
+          : loaded.length > 0;
+        if (!verified) {
+          auditLog('load-company', args, 'error', Date.now() - start);
+          return {
+            isError: true,
+            content: [{ type: 'text', text: logs.join('\n') + `\n\nTally restarted but the requested company is not in the loaded list. Common causes: folder ${companyId} has no valid company data, or Tally needs migration before it can open it. Check Tally manually.` }]
+          };
+        }
+
+        // Pick activeCompany: prefer the verified name match; fall back to the only loaded company on Silver/single-load setups.
+        if (expectedName && loaded.some(n => n.toLowerCase() === expectedName.toLowerCase())) {
+          activeCompany = loaded.find(n => n.toLowerCase() === expectedName.toLowerCase()) || expectedName;
+        } else if (loaded.length === 1) {
+          activeCompany = loaded[0];
+        }
+        if (activeCompany) logs.push(`  Set activeCompany = "${activeCompany}".`);
 
         auditLog('load-company', args, 'success', Date.now() - start);
         return {
-          content: [{ type: 'text', text: logs.join('\n') + `\n\nTally is back up with ${loaded.length} loaded company/companies. Use list-loaded-companies to see names, then set-active-company to target the one you want.` }]
+          content: [{ type: 'text', text: logs.join('\n') + `\n\nTally is back up with ${loaded.length} loaded company/companies (edition: ${edition}). Active company: ${activeCompany || '(unset)'}.` }]
         };
       } catch (err) {
         auditLog('load-company', args, 'error', Date.now() - start);

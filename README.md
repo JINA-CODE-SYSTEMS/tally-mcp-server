@@ -48,6 +48,9 @@ Copy `.env.example` to `.env` and configure:
 | `TALLY_PORT` | `9000` | Tally Prime XML server port |
 | `TALLY_DATA_PATH` | `C:\Users\Public\TallyPrime\data` | Tally data directory (for `list-companies`) |
 | `TALLY_EXE_PATH` | `C:\Program Files\TallyPrime\tally.exe` | Tally executable path |
+| `TALLY_INI_PATH` | `C:\Program Files\TallyPrimeEditLog\tally.ini` | Path to tally.ini (used by `load-company`) |
+| `TALLY_EDITION` | `silver` | `silver` or `gold`. Drives `load-company` semantics — see [Editions](#editions) below. |
+| `TALLY_DEBUG_XML` | *(unset)* | Set to `1` to enable the `tally-raw-xml-probe` tool for protocol RE. Leave unset in production. |
 | `PORT` | `3000` | HTTP server port |
 | `MCP_DOMAIN` | `http://localhost:3000` | Public-facing URL |
 | `BIND_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` only behind reverse proxy) |
@@ -71,6 +74,34 @@ Copy `.env.example` to `.env` and configure:
 | `LLM_MAX_TOKENS` | `300` | Max tokens per LLM response |
 | `LLM_TIMEOUT_SEC` | `30` | LLM API request timeout in seconds |
 | `ANTHROPIC_API_VERSION` | `2023-06-01` | Anthropic API version header |
+
+## Editions
+
+Tally Prime ships in two relevant editions, and `load-company` adapts its behavior to each. **You must set `TALLY_EDITION` correctly** — defaulting to `silver` is the safe assumption.
+
+| Edition | Companies resident at once | `load-company` behavior |
+| ------- | -------------------------- | ----------------------- |
+| `silver` | **1** (engine limit) | Always a SWAP — strips other `Load=` entries, restarts Tally with only the requested company. `replace=true` is forced regardless of what was passed. `list-loaded-companies` will only ever return 0 or 1 entry. |
+| `gold` | many | Additive by default — appends `Load=<id>` to `tally.ini`, restarts Tally with the new company plus all previous ones. Pass `replace=true` to force a swap. After loading several, switch between them via `set-active-company` (in-memory pointer flip, no restart). |
+
+**Why this matters for the multi-subsidiary cross-reference workflow:** Silver clients can only query one company at a time, so an LLM doing "compare ledgers across 3 subsidiaries" will pay the ~10–30s restart latency between each. Gold clients can pre-load all subsidiaries and switch between them for free.
+
+**Why no auto-detection:** Tally's edition isn't reliably exposed via the XML server. Rather than ship a fragile auto-detect that could miscategorize and silently degrade behavior, the server takes the configured value as authoritative.
+
+### Background: why Tally must be restarted to load a company
+
+Tally Prime has **no XML or TDL primitive that loads a company from disk into memory**. We confirmed this by reverse-engineering every dispatch surface the XML server exposes (see [`notes/tdl-experiments.md`](notes/tdl-experiments.md)). The built-in `$$CmpLoadCompany` is misleadingly named — it's "select among already-loaded companies", not "load from disk". Loading is exclusively initiated by Tally process startup (via `Load=` directives in `tally.ini`) or the Tally UI (Alt+F3).
+
+Therefore `load-company` works the only way it can: rewrites `tally.ini`, kills `tally.exe`, and asks the GUI agent (which lives in the user's interactive desktop session) to start it again. This is unavoidable until Tally exposes a load verb in a future protocol version.
+
+### Operational requirement: GUI agent must be running
+
+Because the MCP server typically runs as a Windows service in **Session 0** (no desktop), it cannot spawn `tally.exe` directly. The companion script [`scripts/tally-gui-agent-v2.ps1`](scripts/tally-gui-agent-v2.ps1) runs in the user's interactive session and acts as the bridge — `load-company` IPCs to it to perform the spawn.
+
+- **Install** the agent to start at user logon (Task Scheduler "At logon" or Windows Startup folder).
+- **No LLM key required** for the deterministic actions (`ping`, `start-tally`). Only set `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` if you want the LLM-guided UI navigation fallback (`open-company` Strategy 3).
+- **`load-company` pings the agent before doing anything destructive** — if the agent isn't responding, the tool refuses to kill Tally and returns a clear error. So a misconfigured deployment never ends up worse than it started.
+- **Check liveness** any time via `open-company-debug` — it returns `guiAgentResponding: true|false`.
 
 ## Setup
 
