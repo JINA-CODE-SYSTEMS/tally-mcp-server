@@ -15,7 +15,7 @@ function auditLog(toolName: string, args: Record<string, any>, status: 'success'
     timestamp: new Date().toISOString(),
     tool: toolName,
     args: Object.fromEntries(
-      Object.entries(args).filter(([k]) => !['password', 'secret', 'token'].includes(k.toLowerCase()))
+      Object.entries(args).filter(([k]) => !['password', 'secret', 'token', 'username', 'user', 'apikey', 'api_key'].includes(k.toLowerCase()))
     ),
     status,
     durationMs
@@ -853,12 +853,14 @@ export async function registerMcpServer(): Promise<McpServer> {
     'load-company',
     {
       title: 'Load Company (via Tally Restart)',
-      description: `loads a company into Tally Prime by editing tally.ini and restarting Tally. Use this when the target company is NOT in list-loaded-companies. Slow (~10-30s for restart) but reliable — Tally has no XML primitive for loading from disk, so a restart is the only option. Accepts either a folder ID (e.g. "100000") or a company name (e.g. "Ross Industries"); resolves names by reading Company.900 from each folder. If multiple folders share a name, returns an ambiguity error listing folder IDs so you can re-call with the specific ID. EDITION-AWARE: on Silver (set TALLY_EDITION=silver), this is always a SWAP — the new company replaces any current one (Silver allows only one company resident). On Gold (TALLY_EDITION=gold), additive by default; pass replace=true to force a swap. Requires the GUI agent (tally-gui-agent-v2.ps1) running in the user's interactive session — the tool pings it before doing anything destructive and refuses to kill Tally if the agent is unreachable. After the restart, the tool verifies the requested company actually appears in the loaded list before reporting success.`,
+      description: `loads a company into Tally Prime by editing tally.ini and restarting Tally. Use this when the target company is NOT in list-loaded-companies. Slow (~10-30s for restart) but reliable — Tally has no XML primitive for loading from disk, so a restart is the only option. Accepts either a folder ID (e.g. "100000") or a company name (e.g. "Ross Industries"); resolves names by reading Company.900 from each folder. If multiple folders share a name, returns an ambiguity error listing folder IDs so you can re-call with the specific ID. EDITION-AWARE: on Silver (set TALLY_EDITION=silver), this is always a SWAP — the new company replaces any current one (Silver allows only one company resident). On Gold (TALLY_EDITION=gold), additive by default; pass replace=true to force a swap. Requires the GUI agent (tally-gui-agent-v2.ps1) running in the user's interactive session — the tool pings it before doing anything destructive and refuses to kill Tally if the agent is unreachable. After the restart, the tool verifies the requested company actually appears in the loaded list. CREDENTIAL HANDLING: if Tally's auto-load fails because the company is password-protected (common with Edit Log boxes — Tally drops to Select Company because it can't bypass the credential prompt), pass userName + password and the tool will use the GUI agent to deterministically keystroke through the Select Company → credentials prompt → Gateway sequence. Credentials are filtered from audit logs.`,
       inputSchema: {
         company: z.string().describe('folder ID (digits only, e.g. "100000") OR company name as stored in Company.900 (e.g. "Ross Industries"). Use list-companies to see both.'),
         waitTimeoutSec: z.number().optional().describe('seconds to wait for the Tally XML server to come back up after restart. Default 60.'),
         replace: z.boolean().optional().describe('if true, only this company is loaded — all other Load= lines are removed from tally.ini. Default false (additive).'),
-        dataPath: z.string().optional().describe('override the data path to scan for company folders. By default, this is read from tally.ini\'s Data= directive (the same path Tally itself uses). Pass this only when you know the data lives somewhere different — e.g. a backup folder or a secondary drive.')
+        dataPath: z.string().optional().describe('override the data path to scan for company folders. By default, this is read from tally.ini\'s Data= directive (the same path Tally itself uses). Pass this only when you know the data lives somewhere different — e.g. a backup folder or a secondary drive.'),
+        userName: z.string().optional().describe('Tally username for the company (if user-based security is enabled). Used by the GUI agent to keystroke through the credential prompt when auto-load is blocked by Tally\'s login dialog. Filtered from audit logs.'),
+        password: z.string().optional().describe('Tally password for the company. Filtered from audit logs. Lives in the IPC file briefly during the call (~5s) — acceptable on a single-user box, document carefully if multi-user.')
       },
       annotations: {
         readOnlyHint: false,
@@ -983,27 +985,52 @@ export async function registerMcpServer(): Promise<McpServer> {
           };
         }
 
-        // Verify load: Tally silently skips auto-load when data is missing/empty, so XML reachability
-        // alone isn't proof of success. We need the requested company to appear in the loaded list.
-        // We have a name (from Company.900 scan) for some folders; for unnamed folders we fall back to
-        // "at least one company loaded" since we can't match by id from XML alone.
+        // Verify load: Tally silently skips auto-load when data is missing/empty or password-protected,
+        // so XML reachability alone isn't proof of success. We need the requested company to appear in the loaded list.
         const expectedName = resolved.companyName.trim();
         let loaded = await listLoadedCompanies();
-        // Retry once after a short wait — guards against the engine still finishing its load
         if (expectedName && !loaded.some(n => n.toLowerCase() === expectedName.toLowerCase())) {
           await sleep(2000);
           loaded = await listLoadedCompanies();
         }
         logs.push(`  Loaded companies after restart: ${loaded.length === 0 ? '(none)' : loaded.join(', ')}`);
 
-        const verified = expectedName
+        let verified = expectedName
           ? loaded.some(n => n.toLowerCase() === expectedName.toLowerCase())
           : loaded.length > 0;
+
+        // Credential fallback: if auto-load failed AND credentials were provided, ask the GUI agent
+        // to keystroke through the Select Company dialog + credential prompt. This handles user-based
+        // security where Tally drops to Select Company because the credential dialog blocked auto-load.
+        if (!verified && (args.userName || args.password)) {
+          logs.push('  Auto-load did not complete — likely blocked by credential prompt. Trying keystroke fallback via GUI agent...');
+          const unlockResp = await callGuiAgent(
+            'select-and-unlock-company',
+            { companyId, userName: args.userName || '', password: args.password || '' },
+            20,
+            agentWatchDir,
+            logs
+          );
+          if (!unlockResp || unlockResp.status !== 'success') {
+            logs.push(`    GUI agent reported: ${unlockResp ? unlockResp.message : 'no response'}`);
+          }
+          // Re-verify after keystrokes settle
+          await sleep(3000);
+          loaded = await listLoadedCompanies();
+          logs.push(`  Loaded companies after keystroke fallback: ${loaded.length === 0 ? '(none)' : loaded.join(', ')}`);
+          verified = expectedName
+            ? loaded.some(n => n.toLowerCase() === expectedName.toLowerCase())
+            : loaded.length > 0;
+        }
+
         if (!verified) {
           auditLog('load-company', args, 'error', Date.now() - start);
+          const hint = (args.userName || args.password)
+            ? 'Even with credentials, the company did not load. Verify the username/password are correct, and that the company is reachable via Alt+F3 → type id → Enter manually.'
+            : 'If the company is password-protected, retry with userName and password arguments to use the keystroke fallback.';
           return {
             isError: true,
-            content: [{ type: 'text', text: logs.join('\n') + `\n\nTally restarted but the requested company is not in the loaded list. Common causes: folder ${companyId} has no valid company data, or Tally needs migration before it can open it. Check Tally manually.` }]
+            content: [{ type: 'text', text: logs.join('\n') + `\n\nTally restarted but the requested company is not in the loaded list. ${hint}` }]
           };
         }
 

@@ -441,6 +441,62 @@ while ($true) {
                 "ping" {
                     Write-Result -Status "success" -Message "Agent v2 is alive (LLM: $LLMProvider)" -Strategy "ping" -CommandId $cmdId
                 }
+                "select-and-unlock-company" {
+                    # Deterministic keystroke flow: open Select Company → type ID → Enter → type credentials → Enter.
+                    # No LLM, works regardless of password type. Used by load-company when auto-load via tally.ini's
+                    # Load= directive can't proceed past the credential prompt (the common case for Edit Log boxes).
+                    $companyId = if ($cmd.companyId) { [string]$cmd.companyId } else { "" }
+                    $userName  = if ($cmd.userName)  { [string]$cmd.userName }  else { "" }
+                    $password  = if ($cmd.password)  { [string]$cmd.password }  else { "" }
+                    $waitMsAfterEnter = if ($cmd.waitMsAfterEnter) { [int]$cmd.waitMsAfterEnter } else { 1500 }
+                    $waitMsAfterCreds = if ($cmd.waitMsAfterCreds) { [int]$cmd.waitMsAfterCreds } else { 2500 }
+                    if (-not $companyId) {
+                        Write-Result -Status "error" -Message "Missing companyId" -Strategy "select-and-unlock" -CommandId $cmdId
+                    } else {
+                        try {
+                            $hwnd = Find-TallyWindow
+                            if ($hwnd -eq [IntPtr]::Zero) {
+                                Write-Result -Status "error" -Message "Tally window not found — is Tally running?" -Strategy "select-and-unlock" -CommandId $cmdId
+                            } else {
+                                [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                                Start-Sleep -Milliseconds 500
+
+                                # Open Select Company dialog (idempotent — works whether or not it's already open)
+                                [TallyUI2]::PressCombo([TallyUI2]::VK_MENU, [TallyUI2]::VK_F3)
+                                Start-Sleep -Milliseconds 800
+
+                                # Type the company id (Tally autocompletes / filters the list)
+                                [TallyUI2]::TypeString($companyId)
+                                Start-Sleep -Milliseconds 600
+
+                                # Press Enter to select the highlighted match — opens the credential prompt if protected
+                                [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
+                                Start-Sleep -Milliseconds $waitMsAfterEnter
+
+                                # If credentials were supplied, enter them
+                                if ($userName) {
+                                    [TallyUI2]::TypeString($userName)
+                                    Start-Sleep -Milliseconds 200
+                                    [TallyUI2]::PressKey([TallyUI2]::VK_TAB)
+                                    Start-Sleep -Milliseconds 200
+                                }
+                                if ($password) {
+                                    [TallyUI2]::TypeString($password)
+                                    Start-Sleep -Milliseconds 200
+                                }
+                                if ($userName -or $password) {
+                                    [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
+                                    Start-Sleep -Milliseconds $waitMsAfterCreds
+                                }
+
+                                $msg = "Keystrokes sent for company $companyId" + $(if ($userName -or $password) { " with credentials" } else { "" })
+                                Write-Result -Status "success" -Message $msg -Strategy "select-and-unlock" -CommandId $cmdId
+                            }
+                        } catch {
+                            Write-Result -Status "error" -Message "Exception: $_" -Strategy "select-and-unlock" -CommandId $cmdId
+                        }
+                    }
+                }
                 "start-tally" {
                     # Spawn tally.exe in this agent's session (which is the user's interactive desktop session).
                     # The MCP service can't do this directly when running in Session 0 — that's why it delegates here.
