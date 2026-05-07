@@ -198,7 +198,8 @@ async function callGuiAgent(
     await sleep(1000);
     if (!fs.existsSync(resultFile)) continue;
     try {
-      const resultText = fs.readFileSync(resultFile, 'utf-8');
+      // Strip leading BOM defensively — PowerShell's [Encoding]::UTF8 emits a BOM that breaks JSON.parse.
+      const resultText = fs.readFileSync(resultFile, 'utf-8').replace(/^﻿/, '');
       const result = JSON.parse(resultText);
       if (!isMatchingGuiAgentCommand(result, commandId)) {
         logs.push(`  [gui-agent] ignoring stale response for commandId ${result?.commandId || 'unknown'}`);
@@ -526,7 +527,7 @@ export async function registerMcpServer(): Promise<McpServer> {
             await new Promise(resolve => setTimeout(resolve, 1000));
             if (fs.existsSync(resultFile)) {
               try {
-                const pingResult = JSON.parse(fs.readFileSync(resultFile, 'utf-8'));
+                const pingResult = JSON.parse(fs.readFileSync(resultFile, 'utf-8').replace(/^﻿/, ''));
                 if (isMatchingGuiAgentCommand(pingResult, pingCommandId)) {
                   agentAlive = true;
                   try { fs.unlinkSync(resultFile); } catch {}
@@ -565,7 +566,7 @@ export async function registerMcpServer(): Promise<McpServer> {
             await new Promise(resolve => setTimeout(resolve, 1000));
             if (fs.existsSync(resultFile)) {
               try {
-                const resultText = fs.readFileSync(resultFile, 'utf-8');
+                const resultText = fs.readFileSync(resultFile, 'utf-8').replace(/^﻿/, '');
                 const result = JSON.parse(resultText);
                 if (!isMatchingGuiAgentCommand(result, commandId)) {
                   logs.push(`  Ignoring stale response for commandId ${result?.commandId || 'unknown'}.`);
@@ -715,7 +716,7 @@ export async function registerMcpServer(): Promise<McpServer> {
 
         if (args.includeRecentResult && fs.existsSync(resultFile)) {
           try {
-            report.recentResult = JSON.parse(fs.readFileSync(resultFile, 'utf-8'));
+            report.recentResult = JSON.parse(fs.readFileSync(resultFile, 'utf-8').replace(/^﻿/, ''));
           } catch (err) {
             report.recentResult = { parseError: String(err) };
           }

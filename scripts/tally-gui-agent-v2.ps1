@@ -292,7 +292,9 @@ function Write-Result {
         commandId = $CommandId
         timestamp = (Get-Date -Format "o")
     } | ConvertTo-Json -Depth 3
-    [System.IO.File]::WriteAllText($ResultFile, $result, [System.Text.Encoding]::UTF8)
+    # Write UTF-8 WITHOUT BOM. .NET's [Encoding]::UTF8 prepends a BOM, which breaks Node's JSON.parse on the read side.
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($ResultFile, $result, $utf8NoBom)
     Write-Host "[$Status] $Message (commandId: $CommandId)"
 }
 
