@@ -11,3 +11,5 @@ scripts/TallyUI.dll
 .runtime/
 .vscode/
 deploy-diagnostics.txt
+installer-staging/
+dist-installer/
