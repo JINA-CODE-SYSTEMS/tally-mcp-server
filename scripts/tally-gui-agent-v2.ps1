@@ -1,4 +1,4 @@
-# MCP Tally GUI Agent v2 — LLM-Guided (Computer Use style)
+# MCP Tally GUI Agent v2 - LLM-Guided (Computer Use style)
 # Takes screenshots of the Tally window, sends to an LLM for analysis,
 # executes the LLM's recommended action, and loops until the goal is achieved.
 #
@@ -22,14 +22,14 @@ $ResultFile  = Join-Path $WatchDir "_mcp_gui_result.json"
 
 # --- Detect LLM provider (optional) ---
 # Deterministic actions (ping, start-tally, exit) work without any LLM key.
-# Only LLM-guided actions (select-company, load-on-startup) require a key — those error at dispatch time
+# Only LLM-guided actions (select-company, load-on-startup) require a key - those error at dispatch time
 # if the key is missing, instead of refusing to start the agent.
 if (-not $LLMProvider) {
     if ($env:ANTHROPIC_API_KEY) { $LLMProvider = "anthropic" }
     elseif ($env:OPENAI_API_KEY) { $LLMProvider = "openai" }
     else { $LLMProvider = "none" }
 }
-Write-Host "LLM Provider: $LLMProvider$(if ($LLMProvider -eq 'none') { ' (LLM-guided actions disabled — set ANTHROPIC_API_KEY or OPENAI_API_KEY to enable)' })"
+Write-Host "LLM Provider: $LLMProvider$(if ($LLMProvider -eq 'none') { ' (LLM-guided actions disabled - set ANTHROPIC_API_KEY or OPENAI_API_KEY to enable)' })"
 
 # --- Configurable LLM settings (override via environment variables) ---
 $ClaudeModel   = if ($env:CLAUDE_MODEL)        { $env:CLAUDE_MODEL }        else { "claude-sonnet-4-20250514" }
@@ -95,7 +95,7 @@ IMPORTANT RULES:
 - Return EXACTLY ONE action per response
 - If the goal appears achieved (company is loaded, shown in title bar or Gateway), return {"action":"done","reason":"..."}
 - If stuck after multiple attempts, return {"action":"fail","reason":"..."}
-- Be precise with text — company names are case-sensitive in Tally
+- Be precise with text - company names are case-sensitive in Tally
 
 RESPOND WITH ONLY A JSON OBJECT, no other text:
 {"action":"<action_type>","value":"<value>","reason":"<brief explanation>"}
@@ -406,13 +406,13 @@ Write-Host "Agent started. Polling every 500ms for commands..."
 
 while ($true) {
     try {
-        # Atomically try to read and delete — avoids TOCTOU race with MCP server
+        # Atomically try to read and delete - avoids TOCTOU race with MCP server
         $cmdText = $null
         try {
             $cmdText = [System.IO.File]::ReadAllText($CommandFile, [System.Text.Encoding]::UTF8)
             Remove-Item $CommandFile -Force -ErrorAction SilentlyContinue
         } catch [System.IO.FileNotFoundException] {
-            # File doesn't exist — normal, just keep polling
+            # File doesn't exist - normal, just keep polling
         } catch [System.IO.DirectoryNotFoundException] {
             # Directory doesn't exist yet
         }
@@ -442,7 +442,7 @@ while ($true) {
                     Write-Result -Status "success" -Message "Agent v2 is alive (LLM: $LLMProvider)" -Strategy "ping" -CommandId $cmdId
                 }
                 "select-and-unlock-company" {
-                    # Deterministic keystroke flow: open Select Company → type ID → Enter → type credentials → Enter.
+                    # Deterministic keystroke flow: open Select Company -> type ID -> Enter -> type credentials -> Enter.
                     # No LLM, works regardless of password type. Used by load-company when auto-load via tally.ini's
                     # Load= directive can't proceed past the credential prompt (the common case for Edit Log boxes).
                     $companyId = if ($cmd.companyId) { [string]$cmd.companyId } else { "" }
@@ -456,12 +456,12 @@ while ($true) {
                         try {
                             $hwnd = Find-TallyWindow
                             if ($hwnd -eq [IntPtr]::Zero) {
-                                Write-Result -Status "error" -Message "Tally window not found — is Tally running?" -Strategy "select-and-unlock" -CommandId $cmdId
+                                Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "select-and-unlock" -CommandId $cmdId
                             } else {
                                 [TallyUI2]::ForceForeground($hwnd) | Out-Null
                                 Start-Sleep -Milliseconds 500
 
-                                # Open Select Company dialog (idempotent — works whether or not it's already open)
+                                # Open Select Company dialog (idempotent - works whether or not it's already open)
                                 [TallyUI2]::PressCombo([TallyUI2]::VK_MENU, [TallyUI2]::VK_F3)
                                 Start-Sleep -Milliseconds 800
 
@@ -469,7 +469,7 @@ while ($true) {
                                 [TallyUI2]::TypeString($companyId)
                                 Start-Sleep -Milliseconds 600
 
-                                # Press Enter to select the highlighted match — opens the credential prompt if protected
+                                # Press Enter to select the highlighted match - opens the credential prompt if protected
                                 [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
                                 Start-Sleep -Milliseconds $waitMsAfterEnter
 
@@ -499,7 +499,7 @@ while ($true) {
                 }
                 "start-tally" {
                     # Spawn tally.exe in this agent's session (which is the user's interactive desktop session).
-                    # The MCP service can't do this directly when running in Session 0 — that's why it delegates here.
+                    # The MCP service can't do this directly when running in Session 0 - that's why it delegates here.
                     $exe = if ($cmd.exePath) { [string]$cmd.exePath } else { "C:\Program Files\TallyPrimeEditLog\tally.exe" }
                     $waitSec = if ($cmd.waitSec) { [int]$cmd.waitSec } else { 30 }
                     if (-not (Test-Path $exe)) {
@@ -507,7 +507,7 @@ while ($true) {
                     } else {
                         try {
                             Start-Process -FilePath $exe | Out-Null
-                            # Poll for the Tally window to appear — confirms the GUI is up before declaring success
+                            # Poll for the Tally window to appear - confirms the GUI is up before declaring success
                             $deadline = (Get-Date).AddSeconds($waitSec)
                             $hwnd = [IntPtr]::Zero
                             while ((Get-Date) -lt $deadline) {
