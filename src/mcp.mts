@@ -137,6 +137,146 @@ export function scanCompanyFolders(dataPath: string): Array<{ folder: string; na
     });
 }
 
+// Reads a company name from a Tally Company.* metadata file (Company.900 for stock layouts,
+// Company.1800 for Tally Prime Edit Log). The files are UTF-16LE blobs with a leading binary
+// header followed by the human-readable company name. We strip non-printable bytes and
+// extract the longest run of letters/spaces/punctuation that looks like a company name.
+// Returns '' if the file cannot be read or no name is recoverable.
+export function extractCompanyNameFromMetadataFile(filePath: string): string {
+  try {
+    if (!fs.existsSync(filePath)) return '';
+    const buf = fs.readFileSync(filePath);
+    const text = buf.toString('utf16le').replace(/[^\x20-\x7Eऀ-ॿ]/g, ' ').trim();
+    const match = text.match(/[A-Za-zऀ-ॿ][\w\sऀ-ॿ.&(),-]{2,}/);
+    return match ? match[0].trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+// Describes a discovered company and its load-readiness — the structured shape returned by
+// list-available-companies. A caller (LLM or human) gets enough context here to:
+//   - decide which company to load (folderId / displayName)
+//   - know whether data files are present (hasData) before risking a load
+//   - know whether to prompt the human for credentials (requiresCredentials)
+//   - deal with both layouts: traditional <data>/<id>/Company.900 and Edit Log's <data>/<id>/<id>/Company.1800
+export type AvailableCompany = {
+  folderId: string;
+  folderPath: string;
+  displayName: string;
+  hasData: boolean;
+  dataFilePath: string | null;
+  requiresCredentials: boolean | null;  // null = unknown; only true/false when the credential-hint config is present
+  knownUsername: string | null;
+  notes: string;
+};
+
+// Optional credential-hint config. Mapping of folder id → known credential metadata.
+// Allows callers to know up-front whether to ask the human for credentials (issue #16, piece C).
+// Path: <dataPath>/.tally-mcp-companies.json by default, or override via TALLY_COMPANIES_CONFIG env var.
+// Format:
+//   {
+//     "100000": { "requiresCredentials": true,  "knownUsername": "admin", "notes": "Edit Log w/ user-based security" },
+//     "200000": { "requiresCredentials": false, "notes": "Auto-loads cleanly" }
+//   }
+// We never store passwords here — only the hint that one is needed.
+export type CompaniesConfig = {
+  [folderId: string]: {
+    requiresCredentials?: boolean;
+    knownUsername?: string;
+    notes?: string;
+  };
+};
+
+export function loadCompaniesConfig(configPath: string): CompaniesConfig {
+  try {
+    if (!fs.existsSync(configPath)) return {};
+    const raw = fs.readFileSync(configPath, 'utf-8').replace(/^﻿/, '');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as CompaniesConfig;
+    return {};
+  } catch {
+    return {};
+  }
+}
+
+// Recursively scans a Tally data directory for company folders and extracts everything we can
+// without touching Tally itself. Handles both layouts:
+//   - Stock Tally Prime: <data>/<id>/Company.900
+//   - Tally Prime Edit Log: <data>/<id>/<id>/Company.1800   (data files one level deeper)
+//
+// Returns one entry per top-level digit-named folder (the canonical "company id"), with a
+// `dataFilePath` pointing at the first .900/.1800 found anywhere in the tree (we walk depth-first
+// up to maxDepth=3 to bound cost on pathological filesystems). hasData=false means the folder
+// exists but no Company.* metadata file was found — usually indicates an empty placeholder.
+//
+// If `configPath` is supplied, credential-hint metadata from that JSON file is merged into the
+// output so callers can short-circuit credential prompting for known-clean companies.
+export function scanAvailableCompanies(
+  dataPath: string,
+  configPath?: string
+): AvailableCompany[] {
+  if (!fs.existsSync(dataPath)) return [];
+
+  const config = configPath ? loadCompaniesConfig(configPath) : {};
+
+  const findMetadataFile = (root: string, maxDepth: number): { metaPath: string; layout: 'flat' | 'nested' } | null => {
+    // BFS down to maxDepth, looking for Company.900 or Company.1800. Return first hit + layout
+    // marker (depth 0 = flat layout, depth >= 1 = nested layout, e.g. Edit Log).
+    type Frame = { dir: string; depth: number };
+    const queue: Frame[] = [{ dir: root, depth: 0 }];
+    while (queue.length) {
+      const { dir, depth } = queue.shift()!;
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        if (entry.isFile() && /^Company\.(900|1800)$/i.test(entry.name)) {
+          return { metaPath: path.join(dir, entry.name), layout: depth === 0 ? 'flat' : 'nested' };
+        }
+      }
+      if (depth < maxDepth) {
+        for (const entry of entries) {
+          if (entry.isDirectory()) queue.push({ dir: path.join(dir, entry.name), depth: depth + 1 });
+        }
+      }
+    }
+    return null;
+  };
+
+  const entries = fs.readdirSync(dataPath, { withFileTypes: true });
+  return entries
+    .filter(e => e.isDirectory() && /^\d+$/.test(e.name))
+    .map(e => {
+      const folderPath = path.join(dataPath, e.name);
+      const found = findMetadataFile(folderPath, 3);
+      const displayName = found ? extractCompanyNameFromMetadataFile(found.metaPath) : '';
+
+      const hint = config[e.name] || {};
+      const requiresCredentials = typeof hint.requiresCredentials === 'boolean' ? hint.requiresCredentials : null;
+      const knownUsername = typeof hint.knownUsername === 'string' && hint.knownUsername.length > 0 ? hint.knownUsername : null;
+
+      const notesPieces: string[] = [];
+      if (found?.layout === 'nested') notesPieces.push('Edit Log nested layout (data one level deep)');
+      if (typeof hint.notes === 'string' && hint.notes.length > 0) notesPieces.push(hint.notes);
+      if (!found) notesPieces.push('No Company.900/.1800 found — likely empty/placeholder folder');
+
+      return {
+        folderId: e.name,
+        folderPath,
+        displayName,
+        hasData: !!found,
+        dataFilePath: found ? found.metaPath : null,
+        requiresCredentials,
+        knownUsername,
+        notes: notesPieces.join('; ')
+      };
+    });
+}
+
 // Resolves a user-supplied company identifier (folder id like "100000", or company name like "Ross Industries") to a unique folder id.
 // Pure function — no filesystem access. Caller passes the folder list from scanCompanyFolders().
 //
@@ -175,6 +315,44 @@ export function getTallyEdition(rawValue: string | undefined = process.env.TALLY
   return String(rawValue || '').trim().toLowerCase() === 'gold' ? 'gold' : 'silver';
 }
 
+// Minimum GUI-agent version this server is willing to talk to. Bumped whenever load-company
+// or open-company-debug start to depend on a new IPC field/action that older agents won't
+// recognize. The agent reports its version on every response (see Write-Result in
+// tally-gui-agent-v2.ps1). If a deploy ships a server expecting a newer agent than is running,
+// we fail fast with a clear message instead of letting the agent silently no-op on unknown
+// fields. (issue #15 - version handshake, option D).
+export const REQUIRED_AGENT_VERSION = '1.1.0';
+
+// Compares two MAJOR.MINOR.PATCH version strings. Returns true if `actual` is at least `required`.
+// Missing/unparseable segments are treated as 0 — so "1" >= "1.0.0", "1.2" >= "1.1.99", etc.
+// Non-numeric suffixes like "1.1.0-rc1" compare by their numeric prefix only ("1.1.0").
+export function isAgentVersionAtLeast(actual: string | null | undefined, required: string): boolean {
+  if (!actual) return false;
+  const parse = (v: string) => v.split('.').map(s => {
+    const m = s.match(/^\d+/);
+    return m ? Number(m[0]) : 0;
+  });
+  const a = parse(actual);
+  const r = parse(required);
+  const len = Math.max(a.length, r.length);
+  for (let i = 0; i < len; i++) {
+    const ai = a[i] ?? 0;
+    const ri = r[i] ?? 0;
+    if (ai > ri) return true;
+    if (ai < ri) return false;
+  }
+  return true;
+}
+
+// Result returned from callGuiAgent. Includes the agent-reported version when present, so callers
+// can do version-handshake checks (load-company refuses if too old, open-company-debug surfaces it).
+export type GuiAgentResponse = {
+  status: string;
+  message: string;
+  agentVersion: string | null;
+  raw: Record<string, any>;
+};
+
 // Sends a command to the GUI agent (running in the user's desktop session) via the JSON file IPC pattern,
 // and waits for a matching response. Returns the agent's response or null on timeout.
 // Used to bridge Session 0 isolation — the MCP service can't spawn GUI apps directly when running as a service.
@@ -184,7 +362,7 @@ async function callGuiAgent(
   timeoutSec: number,
   dataPath: string,
   logs: string[]
-): Promise<{ status: string; message: string } | null> {
+): Promise<GuiAgentResponse | null> {
   const commandFile = path.join(dataPath, '_mcp_gui_command.json');
   const resultFile = path.join(dataPath, '_mcp_gui_result.json');
   const commandId = createGuiAgentCommandId(action);
@@ -206,9 +384,15 @@ async function callGuiAgent(
         try { fs.unlinkSync(resultFile); } catch {}
         continue;
       }
-      logs.push(`  [gui-agent] response: status=${result.status} message=${result.message}`);
+      const versionStr = typeof result.agentVersion === 'string' ? result.agentVersion : null;
+      logs.push(`  [gui-agent] response: status=${result.status} message=${result.message}${versionStr ? ` agentVersion=${versionStr}` : ''}`);
       try { fs.unlinkSync(resultFile); } catch {}
-      return { status: String(result.status || ''), message: String(result.message || '') };
+      return {
+        status: String(result.status || ''),
+        message: String(result.message || ''),
+        agentVersion: versionStr,
+        raw: result
+      };
     } catch {
       try { fs.unlinkSync(resultFile); } catch {}
     }
@@ -217,11 +401,24 @@ async function callGuiAgent(
   return null;
 }
 
-// Lightweight ping to confirm the GUI agent is alive. Returns true if the agent answers within timeoutSec.
+// Result of a GUI-agent ping: alive + version + whether version meets the server's required minimum.
+// `versionOk=false` when alive=true means the agent is running but too old — load-company refuses
+// in that case rather than risk silent no-ops on unrecognized IPC fields.
+export type GuiAgentPingResult = {
+  alive: boolean;
+  agentVersion: string | null;
+  versionOk: boolean;
+};
+
+// Lightweight ping to confirm the GUI agent is alive. Returns its version if reachable.
 // Used as a pre-flight in load-company so we never kill Tally without confirming we can bring it back.
-async function pingGuiAgent(dataPath: string, timeoutSec = 4, logs: string[] = []): Promise<boolean> {
+async function pingGuiAgent(dataPath: string, timeoutSec = 4, logs: string[] = []): Promise<GuiAgentPingResult> {
   const resp = await callGuiAgent('ping', {}, timeoutSec, dataPath, logs);
-  return !!resp && resp.status === 'success';
+  if (!resp || resp.status !== 'success') {
+    return { alive: false, agentVersion: null, versionOk: false };
+  }
+  const versionOk = isAgentVersionAtLeast(resp.agentVersion, REQUIRED_AGENT_VERSION);
+  return { alive: true, agentVersion: resp.agentVersion, versionOk };
 }
 
 // Polls the Tally XML server until it responds successfully, or timeout elapses.
@@ -360,6 +557,55 @@ export async function registerMcpServer(): Promise<McpServer> {
       } catch (err) {
         auditLog('list-companies', args, 'error', Date.now() - start);
         throw err;
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'list-available-companies',
+    {
+      title: 'List Available Companies',
+      description: `discovers companies on disk with enough metadata to drive a load-company call without trial and error. Returns one row per digit-named folder under the Tally data directory, with: folderId, folderPath, displayName (extracted from Company.900 / Company.1800), hasData (whether any company metadata file was found), dataFilePath, requiresCredentials (null if unknown, true/false if a credential-hint config exists), knownUsername, notes. Handles both layouts: stock Tally Prime (<data>/<id>/Company.900) and Tally Prime Edit Log (<data>/<id>/<id>/Company.1800 — one level deeper). Recursively walks each folder up to depth 3 so an LLM doesn't get fooled into thinking nested-layout folders are empty. CREDENTIAL HINTS: optional config file at <dataPath>/.tally-mcp-companies.json (or override via TALLY_COMPANIES_CONFIG env var) maps folder id → { requiresCredentials, knownUsername, notes }. The config never stores passwords; it only signals "the human will need to supply credentials before load-company succeeds for this folder." Use this tool BEFORE load-company instead of trying random folder ids and waiting for failures.`,
+      inputSchema: {
+        dataPath: z.string().optional().describe('override the data path to scan. By default, this is the value of TALLY_DATA_PATH env var; falls back to the documented Edit Log default. Pass an explicit path when scanning a backup folder or a secondary drive.'),
+        configPath: z.string().optional().describe('override the credentials-hint config path. Default is <dataPath>/.tally-mcp-companies.json (or TALLY_COMPANIES_CONFIG env if set).')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      try {
+        const tallyDataPath = args.dataPath || process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        if (!fs.existsSync(tallyDataPath)) {
+          auditLog('list-available-companies', args, 'error', Date.now() - start);
+          return { isError: true, content: [{ type: 'text', text: `Data directory not found: ${tallyDataPath}` }] };
+        }
+        const configPath = args.configPath
+          || process.env.TALLY_COMPANIES_CONFIG
+          || path.join(tallyDataPath, '.tally-mcp-companies.json');
+        const companies = scanAvailableCompanies(tallyDataPath, configPath);
+
+        if (companies.length === 0) {
+          auditLog('list-available-companies', args, 'success', Date.now() - start);
+          return { content: [{ type: 'text', text: `No company folders found in ${tallyDataPath}.` }] };
+        }
+
+        const summary = {
+          dataPath: tallyDataPath,
+          configPath: fs.existsSync(configPath) ? configPath : `${configPath} (not present — credential hints unavailable)`,
+          companies
+        };
+        auditLog('list-available-companies', args, 'success', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify(summary, null, 2) }] };
+      } catch (err) {
+        auditLog('list-available-companies', args, 'error', Date.now() - start);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `list-available-companies failed: ${err}` }]
+        };
       }
     }
   );
@@ -710,9 +956,16 @@ export async function registerMcpServer(): Promise<McpServer> {
         // Live probe of the GUI agent — separate from "is the script file present" since the agent could
         // be installed but not running (the most common Session 0 misconfiguration).
         const guiAgentLogs: string[] = [];
-        const agentResponding = await pingGuiAgent(tallyDataPath, 4, guiAgentLogs);
-        report.guiAgentResponding = agentResponding;
-        if (!agentResponding) report.guiAgentHint = 'Agent did not respond to ping. Start tally-gui-agent-v2.ps1 in the user session (Task Scheduler at logon is recommended).';
+        const agentPing = await pingGuiAgent(tallyDataPath, 4, guiAgentLogs);
+        report.guiAgentResponding = agentPing.alive;
+        report.guiAgentVersion = agentPing.agentVersion;
+        report.guiAgentVersionRequired = REQUIRED_AGENT_VERSION;
+        report.guiAgentVersionOk = agentPing.versionOk;
+        if (!agentPing.alive) {
+          report.guiAgentHint = 'Agent did not respond to ping. Start tally-gui-agent-v2.ps1 in the user session (Task Scheduler at logon is recommended; setup-windows.ps1 registers the task as TallyMCPAgent).';
+        } else if (!agentPing.versionOk) {
+          report.guiAgentHint = `Agent is running but reports version ${agentPing.agentVersion ?? '(none)'}, older than the server's required minimum ${REQUIRED_AGENT_VERSION}. Restart the agent to pick up the on-disk update (the agent self-restarts on script change unless launched with -NoSelfRestart; otherwise: 'schtasks /End /TN TallyMCPAgent; schtasks /Run /TN TallyMCPAgent').`;
+        }
 
         if (args.includeRecentResult && fs.existsSync(resultFile)) {
           try {
@@ -924,15 +1177,26 @@ export async function registerMcpServer(): Promise<McpServer> {
         // to bring it back, the box is left in a worse state than it started.
         const agentWatchDir = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
         logs.push('  Pinging GUI agent (must be alive before we kill Tally)...');
-        const agentAlive = await pingGuiAgent(agentWatchDir, 4, logs);
-        if (!agentAlive) {
+        const agentPing = await pingGuiAgent(agentWatchDir, 4, logs);
+        if (!agentPing.alive) {
           auditLog('load-company', args, 'error', Date.now() - start);
           return {
             isError: true,
             content: [{ type: 'text', text: logs.join('\n') + `\n\nGUI agent did not respond at ${agentWatchDir}. Refusing to kill Tally without confirming we can restart it.\n\nTo fix: start tally-gui-agent-v2.ps1 in the user's interactive session (e.g. via Task Scheduler "At logon"). Then retry.` }]
           };
         }
-        logs.push('    GUI agent is alive.');
+        // Version handshake: refuse to call select-and-unlock-company / start-tally on an agent that
+        // predates the IPC fields they rely on. Better to fail fast here than silently mis-key
+        // credentials into a stale agent. (issue #15 - option D)
+        if (!agentPing.versionOk) {
+          auditLog('load-company', args, 'error', Date.now() - start);
+          const reportedVersion = agentPing.agentVersion ?? '(none reported)';
+          return {
+            isError: true,
+            content: [{ type: 'text', text: logs.join('\n') + `\n\nGUI agent is alive but reports version ${reportedVersion}, which is older than the required minimum ${REQUIRED_AGENT_VERSION}. The agent on disk has been updated by a deploy but the running process is stale.\n\nTo fix: stop and restart the agent (Task Scheduler: 'schtasks /End /TN TallyMCPAgent && schtasks /Run /TN TallyMCPAgent'), or just close + relaunch the PowerShell window. The agent self-restarts when its script changes; this only happens if it has been disabled with -NoSelfRestart.` }]
+          };
+        }
+        logs.push(`    GUI agent is alive (version ${agentPing.agentVersion ?? '(unknown)'}).`);
 
         const currentLoads = parseTallyIniLoads(ini);
         logs.push(`  Current Load= entries: ${currentLoads.length === 0 ? '(none)' : currentLoads.join(', ')}`);
