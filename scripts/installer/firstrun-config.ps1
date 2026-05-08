@@ -234,39 +234,43 @@ try {
     Write-Host "[OK] Service '$ServiceName' registered with bundled node + nssm"
 
     # --- 4. Register the GUI agent at-logon Scheduled Task -----------------
-    # schtasks writes "ERROR: The system cannot find the file specified" to stderr when
-    # /Delete is run against a non-existent task (the normal case on a fresh install). With
-    # ErrorActionPreference=Stop that promotes to a terminating error and aborts the script
-    # before we ever reach `nssm start`. Relax the preference around schtasks invocations.
-    $savedPref2 = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
+    # Use the ScheduledTasks PowerShell module rather than schtasks.exe. schtasks.exe via the
+    # `&` operator with /TR mangles the inner quotes around paths with spaces (e.g.
+    # "C:\Program Files\TallyMCP\scripts\tally-gui-agent-v2.ps1"), producing
+    # "Invalid argument/option - 'Files\...'". The cmdlet route uses real argument arrays so
+    # paths with spaces survive without escape gymnastics. The module is built-in on
+    # Windows Server 2008 R2+ / Windows 10+, so this is safe across our supported targets.
+    $taskRegistered = $false
     try {
-        & schtasks /Delete /TN $AgentTaskName /F 2>$null | Out-Null
-        $taskAction = "powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Minimized -File `"$agentScript`""
-        & schtasks /Create /TN $AgentTaskName /SC ONLOGON /RU $AgentTaskUser /RL LIMITED /TR $taskAction /F 2>$null | Out-Null
-        $taskCreateExit = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $savedPref2
-    }
-    if ($taskCreateExit -eq 0) {
+        # Best-effort cleanup of any stale registration. SilentlyContinue handles "not found".
+        Unregister-ScheduledTask -TaskName $AgentTaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+
+        $taskAction = New-ScheduledTaskAction `
+            -Execute 'powershell.exe' `
+            -Argument "-ExecutionPolicy Bypass -NoProfile -WindowStyle Minimized -File `"$agentScript`""
+        $taskTrigger = New-ScheduledTaskTrigger -AtLogOn -User $AgentTaskUser
+        $taskPrincipal = New-ScheduledTaskPrincipal -UserId $AgentTaskUser -LogonType Interactive -RunLevel Limited
+        $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+        $taskDef = New-ScheduledTask -Action $taskAction -Trigger $taskTrigger -Principal $taskPrincipal -Settings $taskSettings -Description "Tally MCP GUI agent (companion to TallyMCP service; spawns Tally + keystrokes credentials in user session)"
+        Register-ScheduledTask -TaskName $AgentTaskName -InputObject $taskDef -Force | Out-Null
+        $taskRegistered = $true
         Write-Host "[OK] Scheduled task '$AgentTaskName' registered (runs at logon, as $AgentTaskUser)"
-        # Trigger the task once now so the agent is alive immediately, not just from next logon.
-        # Without this, load-company calls fail with "GUI agent did not respond" until the user
-        # logs out + back in. With it, the agent is running by the time the wizard finishes.
-        $savedPref4 = $ErrorActionPreference
-        $ErrorActionPreference = 'Continue'
+    } catch {
+        Write-Host "[WARN] Register-ScheduledTask failed: $_" -ForegroundColor Yellow
+        Write-Host "       GUI agent task NOT registered. Re-run the wizard or register manually." -ForegroundColor Yellow
+    }
+
+    # Trigger the task once now so the agent is alive immediately, not just from next logon.
+    # Without this, load-company calls fail with "GUI agent did not respond" until the user
+    # logs out + back in. With it, the agent is running by the time the wizard finishes.
+    if ($taskRegistered) {
         try {
-            & schtasks /Run /TN $AgentTaskName 2>$null | Out-Null
-        } finally {
-            $ErrorActionPreference = $savedPref4
-        }
-        if ($LASTEXITCODE -eq 0) {
+            Start-ScheduledTask -TaskName $AgentTaskName
             Write-Host "[OK] GUI agent started in the current user session (PID will appear after a few seconds)"
-        } else {
-            Write-Host "[WARN] schtasks /Run returned $LASTEXITCODE - the task is registered but did not start now. It will start on next logon, or run 'schtasks /Run /TN $AgentTaskName' manually." -ForegroundColor Yellow
+        } catch {
+            Write-Host "[WARN] Start-ScheduledTask failed: $_" -ForegroundColor Yellow
+            Write-Host "       Task is registered but did not start now. It will start on next logon, or run 'Start-ScheduledTask -TaskName $AgentTaskName' manually." -ForegroundColor Yellow
         }
-    } else {
-        Write-Host "[WARN] schtasks /Create returned $taskCreateExit - GUI agent task NOT registered. Re-run the wizard or register manually." -ForegroundColor Yellow
     }
 
     # --- 5. Start the service ----------------------------------------------
