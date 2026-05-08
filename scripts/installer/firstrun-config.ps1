@@ -42,6 +42,7 @@ param(
     [Parameter(Mandatory=$true)] [string]$InstallDir,
     [string]$ServiceName    = 'TallyMCP',
     [string]$AgentTaskName  = 'TallyMCPAgent',
+    [string]$TrayTaskName   = 'TallyMCPTray',
     # The OAuth password is read from a JSON credentials file (written by Inno Setup into the
     # installer's user-only temp folder). Avoids exposing the password on the command line where
     # it would be visible to any local process via Get-CimInstance Win32_Process / wmic during
@@ -54,7 +55,8 @@ param(
     [string]$TallyDataPath  = 'C:\Users\Public\TallyPrimeEditLog\data',
     [string]$TallyIniPath   = 'C:\Program Files\TallyPrimeEditLog\tally.ini',
     [string]$McpDomain      = '',
-    [string]$AgentTaskUser  = $env:USERNAME
+    [string]$AgentTaskUser  = $env:USERNAME,
+    [switch]$SkipTrayTask
 )
 
 # --- Resolve OAuth password ---
@@ -273,6 +275,45 @@ try {
         }
     }
 
+    # --- 4b. Register the tray status app at-logon Scheduled Task ----------
+    # Optional companion to the agent task (issue #20). Gives the operator a coloured tray
+    # icon + right-click action menu so they don't need to run Get-Service / Get-ScheduledTask
+    # by hand to know the system is healthy. Same constraints as the agent task (interactive
+    # desktop only, runs as the same user, /RL LIMITED), so we mirror the registration code.
+    $trayScript = Join-Path $InstallDir 'scripts\tray\tally-mcp-tray.ps1'
+    $trayTaskRegistered = $false
+    if ($SkipTrayTask) {
+        Write-Host "[*] Skipping tray task registration (-SkipTrayTask)" -ForegroundColor DarkGray
+    } elseif (-not (Test-Path -LiteralPath $trayScript)) {
+        Write-Host "[WARN] Tray script not found at $trayScript - skipping at-logon registration" -ForegroundColor Yellow
+    } else {
+        try {
+            Unregister-ScheduledTask -TaskName $TrayTaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+
+            $trayArgs = "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$trayScript`" -InstallDir `"$InstallDir`" -ServiceName `"$ServiceName`" -AgentTaskName `"$AgentTaskName`""
+            $trayAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $trayArgs
+            $trayTrigger = New-ScheduledTaskTrigger -AtLogOn -User $AgentTaskUser
+            $trayPrincipal = New-ScheduledTaskPrincipal -UserId $AgentTaskUser -LogonType Interactive -RunLevel Limited
+            $traySettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+            $trayDef = New-ScheduledTask -Action $trayAction -Trigger $trayTrigger -Principal $trayPrincipal -Settings $traySettings -Description "Tally MCP status tray icon (issue #20; polls service/agent/Tally health and exposes admin actions)"
+            Register-ScheduledTask -TaskName $TrayTaskName -InputObject $trayDef -Force | Out-Null
+            $trayTaskRegistered = $true
+            Write-Host "[OK] Scheduled task '$TrayTaskName' registered (runs at logon, as $AgentTaskUser)"
+        } catch {
+            Write-Host "[WARN] Tray Register-ScheduledTask failed: $_" -ForegroundColor Yellow
+            Write-Host "       Tray icon NOT registered. Re-run the wizard or register manually." -ForegroundColor Yellow
+        }
+    }
+
+    if ($trayTaskRegistered) {
+        try {
+            Start-ScheduledTask -TaskName $TrayTaskName
+            Write-Host "[OK] Tray icon started in the current user session"
+        } catch {
+            Write-Host "[WARN] Tray Start-ScheduledTask failed: $_" -ForegroundColor Yellow
+        }
+    }
+
     # --- 5. Start the service ----------------------------------------------
     # Same defensive pattern: nssm start can write to stderr in benign cases (e.g. service
     # already running because Windows auto-started it on registration with SERVICE_AUTO_START).
@@ -292,6 +333,7 @@ try {
     Write-Host "Configuration complete."
     Write-Host "  Service:        $ServiceName  ($($svc.Status))"
     Write-Host "  Agent task:     $AgentTaskName"
+    Write-Host "  Tray task:      $TrayTaskName"
     Write-Host "  .env:           $envFile"
     Write-Host "  Logs:           $(Join-Path $InstallDir 'logs')"
     Write-Host ""
