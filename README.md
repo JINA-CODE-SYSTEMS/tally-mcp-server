@@ -8,11 +8,15 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that 
 
 ## Features
 
-- **23 MCP tools** — financial reports, master data, stock, GST, voucher creation
+- **29 MCP tools** — financial reports, master data, stock, GST, voucher creation, plus dedicated company-management tools (`load-company`, `set-active-company`, `list-loaded-companies`, `list-available-companies`)
+- **Cold-load with credentials** — load a password-protected company from a Tally with nothing resident, end-to-end via MCP. Edition-aware (Silver swaps, Gold accumulates). Documented in [Editions](#editions).
+- **Companion GUI agent** — runs in the user session, bridges Windows Session 0 isolation so the Session-0 service can spawn `tally.exe` and keystroke through credential prompts. Self-restarts on script update; version handshake refuses stale agents.
 - **DuckDB in-memory analytics** — cached report tables for complex SQL queries
 - **OAuth 2.1 + PKCE** authentication for remote/cloud deployments
 - **Security hardened** — Helmet, CORS, rate limiting, audit logging, read-only mode
 - **Local & remote** — run as a local stdio server or a cloud HTTP server behind a reverse proxy
+- **Windows installer** ([#18](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/18)) — double-click `.exe` from "nothing installed" to "service running" in under 5 minutes. Bundles portable Node + NSSM; no admin pre-reqs beyond UAC.
+- **Status tray icon** ([#20](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/20)) — at-a-glance health for non-developer operators. Service + agent + Tally + public URL all visible in one click.
 
 ## Prerequisites
 
