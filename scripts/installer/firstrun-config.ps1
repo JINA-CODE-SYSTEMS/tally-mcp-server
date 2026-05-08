@@ -127,6 +127,12 @@ try {
         "TALLY_EXE_PATH=$TallyExePath"
         "TALLY_DATA_PATH=$TallyDataPath"
         "TALLY_INI_PATH=$TallyIniPath"
+        # The installer's whole reason for existing is "Node + reverse proxy on the same box",
+        # so we bind to all interfaces. The reverse proxy in front (Caddy/IIS/Cloudflare Tunnel)
+        # is responsible for restricting access. Without this, a Caddyfile that says
+        # `reverse_proxy localhost:3000` resolves localhost to ::1 first on Windows, but Node
+        # only listens on 127.0.0.1 (the upstream library default), and Caddy returns 502.
+        "BIND_HOST=0.0.0.0"
     )
     if ($McpDomain) {
         $envLines += "MCP_DOMAIN=$McpDomain"
