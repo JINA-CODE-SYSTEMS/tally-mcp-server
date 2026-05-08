@@ -215,10 +215,12 @@ begin
   begin
     CredsPath := GetCredentialsFilePath('');
     Password := ConfigPage.Values[0];
-    // Minimal JSON-string escaping for the password — backslash and double-quote only.
-    // Pascal Script doesn't have a JSON encoder; this is enough for the only field we write.
-    Escaped := StringChange(Password, '\', '\\');
-    Escaped := StringChange(Escaped, '"', '\"');
+    // Minimal JSON-string escaping: backslash and double-quote only.
+    // Pascal Script's StringChange is a procedure that mutates a var argument in place
+    // (it does NOT return a string), so we copy first and then mutate the copy.
+    Escaped := Password;
+    StringChange(Escaped, '\', '\\');
+    StringChange(Escaped, '"', '\"');
     Json := '{"password":"' + Escaped + '"}';
     if not SaveStringToFile(CredsPath, Json, False) then
     begin
