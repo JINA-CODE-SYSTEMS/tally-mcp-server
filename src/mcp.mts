@@ -15,7 +15,7 @@ function auditLog(toolName: string, args: Record<string, any>, status: 'success'
     timestamp: new Date().toISOString(),
     tool: toolName,
     args: Object.fromEntries(
-      Object.entries(args).filter(([k]) => !['password', 'secret', 'token'].includes(k.toLowerCase()))
+      Object.entries(args).filter(([k]) => !['password', 'secret', 'token', 'username', 'user', 'apikey', 'api_key'].includes(k.toLowerCase()))
     ),
     status,
     durationMs
@@ -137,6 +137,146 @@ export function scanCompanyFolders(dataPath: string): Array<{ folder: string; na
     });
 }
 
+// Reads a company name from a Tally Company.* metadata file (Company.900 for stock layouts,
+// Company.1800 for Tally Prime Edit Log). The files are UTF-16LE blobs with a leading binary
+// header followed by the human-readable company name. We strip non-printable bytes and
+// extract the longest run of letters/spaces/punctuation that looks like a company name.
+// Returns '' if the file cannot be read or no name is recoverable.
+export function extractCompanyNameFromMetadataFile(filePath: string): string {
+  try {
+    if (!fs.existsSync(filePath)) return '';
+    const buf = fs.readFileSync(filePath);
+    const text = buf.toString('utf16le').replace(/[^\x20-\x7Eऀ-ॿ]/g, ' ').trim();
+    const match = text.match(/[A-Za-zऀ-ॿ][\w\sऀ-ॿ.&(),-]{2,}/);
+    return match ? match[0].trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+// Describes a discovered company and its load-readiness — the structured shape returned by
+// list-available-companies. A caller (LLM or human) gets enough context here to:
+//   - decide which company to load (folderId / displayName)
+//   - know whether data files are present (hasData) before risking a load
+//   - know whether to prompt the human for credentials (requiresCredentials)
+//   - deal with both layouts: traditional <data>/<id>/Company.900 and Edit Log's <data>/<id>/<id>/Company.1800
+export type AvailableCompany = {
+  folderId: string;
+  folderPath: string;
+  displayName: string;
+  hasData: boolean;
+  dataFilePath: string | null;
+  requiresCredentials: boolean | null;  // null = unknown; only true/false when the credential-hint config is present
+  knownUsername: string | null;
+  notes: string;
+};
+
+// Optional credential-hint config. Mapping of folder id → known credential metadata.
+// Allows callers to know up-front whether to ask the human for credentials (issue #16, piece C).
+// Path: <dataPath>/.tally-mcp-companies.json by default, or override via TALLY_COMPANIES_CONFIG env var.
+// Format:
+//   {
+//     "100000": { "requiresCredentials": true,  "knownUsername": "admin", "notes": "Edit Log w/ user-based security" },
+//     "200000": { "requiresCredentials": false, "notes": "Auto-loads cleanly" }
+//   }
+// We never store passwords here — only the hint that one is needed.
+export type CompaniesConfig = {
+  [folderId: string]: {
+    requiresCredentials?: boolean;
+    knownUsername?: string;
+    notes?: string;
+  };
+};
+
+export function loadCompaniesConfig(configPath: string): CompaniesConfig {
+  try {
+    if (!fs.existsSync(configPath)) return {};
+    const raw = fs.readFileSync(configPath, 'utf-8').replace(/^﻿/, '');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as CompaniesConfig;
+    return {};
+  } catch {
+    return {};
+  }
+}
+
+// Recursively scans a Tally data directory for company folders and extracts everything we can
+// without touching Tally itself. Handles both layouts:
+//   - Stock Tally Prime: <data>/<id>/Company.900
+//   - Tally Prime Edit Log: <data>/<id>/<id>/Company.1800   (data files one level deeper)
+//
+// Returns one entry per top-level digit-named folder (the canonical "company id"), with a
+// `dataFilePath` pointing at the first .900/.1800 found anywhere in the tree (we walk depth-first
+// up to maxDepth=3 to bound cost on pathological filesystems). hasData=false means the folder
+// exists but no Company.* metadata file was found — usually indicates an empty placeholder.
+//
+// If `configPath` is supplied, credential-hint metadata from that JSON file is merged into the
+// output so callers can short-circuit credential prompting for known-clean companies.
+export function scanAvailableCompanies(
+  dataPath: string,
+  configPath?: string
+): AvailableCompany[] {
+  if (!fs.existsSync(dataPath)) return [];
+
+  const config = configPath ? loadCompaniesConfig(configPath) : {};
+
+  const findMetadataFile = (root: string, maxDepth: number): { metaPath: string; layout: 'flat' | 'nested' } | null => {
+    // BFS down to maxDepth, looking for Company.900 or Company.1800. Return first hit + layout
+    // marker (depth 0 = flat layout, depth >= 1 = nested layout, e.g. Edit Log).
+    type Frame = { dir: string; depth: number };
+    const queue: Frame[] = [{ dir: root, depth: 0 }];
+    while (queue.length) {
+      const { dir, depth } = queue.shift()!;
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        if (entry.isFile() && /^Company\.(900|1800)$/i.test(entry.name)) {
+          return { metaPath: path.join(dir, entry.name), layout: depth === 0 ? 'flat' : 'nested' };
+        }
+      }
+      if (depth < maxDepth) {
+        for (const entry of entries) {
+          if (entry.isDirectory()) queue.push({ dir: path.join(dir, entry.name), depth: depth + 1 });
+        }
+      }
+    }
+    return null;
+  };
+
+  const entries = fs.readdirSync(dataPath, { withFileTypes: true });
+  return entries
+    .filter(e => e.isDirectory() && /^\d+$/.test(e.name))
+    .map(e => {
+      const folderPath = path.join(dataPath, e.name);
+      const found = findMetadataFile(folderPath, 3);
+      const displayName = found ? extractCompanyNameFromMetadataFile(found.metaPath) : '';
+
+      const hint = config[e.name] || {};
+      const requiresCredentials = typeof hint.requiresCredentials === 'boolean' ? hint.requiresCredentials : null;
+      const knownUsername = typeof hint.knownUsername === 'string' && hint.knownUsername.length > 0 ? hint.knownUsername : null;
+
+      const notesPieces: string[] = [];
+      if (found?.layout === 'nested') notesPieces.push('Edit Log nested layout (data one level deep)');
+      if (typeof hint.notes === 'string' && hint.notes.length > 0) notesPieces.push(hint.notes);
+      if (!found) notesPieces.push('No Company.900/.1800 found — likely empty/placeholder folder');
+
+      return {
+        folderId: e.name,
+        folderPath,
+        displayName,
+        hasData: !!found,
+        dataFilePath: found ? found.metaPath : null,
+        requiresCredentials,
+        knownUsername,
+        notes: notesPieces.join('; ')
+      };
+    });
+}
+
 // Resolves a user-supplied company identifier (folder id like "100000", or company name like "Ross Industries") to a unique folder id.
 // Pure function — no filesystem access. Caller passes the folder list from scanCompanyFolders().
 //
@@ -166,6 +306,119 @@ export function resolveCompanyInput(input: string, folders: Array<{ folder: stri
   }
   if (nameMatches.length > 1) return { kind: 'ambiguous', matches: nameMatches };
   return { kind: 'not-found', available: folders };
+}
+
+// Resolves the configured Tally edition from env var. Defaults to "silver" — safer assumption since
+// Silver is more restrictive (single company resident); Gold treated as Silver still works, just slower than necessary.
+// Anything other than "gold" (case-insensitive) is treated as Silver.
+export function getTallyEdition(rawValue: string | undefined = process.env.TALLY_EDITION): 'silver' | 'gold' {
+  return String(rawValue || '').trim().toLowerCase() === 'gold' ? 'gold' : 'silver';
+}
+
+// Minimum GUI-agent version this server is willing to talk to. Bumped whenever load-company
+// or open-company-debug start to depend on a new IPC field/action that older agents won't
+// recognize. The agent reports its version on every response (see Write-Result in
+// tally-gui-agent-v2.ps1). If a deploy ships a server expecting a newer agent than is running,
+// we fail fast with a clear message instead of letting the agent silently no-op on unknown
+// fields. (issue #15 - version handshake, option D).
+export const REQUIRED_AGENT_VERSION = '1.1.0';
+
+// Compares two MAJOR.MINOR.PATCH version strings. Returns true if `actual` is at least `required`.
+// Missing/unparseable segments are treated as 0 — so "1" >= "1.0.0", "1.2" >= "1.1.99", etc.
+// Non-numeric suffixes like "1.1.0-rc1" compare by their numeric prefix only ("1.1.0").
+export function isAgentVersionAtLeast(actual: string | null | undefined, required: string): boolean {
+  if (!actual) return false;
+  const parse = (v: string) => v.split('.').map(s => {
+    const m = s.match(/^\d+/);
+    return m ? Number(m[0]) : 0;
+  });
+  const a = parse(actual);
+  const r = parse(required);
+  const len = Math.max(a.length, r.length);
+  for (let i = 0; i < len; i++) {
+    const ai = a[i] ?? 0;
+    const ri = r[i] ?? 0;
+    if (ai > ri) return true;
+    if (ai < ri) return false;
+  }
+  return true;
+}
+
+// Result returned from callGuiAgent. Includes the agent-reported version when present, so callers
+// can do version-handshake checks (load-company refuses if too old, open-company-debug surfaces it).
+export type GuiAgentResponse = {
+  status: string;
+  message: string;
+  agentVersion: string | null;
+  raw: Record<string, any>;
+};
+
+// Sends a command to the GUI agent (running in the user's desktop session) via the JSON file IPC pattern,
+// and waits for a matching response. Returns the agent's response or null on timeout.
+// Used to bridge Session 0 isolation — the MCP service can't spawn GUI apps directly when running as a service.
+async function callGuiAgent(
+  action: string,
+  payload: Record<string, any>,
+  timeoutSec: number,
+  dataPath: string,
+  logs: string[]
+): Promise<GuiAgentResponse | null> {
+  const commandFile = path.join(dataPath, '_mcp_gui_command.json');
+  const resultFile = path.join(dataPath, '_mcp_gui_result.json');
+  const commandId = createGuiAgentCommandId(action);
+
+  try { fs.unlinkSync(resultFile); } catch {}
+  const command = JSON.stringify({ action, ...payload, commandId, timestamp: new Date().toISOString() });
+  fs.writeFileSync(commandFile, command, 'utf-8');
+  logs.push(`  [gui-agent] sent action=${action} commandId=${commandId}, waiting up to ${timeoutSec}s`);
+
+  for (let i = 0; i < timeoutSec; i++) {
+    await sleep(1000);
+    if (!fs.existsSync(resultFile)) continue;
+    try {
+      // Strip leading BOM defensively — PowerShell's [Encoding]::UTF8 emits a BOM that breaks JSON.parse.
+      const resultText = fs.readFileSync(resultFile, 'utf-8').replace(/^﻿/, '');
+      const result = JSON.parse(resultText);
+      if (!isMatchingGuiAgentCommand(result, commandId)) {
+        logs.push(`  [gui-agent] ignoring stale response for commandId ${result?.commandId || 'unknown'}`);
+        try { fs.unlinkSync(resultFile); } catch {}
+        continue;
+      }
+      const versionStr = typeof result.agentVersion === 'string' ? result.agentVersion : null;
+      logs.push(`  [gui-agent] response: status=${result.status} message=${result.message}${versionStr ? ` agentVersion=${versionStr}` : ''}`);
+      try { fs.unlinkSync(resultFile); } catch {}
+      return {
+        status: String(result.status || ''),
+        message: String(result.message || ''),
+        agentVersion: versionStr,
+        raw: result
+      };
+    } catch {
+      try { fs.unlinkSync(resultFile); } catch {}
+    }
+  }
+  logs.push(`  [gui-agent] no response within ${timeoutSec}s`);
+  return null;
+}
+
+// Result of a GUI-agent ping: alive + version + whether version meets the server's required minimum.
+// `versionOk=false` when alive=true means the agent is running but too old — load-company refuses
+// in that case rather than risk silent no-ops on unrecognized IPC fields.
+export type GuiAgentPingResult = {
+  alive: boolean;
+  agentVersion: string | null;
+  versionOk: boolean;
+};
+
+// Lightweight ping to confirm the GUI agent is alive. Returns its version if reachable.
+// Used as a pre-flight in load-company so we never kill Tally without confirming we can bring it back.
+async function pingGuiAgent(dataPath: string, timeoutSec = 4, logs: string[] = []): Promise<GuiAgentPingResult> {
+  const resp = await callGuiAgent('ping', {}, timeoutSec, dataPath, logs);
+  if (!resp || resp.status !== 'success') {
+    return { alive: false, agentVersion: null, versionOk: false };
+  }
+  const versionOk = isAgentVersionAtLeast(resp.agentVersion, REQUIRED_AGENT_VERSION);
+  return { alive: true, agentVersion: resp.agentVersion, versionOk };
 }
 
 // Polls the Tally XML server until it responds successfully, or timeout elapses.
@@ -304,6 +557,55 @@ export async function registerMcpServer(): Promise<McpServer> {
       } catch (err) {
         auditLog('list-companies', args, 'error', Date.now() - start);
         throw err;
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'list-available-companies',
+    {
+      title: 'List Available Companies',
+      description: `discovers companies on disk with enough metadata to drive a load-company call without trial and error. Returns one row per digit-named folder under the Tally data directory, with: folderId, folderPath, displayName (extracted from Company.900 / Company.1800), hasData (whether any company metadata file was found), dataFilePath, requiresCredentials (null if unknown, true/false if a credential-hint config exists), knownUsername, notes. Handles both layouts: stock Tally Prime (<data>/<id>/Company.900) and Tally Prime Edit Log (<data>/<id>/<id>/Company.1800 — one level deeper). Recursively walks each folder up to depth 3 so an LLM doesn't get fooled into thinking nested-layout folders are empty. CREDENTIAL HINTS: optional config file at <dataPath>/.tally-mcp-companies.json (or override via TALLY_COMPANIES_CONFIG env var) maps folder id → { requiresCredentials, knownUsername, notes }. The config never stores passwords; it only signals "the human will need to supply credentials before load-company succeeds for this folder." Use this tool BEFORE load-company instead of trying random folder ids and waiting for failures.`,
+      inputSchema: {
+        dataPath: z.string().optional().describe('override the data path to scan. By default, this is the value of TALLY_DATA_PATH env var; falls back to the documented Edit Log default. Pass an explicit path when scanning a backup folder or a secondary drive.'),
+        configPath: z.string().optional().describe('override the credentials-hint config path. Default is <dataPath>/.tally-mcp-companies.json (or TALLY_COMPANIES_CONFIG env if set).')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      try {
+        const tallyDataPath = args.dataPath || process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        if (!fs.existsSync(tallyDataPath)) {
+          auditLog('list-available-companies', args, 'error', Date.now() - start);
+          return { isError: true, content: [{ type: 'text', text: `Data directory not found: ${tallyDataPath}` }] };
+        }
+        const configPath = args.configPath
+          || process.env.TALLY_COMPANIES_CONFIG
+          || path.join(tallyDataPath, '.tally-mcp-companies.json');
+        const companies = scanAvailableCompanies(tallyDataPath, configPath);
+
+        if (companies.length === 0) {
+          auditLog('list-available-companies', args, 'success', Date.now() - start);
+          return { content: [{ type: 'text', text: `No company folders found in ${tallyDataPath}.` }] };
+        }
+
+        const summary = {
+          dataPath: tallyDataPath,
+          configPath: fs.existsSync(configPath) ? configPath : `${configPath} (not present — credential hints unavailable)`,
+          companies
+        };
+        auditLog('list-available-companies', args, 'success', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify(summary, null, 2) }] };
+      } catch (err) {
+        auditLog('list-available-companies', args, 'error', Date.now() - start);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `list-available-companies failed: ${err}` }]
+        };
       }
     }
   );
@@ -471,7 +773,7 @@ export async function registerMcpServer(): Promise<McpServer> {
             await new Promise(resolve => setTimeout(resolve, 1000));
             if (fs.existsSync(resultFile)) {
               try {
-                const pingResult = JSON.parse(fs.readFileSync(resultFile, 'utf-8'));
+                const pingResult = JSON.parse(fs.readFileSync(resultFile, 'utf-8').replace(/^﻿/, ''));
                 if (isMatchingGuiAgentCommand(pingResult, pingCommandId)) {
                   agentAlive = true;
                   try { fs.unlinkSync(resultFile); } catch {}
@@ -510,7 +812,7 @@ export async function registerMcpServer(): Promise<McpServer> {
             await new Promise(resolve => setTimeout(resolve, 1000));
             if (fs.existsSync(resultFile)) {
               try {
-                const resultText = fs.readFileSync(resultFile, 'utf-8');
+                const resultText = fs.readFileSync(resultFile, 'utf-8').replace(/^﻿/, '');
                 const result = JSON.parse(resultText);
                 if (!isMatchingGuiAgentCommand(result, commandId)) {
                   logs.push(`  Ignoring stale response for commandId ${result?.commandId || 'unknown'}.`);
@@ -632,6 +934,7 @@ export async function registerMcpServer(): Promise<McpServer> {
           anthropicKeySet: !!process.env.ANTHROPIC_API_KEY,
           configuredTimeoutSeconds: getOpenCompanyGuiTimeoutSeconds(),
           configuredMaxSteps: getOpenCompanyGuiMaxSteps(),
+          tallyEdition: getTallyEdition(),
           activeCompany: activeCompany || null
         };
 
@@ -650,9 +953,23 @@ export async function registerMcpServer(): Promise<McpServer> {
           };
         }
 
+        // Live probe of the GUI agent — separate from "is the script file present" since the agent could
+        // be installed but not running (the most common Session 0 misconfiguration).
+        const guiAgentLogs: string[] = [];
+        const agentPing = await pingGuiAgent(tallyDataPath, 4, guiAgentLogs);
+        report.guiAgentResponding = agentPing.alive;
+        report.guiAgentVersion = agentPing.agentVersion;
+        report.guiAgentVersionRequired = REQUIRED_AGENT_VERSION;
+        report.guiAgentVersionOk = agentPing.versionOk;
+        if (!agentPing.alive) {
+          report.guiAgentHint = 'Agent did not respond to ping. Start tally-gui-agent-v2.ps1 in the user session (Task Scheduler at logon is recommended; setup-windows.ps1 registers the task as TallyMCPAgent).';
+        } else if (!agentPing.versionOk) {
+          report.guiAgentHint = `Agent is running but reports version ${agentPing.agentVersion ?? '(none)'}, older than the server's required minimum ${REQUIRED_AGENT_VERSION}. Restart the agent to pick up the on-disk update (the agent self-restarts on script change unless launched with -NoSelfRestart; otherwise: 'schtasks /End /TN TallyMCPAgent; schtasks /Run /TN TallyMCPAgent').`;
+        }
+
         if (args.includeRecentResult && fs.existsSync(resultFile)) {
           try {
-            report.recentResult = JSON.parse(fs.readFileSync(resultFile, 'utf-8'));
+            report.recentResult = JSON.parse(fs.readFileSync(resultFile, 'utf-8').replace(/^﻿/, ''));
           } catch (err) {
             report.recentResult = { parseError: String(err) };
           }
@@ -673,10 +990,52 @@ export async function registerMcpServer(): Promise<McpServer> {
   );
 
   mcpServer.registerTool(
+    'tally-raw-xml-probe',
+    {
+      title: 'Tally Raw XML Probe (debug only)',
+      description: `Posts a raw XML envelope to the Tally XML server and returns the raw response — bypasses all wrapper logic. Used for protocol reverse-engineering and undocumented verb discovery. NOT for normal use; the wrapped tools (list-master, trial-balance, etc.) construct XML safely. Disabled unless TALLY_DEBUG_XML=1 is set in the server env.`,
+      inputSchema: {
+        xml: z.string().describe('raw XML envelope to POST to the Tally XML server. Standard structure: <ENVELOPE><HEADER>...</HEADER><BODY>...</BODY></ENVELOPE>.'),
+        label: z.string().optional().describe('optional label included in the audit log so probes can be correlated to experiment notes (e.g. "H1-import-variant").')
+      },
+      annotations: {
+        readOnlyHint: false,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      const auditArgs = { xmlLength: args.xml.length, label: args.label };
+      if (process.env.TALLY_DEBUG_XML !== '1') {
+        auditLog('tally-raw-xml-probe', auditArgs, 'denied', Date.now() - start);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: 'Disabled. Set TALLY_DEBUG_XML=1 in the server env to enable raw XML probes.' }]
+        };
+      }
+      try {
+        const resp = await postTallyXML(args.xml);
+        auditLog('tally-raw-xml-probe', { ...auditArgs, respLength: resp.length }, 'success', Date.now() - start);
+        const cap = 50000;
+        const body = resp.length > cap ? `${resp.slice(0, cap)}\n\n[TRUNCATED — full length ${resp.length} chars]` : resp;
+        return {
+          content: [{ type: 'text', text: `[response: ${resp.length} chars in ${Date.now() - start}ms${args.label ? `, label="${args.label}"` : ''}]\n\n${body}` }]
+        };
+      } catch (err) {
+        auditLog('tally-raw-xml-probe', auditArgs, 'error', Date.now() - start);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `tally-raw-xml-probe failed: ${err}` }]
+        };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
     'list-loaded-companies',
     {
       title: 'List Loaded Companies',
-      description: `lists companies currently loaded in Tally Prime (i.e. accessible right now without an open-company call). Use this before set-active-company to confirm the target is loaded. Different from list-companies, which enumerates company folders on disk regardless of whether they are loaded.`,
+      description: `lists companies currently loaded in Tally Prime (i.e. accessible right now without an open-company call). Use this before set-active-company to confirm the target is loaded. Different from list-companies, which enumerates company folders on disk regardless of whether they are loaded. NOTE: on Silver edition (TALLY_EDITION=silver), Tally allows only one company resident at any time — this list will have at most 1 entry. On Gold, multiple entries can coexist.`,
       inputSchema: {},
       annotations: {
         readOnlyHint: true,
@@ -747,12 +1106,14 @@ export async function registerMcpServer(): Promise<McpServer> {
     'load-company',
     {
       title: 'Load Company (via Tally Restart)',
-      description: `loads a company into Tally Prime by editing tally.ini and restarting Tally. Use this when the target company is NOT in list-loaded-companies. Slow (~10-30s for restart) but reliable — bypasses the XML-API limitation that no company-load verb exists. Accepts either a folder ID (e.g. "100000") or a company name (e.g. "Ross Industries"); resolves names by reading Company.900 from each folder. If multiple folders share a name, returns an ambiguity error listing folder IDs so you can re-call with the specific ID. Existing loaded companies are preserved by default (additive). Once loaded, use set-active-company to switch cheaply between loaded companies. Requires the MCP service process to have write access to tally.ini and permission to start tally.exe in the user's desktop session.`,
+      description: `loads a company into Tally Prime by editing tally.ini and restarting Tally. Use this when the target company is NOT in list-loaded-companies. Slow (~10-30s for restart) but reliable — Tally has no XML primitive for loading from disk, so a restart is the only option. Accepts either a folder ID (e.g. "100000") or a company name (e.g. "Ross Industries"); resolves names by reading Company.900 from each folder. If multiple folders share a name, returns an ambiguity error listing folder IDs so you can re-call with the specific ID. EDITION-AWARE: on Silver (set TALLY_EDITION=silver), this is always a SWAP — the new company replaces any current one (Silver allows only one company resident). On Gold (TALLY_EDITION=gold), additive by default; pass replace=true to force a swap. Requires the GUI agent (tally-gui-agent-v2.ps1) running in the user's interactive session — the tool pings it before doing anything destructive and refuses to kill Tally if the agent is unreachable. After the restart, the tool verifies the requested company actually appears in the loaded list. CREDENTIAL HANDLING: if Tally's auto-load fails because the company is password-protected (common with Edit Log boxes — Tally drops to Select Company because it can't bypass the credential prompt), pass userName + password and the tool will use the GUI agent to deterministically keystroke through the Select Company → credentials prompt → Gateway sequence. Credentials are filtered from audit logs.`,
       inputSchema: {
         company: z.string().describe('folder ID (digits only, e.g. "100000") OR company name as stored in Company.900 (e.g. "Ross Industries"). Use list-companies to see both.'),
         waitTimeoutSec: z.number().optional().describe('seconds to wait for the Tally XML server to come back up after restart. Default 60.'),
         replace: z.boolean().optional().describe('if true, only this company is loaded — all other Load= lines are removed from tally.ini. Default false (additive).'),
-        dataPath: z.string().optional().describe('override the data path to scan for company folders. By default, this is read from tally.ini\'s Data= directive (the same path Tally itself uses). Pass this only when you know the data lives somewhere different — e.g. a backup folder or a secondary drive.')
+        dataPath: z.string().optional().describe('override the data path to scan for company folders. By default, this is read from tally.ini\'s Data= directive (the same path Tally itself uses). Pass this only when you know the data lives somewhere different — e.g. a backup folder or a secondary drive.'),
+        userName: z.string().optional().describe('Tally username for the company (if user-based security is enabled). Used by the GUI agent to keystroke through the credential prompt when auto-load is blocked by Tally\'s login dialog. Filtered from audit logs.'),
+        password: z.string().optional().describe('Tally password for the company. Filtered from audit logs. Lives in the IPC file briefly during the call (~5s) — acceptable on a single-user box, document carefully if multi-user.')
       },
       annotations: {
         readOnlyHint: false,
@@ -764,7 +1125,9 @@ export async function registerMcpServer(): Promise<McpServer> {
       const logs: string[] = [];
       const company = args.company;
       const timeoutMs = (args.waitTimeoutSec ?? 60) * 1000;
-      const replace = !!args.replace;
+      const edition = getTallyEdition();
+      // Silver allows only one company resident, so any "add" semantics are meaningless — force replace.
+      const replace = edition === 'silver' ? true : !!args.replace;
       const tallyIniPath = process.env.TALLY_INI_PATH || 'C:\\Program Files\\TallyPrimeEditLog\\tally.ini';
       const tallyExePath = process.env.TALLY_EXE_PATH || 'C:\\Program Files\\TallyPrimeEditLog\\tally.exe';
       try {
@@ -806,9 +1169,34 @@ export async function registerMcpServer(): Promise<McpServer> {
           return { isError: true, content: [{ type: 'text', text: `Multiple companies match the name "${company}":\n${list}\n\nRe-call load-company with the specific folder id (e.g. company: "${resolved.matches[0].folder}") to disambiguate.` }] };
         }
         const companyId = resolved.folderId;
-        logs.push(`[load-company] input="${company}" matchedBy=${resolved.matchedBy} folderId=${companyId} companyName="${resolved.companyName}" replace=${replace}`);
+        logs.push(`[load-company] input="${company}" matchedBy=${resolved.matchedBy} folderId=${companyId} companyName="${resolved.companyName}" edition=${edition} replace=${replace}${edition === 'silver' && args.replace === false ? ' (Silver: replace forced true)' : ''}`);
         logs.push(`  tallyIni=${tallyIniPath}`);
         logs.push(`  dataPath=${tallyDataPath} (source: ${dataPathSource})`);
+
+        // Pre-flight: confirm the GUI agent is alive BEFORE we kill Tally. If we kill without an agent
+        // to bring it back, the box is left in a worse state than it started.
+        const agentWatchDir = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        logs.push('  Pinging GUI agent (must be alive before we kill Tally)...');
+        const agentPing = await pingGuiAgent(agentWatchDir, 4, logs);
+        if (!agentPing.alive) {
+          auditLog('load-company', args, 'error', Date.now() - start);
+          return {
+            isError: true,
+            content: [{ type: 'text', text: logs.join('\n') + `\n\nGUI agent did not respond at ${agentWatchDir}. Refusing to kill Tally without confirming we can restart it.\n\nTo fix: start tally-gui-agent-v2.ps1 in the user's interactive session (e.g. via Task Scheduler "At logon"). Then retry.` }]
+          };
+        }
+        // Version handshake: refuse to call select-and-unlock-company / start-tally on an agent that
+        // predates the IPC fields they rely on. Better to fail fast here than silently mis-key
+        // credentials into a stale agent. (issue #15 - option D)
+        if (!agentPing.versionOk) {
+          auditLog('load-company', args, 'error', Date.now() - start);
+          const reportedVersion = agentPing.agentVersion ?? '(none reported)';
+          return {
+            isError: true,
+            content: [{ type: 'text', text: logs.join('\n') + `\n\nGUI agent is alive but reports version ${reportedVersion}, which is older than the required minimum ${REQUIRED_AGENT_VERSION}. The agent on disk has been updated by a deploy but the running process is stale.\n\nTo fix: stop and restart the agent (Task Scheduler: 'schtasks /End /TN TallyMCPAgent && schtasks /Run /TN TallyMCPAgent'), or just close + relaunch the PowerShell window. The agent self-restarts when its script changes; this only happens if it has been disabled with -NoSelfRestart.` }]
+          };
+        }
+        logs.push(`    GUI agent is alive (version ${agentPing.agentVersion ?? '(unknown)'}).`);
 
         const currentLoads = parseTallyIniLoads(ini);
         logs.push(`  Current Load= entries: ${currentLoads.length === 0 ? '(none)' : currentLoads.join(', ')}`);
@@ -835,15 +1223,19 @@ export async function registerMcpServer(): Promise<McpServer> {
         }
         await sleep(2000);
 
-        // Start Tally — uses cmd /c start so the process is detached from this Node process.
-        // Caveat: if the MCP service runs in Windows Session 0, the spawned tally.exe will also be in Session 0
-        // and have no desktop. The service must run in the user's interactive session for the GUI to appear.
-        logs.push(`  Starting Tally (${tallyExePath})...`);
-        try {
-          execSync(`cmd /c start "" "${tallyExePath}"`, { timeout: 5000, windowsHide: true });
-          logs.push('    Spawn command issued.');
-        } catch (err) {
-          logs.push(`    Spawn failed: ${err}`);
+        // Start Tally via the GUI agent IPC. The MCP service typically runs in Windows Session 0 (no desktop),
+        // so it can't spawn GUI apps directly. The agent (tally-gui-agent-v2.ps1) runs in the interactive
+        // user session and does the Start-Process on our behalf.
+        // The agent's watch directory comes from TALLY_DATA_PATH env (same as the agent's startup logic) —
+        // it must match what the agent is watching, NOT what tally.ini's Data= says (those can differ).
+        logs.push(`  Starting Tally via GUI agent (${tallyExePath})...`);
+        const agentResp = await callGuiAgent('start-tally', { exePath: tallyExePath, waitSec: 30 }, 35, agentWatchDir, logs);
+        if (!agentResp) {
+          logs.push('    GUI agent did not respond — is tally-gui-agent-v2.ps1 running in the user session?');
+        } else if (agentResp.status !== 'success') {
+          logs.push(`    GUI agent reported failure: ${agentResp.message}`);
+        } else {
+          logs.push(`    GUI agent reports Tally window detected.`);
         }
 
         // Poll XML server until ready (or timeout)
@@ -857,23 +1249,66 @@ export async function registerMcpServer(): Promise<McpServer> {
           };
         }
 
-        // Verify the company actually loaded — match by id substring against loaded company names
-        const loaded = await listLoadedCompanies();
-        logs.push(`  Loaded companies after restart: ${loaded.length === 0 ? '(none)' : loaded.join(', ')}`);
-        // We don't know the company *name* from just the folder id, so we accept "any company loaded" as success here.
-        // The caller should follow up with list-loaded-companies + set-active-company to pick the right one by name.
-
-        if (loaded.length > 0 && newLoads.includes(companyId)) {
-          // Best-effort: if there's only one loaded company and we requested only one, set it active.
-          if (loaded.length === 1) {
-            activeCompany = loaded[0];
-            logs.push(`  Set activeCompany = "${loaded[0]}".`);
-          }
+        // Verify load: Tally silently skips auto-load when data is missing/empty or password-protected,
+        // so XML reachability alone isn't proof of success. We need the requested company to appear in the loaded list.
+        const expectedName = resolved.companyName.trim();
+        let loaded = await listLoadedCompanies();
+        if (expectedName && !loaded.some(n => n.toLowerCase() === expectedName.toLowerCase())) {
+          await sleep(2000);
+          loaded = await listLoadedCompanies();
         }
+        logs.push(`  Loaded companies after restart: ${loaded.length === 0 ? '(none)' : loaded.join(', ')}`);
+
+        let verified = expectedName
+          ? loaded.some(n => n.toLowerCase() === expectedName.toLowerCase())
+          : loaded.length > 0;
+
+        // Credential fallback: if auto-load failed AND credentials were provided, ask the GUI agent
+        // to keystroke through the Select Company dialog + credential prompt. This handles user-based
+        // security where Tally drops to Select Company because the credential dialog blocked auto-load.
+        if (!verified && (args.userName || args.password)) {
+          logs.push('  Auto-load did not complete — likely blocked by credential prompt. Trying keystroke fallback via GUI agent...');
+          const unlockResp = await callGuiAgent(
+            'select-and-unlock-company',
+            { companyId, userName: args.userName || '', password: args.password || '' },
+            20,
+            agentWatchDir,
+            logs
+          );
+          if (!unlockResp || unlockResp.status !== 'success') {
+            logs.push(`    GUI agent reported: ${unlockResp ? unlockResp.message : 'no response'}`);
+          }
+          // Re-verify after keystrokes settle
+          await sleep(3000);
+          loaded = await listLoadedCompanies();
+          logs.push(`  Loaded companies after keystroke fallback: ${loaded.length === 0 ? '(none)' : loaded.join(', ')}`);
+          verified = expectedName
+            ? loaded.some(n => n.toLowerCase() === expectedName.toLowerCase())
+            : loaded.length > 0;
+        }
+
+        if (!verified) {
+          auditLog('load-company', args, 'error', Date.now() - start);
+          const hint = (args.userName || args.password)
+            ? 'Even with credentials, the company did not load. Verify the username/password are correct, and that the company is reachable via Alt+F3 → type id → Enter manually.'
+            : 'If the company is password-protected, retry with userName and password arguments to use the keystroke fallback.';
+          return {
+            isError: true,
+            content: [{ type: 'text', text: logs.join('\n') + `\n\nTally restarted but the requested company is not in the loaded list. ${hint}` }]
+          };
+        }
+
+        // Pick activeCompany: prefer the verified name match; fall back to the only loaded company on Silver/single-load setups.
+        if (expectedName && loaded.some(n => n.toLowerCase() === expectedName.toLowerCase())) {
+          activeCompany = loaded.find(n => n.toLowerCase() === expectedName.toLowerCase()) || expectedName;
+        } else if (loaded.length === 1) {
+          activeCompany = loaded[0];
+        }
+        if (activeCompany) logs.push(`  Set activeCompany = "${activeCompany}".`);
 
         auditLog('load-company', args, 'success', Date.now() - start);
         return {
-          content: [{ type: 'text', text: logs.join('\n') + `\n\nTally is back up with ${loaded.length} loaded company/companies. Use list-loaded-companies to see names, then set-active-company to target the one you want.` }]
+          content: [{ type: 'text', text: logs.join('\n') + `\n\nTally is back up with ${loaded.length} loaded company/companies (edition: ${edition}). Active company: ${activeCompany || '(unset)'}.` }]
         };
       } catch (err) {
         auditLog('load-company', args, 'error', Date.now() - start);

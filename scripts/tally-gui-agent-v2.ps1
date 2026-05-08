@@ -1,17 +1,25 @@
-# MCP Tally GUI Agent v2 — LLM-Guided (Computer Use style)
+# MCP Tally GUI Agent v2 - LLM-Guided (Computer Use style)
 # Takes screenshots of the Tally window, sends to an LLM for analysis,
 # executes the LLM's recommended action, and loops until the goal is achieved.
 #
 # RUN: In the interactive desktop session where Tally is visible
 #   powershell -ExecutionPolicy Bypass -File tally-gui-agent-v2.ps1
 #
-# REQUIRES: ANTHROPIC_API_KEY or OPENAI_API_KEY in environment
+# REQUIRES: ANTHROPIC_API_KEY or OPENAI_API_KEY in environment (optional - only for LLM-guided actions)
 
 param(
     [string]$WatchDir = $null,
     [string]$LLMProvider = $null,   # "anthropic" or "openai" (auto-detected from available API key)
-    [int]$MaxSteps = 15             # Safety limit per command
+    [int]$MaxSteps = 15,            # Safety limit per command
+    [switch]$NoSelfRestart          # Disable self-watching auto-restart (for debugging)
 )
+
+# --- Agent version (bumped whenever the IPC contract or script behavior changes) ---
+# The MCP server reads this from the ping response and refuses load-company calls
+# against an agent older than its required minimum (issue #15 - version handshake).
+# Format: MAJOR.MINOR.PATCH. Bump MINOR on any new IPC action or response field;
+# bump PATCH on internal fixes that callers can ignore.
+$Script:AgentVersion = "1.1.0"
 
 if (-not $WatchDir) {
     $WatchDir = if ($env:TALLY_DATA_PATH) { $env:TALLY_DATA_PATH } else { "C:\Users\Public\TallyPrimeEditLog\data" }
@@ -20,16 +28,16 @@ if (-not $WatchDir) {
 $CommandFile = Join-Path $WatchDir "_mcp_gui_command.json"
 $ResultFile  = Join-Path $WatchDir "_mcp_gui_result.json"
 
-# --- Detect LLM provider ---
+# --- Detect LLM provider (optional) ---
+# Deterministic actions (ping, start-tally, exit) work without any LLM key.
+# Only LLM-guided actions (select-company, load-on-startup) require a key - those error at dispatch time
+# if the key is missing, instead of refusing to start the agent.
 if (-not $LLMProvider) {
     if ($env:ANTHROPIC_API_KEY) { $LLMProvider = "anthropic" }
     elseif ($env:OPENAI_API_KEY) { $LLMProvider = "openai" }
-    else {
-        Write-Host "[ERROR] Set ANTHROPIC_API_KEY or OPENAI_API_KEY environment variable."
-        exit 1
-    }
+    else { $LLMProvider = "none" }
 }
-Write-Host "LLM Provider: $LLMProvider"
+Write-Host "LLM Provider: $LLMProvider$(if ($LLMProvider -eq 'none') { ' (LLM-guided actions disabled - set ANTHROPIC_API_KEY or OPENAI_API_KEY to enable)' })"
 
 # --- Configurable LLM settings (override via environment variables) ---
 $ClaudeModel   = if ($env:CLAUDE_MODEL)        { $env:CLAUDE_MODEL }        else { "claude-sonnet-4-20250514" }
@@ -95,7 +103,7 @@ IMPORTANT RULES:
 - Return EXACTLY ONE action per response
 - If the goal appears achieved (company is loaded, shown in title bar or Gateway), return {"action":"done","reason":"..."}
 - If stuck after multiple attempts, return {"action":"fail","reason":"..."}
-- Be precise with text — company names are case-sensitive in Tally
+- Be precise with text - company names are case-sensitive in Tally
 
 RESPOND WITH ONLY A JSON OBJECT, no other text:
 {"action":"<action_type>","value":"<value>","reason":"<brief explanation>"}
@@ -284,16 +292,64 @@ function Execute-Action {
 }
 
 function Write-Result {
-    param([string]$Status, [string]$Message, [string]$Strategy, [string]$CommandId = "")
-    $result = @{
-        status    = $Status
-        message   = $Message
-        strategy  = $Strategy
-        commandId = $CommandId
-        timestamp = (Get-Date -Format "o")
-    } | ConvertTo-Json -Depth 3
-    [System.IO.File]::WriteAllText($ResultFile, $result, [System.Text.Encoding]::UTF8)
+    param(
+        [string]$Status,
+        [string]$Message,
+        [string]$Strategy,
+        [string]$CommandId = "",
+        [hashtable]$Extra = $null
+    )
+    $payload = [ordered]@{
+        status       = $Status
+        message      = $Message
+        strategy     = $Strategy
+        commandId    = $CommandId
+        timestamp    = (Get-Date -Format "o")
+        agentVersion = $Script:AgentVersion
+    }
+    if ($Extra) {
+        foreach ($k in $Extra.Keys) { $payload[$k] = $Extra[$k] }
+    }
+    $result = $payload | ConvertTo-Json -Depth 3
+    # Write UTF-8 WITHOUT BOM. .NET's [Encoding]::UTF8 prepends a BOM, which breaks Node's JSON.parse on the read side.
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($ResultFile, $result, $utf8NoBom)
     Write-Host "[$Status] $Message (commandId: $CommandId)"
+}
+
+# Self-update detection: tracks the script's mtime at startup. If the file changes on disk
+# (e.g. a deploy.ps1 git pull replaced it), Test-ScriptUpdated returns true and the main
+# loop calls Restart-Self before the next command. Combined with Task Scheduler at-logon,
+# this is the agent-update story from issue #15.
+$Script:AgentScriptPath  = $PSCommandPath
+$Script:AgentScriptMTime = if (Test-Path -LiteralPath $Script:AgentScriptPath) {
+    (Get-Item -LiteralPath $Script:AgentScriptPath).LastWriteTimeUtc
+} else { $null }
+
+function Test-ScriptUpdated {
+    if ($NoSelfRestart) { return $false }
+    if (-not $Script:AgentScriptPath) { return $false }
+    if (-not (Test-Path -LiteralPath $Script:AgentScriptPath)) { return $false }
+    $current = (Get-Item -LiteralPath $Script:AgentScriptPath).LastWriteTimeUtc
+    if (-not $Script:AgentScriptMTime) { return $false }
+    return ($current -ne $Script:AgentScriptMTime)
+}
+
+function Restart-Self {
+    Write-Host "[self-restart] script changed on disk; re-launching new version..."
+    # Re-launch under the same powershell host with the same arguments. We pass -NoSelfRestart NOT,
+    # so the new process picks up its own mtime and watches from there.
+    $argList = @('-ExecutionPolicy', 'Bypass', '-NoProfile', '-File', $Script:AgentScriptPath)
+    if ($WatchDir)    { $argList += @('-WatchDir',    $WatchDir) }
+    if ($LLMProvider) { $argList += @('-LLMProvider', $LLMProvider) }
+    if ($MaxSteps)    { $argList += @('-MaxSteps',    [string]$MaxSteps) }
+    try {
+        Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -WindowStyle Normal | Out-Null
+    } catch {
+        Write-Host "[self-restart] Start-Process failed: $_  (this instance will keep running)"
+        return
+    }
+    exit 0
 }
 
 function Invoke-LLMGuidedAction {
@@ -396,21 +452,26 @@ function Invoke-LLMGuidedAction {
 
 # --- Main watch loop ---
 Write-Host "=== MCP Tally GUI Agent v2 (LLM-Guided) ==="
+Write-Host "Version:  $Script:AgentVersion"
 Write-Host "Watching: $CommandFile"
 Write-Host "Results:  $ResultFile"
 Write-Host "Provider: $LLMProvider"
 Write-Host "Max steps per command: $MaxSteps"
+Write-Host "Self-restart on script change: $(-not $NoSelfRestart)"
 Write-Host "Agent started. Polling every 500ms for commands..."
 
 while ($true) {
+    # Check if our own script file changed on disk between iterations. If so, the user/deploy
+    # has shipped a new agent version; re-launch into the new version and exit this process.
+    if (Test-ScriptUpdated) { Restart-Self }
     try {
-        # Atomically try to read and delete — avoids TOCTOU race with MCP server
+        # Atomically try to read and delete - avoids TOCTOU race with MCP server
         $cmdText = $null
         try {
             $cmdText = [System.IO.File]::ReadAllText($CommandFile, [System.Text.Encoding]::UTF8)
             Remove-Item $CommandFile -Force -ErrorAction SilentlyContinue
         } catch [System.IO.FileNotFoundException] {
-            # File doesn't exist — normal, just keep polling
+            # File doesn't exist - normal, just keep polling
         } catch [System.IO.DirectoryNotFoundException] {
             # Directory doesn't exist yet
         }
@@ -423,13 +484,121 @@ while ($true) {
 
             switch ($cmd.action) {
                 "select-company" {
-                    Invoke-LLMGuidedAction -CompanyName $cmd.companyName -Action "select-company" -CommandId $cmdId -MaxStepsOverride $cmdMaxSteps
+                    if ($LLMProvider -eq "none") {
+                        Write-Result -Status "error" -Message "select-company requires an LLM key (ANTHROPIC_API_KEY or OPENAI_API_KEY). Use load-company (tally.ini-driven) for LLM-free company loading." -Strategy "select-company" -CommandId $cmdId
+                    } else {
+                        Invoke-LLMGuidedAction -CompanyName $cmd.companyName -Action "select-company" -CommandId $cmdId -MaxStepsOverride $cmdMaxSteps
+                    }
                 }
                 "load-on-startup" {
-                    Invoke-LLMGuidedAction -CompanyName $cmd.companyName -Action "load-on-startup" -CommandId $cmdId -MaxStepsOverride $cmdMaxSteps
+                    if ($LLMProvider -eq "none") {
+                        Write-Result -Status "error" -Message "load-on-startup requires an LLM key. Use load-company (tally.ini-driven) instead." -Strategy "load-on-startup" -CommandId $cmdId
+                    } else {
+                        Invoke-LLMGuidedAction -CompanyName $cmd.companyName -Action "load-on-startup" -CommandId $cmdId -MaxStepsOverride $cmdMaxSteps
+                    }
                 }
                 "ping" {
-                    Write-Result -Status "success" -Message "Agent v2 is alive (LLM: $LLMProvider)" -Strategy "ping" -CommandId $cmdId
+                    $extra = @{
+                        llmProvider = $LLMProvider
+                        scriptPath  = $Script:AgentScriptPath
+                        scriptMTime = if ($Script:AgentScriptMTime) { $Script:AgentScriptMTime.ToString('o') } else { $null }
+                        pid         = $PID
+                    }
+                    Write-Result -Status "success" -Message "Agent v2 is alive (LLM: $LLMProvider, version: $Script:AgentVersion)" -Strategy "ping" -CommandId $cmdId -Extra $extra
+                }
+                "select-and-unlock-company" {
+                    # Deterministic keystroke flow: type company id (already at Select Company) -> Enter -> type credentials -> Enter.
+                    # IMPORTANT: do NOT send Alt+F3 first - on Tally Prime Edit Log it activates a "Specify Path" sub-mode,
+                    # not the regular Select Company list. After Tally launches with no company loaded, the company list is
+                    # already in focus and accepts typed input directly.
+                    # No LLM, works regardless of password type. Used by load-company when auto-load via tally.ini's
+                    # Load= directive can't proceed past the credential prompt.
+                    $companyId = if ($cmd.companyId) { [string]$cmd.companyId } else { "" }
+                    $userName  = if ($cmd.userName)  { [string]$cmd.userName }  else { "" }
+                    $password  = if ($cmd.password)  { [string]$cmd.password }  else { "" }
+                    $waitMsAfterEnter = if ($cmd.waitMsAfterEnter) { [int]$cmd.waitMsAfterEnter } else { 3000 }
+                    $waitMsAfterCreds = if ($cmd.waitMsAfterCreds) { [int]$cmd.waitMsAfterCreds } else { 3000 }
+                    if (-not $companyId) {
+                        Write-Result -Status "error" -Message "Missing companyId" -Strategy "select-and-unlock" -CommandId $cmdId
+                    } else {
+                        try {
+                            $hwnd = Find-TallyWindow
+                            if ($hwnd -eq [IntPtr]::Zero) {
+                                Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "select-and-unlock" -CommandId $cmdId
+                            } else {
+                                [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                                Start-Sleep -Milliseconds 500
+
+                                # Reset to a known state by Escaping out of any wedged dialog from a prior run.
+                                # Two Escapes is safe: closes innermost dialog, then any outer modal. If we were already
+                                # at the bare Select Company list, Escape there is a no-op.
+                                [TallyUI2]::PressKey([TallyUI2]::VK_ESCAPE)
+                                Start-Sleep -Milliseconds 300
+                                [TallyUI2]::PressKey([TallyUI2]::VK_ESCAPE)
+                                Start-Sleep -Milliseconds 500
+
+                                # Type the company id directly into the Select Company list (Tally filters as you type)
+                                [TallyUI2]::TypeString($companyId)
+                                Start-Sleep -Milliseconds 800
+
+                                # Tally Prime Edit Log requires TWO Enters: first confirms the search/selection,
+                                # second opens the company (and brings up the credential prompt if protected).
+                                [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
+                                Start-Sleep -Milliseconds 600
+                                [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
+                                Start-Sleep -Milliseconds $waitMsAfterEnter
+
+                                # If credentials were supplied, enter them
+                                if ($userName) {
+                                    [TallyUI2]::TypeString($userName)
+                                    Start-Sleep -Milliseconds 300
+                                    [TallyUI2]::PressKey([TallyUI2]::VK_TAB)
+                                    Start-Sleep -Milliseconds 300
+                                }
+                                if ($password) {
+                                    [TallyUI2]::TypeString($password)
+                                    Start-Sleep -Milliseconds 300
+                                }
+                                if ($userName -or $password) {
+                                    [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
+                                    Start-Sleep -Milliseconds $waitMsAfterCreds
+                                }
+
+                                $msg = "Keystrokes sent for company $companyId" + $(if ($userName -or $password) { " with credentials" } else { "" })
+                                Write-Result -Status "success" -Message $msg -Strategy "select-and-unlock" -CommandId $cmdId
+                            }
+                        } catch {
+                            Write-Result -Status "error" -Message "Exception: $_" -Strategy "select-and-unlock" -CommandId $cmdId
+                        }
+                    }
+                }
+                "start-tally" {
+                    # Spawn tally.exe in this agent's session (which is the user's interactive desktop session).
+                    # The MCP service can't do this directly when running in Session 0 - that's why it delegates here.
+                    $exe = if ($cmd.exePath) { [string]$cmd.exePath } else { "C:\Program Files\TallyPrimeEditLog\tally.exe" }
+                    $waitSec = if ($cmd.waitSec) { [int]$cmd.waitSec } else { 30 }
+                    if (-not (Test-Path $exe)) {
+                        Write-Result -Status "error" -Message "tally.exe not found at $exe" -Strategy "start-tally" -CommandId $cmdId
+                    } else {
+                        try {
+                            Start-Process -FilePath $exe | Out-Null
+                            # Poll for the Tally window to appear - confirms the GUI is up before declaring success
+                            $deadline = (Get-Date).AddSeconds($waitSec)
+                            $hwnd = [IntPtr]::Zero
+                            while ((Get-Date) -lt $deadline) {
+                                $hwnd = Find-TallyWindow
+                                if ($hwnd -ne [IntPtr]::Zero) { break }
+                                Start-Sleep -Milliseconds 500
+                            }
+                            if ($hwnd -ne [IntPtr]::Zero) {
+                                Write-Result -Status "success" -Message "Tally started; window detected within timeout" -Strategy "start-tally" -CommandId $cmdId
+                            } else {
+                                Write-Result -Status "error" -Message "Tally process spawned but no window appeared within ${waitSec}s" -Strategy "start-tally" -CommandId $cmdId
+                            }
+                        } catch {
+                            Write-Result -Status "error" -Message "Start-Process failed: $_" -Strategy "start-tally" -CommandId $cmdId
+                        }
+                    }
                 }
                 "exit" {
                     Write-Result -Status "success" -Message "Shutting down" -Strategy "exit" -CommandId $cmdId

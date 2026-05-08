@@ -6,7 +6,12 @@
 param(
     [string]$InstallDir = "C:\tally-mcp-server",
     [string]$NodePath = "C:\Program Files\nodejs\node.exe",
-    [string]$ServiceName = "TallyMCP"
+    [string]$ServiceName = "TallyMCP",
+    [string]$AgentTaskName = "TallyMCPAgent",
+    [string]$TrayTaskName = "TallyMCPTray",
+    [string]$AgentTaskUser = $env:USERNAME,
+    [switch]$SkipAgentTask,
+    [switch]$SkipTrayTask
 )
 
 $ErrorActionPreference = "Stop"
@@ -121,9 +126,75 @@ if ($svc.Status -eq "Running") {
     Write-Warning "Service status: $($svc.Status). Check logs at $InstallDir\logs\"
 }
 
+# --- Step 7: Register the GUI agent as a Scheduled Task at logon ---
+# Why: tally-gui-agent-v2.ps1 must run in the user's interactive desktop session (not Session 0)
+# because it spawns and keystrokes into tally.exe. Manual launch survives only until the user
+# logs out or closes the window. Registering at-logon makes the agent come back automatically
+# after every reboot/login (issue #15 - agent persistence, option A).
+if ($SkipAgentTask) {
+    Write-Host "[*] Skipping GUI agent task registration (-SkipAgentTask)" -ForegroundColor DarkGray
+} else {
+    $agentScript = Join-Path $InstallDir "scripts\tally-gui-agent-v2.ps1"
+    if (-not (Test-Path $agentScript)) {
+        Write-Host "[WARN] Agent script not found at $agentScript - skipping at-logon registration" -ForegroundColor Yellow
+    } else {
+        Write-Host "[*] Registering GUI agent at logon for user '$AgentTaskUser'..." -ForegroundColor Yellow
+        # Remove any prior registration so re-runs of this script are idempotent
+        schtasks /Delete /TN $AgentTaskName /F 2>$null | Out-Null
+
+        $taskAction = "powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Minimized -File `"$agentScript`""
+        # /RL LIMITED so the task runs with the user's normal token (admin keystrokes don't reach
+        # non-elevated Tally windows due to UIPI, and Tally Prime ships unelevated by default).
+        & schtasks /Create /TN $AgentTaskName /SC ONLOGON /RU $AgentTaskUser /RL LIMITED /TR $taskAction /F | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "[OK] Scheduled task '$AgentTaskName' registered (runs at logon, as $AgentTaskUser)" -ForegroundColor Green
+            Write-Host "     The agent will start automatically on next logon. To start now without re-logging in:" -ForegroundColor DarkGray
+            Write-Host "       schtasks /Run /TN $AgentTaskName" -ForegroundColor DarkGray
+        } else {
+            Write-Host "[WARN] schtasks /Create returned $LASTEXITCODE - register manually if needed" -ForegroundColor Yellow
+        }
+    }
+}
+
+# --- Step 8: Register the tray status app as a Scheduled Task at logon ---
+# Why: a non-developer operator should be able to see TallyMCP health at a glance
+# without running Get-Service / Get-ScheduledTask / Get-Process by hand. The tray
+# polls every few seconds and surfaces a coloured icon plus a right-click action
+# menu for restart / view-logs / launch-Tally / reconfigure (issue #20).
+if ($SkipTrayTask) {
+    Write-Host "[*] Skipping tray task registration (-SkipTrayTask)" -ForegroundColor DarkGray
+} else {
+    $trayScript = Join-Path $InstallDir "scripts\tray\tally-mcp-tray.ps1"
+    if (-not (Test-Path $trayScript)) {
+        Write-Host "[WARN] Tray script not found at $trayScript - skipping at-logon registration" -ForegroundColor Yellow
+    } else {
+        Write-Host "[*] Registering tray status app at logon for user '$AgentTaskUser'..." -ForegroundColor Yellow
+        schtasks /Delete /TN $TrayTaskName /F 2>$null | Out-Null
+
+        # WindowStyle Hidden so the PowerShell host doesn't flash a console at every logon.
+        # Tray uses NotifyIcon, which lives on the user's interactive desktop, so we need
+        # /RL LIMITED + an at-logon trigger as the same user (NOT SYSTEM, which has no
+        # interactive desktop and would silently no-op).
+        $taskAction = "powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$trayScript`" -InstallDir `"$InstallDir`" -ServiceName `"$ServiceName`" -AgentTaskName `"$AgentTaskName`""
+        & schtasks /Create /TN $TrayTaskName /SC ONLOGON /RU $AgentTaskUser /RL LIMITED /TR $taskAction /F | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "[OK] Scheduled task '$TrayTaskName' registered (runs at logon, as $AgentTaskUser)" -ForegroundColor Green
+            Write-Host "     The tray icon will appear automatically on next logon. To start now without re-logging in:" -ForegroundColor DarkGray
+            Write-Host "       schtasks /Run /TN $TrayTaskName" -ForegroundColor DarkGray
+        } else {
+            Write-Host "[WARN] schtasks /Create returned $LASTEXITCODE - tray task NOT registered" -ForegroundColor Yellow
+        }
+    }
+}
+
 Write-Host ""
 Write-Host "Useful commands:" -ForegroundColor Yellow
-Write-Host "  nssm status $ServiceName     # Check status"
-Write-Host "  nssm restart $ServiceName    # Restart"
-Write-Host "  nssm stop $ServiceName       # Stop"
-Write-Host "  nssm edit $ServiceName       # Edit config (GUI)"
+Write-Host "  nssm status $ServiceName             # Check service status"
+Write-Host "  nssm restart $ServiceName            # Restart service"
+Write-Host "  nssm stop $ServiceName               # Stop service"
+Write-Host "  nssm edit $ServiceName               # Edit config (GUI)"
+Write-Host "  schtasks /Query /TN $AgentTaskName   # Check agent task status"
+Write-Host "  schtasks /Run /TN $AgentTaskName     # Start agent now"
+Write-Host "  schtasks /End /TN $AgentTaskName     # Stop agent"
+Write-Host "  schtasks /Run /TN $TrayTaskName      # Start tray icon now"
+Write-Host "  schtasks /End /TN $TrayTaskName      # Hide tray icon"
