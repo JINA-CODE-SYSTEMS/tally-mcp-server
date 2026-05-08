@@ -63,6 +63,12 @@ Source: "{#RepoRoot}\package.json";    DestDir: "{app}";          Flags: ignorev
 Source: "{#RepoRoot}\package-lock.json"; DestDir: "{app}";        Flags: ignoreversion
 Source: "{#RepoRoot}\node_modules\*";  DestDir: "{app}\node_modules"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+; --- Runtime config directories. tally.mts loads pull/config.json + push/config.json plus
+; per-report XML templates from these paths at startup. Without them the server crashes on
+; first import with ENOENT before app.listen() is even reached. ---
+Source: "{#RepoRoot}\pull\*";          DestDir: "{app}\pull";     Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#RepoRoot}\push\*";          DestDir: "{app}\push";     Flags: ignoreversion recursesubdirs createallsubdirs
+
 ; --- Scripts (deploy + GUI agent + Win32 interop DLL). The DLL is prebuilt on the build
 ; box rather than at install time so we don't depend on csc.exe on the client. ---
 Source: "{#RepoRoot}\scripts\tally-gui-agent-v2.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
