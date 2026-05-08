@@ -69,10 +69,38 @@ if (-not $SkipBuild) {
     # Compile TallyUI.dll so the installer ships a ready-to-load DLL (clients don't need csc.exe).
     $cscPath = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
     if (Test-Path $cscPath) {
+        # Any running agent has TallyUI.dll loaded via Add-Type, which takes an exclusive read lock
+        # on Windows. csc.exe can't overwrite the file while that lock exists. Stop the agent first;
+        # the operator can restart it after the build (or the at-logon task picks it up next login).
+        $agentTaskName = 'TallyMCPAgent'
+        $stoppedAny = $false
+        try { & schtasks /End /TN $agentTaskName 2>$null | Out-Null; if ($LASTEXITCODE -eq 0) { $stoppedAny = $true } } catch {}
+        try {
+            Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -and $_.CommandLine -like '*tally-gui-agent-v2.ps1*' } |
+                ForEach-Object {
+                    Write-Host "    Stopping running agent (pid=$($_.ProcessId)) so TallyUI.dll can be replaced..." -ForegroundColor DarkGray
+                    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+                    $stoppedAny = $true
+                }
+        } catch {}
+        if ($stoppedAny) { Start-Sleep -Seconds 2 }
+
+        # Compile to a temp file then atomic-rename, so a future locked-DLL race doesn't leave us with
+        # a half-written DLL. (Tracks the deploy.yml pattern.)
+        $finalDll = Join-Path $repoRoot 'scripts\TallyUI.dll'
+        $tempDll  = "$finalDll.new"
         Write-Host "==> Compiling TallyUI.dll" -ForegroundColor Cyan
         & $cscPath /nologo /target:library /reference:System.Drawing.dll `
-            /out:scripts\TallyUI.dll scripts\TallyUI.cs
+            /out:$tempDll scripts\TallyUI.cs
         if ($LASTEXITCODE -ne 0) { throw "TallyUI.dll compile failed" }
+        Move-Item -Force -LiteralPath $tempDll -Destination $finalDll
+
+        if ($stoppedAny) {
+            Write-Host "    Agent was stopped to release the DLL lock. Restart it manually after the build:" -ForegroundColor DarkYellow
+            Write-Host "      schtasks /Run /TN $agentTaskName" -ForegroundColor DarkGray
+            Write-Host "      (or relaunch tally-gui-agent-v2.ps1 in your interactive session)" -ForegroundColor DarkGray
+        }
     } else {
         Write-Warning "csc.exe not found at $cscPath - skipping TallyUI.dll compile. The installer will package a stale DLL if one exists."
     }
