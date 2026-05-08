@@ -187,6 +187,9 @@ begin
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
+var
+  agentUserValue: string;
+  errCode: Integer;
 begin
   Result := True;
   if CurPageID = ConfigPage.ID then
@@ -194,6 +197,34 @@ begin
     if Length(ConfigPage.Values[0]) < 12 then
     begin
       MsgBox('OAuth password must be at least 12 characters.', mbError, MB_OK);
+      Result := False;
+      exit;
+    end;
+
+    // Validate the GUI agent user actually exists on this box. Catches typos / paste accidents
+    // (e.g. accidentally fragmenting the public-domain string into the user field) BEFORE the
+    // installer tries to register the scheduled task with a bogus account, which fails with
+    // "No mapping between account names and security IDs was done."
+    agentUserValue := Trim(ConfigPage.Values[5]);
+    if Length(agentUserValue) = 0 then
+    begin
+      MsgBox('Windows user (last field) cannot be empty.', mbError, MB_OK);
+      Result := False;
+      exit;
+    end;
+    // ShellExec runs `net user "<name>"` quietly; exit code 0 = user exists.
+    if not ShellExec('open', 'cmd.exe', '/c net user "' + agentUserValue + '" >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, errCode) then
+    begin
+      // ShellExec itself failed to launch — fall through and let the install proceed; the
+      // post-install task registration will surface the real error.
+      Result := True;
+    end
+    else if errCode <> 0 then
+    begin
+      MsgBox('Windows user "' + agentUserValue + '" does not exist on this box.' + #13#10 +
+             'Use the actual logon name (e.g. ' + GetUserNameString() + ').' + #13#10#13#10 +
+             'If you continue with this value, the GUI agent task will not register and load-company will not work.',
+             mbError, MB_OK);
       Result := False;
       exit;
     end;
