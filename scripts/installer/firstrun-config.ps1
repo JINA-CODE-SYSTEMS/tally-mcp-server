@@ -218,17 +218,36 @@ try {
     Write-Host "[OK] Service '$ServiceName' registered with bundled node + nssm"
 
     # --- 4. Register the GUI agent at-logon Scheduled Task -----------------
-    schtasks /Delete /TN $AgentTaskName /F 2>$null | Out-Null
-    $taskAction = "powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Minimized -File `"$agentScript`""
-    & schtasks /Create /TN $AgentTaskName /SC ONLOGON /RU $AgentTaskUser /RL LIMITED /TR $taskAction /F | Out-Null
-    if ($LASTEXITCODE -eq 0) {
+    # schtasks writes "ERROR: The system cannot find the file specified" to stderr when
+    # /Delete is run against a non-existent task (the normal case on a fresh install). With
+    # ErrorActionPreference=Stop that promotes to a terminating error and aborts the script
+    # before we ever reach `nssm start`. Relax the preference around schtasks invocations.
+    $savedPref2 = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & schtasks /Delete /TN $AgentTaskName /F 2>$null | Out-Null
+        $taskAction = "powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Minimized -File `"$agentScript`""
+        & schtasks /Create /TN $AgentTaskName /SC ONLOGON /RU $AgentTaskUser /RL LIMITED /TR $taskAction /F 2>$null | Out-Null
+        $taskCreateExit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedPref2
+    }
+    if ($taskCreateExit -eq 0) {
         Write-Host "[OK] Scheduled task '$AgentTaskName' registered (runs at logon, as $AgentTaskUser)"
     } else {
-        Write-Host "[WARN] schtasks /Create returned $LASTEXITCODE - GUI agent task NOT registered. Re-run the wizard or register manually." -ForegroundColor Yellow
+        Write-Host "[WARN] schtasks /Create returned $taskCreateExit - GUI agent task NOT registered. Re-run the wizard or register manually." -ForegroundColor Yellow
     }
 
     # --- 5. Start the service ----------------------------------------------
-    & $bundledNssm start $ServiceName | Out-Null
+    # Same defensive pattern: nssm start can write to stderr in benign cases (e.g. service
+    # already running because Windows auto-started it on registration with SERVICE_AUTO_START).
+    $savedPref3 = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $bundledNssm start $ServiceName 2>$null | Out-Null
+    } finally {
+        $ErrorActionPreference = $savedPref3
+    }
     Start-Sleep -Seconds 3
     $svc = Get-Service -Name $ServiceName
     Write-Host "[OK] Service status after start: $($svc.Status)"
