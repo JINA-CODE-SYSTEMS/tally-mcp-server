@@ -197,7 +197,15 @@ try {
     }
 
     # --- 3. Register NSSM service pointing at bundled node + dist/server.mjs --
-    & $bundledNssm install $ServiceName $bundledNode $serverEntry | Out-Null
+    # IMPORTANT: pass the script as a RELATIVE path ('dist\server.mjs') against AppDirectory rather
+    # than the absolute path 'C:\Program Files\TallyMCP\dist\server.mjs'. NSSM's storage of the
+    # AppParameters value via the install command's third positional arg loses the quoting around
+    # spaces somewhere in the PowerShell -> nssm.exe -> Windows registry chain, so the resulting
+    # service launches as `node.exe C:\Program Files\TallyMCP\dist\server.mjs` (unquoted), which
+    # Node tokenizes at the first space and tries to load `C:\Program` as a module. Relative paths
+    # with no spaces sidestep the whole quoting fragility. AppDirectory is set on the next line.
+    $serverEntryRelative = 'dist\server.mjs'
+    & $bundledNssm install $ServiceName $bundledNode $serverEntryRelative | Out-Null
     & $bundledNssm set $ServiceName AppDirectory $InstallDir                            | Out-Null
     & $bundledNssm set $ServiceName Description  'Tally Prime MCP Server'               | Out-Null
     & $bundledNssm set $ServiceName Start        SERVICE_AUTO_START                     | Out-Null
