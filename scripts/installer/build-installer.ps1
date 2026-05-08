@@ -131,13 +131,35 @@ if (-not (Test-Path (Join-Path $nodeStaging 'node.exe'))) {
 }
 
 # --- 3. Stage NSSM ---------------------------------------------------------
+# nssm.cc is frequently flaky (502/503). We try the primary URL first with retries, then fall back
+# to a known-good mirror on web.archive.org. If neither works, the operator can drop nssm.exe
+# (x64) into installer-staging/ manually and re-run without -DownloadDeps.
 $nssmTarget = Join-Path $staging 'nssm.exe'
 if ($DownloadDeps) {
     $nssmZip = Join-Path $staging "nssm-$NssmVersion.zip"
-    $nssmUrl = "https://nssm.cc/release/nssm-$NssmVersion.zip"
+    $nssmUrls = @(
+        "https://nssm.cc/release/nssm-$NssmVersion.zip",
+        "https://web.archive.org/web/2024/https://nssm.cc/release/nssm-$NssmVersion.zip"
+    )
     if (-not (Test-Path $nssmZip)) {
-        Write-Host "==> Downloading NSSM v$NssmVersion" -ForegroundColor Cyan
-        Invoke-WebRequest -Uri $nssmUrl -OutFile $nssmZip
+        $downloaded = $false
+        foreach ($url in $nssmUrls) {
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+                Write-Host "==> Downloading NSSM v$NssmVersion (attempt $attempt) from $url" -ForegroundColor Cyan
+                try {
+                    Invoke-WebRequest -Uri $url -OutFile $nssmZip -ErrorAction Stop
+                    $downloaded = $true
+                    break
+                } catch {
+                    Write-Warning "  download failed: $($_.Exception.Message)"
+                    if ($attempt -lt 3) { Start-Sleep -Seconds (3 * $attempt) }
+                }
+            }
+            if ($downloaded) { break }
+        }
+        if (-not $downloaded) {
+            throw "Could not download NSSM from any source. Manual workaround: download nssm.exe (x64) from any reliable source (e.g. chocolatey: 'choco install nssm', or scoop: 'scoop install nssm'), copy it to '$nssmTarget', then re-run this script WITHOUT -DownloadDeps."
+        }
     }
     $nssmExtracted = Join-Path $staging "nssm-$NssmVersion"
     if (-not (Test-Path $nssmExtracted)) {
@@ -148,7 +170,7 @@ if ($DownloadDeps) {
     Copy-Item -Path $nssm64 -Destination $nssmTarget -Force
 }
 if (-not (Test-Path $nssmTarget)) {
-    throw "nssm.exe not found at $nssmTarget. Re-run with -DownloadDeps, or place nssm.exe (x64) there manually."
+    throw "nssm.exe not found at $nssmTarget. Re-run with -DownloadDeps, or place nssm.exe (x64) there manually (e.g. via 'choco install nssm' then copy)."
 }
 
 # --- 4. Locate ISCC.exe ---------------------------------------------------
