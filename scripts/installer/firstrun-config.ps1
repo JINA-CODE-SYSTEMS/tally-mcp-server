@@ -46,7 +46,9 @@ param(
     # installer's user-only temp folder). Avoids exposing the password on the command line where
     # it would be visible to any local process via Get-CimInstance Win32_Process / wmic during
     # the ~30s install window. The file is deleted immediately after read.
-    [Parameter(Mandatory=$true)] [string]$CredentialsFile,
+    # When the script is re-run interactively (Start Menu "Reconfigure"), this is omitted and we
+    # prompt the operator with Read-Host -AsSecureString instead.
+    [string]$CredentialsFile = '',
     [string]$TallyEdition   = 'silver',
     [string]$TallyExePath   = 'C:\Program Files\TallyPrimeEditLog\tally.exe',
     [string]$TallyDataPath  = 'C:\Users\Public\TallyPrimeEditLog\data',
@@ -55,39 +57,62 @@ param(
     [string]$AgentTaskUser  = $env:USERNAME
 )
 
-# --- Read + delete credentials file before any other work ---
-# Even if anything below throws, the credentials file should not survive.
-if (-not (Test-Path -LiteralPath $CredentialsFile)) {
-    throw "Credentials file not found at '$CredentialsFile'. Inno Setup should have written it before invoking this script."
-}
-$credsRaw = $null
-try {
-    $credsRaw = [System.IO.File]::ReadAllText($CredentialsFile, [System.Text.Encoding]::UTF8)
-} finally {
-    # Best-effort secure delete: overwrite with zeros, then unlink. Even on a power loss between
-    # those two ops, the file is in the user's temp folder (auto-cleaned by Inno); residual
-    # exposure is bounded.
+# --- Resolve OAuth password ---
+# Two entry paths:
+#   1. Inno Setup wizard: passes -CredentialsFile pointing at a JSON in the installer's user-only
+#      temp folder. We read + delete it immediately so the password never sits on a process command
+#      line where Get-CimInstance Win32_Process could observe it.
+#   2. Interactive "Reconfigure" Start Menu shortcut: re-runs this script with only -InstallDir.
+#      We prompt the operator securely via Read-Host -AsSecureString.
+$Password = $null
+if ($CredentialsFile -and $CredentialsFile.Trim().Length -gt 0) {
+    if (-not (Test-Path -LiteralPath $CredentialsFile)) {
+        throw "Credentials file not found at '$CredentialsFile'. Inno Setup should have written it before invoking this script."
+    }
+    $credsRaw = $null
     try {
-        $size = (Get-Item -LiteralPath $CredentialsFile -ErrorAction SilentlyContinue).Length
-        if ($size -gt 0) {
-            $zeros = New-Object byte[] $size
-            [System.IO.File]::WriteAllBytes($CredentialsFile, $zeros)
-        }
-    } catch {}
-    Remove-Item -LiteralPath $CredentialsFile -Force -ErrorAction SilentlyContinue
+        $credsRaw = [System.IO.File]::ReadAllText($CredentialsFile, [System.Text.Encoding]::UTF8)
+    } finally {
+        # Best-effort secure delete: overwrite with zeros, then unlink. Bounded residual exposure.
+        try {
+            $size = (Get-Item -LiteralPath $CredentialsFile -ErrorAction SilentlyContinue).Length
+            if ($size -gt 0) {
+                $zeros = New-Object byte[] $size
+                [System.IO.File]::WriteAllBytes($CredentialsFile, $zeros)
+            }
+        } catch {}
+        Remove-Item -LiteralPath $CredentialsFile -Force -ErrorAction SilentlyContinue
+    }
+    try {
+        $creds = $credsRaw | ConvertFrom-Json
+    } catch {
+        throw "Credentials file '$CredentialsFile' is not valid JSON: $_"
+    }
+    if (-not $creds.password) {
+        throw "Credentials file did not contain a 'password' field."
+    }
+    $Password = [string]$creds.password
+    # Hint to GC: drop the raw JSON string from memory once we've extracted the field.
+    $credsRaw = $null
+} else {
+    # Interactive prompt path. SecureString -> plaintext extraction; SecureString is just a
+    # roadblock here, not real protection (the password ends up in $Password as a plain string
+    # for use in .env-writing). Marshal pattern is the recommended one for Read-Host -AsSecureString.
+    Write-Host ""
+    Write-Host "Tally MCP Reconfigure" -ForegroundColor Cyan
+    Write-Host "(re-running first-run wizard interactively; press Ctrl+C to abort)"
+    Write-Host ""
+    $secure = Read-Host -Prompt "OAuth password (min 12 chars)" -AsSecureString
+    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try {
+        $Password = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    } finally {
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+    if ($Password.Length -lt 12) {
+        throw "Password too short (got $($Password.Length) chars, need >= 12)."
+    }
 }
-$creds = $null
-try {
-    $creds = $credsRaw | ConvertFrom-Json
-} catch {
-    throw "Credentials file '$CredentialsFile' is not valid JSON: $_"
-}
-if (-not $creds.password) {
-    throw "Credentials file did not contain a 'password' field."
-}
-$Password = [string]$creds.password
-# Hint to GC: drop the raw JSON string from memory once we've extracted the field.
-$credsRaw = $null
 
 $ErrorActionPreference = 'Stop'
 $transcript = Join-Path $InstallDir 'logs\firstrun-config.log'
