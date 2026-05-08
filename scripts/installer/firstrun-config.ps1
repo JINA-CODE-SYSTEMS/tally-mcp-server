@@ -250,6 +250,21 @@ try {
     }
     if ($taskCreateExit -eq 0) {
         Write-Host "[OK] Scheduled task '$AgentTaskName' registered (runs at logon, as $AgentTaskUser)"
+        # Trigger the task once now so the agent is alive immediately, not just from next logon.
+        # Without this, load-company calls fail with "GUI agent did not respond" until the user
+        # logs out + back in. With it, the agent is running by the time the wizard finishes.
+        $savedPref4 = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & schtasks /Run /TN $AgentTaskName 2>$null | Out-Null
+        } finally {
+            $ErrorActionPreference = $savedPref4
+        }
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "[OK] GUI agent started in the current user session (PID will appear after a few seconds)"
+        } else {
+            Write-Host "[WARN] schtasks /Run returned $LASTEXITCODE - the task is registered but did not start now. It will start on next logon, or run 'schtasks /Run /TN $AgentTaskName' manually." -ForegroundColor Yellow
+        }
     } else {
         Write-Host "[WARN] schtasks /Create returned $taskCreateExit - GUI agent task NOT registered. Re-run the wizard or register manually." -ForegroundColor Yellow
     }
