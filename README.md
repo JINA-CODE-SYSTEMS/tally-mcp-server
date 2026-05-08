@@ -8,11 +8,15 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that 
 
 ## Features
 
-- **23 MCP tools** — financial reports, master data, stock, GST, voucher creation
+- **29 MCP tools** — financial reports, master data, stock, GST, voucher creation, plus dedicated company-management tools (`load-company`, `set-active-company`, `list-loaded-companies`, `list-available-companies`)
+- **Cold-load with credentials** — load a password-protected company from a Tally with nothing resident, end-to-end via MCP. Edition-aware (Silver swaps, Gold accumulates). Documented in [Editions](#editions).
+- **Companion GUI agent** — runs in the user session, bridges Windows Session 0 isolation so the Session-0 service can spawn `tally.exe` and keystroke through credential prompts. Self-restarts on script update; version handshake refuses stale agents.
 - **DuckDB in-memory analytics** — cached report tables for complex SQL queries
 - **OAuth 2.1 + PKCE** authentication for remote/cloud deployments
 - **Security hardened** — Helmet, CORS, rate limiting, audit logging, read-only mode
 - **Local & remote** — run as a local stdio server or a cloud HTTP server behind a reverse proxy
+- **Windows installer** ([#18](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/18)) — double-click `.exe` from "nothing installed" to "service running" in under 5 minutes. Bundles portable Node + NSSM; no admin pre-reqs beyond UAC.
+- **Status tray icon** ([#20](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/20)) — at-a-glance health for non-developer operators. Service + agent + Tally + public URL all visible in one click.
 
 ## Prerequisites
 
@@ -28,6 +32,16 @@ Port = 9000
 > **Note:** Avoid the Educational edition — its date-range limitations produce incomplete data.
 
 ## Installation
+
+### Option A — Windows installer (recommended for client deployments)
+
+A double-click `TallyMCP-Setup-<version>.exe` takes a Windows box from
+"nothing installed" to "service running" in under 5 minutes. Bundles portable
+Node.js + NSSM, prompts for the few values it can't auto-detect, registers
+the Windows service and the GUI agent at-logon task. See
+[docs/installer.md](docs/installer.md) for build instructions.
+
+### Option B — From source (development / custom deployments)
 
 ```bash
 git clone https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server.git
@@ -48,6 +62,10 @@ Copy `.env.example` to `.env` and configure:
 | `TALLY_PORT` | `9000` | Tally Prime XML server port |
 | `TALLY_DATA_PATH` | `C:\Users\Public\TallyPrime\data` | Tally data directory (for `list-companies`) |
 | `TALLY_EXE_PATH` | `C:\Program Files\TallyPrime\tally.exe` | Tally executable path |
+| `TALLY_INI_PATH` | `C:\Program Files\TallyPrimeEditLog\tally.ini` | Path to tally.ini (used by `load-company`) |
+| `TALLY_COMPANIES_CONFIG` | `<TALLY_DATA_PATH>/.tally-mcp-companies.json` | Optional credential-hint config for `list-available-companies`. See "Optional credential-hint config" below. |
+| `TALLY_EDITION` | `silver` | `silver` or `gold`. Drives `load-company` semantics — see [Editions](#editions) below. |
+| `TALLY_DEBUG_XML` | *(unset)* | Set to `1` to enable the `tally-raw-xml-probe` tool for protocol RE. Leave unset in production. |
 | `PORT` | `3000` | HTTP server port |
 | `MCP_DOMAIN` | `http://localhost:3000` | Public-facing URL |
 | `BIND_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` only behind reverse proxy) |
@@ -71,6 +89,36 @@ Copy `.env.example` to `.env` and configure:
 | `LLM_MAX_TOKENS` | `300` | Max tokens per LLM response |
 | `LLM_TIMEOUT_SEC` | `30` | LLM API request timeout in seconds |
 | `ANTHROPIC_API_VERSION` | `2023-06-01` | Anthropic API version header |
+
+## Editions
+
+Tally Prime ships in two relevant editions, and `load-company` adapts its behavior to each. **You must set `TALLY_EDITION` correctly** — defaulting to `silver` is the safe assumption.
+
+| Edition | Companies resident at once | `load-company` behavior |
+| ------- | -------------------------- | ----------------------- |
+| `silver` | **1** (engine limit) | Always a SWAP — strips other `Load=` entries, restarts Tally with only the requested company. `replace=true` is forced regardless of what was passed. `list-loaded-companies` will only ever return 0 or 1 entry. |
+| `gold` | many | Additive by default — appends `Load=<id>` to `tally.ini`, restarts Tally with the new company plus all previous ones. Pass `replace=true` to force a swap. After loading several, switch between them via `set-active-company` (in-memory pointer flip, no restart). |
+
+**Why this matters for the multi-subsidiary cross-reference workflow:** Silver clients can only query one company at a time, so an LLM doing "compare ledgers across 3 subsidiaries" will pay the ~10–30s restart latency between each. Gold clients can pre-load all subsidiaries and switch between them for free.
+
+**Why no auto-detection:** Tally's edition isn't reliably exposed via the XML server. Rather than ship a fragile auto-detect that could miscategorize and silently degrade behavior, the server takes the configured value as authoritative.
+
+### Background: why Tally must be restarted to load a company
+
+Tally Prime has **no XML or TDL primitive that loads a company from disk into memory**. We confirmed this by reverse-engineering every dispatch surface the XML server exposes (see [`notes/tdl-experiments.md`](notes/tdl-experiments.md)). The built-in `$$CmpLoadCompany` is misleadingly named — it's "select among already-loaded companies", not "load from disk". Loading is exclusively initiated by Tally process startup (via `Load=` directives in `tally.ini`) or the Tally UI (Alt+F3).
+
+Therefore `load-company` works the only way it can: rewrites `tally.ini`, kills `tally.exe`, and asks the GUI agent (which lives in the user's interactive desktop session) to start it again. This is unavoidable until Tally exposes a load verb in a future protocol version.
+
+### Operational requirement: GUI agent must be running
+
+Because the MCP server typically runs as a Windows service in **Session 0** (no desktop), it cannot spawn `tally.exe` directly. The companion script [`scripts/tally-gui-agent-v2.ps1`](scripts/tally-gui-agent-v2.ps1) runs in the user's interactive session and acts as the bridge — `load-company` IPCs to it to perform the spawn.
+
+- **Install** the agent to start at user logon. `setup-windows.ps1` registers a `TallyMCPAgent` Scheduled Task at-logon for the configured user — no manual setup needed. The Windows installer (option A above) does the same automatically.
+- **Self-update on deploy.** When a `git pull` replaces `tally-gui-agent-v2.ps1` on disk, the running agent detects the mtime change between commands and re-launches into the new version. Combined with the at-logon task, deploys propagate without operator intervention.
+- **Version handshake.** The agent reports `agentVersion` on every response. `load-company` refuses to call destructive actions on an agent older than `REQUIRED_AGENT_VERSION` and returns a clear remediation message instead of silently no-op'ing on unrecognized IPC fields. `open-company-debug` surfaces both the running version and `versionOk` status.
+- **No LLM key required** for the deterministic actions (`ping`, `start-tally`, `select-and-unlock-company`). Only set `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` if you want the LLM-guided UI navigation fallback (`open-company` Strategy 3).
+- **`load-company` pings the agent before doing anything destructive** — if the agent isn't responding (or is too old), the tool refuses to kill Tally and returns a clear error. So a misconfigured deployment never ends up worse than it started.
+- **Check liveness** any time via `open-company-debug` — it returns `guiAgentResponding`, `guiAgentVersion`, `guiAgentVersionOk`, and `guiAgentVersionRequired`.
 
 ## Setup
 
@@ -131,7 +179,23 @@ The server uses OAuth 2.1 with PKCE for authentication. Detailed setup guides:
 | Tool | Description |
 |------|-------------|
 | `list-companies` | Lists company folders in the Tally data directory (no open company required) |
-| `open-company` | Attempts to load a company into Tally (**[experimental — see #1](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/1)**) |
+| `list-available-companies` | Recursive scan with display names + credential-requirement hints. Handles both stock layout and Tally Prime Edit Log's nested layout. Use this BEFORE `load-company` so an LLM/human knows which folder to load and whether credentials are needed. |
+| `list-loaded-companies` | Lists companies currently resident in Tally (no restart needed) |
+| `load-company` | Loads a company by editing `tally.ini` and restarting Tally. Edition-aware. Accepts optional `userName` + `password` for password-protected companies. |
+| `set-active-company` | Cheap pointer flip between already-loaded companies (Gold edition) |
+| `open-company` | Legacy multi-strategy loader (**[experimental — see #1](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/1)**) |
+| `open-company-debug` | Reports server config, agent liveness, agent version, edition, and Tally XML reachability |
+
+**Optional credential-hint config** (used by `list-available-companies`): drop a `.tally-mcp-companies.json` into the Tally data path (or set `TALLY_COMPANIES_CONFIG` to point elsewhere) with the shape:
+
+```json
+{
+  "100000": { "requiresCredentials": true,  "knownUsername": "admin", "notes": "Edit Log; user-based security" },
+  "200000": { "requiresCredentials": false, "notes": "Auto-loads cleanly" }
+}
+```
+
+The config never stores passwords — only the hint that one is needed, so callers can prompt the human up-front instead of waiting for `load-company` to fail.
 
 ### Financial Reports
 
@@ -212,50 +276,18 @@ Most report tools cache their output in a temporary DuckDB table (returned as `t
 
 The `scripts/` directory contains Windows-specific automation tools used by the `open-company` feature and server deployment.
 
-### GUI Agent v1 — Keystroke Automation
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\tally-gui-agent.ps1 [-WatchDir <path>]
-```
-
-Runs in the **interactive desktop session** where Tally is visible. Watches for command files from the MCP server and injects keystrokes (F-keys, Enter, Escape, menu navigation) into the Tally window to load companies.
-
-- **Install:** Add to Windows Startup folder or Task Scheduler (run at user logon)
-- `-WatchDir` defaults to `$env:TALLY_DATA_PATH` or `C:\Users\Public\TallyPrimeEditLog\data`
-
-### GUI Agent v2 — LLM-Guided (Computer Use)
+### GUI Agent — Companion Script for Cross-Session Operations
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\tally-gui-agent-v2.ps1 [-LLMProvider anthropic|openai] [-MaxSteps 15]
 ```
 
-Advanced agent that takes **screenshots** of the Tally window, sends them to an LLM (Claude or GPT-4o) for visual analysis, executes the recommended action, and loops until the goal is achieved. Requires `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`.
+Runs in the **interactive desktop session** where Tally is visible. The MCP server (which typically runs in Windows Session 0 with no desktop) communicates with this agent via JSON file IPC to perform actions that need a real desktop — most importantly **launching `tally.exe`** for `load-company` and **automating Alt+F3 → Select Company** for the optional LLM-guided fallback.
 
-- **Install:** Same as v1 — run in interactive session
+- **Install:** Add to Windows Startup folder or Task Scheduler (run at user logon)
 - Requires `TallyUI.dll` (see below)
+- **LLM key is OPTIONAL.** Deterministic actions (`ping`, `start-tally`) work without one. Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` only if you need the LLM-guided UI navigation fallback (`open-company` Strategy 3).
 - LLM model, tokens, and timeout are configurable via env vars (see [Configuration](#configuration))
-
-### Company Loader UI Script
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\open-company-ui.ps1 -TallyExePath "..." -CompanyDataPath "..."
-```
-
-Standalone script to load a specific company into Tally via Win32 keystroke injection. Used internally by the `open-company` tool's Strategy 2.
-
-### TDL Add-on — Programmatic Company Loading
-
-```
-scripts/mcp-company-loader.tdl
-```
-
-A Tally TDL add-on that enables company loading via the XML server API (Strategy 1 of `open-company`). Install by copying to the Tally directory and adding to `tally.ini`:
-
-```ini
-[Tally]
-TDL = yes
-Default TDL = mcp-company-loader.tdl
-```
 
 ### TallyUI.dll — Win32 Interop Library
 
@@ -271,7 +303,26 @@ Compiled C# library wrapping Windows APIs for window management, keystroke injec
 powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1 [-InstallDir C:\tally-mcp-server] [-NodePath "..."] [-ServiceName TallyMCP]
 ```
 
-One-time setup to register the MCP server as a Windows service via [NSSM](https://nssm.cc/). Configures auto-start, log rotation, and loads `.env` variables. See [Windows Server Setup](docs/server-setup-windows.md) for the full guide.
+One-time setup to register the MCP server as a Windows service via [NSSM](https://nssm.cc/). Configures auto-start, log rotation, loads `.env` variables, and registers two at-logon scheduled tasks: `TallyMCPAgent` (the GUI agent) and `TallyMCPTray` (the status tray icon). See [Windows Server Setup](docs/server-setup-windows.md) for the full guide.
+
+### Status Tray Icon (issue #20)
+
+```powershell
+powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File scripts\tray\tally-mcp-tray.ps1
+```
+
+Runs in the user's interactive desktop session and surfaces a coloured tray icon (green/yellow/red/gray) reflecting overall TallyMCP health. Polls every few seconds for: service status, GUI agent task + process, Tally Prime process, and a public-URL OAuth metadata probe. Right-click for one-click admin actions:
+
+- **Open logs folder** (also: double-click the tray icon)
+- **Restart service** (prompts UAC for admin)
+- **Restart GUI agent**
+- **Launch Tally Prime** (uses `TALLY_EXE_PATH` from `.env`)
+- **Reconfigure...** (re-runs `firstrun-config.ps1` for `.env` changes)
+- **Quit (hide tray)** — hides the icon only; service and agent keep running
+
+`setup-windows.ps1` registers this as `TallyMCPTray` ONLOGON; the Windows installer (Option A above) does the same. Pass `-SkipTrayTask` to either if you don't want the tray icon (e.g. headless server install).
+
+No new runtime dependencies — uses WinForms `NotifyIcon` + `System.Drawing` already present on every Windows 10+ box.
 
 ### Deploy a New Version
 
