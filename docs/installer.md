@@ -17,7 +17,9 @@ A double-click installer that takes a Windows box from "nothing installed" to
 4. Registers the `TallyMCP` Windows service via the bundled NSSM, pointing at the bundled
    `node-portable\node.exe` (no system Node required).
 5. Registers the `TallyMCPAgent` scheduled task at-logon for the configured user.
-6. Starts the service.
+6. Registers the `TallyMCPTray` scheduled task at-logon (status tray icon — issue #20).
+7. Starts the service and triggers both scheduled tasks immediately so the operator sees
+   a working tray icon when the wizard finishes (rather than only after the next logon).
 
 The uninstaller stops + removes the service, deletes the scheduled task,
 kills any leftover `node.exe`, and removes installed files. `.env` is
@@ -56,8 +58,9 @@ To iterate just on the wizard without rebuilding the project:
 |------|---------|
 | `scripts/installer/tally-mcp.iss`       | Inno Setup script (sources, dirs, wizard, [Run] / [UninstallRun]) |
 | `scripts/installer/build-installer.ps1` | Build orchestrator (npm build → dep staging → ISCC) |
-| `scripts/installer/firstrun-config.ps1` | Post-install: writes .env, registers service + agent task, starts service |
-| `scripts/installer/uninstall-cleanup.ps1` | Pre-uninstall: stops service, removes NSSM entry, deletes scheduled task |
+| `scripts/installer/firstrun-config.ps1` | Post-install: writes .env, registers service + agent task + tray task, starts service |
+| `scripts/installer/uninstall-cleanup.ps1` | Pre-uninstall: stops service, removes NSSM entry, deletes both scheduled tasks |
+| `scripts/tray/tally-mcp-tray.ps1`       | Status tray icon (issue #20). WinForms NotifyIcon + polling loop. |
 
 ## Re-configuring an installed instance
 

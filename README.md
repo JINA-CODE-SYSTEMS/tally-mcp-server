@@ -299,7 +299,26 @@ Compiled C# library wrapping Windows APIs for window management, keystroke injec
 powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1 [-InstallDir C:\tally-mcp-server] [-NodePath "..."] [-ServiceName TallyMCP]
 ```
 
-One-time setup to register the MCP server as a Windows service via [NSSM](https://nssm.cc/). Configures auto-start, log rotation, and loads `.env` variables. See [Windows Server Setup](docs/server-setup-windows.md) for the full guide.
+One-time setup to register the MCP server as a Windows service via [NSSM](https://nssm.cc/). Configures auto-start, log rotation, loads `.env` variables, and registers two at-logon scheduled tasks: `TallyMCPAgent` (the GUI agent) and `TallyMCPTray` (the status tray icon). See [Windows Server Setup](docs/server-setup-windows.md) for the full guide.
+
+### Status Tray Icon (issue #20)
+
+```powershell
+powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File scripts\tray\tally-mcp-tray.ps1
+```
+
+Runs in the user's interactive desktop session and surfaces a coloured tray icon (green/yellow/red/gray) reflecting overall TallyMCP health. Polls every few seconds for: service status, GUI agent task + process, Tally Prime process, and a public-URL OAuth metadata probe. Right-click for one-click admin actions:
+
+- **Open logs folder** (also: double-click the tray icon)
+- **Restart service** (prompts UAC for admin)
+- **Restart GUI agent**
+- **Launch Tally Prime** (uses `TALLY_EXE_PATH` from `.env`)
+- **Reconfigure...** (re-runs `firstrun-config.ps1` for `.env` changes)
+- **Quit (hide tray)** — hides the icon only; service and agent keep running
+
+`setup-windows.ps1` registers this as `TallyMCPTray` ONLOGON; the Windows installer (Option A above) does the same. Pass `-SkipTrayTask` to either if you don't want the tray icon (e.g. headless server install).
+
+No new runtime dependencies — uses WinForms `NotifyIcon` + `System.Drawing` already present on every Windows 10+ box.
 
 ### Deploy a New Version
 

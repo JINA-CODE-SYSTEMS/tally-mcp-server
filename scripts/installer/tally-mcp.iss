@@ -23,6 +23,7 @@
 #define MyAppURL         "https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server"
 #define MyServiceName    "TallyMCP"
 #define MyAgentTaskName  "TallyMCPAgent"
+#define MyTrayTaskName   "TallyMCPTray"
 
 ; Source root: the installer is built from <repo>/scripts/installer/, so SourceDir
 ; climbs two levels to reach the repo root. SourcePath itself is provided by Inno.
@@ -79,6 +80,11 @@ Source: "{#RepoRoot}\scripts\setup-windows.ps1";      DestDir: "{app}\scripts"; 
 Source: "{#RepoRoot}\scripts\installer\firstrun-config.ps1";    DestDir: "{app}\scripts\installer"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\installer\uninstall-cleanup.ps1";  DestDir: "{app}\scripts\installer"; Flags: ignoreversion
 
+; --- Tray status app (issue #20). Polls service/agent/Tally health and surfaces a
+; coloured tray icon + right-click action menu. Registered as a per-user at-logon
+; scheduled task by firstrun-config.ps1. ---
+Source: "{#RepoRoot}\scripts\tray\tally-mcp-tray.ps1"; DestDir: "{app}\scripts\tray"; Flags: ignoreversion
+
 ; --- Bundled portable Node.js. Avoids version conflicts with anything else on the box.
 ; The build script populates installer-staging/node-portable/ from the official Node zip. ---
 Source: "{#StagingRoot}\node-portable\*"; DestDir: "{app}\node-portable"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -100,7 +106,7 @@ Name: "{group}\Uninstall {#MyAppName}";  Filename: "{uninstallexe}"
 [Run]
 ; --- 1. First-run wizard: writes .env from collected wizard inputs and registers the NSSM service ---
 Filename: "powershell.exe"; \
-  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -CredentialsFile ""{code:GetCredentialsFilePath}"" -TallyEdition ""{code:GetWizardEdition}"" -TallyExePath ""{code:GetWizardExePath}"" -TallyDataPath ""{code:GetWizardDataPath}"" -TallyIniPath ""{code:GetWizardIniPath}"" -McpDomain ""{code:GetWizardDomain}"" -AgentTaskUser ""{code:GetWizardAgentUser}"""; \
+  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"" -CredentialsFile ""{code:GetCredentialsFilePath}"" -TallyEdition ""{code:GetWizardEdition}"" -TallyExePath ""{code:GetWizardExePath}"" -TallyDataPath ""{code:GetWizardDataPath}"" -TallyIniPath ""{code:GetWizardIniPath}"" -McpDomain ""{code:GetWizardDomain}"" -AgentTaskUser ""{code:GetWizardAgentUser}"""; \
   WorkingDir: "{app}"; \
   StatusMsg: "Configuring service and writing .env..."; \
   Flags: runhidden waituntilterminated
@@ -108,7 +114,7 @@ Filename: "powershell.exe"; \
 [UninstallRun]
 ; --- Cleanup BEFORE Inno deletes files: stop service, remove NSSM entry, remove scheduled task ---
 Filename: "powershell.exe"; \
-  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\uninstall-cleanup.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"""; \
+  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\uninstall-cleanup.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"""; \
   RunOnceId: "TallyMcpUninstallCleanup"; \
   Flags: runhidden waituntilterminated
 

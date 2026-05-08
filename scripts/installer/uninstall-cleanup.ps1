@@ -14,7 +14,8 @@
 param(
     [Parameter(Mandatory=$true)] [string]$InstallDir,
     [string]$ServiceName   = 'TallyMCP',
-    [string]$AgentTaskName = 'TallyMCPAgent'
+    [string]$AgentTaskName = 'TallyMCPAgent',
+    [string]$TrayTaskName  = 'TallyMCPTray'
 )
 
 # ErrorActionPreference deliberately Continue: uninstall must finish even if a step throws.
@@ -71,6 +72,26 @@ try {
         }
 } catch {
     Write-Host "[WARN] agent process stop raised: $_"
+}
+
+# 5. Remove the tray status app at-logon scheduled task and kill any running tray process.
+#    Same shape as the agent cleanup above; both are interactive-session-only and won't be
+#    visible if the uninstaller is invoked from an admin session different from the user's.
+try {
+    & schtasks /Delete /TN $TrayTaskName /F 2>$null | Out-Null
+    Write-Host "[OK] Scheduled task '$TrayTaskName' removed (or did not exist)"
+} catch {
+    Write-Host "[WARN] tray schtasks /Delete raised: $_"
+}
+try {
+    Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" |
+        Where-Object { $_.CommandLine -and $_.CommandLine -like '*tally-mcp-tray.ps1*' } |
+        ForEach-Object {
+            Write-Host "[*] Stopping tray process pid=$($_.ProcessId)"
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+} catch {
+    Write-Host "[WARN] tray process stop raised: $_"
 }
 
 Write-Host "Cleanup complete; Inno Setup will now remove files."
