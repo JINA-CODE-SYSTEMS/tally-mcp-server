@@ -140,11 +140,29 @@ try {
     Write-Host "[OK] Wrote $envFile ($($envLines.Count) lines)"
 
     # --- 2. Stop and remove any existing service (idempotent re-runs) ------
+    # nssm.exe writes benign "service not running" / "service does not exist" messages to stderr,
+    # which PowerShell 5.x with ErrorActionPreference=Stop promotes to terminating errors and
+    # aborts the script. Only call `stop` when the service is actually running, and temporarily
+    # relax the preference around the nssm invocations so unexpected stderr doesn't kill us.
     $existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if ($existing) {
         Write-Host "[*] Existing service detected; stopping and removing..."
-        & $bundledNssm stop $ServiceName 2>$null | Out-Null
-        & $bundledNssm remove $ServiceName confirm | Out-Null
+        $savedPref = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            if ($existing.Status -eq 'Running') {
+                & $bundledNssm stop $ServiceName 2>$null | Out-Null
+                Start-Sleep -Seconds 2
+            }
+            & $bundledNssm remove $ServiceName confirm 2>$null | Out-Null
+        } finally {
+            $ErrorActionPreference = $savedPref
+        }
+        # Wait for SCM to fully reap the service registration before we re-install.
+        $deadline = (Get-Date).AddSeconds(15)
+        while ((Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) -and ((Get-Date) -lt $deadline)) {
+            Start-Sleep -Milliseconds 500
+        }
     }
 
     # --- 3. Register NSSM service pointing at bundled node + dist/server.mjs --
