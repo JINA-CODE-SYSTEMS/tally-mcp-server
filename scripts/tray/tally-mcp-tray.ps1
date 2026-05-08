@@ -51,7 +51,7 @@ param(
 )
 
 # Resolve InstallDir relative to this file when not provided. The tray script lives at
-# <InstallDir>\scripts\tray\tally-mcp-tray.ps1 — climb two levels.
+# <InstallDir>\scripts\tray\tally-mcp-tray.ps1 - climb two levels.
 if (-not $InstallDir -or -not $InstallDir.Trim()) {
     $InstallDir = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 }
@@ -76,7 +76,7 @@ $State = [hashtable]::Synchronized(@{
 })
 
 # ---------------------------------------------------------------------------
-# .env parsing — minimal. We only need MCP_DOMAIN to decide whether to probe a
+# .env parsing - minimal. We only need MCP_DOMAIN to decide whether to probe a
 # public URL. Reusing dotenv would mean shipping node, which defeats the
 # zero-dependency goal.
 # ---------------------------------------------------------------------------
@@ -125,6 +125,20 @@ $IconYellow = New-StatusIcon -Fill ([System.Drawing.Color]::FromArgb(218,165,32)
 $IconRed    = New-StatusIcon -Fill ([System.Drawing.Color]::FromArgb(218,54,51))   -Border ([System.Drawing.Color]::FromArgb(120,25,25))
 $IconGray   = New-StatusIcon -Fill ([System.Drawing.Color]::FromArgb(150,150,150)) -Border ([System.Drawing.Color]::FromArgb(80,80,80))
 
+# Icon.FromHandle does NOT take ownership of the HICON. We must DestroyIcon ourselves on shutdown
+# or the GDI handles leak for the tray's lifetime. P/Invoke once and reuse on Quit.
+Add-Type -Namespace TallyTray -Name User32 -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool DestroyIcon(System.IntPtr hIcon);
+"@
+function Dispose-StatusIcon {
+    param([hashtable]$IconBundle)
+    if (-not $IconBundle) { return }
+    try { $IconBundle.Icon.Dispose() } catch {}
+    try { $IconBundle.Bitmap.Dispose() } catch {}
+    try { [void][TallyTray.User32]::DestroyIcon($IconBundle.Hicon) } catch {}
+}
+
 # ---------------------------------------------------------------------------
 # Health polling. Each probe is wrapped in try/catch so a transient failure on
 # one (e.g. agent task lookup raising on a domain-joined box without RSAT)
@@ -146,7 +160,7 @@ function Invoke-StatusPoll {
     try {
         # Find the actual running agent process (different from "task is registered"). The task can
         # be Ready (idle/registered) while the process has crashed; we want to know about that.
-        # CIM filter on Name, then substring-match the command line. Loose match is fine — we only
+        # CIM filter on Name, then substring-match the command line. Loose match is fine - we only
         # care that the agent script is somewhere in the args.
         $procs = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
             Where-Object { $_.CommandLine -and $_.CommandLine -like '*tally-gui-agent-v2.ps1*' }
@@ -161,7 +175,7 @@ function Invoke-StatusPoll {
         $State.TallyProcess = Get-Process -Name 'tally' -ErrorAction SilentlyContinue | Select-Object -First 1
     } catch { $State.TallyProcess = $null }
 
-    # Public URL probe is optional — if MCP_DOMAIN is unset, the operator is running localhost-only
+    # Public URL probe is optional - if MCP_DOMAIN is unset, the operator is running localhost-only
     # and there's nothing to probe externally. Probe the local OAuth metadata endpoint instead so
     # at least one signal of "the HTTP listener is up" reaches the tray.
     try {
@@ -189,8 +203,10 @@ function Invoke-StatusPoll {
             $body = '<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>List of Companies</ID></HEADER></ENVELOPE>'
             $resp = Invoke-WebRequest -Uri 'http://127.0.0.1:9000/' -Method POST -Body $body -ContentType 'text/xml; charset=utf-8' -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
             # Tally returns an XML-like list of companies; the first <COMPANY NAME="..."> is the active one.
-            # Simple regex extract — full XML parse is unwarranted for a tooltip string.
-            $match = [regex]::Match($resp.Content, '<COMPANYNAME>(.*?)</COMPANYNAME>', 'IgnoreCase')
+            # Simple regex extract - full XML parse is unwarranted for a tooltip string.
+            # Tally's "List of Companies" envelope returns <NAME>...</NAME> tags inside <COMPANY>
+            # blocks (verified against a real Tally Prime Edit Log instance). Take the first <NAME>.
+            $match = [regex]::Match($resp.Content, '<NAME>([^<]+)</NAME>', 'IgnoreCase')
             if ($match.Success) {
                 $State.LoadedCompany = $match.Groups[1].Value.Trim()
             } else {
@@ -207,7 +223,7 @@ function Invoke-StatusPoll {
 # ---------------------------------------------------------------------------
 # Status -> icon colour. Green = everything we expect to be running is running.
 # Yellow = at least one degraded but core service is up (e.g. agent down but
-# service alive — load-company will fail but read-only tools still work).
+# service alive - load-company will fail but read-only tools still work).
 # Red = the MCP service itself is down or missing.
 # Gray = first poll hasn't completed yet.
 # ---------------------------------------------------------------------------
@@ -219,7 +235,7 @@ function Get-OverallStatus {
 
     if (-not $serviceOk) { return 'red' }
     if ($agentOk -and $urlOk) { return 'green' }
-    # Service running but something downstream is degraded — yellow rather than red. The MCP
+    # Service running but something downstream is degraded - yellow rather than red. The MCP
     # endpoint may still be reachable and useful for read-only tools even with no agent.
     return 'yellow'
 }
@@ -264,7 +280,7 @@ $tray.Visible = $true
 
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 
-# Header items — these are status read-outs, not actions. Disabled but not hidden.
+# Header items - these are status read-outs, not actions. Disabled but not hidden.
 $miHeader = $menu.Items.Add('TallyMCP - polling...')
 $miHeader.Enabled = $false
 
@@ -296,7 +312,17 @@ $miRestartService.Add_Click({
         # Service control needs admin. RunAs verb prompts UAC; the actual stop/start runs
         # in a separate elevated PowerShell so the tray (running unelevated as the user) doesn't
         # have to be admin itself.
-        $cmd = "Restart-Service -Name '$ServiceName' -Force; Start-Sleep -Seconds 2; Get-Service -Name '$ServiceName' | Out-String | Write-Host; Start-Sleep -Seconds 2"
+        # IMPORTANT: do NOT use Restart-Service / Stop-Service. Node-under-NSSM does not have a
+        # working SIGTERM/SIGINT handler in service context, so graceful stop hangs reliably and
+        # SCM ends up in StopPending. Mirror deploy.ps1's pattern: taskkill node, then Start-Service.
+        $cmd = @"
+taskkill /F /IM node.exe 2>`$null | Out-Null
+Start-Sleep -Seconds 3
+Start-Service -Name '$ServiceName' -ErrorAction Stop
+Start-Sleep -Seconds 2
+Get-Service -Name '$ServiceName' | Out-String | Write-Host
+Start-Sleep -Seconds 3
+"@
         Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', $cmd) -Verb RunAs -WindowStyle Hidden
     } catch {
         [System.Windows.Forms.MessageBox]::Show("Restart failed: $_", 'TallyMCP', 'OK', 'Error') | Out-Null
@@ -308,12 +334,30 @@ $miRestartAgent.Add_Click({
     try {
         # Agent task runs as the current user already, so no elevation needed.
         Stop-ScheduledTask -TaskName $AgentTaskName -ErrorAction SilentlyContinue
-        # Also kill any leftover powershell.exe instances running the agent script — Stop-ScheduledTask
+        # Also kill any leftover powershell.exe instances running the agent script - Stop-ScheduledTask
         # ends the task, but if the agent was launched manually it's not a task instance.
+        # Tighten the match: also require -File pointing at the bundled agent path, so we don't
+        # accidentally kill a maintainer's own PowerShell window that happens to have the script
+        # name in scrollback or a different command line.
+        $bundledAgent = Join-Path $InstallDir 'scripts\tally-gui-agent-v2.ps1'
         Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -and $_.CommandLine -like '*tally-gui-agent-v2.ps1*' } |
+            Where-Object {
+                $_.CommandLine -and
+                $_.CommandLine -like "*-File*" -and
+                $_.CommandLine -like "*$bundledAgent*"
+            } |
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-        Start-Sleep -Milliseconds 500
+
+        # Wait for the task to actually report not-Running before starting again. Stop-ScheduledTask
+        # returns before the underlying process is fully gone; a too-quick Start can collide with
+        # the engine still tearing down the previous instance.
+        $deadline = (Get-Date).AddSeconds(5)
+        while ((Get-Date) -lt $deadline) {
+            $t = Get-ScheduledTask -TaskName $AgentTaskName -ErrorAction SilentlyContinue
+            if (-not $t -or $t.State -ne 'Running') { break }
+            Start-Sleep -Milliseconds 200
+        }
+
         Start-ScheduledTask -TaskName $AgentTaskName -ErrorAction Stop
     } catch {
         [System.Windows.Forms.MessageBox]::Show("Restart agent failed: $_", 'TallyMCP', 'OK', 'Error') | Out-Null
@@ -363,7 +407,7 @@ $miQuit.Add_Click({
 
 $tray.ContextMenuStrip = $menu
 
-# Double-click the tray icon → open logs (most-frequent action when something looks off)
+# Double-click the tray icon -> open logs (most-frequent action when something looks off)
 $tray.add_DoubleClick({ $miOpenLogs.PerformClick() })
 
 # ---------------------------------------------------------------------------
@@ -436,3 +480,8 @@ $timer.Start()
 $tray.Visible = $false
 $tray.Dispose()
 $timer.Dispose()
+# Free GDI HICONs we allocated via Bitmap.GetHicon (Icon.FromHandle did not take ownership).
+Dispose-StatusIcon $IconGreen
+Dispose-StatusIcon $IconYellow
+Dispose-StatusIcon $IconRed
+Dispose-StatusIcon $IconGray
