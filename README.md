@@ -2,6 +2,11 @@
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
 
+**A [Jina Code Systems LLP](https://github.com/JINA-CODE-SYSTEMS) project.**
+Copyright © 2026 Jina Code Systems LLP. Licensed under [AGPL-3.0-or-later](LICENSE).
+This attribution is a required notice under AGPL-3.0 § 7(b) and **must be preserved** in
+all copies, forks, and derivative works — see [NOTICE](NOTICE) for the full clause.
+
 > **Note:** Git history was rewritten on 16 Apr 2026 to remove accidentally committed auth tokens. All leaked credentials have been rotated. Thanks to [@Journeyman1987](https://github.com/Journeyman1987) for flagging this.
 
 An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that bridges **Tally Prime ERP** with AI assistants like Claude, ChatGPT, GitHub Copilot, and any MCP-compatible client. Query financial reports, manage masters, create vouchers, and analyse GST data — all through natural language.
@@ -382,8 +387,10 @@ npm audit              # Check for dependency vulnerabilities
 
 ## Credits
 
-Originally created by [Dhananjay Gokhale](https://github.com/dhananjay1405/tally-mcp-server). This fork is maintained by [Jinacode Systems](https://github.com/JINA-CODE-SYSTEMS).
+Originally created by [Dhananjay Gokhale](https://github.com/dhananjay1405/tally-mcp-server) under the MIT licence (the original MIT notice is preserved in [NOTICE](NOTICE)). This fork is maintained by **[Jina Code Systems LLP](https://github.com/JINA-CODE-SYSTEMS)** and is licensed under AGPL-3.0-or-later.
 
 ## License
 
-[AGPL-3.0-or-later](LICENSE)
+[AGPL-3.0-or-later](LICENSE) — Copyright © 2026 **Jina Code Systems LLP**.
+
+Per AGPL-3.0 § 7(b), the "A Jina Code Systems LLP project" attribution at the top of this README, in [NOTICE](NOTICE), and in the application's `--version` / startup banner output is a **required notice**. Forks and derivative works must keep it intact (modifications and additions to the surrounding text are welcome; removal of the attribution is not). See [NOTICE](NOTICE) for the canonical clause.
