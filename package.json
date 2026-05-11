@@ -11,7 +11,7 @@
     "type": "git",
     "url": "git+https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server.git"
   },
-  "author": "Jinacode Systems",
+  "author": "Jina Code Systems LLP",
   "license": "AGPL-3.0-or-later",
   "engines": {
     "node": ">=20.0.0"
