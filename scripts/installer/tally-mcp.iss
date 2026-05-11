@@ -51,6 +51,11 @@ ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 UninstallDisplayIcon={app}\dist\server.mjs
 ChangesEnvironment=yes
+; Jinacode Systems branding. Comma-separated lists let Inno pick the closest size
+; to the user's display scaling — the standard BMP renders on 100% DPI, the @2x
+; variant covers 150-200% scaling without upscale blur.
+WizardImageFile=assets\wizard-sidebar.bmp,assets\wizard-sidebar@2x.bmp
+WizardSmallImageFile=assets\wizard-small.bmp,assets\wizard-small@2x.bmp
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
