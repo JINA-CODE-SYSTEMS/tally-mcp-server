@@ -87,8 +87,15 @@ Source: "{#RepoRoot}\scripts\installer\uninstall-cleanup.ps1";  DestDir: "{app}\
 
 ; --- Tray status app (issue #20). Polls service/agent/Tally health and surfaces a
 ; coloured tray icon + right-click action menu. Registered as a per-user at-logon
-; scheduled task by firstrun-config.ps1. ---
+; scheduled task by firstrun-config.ps1. Double-clicking the tray opens a dashboard
+; window that reads the bundled logo (assets/) and LICENSE file shipped below. ---
 Source: "{#RepoRoot}\scripts\tray\tally-mcp-tray.ps1"; DestDir: "{app}\scripts\tray"; Flags: ignoreversion
+Source: "{#RepoRoot}\scripts\tray\assets\*";           DestDir: "{app}\scripts\tray\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+; --- LICENSE at the install root so the tray dashboard can read it post-install.
+; (LicenseFile= above only feeds the wizard's accept-license page; that copy is not
+; placed on disk.) ---
+Source: "{#RepoRoot}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
 ; --- Bundled portable Node.js. Avoids version conflicts with anything else on the box.
 ; The build script populates installer-staging/node-portable/ from the official Node zip. ---
