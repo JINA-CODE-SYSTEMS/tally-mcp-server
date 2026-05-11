@@ -407,8 +407,228 @@ $miQuit.Add_Click({
 
 $tray.ContextMenuStrip = $menu
 
-# Double-click the tray icon -> open logs (most-frequent action when something looks off)
-$tray.add_DoubleClick({ $miOpenLogs.PerformClick() })
+# ---------------------------------------------------------------------------
+# Dashboard window (double-click target). Single modeless Form that mirrors
+# the tray menu's status read-out + actions, plus the JINA CODE SYSTEMS brand
+# and the bundled LICENSE text. Built lazily on first double-click and re-used
+# on subsequent opens (so the logo bitmap is loaded once, not per-open).
+#
+# Wired to the existing menu items via PerformClick so the dashboard buttons
+# and the right-click menu share one implementation per action.
+# ---------------------------------------------------------------------------
+$Dashboard       = $null     # the Form instance, or $null if never opened / disposed
+$DashboardLabels = $null     # hashtable of the live-updating status labels
+
+function Show-Dashboard {
+    if ($Dashboard -and -not $Dashboard.IsDisposed) {
+        # Already open - just bring to front. Set TopMost briefly so it pops above
+        # other windows even when called from a tray click that has no input focus.
+        if ($Dashboard.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) {
+            $Dashboard.WindowState = [System.Windows.Forms.FormWindowState]::Normal
+        }
+        $Dashboard.TopMost = $true; $Dashboard.TopMost = $false
+        $Dashboard.Activate()
+        return
+    }
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text          = 'TallyMCP - Dashboard'
+    $form.Size          = New-Object System.Drawing.Size 640, 620
+    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $form.MinimumSize   = New-Object System.Drawing.Size 560, 540
+    $form.BackColor     = [System.Drawing.Color]::White
+    $form.Font          = New-Object System.Drawing.Font 'Segoe UI', 9
+
+    # --- Header band: logo + product name + version. Anchored top, fixed-height. ---
+    $header = New-Object System.Windows.Forms.Panel
+    $header.Dock      = [System.Windows.Forms.DockStyle]::Top
+    $header.Height    = 120
+    $header.BackColor = [System.Drawing.Color]::White
+    $form.Controls.Add($header)
+
+    $logoPath = Join-Path $PSScriptRoot 'assets\jina-logo.png'
+    if (Test-Path -LiteralPath $logoPath) {
+        $pic = New-Object System.Windows.Forms.PictureBox
+        $pic.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
+        $pic.Location = New-Object System.Drawing.Point 16, 12
+        $pic.Size     = New-Object System.Drawing.Size 96, 96
+        try { $pic.Image = [System.Drawing.Image]::FromFile($logoPath) } catch {}
+        $header.Controls.Add($pic)
+    }
+
+    $lblProduct = New-Object System.Windows.Forms.Label
+    $lblProduct.Text     = 'Tally MCP Server'
+    $lblProduct.Font     = New-Object System.Drawing.Font 'Segoe UI Semibold', 16
+    $lblProduct.AutoSize = $true
+    $lblProduct.Location = New-Object System.Drawing.Point 128, 24
+    $header.Controls.Add($lblProduct)
+
+    $lblPublisher = New-Object System.Windows.Forms.Label
+    $lblPublisher.Text     = 'by JINA CODE SYSTEMS LLP'
+    $lblPublisher.Font     = New-Object System.Drawing.Font 'Segoe UI', 9
+    $lblPublisher.ForeColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
+    $lblPublisher.AutoSize = $true
+    $lblPublisher.Location = New-Object System.Drawing.Point 128, 56
+    $header.Controls.Add($lblPublisher)
+
+    $lblVersion = New-Object System.Windows.Forms.Label
+    $lblVersion.Text     = 'v1.1.0'
+    $lblVersion.Font     = New-Object System.Drawing.Font 'Segoe UI', 9
+    $lblVersion.ForeColor = [System.Drawing.Color]::FromArgb(120, 120, 120)
+    $lblVersion.AutoSize = $true
+    $lblVersion.Location = New-Object System.Drawing.Point 128, 80
+    $header.Controls.Add($lblVersion)
+
+    # --- Status panel: 4 live-updating lines, refreshed by Update-DashboardUi. ---
+    $status = New-Object System.Windows.Forms.GroupBox
+    $status.Text     = ' Status '
+    $status.Location = New-Object System.Drawing.Point 16, 130
+    $status.Size     = New-Object System.Drawing.Size 600, 110
+    $status.Anchor   = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $form.Controls.Add($status)
+
+    $labels = @{}
+    $rowY = 22
+    foreach ($name in @('Service','Agent','Tally','PublicUrl')) {
+        $caption = New-Object System.Windows.Forms.Label
+        $caption.Text     = switch ($name) {
+            'Service'   { 'Service:' }
+            'Agent'     { 'Agent:' }
+            'Tally'     { 'Tally:' }
+            'PublicUrl' { 'Public URL:' }
+        }
+        $caption.Location = New-Object System.Drawing.Point 16, $rowY
+        $caption.Size     = New-Object System.Drawing.Size 100, 18
+        $caption.Font     = New-Object System.Drawing.Font 'Segoe UI Semibold', 9
+        $status.Controls.Add($caption)
+
+        $value = New-Object System.Windows.Forms.Label
+        $value.Text     = '-'
+        $value.Location = New-Object System.Drawing.Point 120, $rowY
+        $value.Size     = New-Object System.Drawing.Size 460, 18
+        $status.Controls.Add($value)
+
+        $labels[$name] = $value
+        $rowY += 20
+    }
+
+    # --- Action buttons: 2x3 grid of the same actions exposed by the right-click menu.
+    # Each button .PerformClick()s the corresponding ToolStripMenuItem so the
+    # implementations stay in one place (no duplicated restart/reconfigure logic). ---
+    $actions = New-Object System.Windows.Forms.GroupBox
+    $actions.Text     = ' Actions '
+    $actions.Location = New-Object System.Drawing.Point 16, 250
+    $actions.Size     = New-Object System.Drawing.Size 600, 110
+    $actions.Anchor   = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $form.Controls.Add($actions)
+
+    $btnSpecs = @(
+        @{ Text = 'Restart service';   X =  16; Y = 24; Click = { $miRestartService.PerformClick() } },
+        @{ Text = 'Restart GUI agent'; X = 210; Y = 24; Click = { $miRestartAgent.PerformClick() } },
+        @{ Text = 'Reconfigure...';    X = 404; Y = 24; Click = { $miReconfigure.PerformClick() } },
+        @{ Text = 'Launch Tally';      X =  16; Y = 64; Click = { $miLaunchTally.PerformClick() } },
+        @{ Text = 'Open logs';         X = 210; Y = 64; Click = { $miOpenLogs.PerformClick() } },
+        @{ Text = 'Copy public URL';   X = 404; Y = 64; Click = {
+            if ($State.PublicUrl) {
+                try { [System.Windows.Forms.Clipboard]::SetText($State.PublicUrl) } catch {}
+            }
+        } }
+    )
+    foreach ($spec in $btnSpecs) {
+        $btn = New-Object System.Windows.Forms.Button
+        $btn.Text     = $spec.Text
+        $btn.Location = New-Object System.Drawing.Point $spec.X, $spec.Y
+        $btn.Size     = New-Object System.Drawing.Size 180, 32
+        $btn.Add_Click($spec.Click)
+        $actions.Controls.Add($btn)
+    }
+
+    # --- License panel: read-only multi-line viewer of the bundled LICENSE file.
+    # Anchored to all four sides so the user can resize the window to read more
+    # without horizontal scroll. ---
+    $licenseGroup = New-Object System.Windows.Forms.GroupBox
+    $licenseGroup.Text     = ' License '
+    $licenseGroup.Location = New-Object System.Drawing.Point 16, 370
+    $licenseGroup.Size     = New-Object System.Drawing.Size 600, 200
+    $licenseGroup.Anchor   = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $form.Controls.Add($licenseGroup)
+
+    $licenseBox = New-Object System.Windows.Forms.TextBox
+    $licenseBox.Multiline  = $true
+    $licenseBox.ReadOnly   = $true
+    $licenseBox.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+    $licenseBox.WordWrap   = $true
+    $licenseBox.Font       = New-Object System.Drawing.Font 'Consolas', 9
+    $licenseBox.BackColor  = [System.Drawing.Color]::FromArgb(248, 248, 248)
+    $licenseBox.Dock       = [System.Windows.Forms.DockStyle]::Fill
+    # The shipped LICENSE (AGPL v3) is ~34KB; default TextBox.MaxLength = 32767 chars
+    # would silently truncate the closing sections of the license, which is exactly the
+    # opposite of what an operator opening this dialog wants to see. 0 disables the cap.
+    $licenseBox.MaxLength  = 0
+    # LICENSE is copied to the install root by the installer (see tally-mcp.iss [Files]).
+    $licensePath = Join-Path $InstallDir 'LICENSE'
+    if (Test-Path -LiteralPath $licensePath) {
+        try {
+            $licenseBox.Text = (Get-Content -LiteralPath $licensePath -Raw -ErrorAction Stop)
+        } catch {
+            $licenseBox.Text = "Unable to read LICENSE file at $licensePath`r`n$_"
+        }
+    } else {
+        $licenseBox.Text = "LICENSE file not found at $licensePath."
+    }
+    $licenseGroup.Controls.Add($licenseBox)
+
+    # Clear the script-scoped references when the form is disposed so the next double-click
+    # creates a fresh one rather than touching a dead handle. Use the script: scope explicitly
+    # since the closure runs outside the Show-Dashboard function frame. The PictureBox + its
+    # backing Image dispose automatically as child controls of the form.
+    $form.add_FormClosed({
+        $script:Dashboard = $null
+        $script:DashboardLabels = $null
+    })
+
+    $script:Dashboard = $form
+    $script:DashboardLabels = $labels
+    Update-DashboardUi  # populate immediately so it doesn't flash a row of '-' before the next poll tick
+    $form.Show()
+    $form.Activate()
+}
+
+function Update-DashboardUi {
+    if (-not $script:Dashboard -or $script:Dashboard.IsDisposed -or -not $script:DashboardLabels) { return }
+
+    if ($State.Service) {
+        $script:DashboardLabels['Service'].Text = "$($State.Service.Status)"
+    } else {
+        $script:DashboardLabels['Service'].Text = 'not installed'
+    }
+
+    if ($State.AgentTask) {
+        $procPart = if ($State.AgentProcess) { "PID $($State.AgentProcess.ProcessId)" } else { 'no process' }
+        $script:DashboardLabels['Agent'].Text = "$($State.AgentTask.State) ($procPart)"
+    } else {
+        $script:DashboardLabels['Agent'].Text = 'task not registered'
+    }
+
+    if ($State.TallyProcess) {
+        $cmp = if ($State.LoadedCompany) { " - $($State.LoadedCompany)" } else { '' }
+        $script:DashboardLabels['Tally'].Text = "Running$cmp"
+    } else {
+        $script:DashboardLabels['Tally'].Text = 'not running'
+    }
+
+    if ($null -eq $State.PublicUrlOk) {
+        $script:DashboardLabels['PublicUrl'].Text = 'not configured'
+    } elseif ($State.PublicUrlOk) {
+        $script:DashboardLabels['PublicUrl'].Text = "OK ($($State.PublicUrl))"
+    } else {
+        $script:DashboardLabels['PublicUrl'].Text = "unreachable ($($State.PublicUrl))"
+    }
+}
+
+# Double-click the tray icon -> open the dashboard (Logs is still one click away in
+# the right-click menu and as a dashboard button).
+$tray.add_DoubleClick({ Show-Dashboard })
 
 # ---------------------------------------------------------------------------
 # Polling timer. Drives the icon colour + menu header text from $State after
@@ -465,6 +685,7 @@ $timer.Interval = [Math]::Max(1000, $PollIntervalSec * 1000)
 $timer.Add_Tick({
     Invoke-StatusPoll
     Update-TrayUi
+    Update-DashboardUi
 })
 
 # First poll synchronously so the icon shows real status from the moment the tray appears
