@@ -51,13 +51,20 @@ param(
 )
 
 # Resolve InstallDir relative to this file when not provided. The tray script lives at
-# <InstallDir>\scripts\tray\tally-mcp-tray.ps1 - climb two levels.
+# <InstallDir>\scripts\tray\tally-mcp-tray.ps1, so we climb three Split-Path -Parents:
+# file -> tray\ -> scripts\ -> <InstallDir>. Two splits land us inside scripts\, which
+# made every Join-Path against InstallDir double up "scripts\" in dev mode.
 if (-not $InstallDir -or -not $InstallDir.Trim()) {
-    $InstallDir = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
+    $InstallDir = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSCommandPath))
 }
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+
+# Dot-source the Manage Companies dialog (defines Show-ManageCompaniesDialog). Lives next
+# to this script so it ships in the same scripts/tray/ install payload.
+$ManageDialogPath = Join-Path (Split-Path -Parent $PSCommandPath) 'manage-companies-dialog.ps1'
+if (Test-Path -LiteralPath $ManageDialogPath) { . $ManageDialogPath }
 
 # ---------------------------------------------------------------------------
 # State container shared between the polling timer and the menu handlers.
@@ -91,10 +98,16 @@ function Read-EnvValue {
         $k = $trimmed.Substring(0, $eq).Trim()
         if ($k -ne $Key) { continue }
         $v = $trimmed.Substring($eq + 1).Trim()
-        # Strip surrounding double-quotes (firstrun-config.ps1 quotes values that may contain '#')
+        # Strip surrounding double-quotes (firstrun-config.ps1 quotes values that may contain '#').
+        # For quoted values, '#' inside the quotes is part of the value, not a comment.
         if ($v.Length -ge 2 -and $v.StartsWith('"') -and $v.EndsWith('"')) {
-            $v = $v.Substring(1, $v.Length - 2) -replace '\\"', '"'
+            return $v.Substring(1, $v.Length - 2) -replace '\\"', '"'
         }
+        # Unquoted values: strip inline '# comment' (dotenv-style). Matters for .env files
+        # copied from .env.example, where empty values like `TALLY_DATA_PATH=    # description`
+        # would otherwise return the comment text as the value.
+        $hash = $v.IndexOf('#')
+        if ($hash -ge 0) { $v = $v.Substring(0, $hash).TrimEnd() }
         return $v
     }
     return ''
@@ -380,6 +393,30 @@ $miLaunchTally.Add_Click({
     }
 })
 
+$miManageCompanies = $menu.Items.Add('Manage Companies...')
+$miManageCompanies.Add_Click({
+    if (-not (Get-Command Show-ManageCompaniesDialog -ErrorAction SilentlyContinue)) {
+        [System.Windows.Forms.MessageBox]::Show("Manage Companies dialog script not loaded.`nExpected: $ManageDialogPath", 'TallyMCP', 'OK', 'Warning') | Out-Null
+        return
+    }
+    # Resolve registry + DPAPI helper paths from InstallDir. Falls back to the install-time
+    # default if TALLY_DATA_PATH is unset; the dialog itself handles a missing file gracefully.
+    $envFile = Join-Path $InstallDir '.env'
+    $dataPath = Read-EnvValue -EnvPath $envFile -Key 'TALLY_DATA_PATH'
+    if (-not $dataPath) { $dataPath = 'C:\Users\Public\TallyPrimeEditLog\data' }
+    $registryPath = Join-Path $dataPath '.tally-mcp-companies.json'
+    $dpapiHelper  = Join-Path $InstallDir 'scripts\dpapi-helper.ps1'
+    if (-not (Test-Path -LiteralPath $dpapiHelper)) {
+        [System.Windows.Forms.MessageBox]::Show("DPAPI helper not found at: $dpapiHelper`nReinstall TallyMCP to restore.", 'TallyMCP', 'OK', 'Warning') | Out-Null
+        return
+    }
+    try {
+        Show-ManageCompaniesDialog -RegistryPath $registryPath -DpapiHelperPath $dpapiHelper
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Manage Companies dialog failed: $_", 'TallyMCP', 'OK', 'Error') | Out-Null
+    }
+})
+
 $miReconfigure = $menu.Items.Add('Reconfigure...')
 $miReconfigure.Add_Click({
     $script = Join-Path $InstallDir 'scripts\installer\firstrun-config.ps1'
@@ -433,9 +470,9 @@ function Show-Dashboard {
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text          = 'TallyMCP - Dashboard'
-    $form.Size          = New-Object System.Drawing.Size 640, 620
+    $form.Size          = New-Object System.Drawing.Size 640, 660
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-    $form.MinimumSize   = New-Object System.Drawing.Size 560, 540
+    $form.MinimumSize   = New-Object System.Drawing.Size 560, 580
     $form.BackColor     = [System.Drawing.Color]::White
     $form.Font          = New-Object System.Drawing.Font 'Segoe UI', 9
 
@@ -518,21 +555,24 @@ function Show-Dashboard {
     $actions = New-Object System.Windows.Forms.GroupBox
     $actions.Text     = ' Actions '
     $actions.Location = New-Object System.Drawing.Point 16, 250
-    $actions.Size     = New-Object System.Drawing.Size 600, 110
+    $actions.Size     = New-Object System.Drawing.Size 600, 150
     $actions.Anchor   = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
     $form.Controls.Add($actions)
 
+    # Grid: 3 columns x 3 rows. Each button .PerformClick()s the corresponding ToolStripMenuItem
+    # so the implementation stays in one place (no duplicated restart/reconfigure logic).
     $btnSpecs = @(
-        @{ Text = 'Restart service';   X =  16; Y = 24; Click = { $miRestartService.PerformClick() } },
-        @{ Text = 'Restart GUI agent'; X = 210; Y = 24; Click = { $miRestartAgent.PerformClick() } },
-        @{ Text = 'Reconfigure...';    X = 404; Y = 24; Click = { $miReconfigure.PerformClick() } },
-        @{ Text = 'Launch Tally';      X =  16; Y = 64; Click = { $miLaunchTally.PerformClick() } },
-        @{ Text = 'Open logs';         X = 210; Y = 64; Click = { $miOpenLogs.PerformClick() } },
-        @{ Text = 'Copy public URL';   X = 404; Y = 64; Click = {
+        @{ Text = 'Restart service';     X =  16; Y =  24; Click = { $miRestartService.PerformClick() } },
+        @{ Text = 'Restart GUI agent';   X = 210; Y =  24; Click = { $miRestartAgent.PerformClick() } },
+        @{ Text = 'Reconfigure...';      X = 404; Y =  24; Click = { $miReconfigure.PerformClick() } },
+        @{ Text = 'Launch Tally';        X =  16; Y =  64; Click = { $miLaunchTally.PerformClick() } },
+        @{ Text = 'Open logs';           X = 210; Y =  64; Click = { $miOpenLogs.PerformClick() } },
+        @{ Text = 'Copy public URL';     X = 404; Y =  64; Click = {
             if ($State.PublicUrl) {
                 try { [System.Windows.Forms.Clipboard]::SetText($State.PublicUrl) } catch {}
             }
-        } }
+        } },
+        @{ Text = 'Manage Companies...'; X =  16; Y = 104; Click = { $miManageCompanies.PerformClick() } }
     )
     foreach ($spec in $btnSpecs) {
         $btn = New-Object System.Windows.Forms.Button
@@ -548,7 +588,7 @@ function Show-Dashboard {
     # without horizontal scroll. ---
     $licenseGroup = New-Object System.Windows.Forms.GroupBox
     $licenseGroup.Text     = ' License '
-    $licenseGroup.Location = New-Object System.Drawing.Point 16, 370
+    $licenseGroup.Location = New-Object System.Drawing.Point 16, 410
     $licenseGroup.Size     = New-Object System.Drawing.Size 600, 200
     $licenseGroup.Anchor   = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
     $form.Controls.Add($licenseGroup)
@@ -673,10 +713,12 @@ function Update-TrayUi {
         $miUrlState.Text = "  Public URL: unreachable"
     }
 
-    # NotifyIcon.Text caps at 127 chars on Win10+ (63 on older). Format-Tooltip is short
-    # enough to fit; we still defensively clamp.
+    # NotifyIcon.Text caps at 63 chars in legacy .NET Framework (which is what PowerShell 5
+    # binds against), even on Win10/11. Newer .NET Core/.NET 5+ allow 127, but we can't rely
+    # on that here. Clamp to 63 to avoid the "Text length must be less than 64 characters"
+    # exception that the old-style WinForms NotifyIcon throws.
     $tip = Format-Tooltip
-    if ($tip.Length -gt 127) { $tip = $tip.Substring(0, 127) }
+    if ($tip.Length -gt 63) { $tip = $tip.Substring(0, 63) }
     $tray.Text = $tip
 }
 

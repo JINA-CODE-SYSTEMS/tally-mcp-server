@@ -221,9 +221,11 @@ const handleMcpRequest = async (req: express.Request, res: express.Response) => 
         // Store the transport by session ID
         transports[sessionId] = transport;
       },
-      // DNS rebinding protection — allow the configured domain hostname
+      // DNS rebinding protection — allow the configured domain host (hostname + port).
+      // The SDK compares against the raw Host header, which always includes the port for
+      // non-default ports, so `.hostname` ('localhost') would never match 'localhost:3000'.
       enableDnsRebindingProtection: true,
-      allowedHosts: [new URL(mcpDomain).hostname],
+      allowedHosts: [new URL(mcpDomain).host],
     });
 
     // Clean up transport when closed

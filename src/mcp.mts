@@ -1,6 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import dotenv from 'dotenv';
-import { execSync } from 'node:child_process';
+import { execSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
@@ -173,12 +173,6 @@ export type AvailableCompany = {
 
 // Optional credential-hint config. Mapping of folder id → known credential metadata.
 // Allows callers to know up-front whether to ask the human for credentials (issue #16, piece C).
-// Path: <dataPath>/.tally-mcp-companies.json by default, or override via TALLY_COMPANIES_CONFIG env var.
-// Format:
-//   {
-//     "100000": { "requiresCredentials": true,  "knownUsername": "admin", "notes": "Edit Log w/ user-based security" },
-//     "200000": { "requiresCredentials": false, "notes": "Auto-loads cleanly" }
-//   }
 // We never store passwords here — only the hint that one is needed.
 export type CompaniesConfig = {
   [folderId: string]: {
@@ -188,16 +182,163 @@ export type CompaniesConfig = {
   };
 };
 
+// Company registry entry — one configured alias the user can refer to from an LLM ("load main").
+// Passwords live in `passwordEnc` as a DPAPI-encrypted base64 blob; plaintext never touches disk.
+export type CompanyEntry = {
+  alias: string;
+  extraAliases?: string[];
+  folderId: string;
+  displayName?: string;
+  username?: string;
+  passwordEnc?: string;
+  notes?: string;
+};
+
+// The on-disk shape of .tally-mcp-companies.json after the registry feature.
+// Old-shape files (a flat { folderId: hints } map) are migrated into `legacyHints` on read;
+// `companies` starts empty and is populated via the Manage Companies dashboard.
+// Path: <dataPath>/.tally-mcp-companies.json by default, or override via TALLY_COMPANIES_CONFIG env var.
+export type CompanyRegistry = {
+  schemaVersion: 1;
+  companies: CompanyEntry[];
+  legacyHints?: CompaniesConfig;
+};
+
+export const EMPTY_COMPANY_REGISTRY: CompanyRegistry = {
+  schemaVersion: 1,
+  companies: [],
+};
+
+function isNewRegistryShape(parsed: any): parsed is CompanyRegistry {
+  return !!parsed
+    && typeof parsed === 'object'
+    && !Array.isArray(parsed)
+    && parsed.schemaVersion === 1
+    && Array.isArray(parsed.companies);
+}
+
+// Back-compat reader — returns just the flat hints. Used by scanAvailableCompanies and any other
+// caller that only cares about "does this folderId need a credential prompt." New code should
+// prefer loadCompanyRegistry instead.
 export function loadCompaniesConfig(configPath: string): CompaniesConfig {
   try {
     if (!fs.existsSync(configPath)) return {};
     const raw = fs.readFileSync(configPath, 'utf-8').replace(/^﻿/, '');
     const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as CompaniesConfig;
-    return {};
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    if (isNewRegistryShape(parsed)) return parsed.legacyHints ?? {};
+    return parsed as CompaniesConfig;
   } catch {
     return {};
   }
+}
+
+// Reads the full registry. Migrates old-shape files in-memory only — does NOT write back.
+// Persistence happens through saveCompanyRegistry, called from the Manage Companies dashboard.
+export function loadCompanyRegistry(configPath: string): CompanyRegistry {
+  try {
+    if (!fs.existsSync(configPath)) return { schemaVersion: 1, companies: [] };
+    const raw = fs.readFileSync(configPath, 'utf-8').replace(/^﻿/, '');
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { schemaVersion: 1, companies: [] };
+    }
+    if (isNewRegistryShape(parsed)) return parsed;
+    return {
+      schemaVersion: 1,
+      companies: [],
+      legacyHints: parsed as CompaniesConfig,
+    };
+  } catch {
+    return { schemaVersion: 1, companies: [] };
+  }
+}
+
+// Atomic write of the registry. Used by the Manage Companies dashboard on save.
+// Caller is responsible for ensuring passwordEnc fields are already DPAPI-encrypted —
+// this function never sees plaintext and never transforms entries.
+export function saveCompanyRegistry(configPath: string, registry: CompanyRegistry): void {
+  atomicWriteFile(configPath, JSON.stringify(registry, null, 2) + '\n');
+}
+
+// Case-insensitive exact-match lookup against alias + extraAliases. Returns null if no match —
+// callers should surface the list of valid aliases in the error so the LLM can recover.
+export function findCompanyByAlias(registry: CompanyRegistry, alias: string): CompanyEntry | null {
+  const target = alias.trim().toLowerCase();
+  if (!target) return null;
+  for (const c of registry.companies) {
+    if (c.alias.trim().toLowerCase() === target) return c;
+    if (c.extraAliases?.some(a => a.trim().toLowerCase() === target)) return c;
+  }
+  return null;
+}
+
+// Returns every alias the user could legitimately type — main alias + extra aliases, deduped,
+// in declaration order. Used in error messages when an unknown alias is requested.
+export function listConfiguredAliases(registry: CompanyRegistry): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const c of registry.companies) {
+    for (const a of [c.alias, ...(c.extraAliases ?? [])]) {
+      const key = a.trim().toLowerCase();
+      if (key && !seen.has(key)) {
+        seen.add(key);
+        out.push(a);
+      }
+    }
+  }
+  return out;
+}
+
+// Path to the PowerShell helper that performs the actual DPAPI Protect/Unprotect.
+// Compiled output lives in dist/, so the helper resolves to ../scripts/dpapi-helper.ps1.
+function dpapiHelperPath(): string {
+  return path.resolve(import.meta.dirname, '..', 'scripts', 'dpapi-helper.ps1');
+}
+
+// Spawns the DPAPI helper with input on stdin (never command-line args, so secrets don't
+// appear in process listings). Returns the helper's stdout as a string. Throws if the helper
+// exits non-zero, returns empty output, or cannot be spawned.
+function runDpapiHelper(action: 'encrypt' | 'decrypt', input: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', dpapiHelperPath(), '-Action', action],
+      { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
+    );
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', d => { stdout += d.toString('utf-8'); });
+    child.stderr.on('data', d => { stderr += d.toString('utf-8'); });
+    child.on('error', reject);
+    child.on('close', code => {
+      if (code !== 0) {
+        reject(new Error(`dpapi-helper ${action} exited ${code}: ${stderr.trim() || 'unknown error'}`));
+        return;
+      }
+      if (!stdout) {
+        reject(new Error(`dpapi-helper ${action} returned empty output`));
+        return;
+      }
+      resolve(stdout);
+    });
+    child.stdin.end(input, 'utf-8');
+  });
+}
+
+// Encrypts a password using Windows DPAPI (LocalMachine scope). Returns a base64 blob suitable
+// for storage in CompanyEntry.passwordEnc. The plaintext is passed via stdin to the helper
+// process — it never appears on the command line or in any log.
+export async function encryptPasswordViaDpapi(plaintext: string): Promise<string> {
+  if (!plaintext) throw new Error('encryptPasswordViaDpapi: plaintext is empty');
+  return runDpapiHelper('encrypt', plaintext);
+}
+
+// Decrypts a DPAPI blob previously produced by encryptPasswordViaDpapi. Throws if the blob was
+// encrypted on a different machine, with a different scope, or has been tampered with.
+export async function decryptPasswordViaDpapi(blob: string): Promise<string> {
+  if (!blob) throw new Error('decryptPasswordViaDpapi: blob is empty');
+  return runDpapiHelper('decrypt', blob);
 }
 
 // Recursively scans a Tally data directory for company folders and extracts everything we can
@@ -2221,6 +2362,121 @@ export async function registerMcpServer(): Promise<McpServer> {
       return {
         content: [{ type: 'text', text: JSON.stringify({ success: true, created: resp.created, lastVchId: resp.lastVchId, taxBreakup: { taxableValue, cgstAmount, sgstAmount, igstAmount, totalInvoiceValue } }) }]
       };
+    }
+  );
+
+  // --- Company registry tools (issue: alias-based fast loading) -----------------------------
+  // Resolves the registry path from env, with the same fallback the installer uses.
+  const resolveRegistryPath = (): string => {
+    if (process.env.TALLY_COMPANIES_CONFIG) return process.env.TALLY_COMPANIES_CONFIG;
+    const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+    return path.join(dataPath, '.tally-mcp-companies.json');
+  };
+
+  mcpServer.registerTool(
+    'list-configured-companies',
+    {
+      title: 'List Configured Companies',
+      description: `lists all companies the user has pre-configured in the Tally MCP registry via the tray dashboard's Manage Companies screen. Each entry is a friendly alias (e.g. "main", "branch") the user can refer to when asking to load a company. Use this BEFORE load-company-by-alias when the user says a short name without specifying an exact match — surface the list so they can clarify. Returns alias, displayName, and whether a stored password exists (never the password itself).`,
+      inputSchema: {},
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      try {
+        const registry = loadCompanyRegistry(resolveRegistryPath());
+        const out = registry.companies.map(c => ({
+          alias: c.alias,
+          extraAliases: c.extraAliases ?? [],
+          folderId: c.folderId,
+          displayName: c.displayName ?? '',
+          hasPassword: !!c.passwordEnc,
+          notes: c.notes ?? ''
+        }));
+        auditLog('list-configured-companies', args, 'success', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify({ count: out.length, companies: out }, null, 2) }] };
+      } catch (err) {
+        auditLog('list-configured-companies', args, 'error', Date.now() - start);
+        return { isError: true, content: [{ type: 'text', text: `list-configured-companies failed: ${err}` }] };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'load-company-by-alias',
+    {
+      title: 'Load Company by Alias',
+      description: `fast deterministic load of a Tally company using a pre-configured alias from the registry. Looks up the alias, decrypts any stored password locally, and dispatches a keystroke flow to the GUI agent: types the folder ID, presses Enter, then types username/password if stored. Prefer this over open-company when the user refers to a company by a short name they've configured (use list-configured-companies first to see what's available). Returns success once Tally has accepted the keystrokes. If the alias is unknown, returns an error listing all valid aliases.`,
+      inputSchema: {
+        alias: z.string().describe('the friendly name the user configured (e.g. "main", "branch"). Case-insensitive, matched against alias and extraAliases.')
+      },
+      annotations: {
+        readOnlyHint: false,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      const logs: string[] = [];
+      try {
+        const registry = loadCompanyRegistry(resolveRegistryPath());
+        const entry = findCompanyByAlias(registry, args.alias);
+        if (!entry) {
+          const valid = listConfiguredAliases(registry);
+          const hint = valid.length > 0
+            ? `Valid aliases: ${valid.join(', ')}. Configure new aliases via the tray icon > Manage Companies.`
+            : `No companies configured yet. Open the tray icon > Manage Companies to add one.`;
+          auditLog('load-company-by-alias', args, 'denied', Date.now() - start);
+          return { isError: true, content: [{ type: 'text', text: `Unknown alias "${args.alias}". ${hint}` }] };
+        }
+
+        // Decrypt the stored password just before dispatch. The plaintext lives in this
+        // function's locals for ~milliseconds and is never logged (auditLog strips fields
+        // named 'password'/'secret'/'token' from args before writing).
+        let plaintextPassword = '';
+        if (entry.passwordEnc) {
+          try {
+            plaintextPassword = await decryptPasswordViaDpapi(entry.passwordEnc);
+          } catch (err) {
+            auditLog('load-company-by-alias', args, 'error', Date.now() - start);
+            return {
+              isError: true,
+              content: [{ type: 'text', text: `Decryption failed for alias "${entry.alias}": ${err}. Fix via tray icon > Manage Companies > Edit > tick "Change password".` }]
+            };
+          }
+        }
+
+        const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const timeoutSec = 30;
+        const resp = await callGuiAgent(
+          'select-and-unlock-company',
+          { companyId: entry.folderId, userName: entry.username ?? '', password: plaintextPassword },
+          timeoutSec,
+          dataPath,
+          logs
+        );
+
+        if (!resp) {
+          auditLog('load-company-by-alias', args, 'error', Date.now() - start);
+          return { isError: true, content: [{ type: 'text', text: `GUI agent did not respond within ${timeoutSec}s. Is the agent running? Logs:\n${logs.join('\n')}` }] };
+        }
+        if (resp.status !== 'success') {
+          auditLog('load-company-by-alias', args, 'error', Date.now() - start);
+          return { isError: true, content: [{ type: 'text', text: `Load failed for "${entry.alias}": ${resp.message}. If the password is wrong, fix via tray icon > Manage Companies > Edit > tick "Change password".` }] };
+        }
+
+        activeCompany = entry.displayName || entry.folderId;
+        auditLog('load-company-by-alias', args, 'success', Date.now() - start);
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ success: true, alias: entry.alias, folderId: entry.folderId, displayName: entry.displayName ?? '', agentMessage: resp.message }) }]
+        };
+      } catch (err) {
+        auditLog('load-company-by-alias', args, 'error', Date.now() - start);
+        return { isError: true, content: [{ type: 'text', text: `load-company-by-alias failed: ${err}` }] };
+      }
     }
   );
 
