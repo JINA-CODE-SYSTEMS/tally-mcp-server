@@ -180,6 +180,30 @@ try {
     Move-Item -Path $envTmp -Destination $envFile -Force
     Write-Host "[OK] Wrote $envFile ($($envLines.Count) lines)"
 
+    # --- 1b. Initialize + lock down the companies registry file -----------
+    # The registry stores DPAPI-encrypted passwords for the alias feature. We pre-create an empty
+    # file so the ACL is in place before anything sensitive is written, then strip inheritance and
+    # grant access only to SYSTEM (the MCP service) and Administrators (operator + tray when
+    # elevated). The DPAPI blob is defense-in-depth; the NTFS ACL is the real access boundary.
+    $registryFile = Join-Path $TallyDataPath '.tally-mcp-companies.json'
+    if (-not (Test-Path -LiteralPath (Split-Path $registryFile))) {
+        New-Item -ItemType Directory -Force -Path (Split-Path $registryFile) | Out-Null
+    }
+    if (-not (Test-Path -LiteralPath $registryFile)) {
+        Set-Content -Path $registryFile -Value '{"schemaVersion":1,"companies":[]}' -Encoding UTF8 -NoNewline
+        Write-Host "[OK] Created empty company registry at $registryFile"
+    } else {
+        Write-Host "[*] Existing company registry detected at $registryFile (preserved)"
+    }
+    # icacls /inheritance:r removes inherited ACEs; /grant:r replaces (not adds) the named ACEs.
+    # 2>$null suppresses the per-line "Successfully processed..." stdout chatter from icacls.
+    & icacls $registryFile /inheritance:r /grant:r 'SYSTEM:F' 'Administrators:F' 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "[OK] Locked NTFS ACL on $registryFile (SYSTEM + Administrators only)"
+    } else {
+        Write-Host "[WARN] icacls exit $LASTEXITCODE on $registryFile - registry file is not locked down" -ForegroundColor Yellow
+    }
+
     # --- 2. Stop and remove any existing service (idempotent re-runs) ------
     # nssm.exe writes benign "service not running" / "service does not exist" messages to stderr,
     # which PowerShell 5.x with ErrorActionPreference=Stop promotes to terminating errors and

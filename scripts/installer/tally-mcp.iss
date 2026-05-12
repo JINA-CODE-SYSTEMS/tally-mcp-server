@@ -97,6 +97,18 @@ Source: "{#RepoRoot}\scripts\tray\assets\*";           DestDir: "{app}\scripts\t
 ; placed on disk.) ---
 Source: "{#RepoRoot}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
+; --- OAuth password prompt page served by the /authorize endpoint. Without this file,
+; OAuth flow crashes with ENOENT when a client (Claude Desktop / VS Code Copilot / etc.)
+; redirects to the authorize URL. Was missing from the installer for the entire 1.x line. ---
+Source: "{#RepoRoot}\authorize.html"; DestDir: "{app}"; Flags: ignoreversion
+
+; --- DPAPI helper for company registry password encryption. Called by both the MCP service
+; (via Node spawn) and the Manage Companies tray dialog. ---
+Source: "{#RepoRoot}\scripts\dpapi-helper.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
+
+; --- Manage Companies dialog, dot-sourced by tally-mcp-tray.ps1 at startup. ---
+Source: "{#RepoRoot}\scripts\tray\manage-companies-dialog.ps1"; DestDir: "{app}\scripts\tray"; Flags: ignoreversion
+
 ; --- Bundled portable Node.js. Avoids version conflicts with anything else on the box.
 ; The build script populates installer-staging/node-portable/ from the official Node zip. ---
 Source: "{#StagingRoot}\node-portable\*"; DestDir: "{app}\node-portable"; Flags: ignoreversion recursesubdirs createallsubdirs

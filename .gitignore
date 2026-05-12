@@ -13,3 +13,10 @@ scripts/TallyUI.dll
 deploy-diagnostics.txt
 installer-staging/
 dist-installer/
+
+# Local-only Claude Code state (per-developer tooling config)
+.claude/
+.mcp.json
+
+# Transient PID file written by scripts/dev-run-local.ps1
+scripts/.dev-pids
