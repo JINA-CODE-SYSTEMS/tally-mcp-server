@@ -326,11 +326,12 @@ function Show-CompanyEditDialog {
     $form.CancelButton = $btnCancel
     $form.AcceptButton = $btnOk
 
-    # Reset the script-scoped result every time so a previous OK from this session can't
-    # leak into a Cancel on the next dialog.
-    $script:result = $null
+    # State container shared with the OK click handler. Using a hashtable (reference type)
+    # + .GetNewClosure() instead of $script:result because PowerShell's $script: scope
+    # doesn't behave reliably for dot-sourced functions invoked from WinForms event handlers.
+    $state = @{ Result = $null }
 
-    $btnOk.Add_Click({
+    $okHandler = {
         $alias = $tbAlias.Text.Trim()
         $folder = $tbFolderId.Text.Trim()
         if (-not $alias) {
@@ -345,7 +346,7 @@ function Show-CompanyEditDialog {
         }
         $extras = @($tbExtraAliases.Text.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 
-        $script:result = @{
+        $state.Result = @{
             alias        = $alias
             extraAliases = $extras
             folderId     = $folder
@@ -360,14 +361,15 @@ function Show-CompanyEditDialog {
             _plaintextPassword = $tbPassword.Text
         }
         if ($isEdit -and $Existing.passwordEnc -and -not $cbChangePassword.Checked) {
-            $script:result.passwordEnc = $Existing.passwordEnc
+            $state.Result.passwordEnc = $Existing.passwordEnc
         }
         $form.DialogResult = 'OK'
         $form.Close()
-    })
+    }.GetNewClosure()
+    $btnOk.Add_Click($okHandler)
 
     [void]$form.ShowDialog()
-    return $script:result
+    return $state.Result
 }
 
 # ---------------------------------------------------------------------------
@@ -382,8 +384,19 @@ function Show-ManageCompaniesDialog {
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
 
-    $registry = Read-CompanyRegistry -Path $RegistryPath
-    $script:dirty = $false
+    # All mutable state lives in this single hashtable. Event handlers capture a reference
+    # to it via .GetNewClosure() so mutations propagate reliably across scope boundaries
+    # (function scope <-> WinForms event handler scope <-> dot-sourced script scope).
+    # Previous version stored Registry as a function-local var and Dirty in $script: scope;
+    # neither survived the round-trip from Add click handler -> Save click handler under
+    # some PowerShell + WinForms invocation paths, so the file ended up persisting an
+    # empty companies array even after a user clicked Add and saw "Saved 1 company."
+    $state = @{
+        Registry        = Read-CompanyRegistry -Path $RegistryPath
+        Dirty           = $false
+        RegistryPath    = $RegistryPath
+        DpapiHelperPath = $DpapiHelperPath
+    }
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'Manage Companies - TallyMCP'
@@ -456,10 +469,21 @@ function Show-ManageCompaniesDialog {
     $grid.AutoSizeColumnsMode = 'Fill'
     $form.Controls.Add($grid)
 
+    # Dirty indicator (top-right) — declared before $refreshGrid so the closure can capture it.
+    $lblDirty = New-Object System.Windows.Forms.Label
+    $lblDirty.Text = ''
+    $lblDirty.Location = New-Object System.Drawing.Point(700, 60)
+    $lblDirty.Size = New-Object System.Drawing.Size(155, 18)
+    $lblDirty.TextAlign = 'MiddleRight'
+    $lblDirty.Font = New-Object System.Drawing.Font 'Segoe UI Italic', 8
+    $lblDirty.ForeColor = [System.Drawing.Color]::FromArgb(180, 80, 25)
+    $lblDirty.Anchor = 'Top,Right'
+    $form.Controls.Add($lblDirty)
+
     $refreshGrid = {
         $selectedAlias = if ($grid.SelectedRows.Count -gt 0) { $grid.SelectedRows[0].Cells['alias'].Value } else { $null }
         $grid.Rows.Clear()
-        foreach ($c in $registry.companies) {
+        foreach ($c in $state.Registry.companies) {
             $hasPw = if ($c.passwordEnc) { 'Yes' } else { 'No' }
             [void]$grid.Rows.Add($c.alias, $c.folderId, $c.displayName, $hasPw, $c.notes)
         }
@@ -472,21 +496,11 @@ function Show-ManageCompaniesDialog {
                 }
             }
         }
-    }
+    }.GetNewClosure()
     & $refreshGrid
 
-    # Dirty indicator (top-right)
-    $lblDirty = New-Object System.Windows.Forms.Label
-    $lblDirty.Text = ''
-    $lblDirty.Location = New-Object System.Drawing.Point(700, 60)
-    $lblDirty.Size = New-Object System.Drawing.Size(155, 18)
-    $lblDirty.TextAlign = 'MiddleRight'
-    $lblDirty.Font = New-Object System.Drawing.Font 'Segoe UI Italic', 8
-    $lblDirty.ForeColor = [System.Drawing.Color]::FromArgb(180, 80, 25)
-    $lblDirty.Anchor = 'Top,Right'
-    $form.Controls.Add($lblDirty)
-    $markDirty = { $script:dirty = $true; $lblDirty.Text = '* unsaved changes' }
-    $markClean = { $script:dirty = $false; $lblDirty.Text = '' }
+    $markDirty = { $state.Dirty = $true; $lblDirty.Text = '* unsaved changes' }.GetNewClosure()
+    $markClean = { $state.Dirty = $false; $lblDirty.Text = '' }.GetNewClosure()
 
     # Buttons
     $btnY = 470
@@ -512,27 +526,27 @@ function Show-ManageCompaniesDialog {
                   -Back ([System.Drawing.Color]::FromArgb(0, 120, 215)) -Fore ([System.Drawing.Color]::White)
     $btnClose  = _MakeButton -Text 'Close'  -X 760 -W 95 -Anchor 'Bottom,Right'
 
-    # Selected entry helper
+    # Selected entry helper - reads from $state.Registry, closes over $grid + $state
     $getSelected = {
         if ($grid.SelectedRows.Count -eq 0) { return $null }
         $idx = $grid.SelectedRows[0].Index
-        if ($idx -lt 0 -or $idx -ge $registry.companies.Count) { return $null }
-        return @{ Index = $idx; Entry = $registry.companies[$idx] }
-    }
+        if ($idx -lt 0 -or $idx -ge $state.Registry.companies.Count) { return $null }
+        return @{ Index = $idx; Entry = $state.Registry.companies[$idx] }
+    }.GetNewClosure()
 
     # --- Add ---------------------------------------------------------------
     $btnAdd.Add_Click({
         $entry = Show-CompanyEditDialog -Title 'Add Company'
         if (-not $entry) { return }
-        $existing = $registry.companies | Where-Object { $_.alias.ToLower() -eq $entry.alias.ToLower() }
+        $existing = $state.Registry.companies | Where-Object { $_.alias.ToLower() -eq $entry.alias.ToLower() }
         if ($existing) {
             [System.Windows.Forms.MessageBox]::Show("Alias '$($entry.alias)' is already in use.", 'Duplicate alias', 'OK', 'Warning') | Out-Null
             return
         }
-        $registry.companies = @($registry.companies) + @($entry)
+        $state.Registry.companies = @($state.Registry.companies) + @($entry)
         & $markDirty
         & $refreshGrid
-    })
+    }.GetNewClosure())
 
     # --- Edit --------------------------------------------------------------
     $btnEdit.Add_Click({
@@ -543,10 +557,10 @@ function Show-ManageCompaniesDialog {
         }
         $entry = Show-CompanyEditDialog -Title "Edit Company: $($sel.Entry.alias)" -Existing $sel.Entry
         if (-not $entry) { return }
-        $registry.companies[$sel.Index] = $entry
+        $state.Registry.companies[$sel.Index] = $entry
         & $markDirty
         & $refreshGrid
-    })
+    }.GetNewClosure())
 
     # --- Delete ------------------------------------------------------------
     $btnDelete.Add_Click({
@@ -558,10 +572,10 @@ function Show-ManageCompaniesDialog {
         $alias = $sel.Entry.alias
         $confirm = [System.Windows.Forms.MessageBox]::Show("Delete '$alias'?", 'Confirm delete', 'YesNo', 'Question')
         if ($confirm -ne 'Yes') { return }
-        $registry.companies = @($registry.companies | Where-Object { $_.alias -ne $alias })
+        $state.Registry.companies = @($state.Registry.companies | Where-Object { $_.alias -ne $alias })
         & $markDirty
         & $refreshGrid
-    })
+    }.GetNewClosure())
 
     # --- Test --------------------------------------------------------------
     $btnTest.Add_Click({
@@ -570,25 +584,25 @@ function Show-ManageCompaniesDialog {
             [System.Windows.Forms.MessageBox]::Show('Select a row first.', 'No selection', 'OK', 'Information') | Out-Null
             return
         }
-        if ($script:dirty) {
+        if ($state.Dirty) {
             $confirm = [System.Windows.Forms.MessageBox]::Show('You have unsaved changes. Save before testing?', 'Save first?', 'YesNo', 'Question')
             if ($confirm -ne 'Yes') { return }
             $btnSave.PerformClick()
-            if ($script:dirty) { return }
+            if ($state.Dirty) { return }
         }
-        $entry = $registry.companies[$sel.Index]
+        $entry = $state.Registry.companies[$sel.Index]
         $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
         $btnTest.Enabled = $false
         try {
             $plain = ''
             if ($entry.passwordEnc) {
-                try { $plain = Unprotect-PasswordViaHelper -HelperPath $DpapiHelperPath -Blob $entry.passwordEnc }
+                try { $plain = Unprotect-PasswordViaHelper -HelperPath $state.DpapiHelperPath -Blob $entry.passwordEnc }
                 catch {
                     [System.Windows.Forms.MessageBox]::Show("Could not decrypt the stored password: $_`n`nFix via Edit > tick 'Change password'.", 'Decrypt failed', 'OK', 'Error') | Out-Null
                     return
                 }
             }
-            $result = Invoke-LoadCompanyViaAgent -RegistryPath $RegistryPath -FolderId $entry.folderId -Username $entry.username -Password $plain
+            $result = Invoke-LoadCompanyViaAgent -RegistryPath $state.RegistryPath -FolderId $entry.folderId -Username $entry.username -Password $plain
             if ($result.ok) {
                 [System.Windows.Forms.MessageBox]::Show("OK - $($result.message)", "Test passed: $($entry.alias)", 'OK', 'Information') | Out-Null
             } else {
@@ -598,17 +612,13 @@ function Show-ManageCompaniesDialog {
             $form.Cursor = [System.Windows.Forms.Cursors]::Default
             $btnTest.Enabled = $true
         }
-    })
+    }.GetNewClosure())
 
     # --- Save --------------------------------------------------------------
-    # Bulletproof password handling: only call DPAPI Protect when we actually have non-empty
-    # plaintext. Using explicit string-length check rather than truthy coercion to avoid the
-    # subtle hashtable-value oddities that bit the previous version.
+    # Encrypt any pending plaintext passwords, strip transient fields, write atomically.
     $btnSave.Add_Click({
         try {
-            foreach ($c in $registry.companies) {
-                # Resolve plaintext password (if user is replacing/setting it). Use defensive
-                # type coercion so a missing/null value reads as empty string, never $null.
+            foreach ($c in $state.Registry.companies) {
                 $plain = ''
                 if ($c.ContainsKey('_plaintextPassword') -and $null -ne $c._plaintextPassword) {
                     $plain = [string]$c._plaintextPassword
@@ -616,50 +626,45 @@ function Show-ManageCompaniesDialog {
                 $changed = ($c.ContainsKey('_passwordChanged') -and $c._passwordChanged -eq $true)
 
                 if ($changed) {
-                    # Protect returns $null on empty input (no-op) so we never call the helper
-                    # with empty plaintext. If we get a real blob, store it; otherwise drop any
-                    # existing passwordEnc (the user cleared the password).
-                    $enc = Protect-PasswordViaHelper -HelperPath $DpapiHelperPath -Plaintext $plain
+                    $enc = Protect-PasswordViaHelper -HelperPath $state.DpapiHelperPath -Plaintext $plain
                     if ($enc) {
                         $c.passwordEnc = $enc
                     } elseif ($c.ContainsKey('passwordEnc')) {
                         $c.Remove('passwordEnc') | Out-Null
                     }
                 }
-                # Always strip transient fields, even on entries we didn't touch.
                 if ($c.ContainsKey('_passwordChanged'))   { $c.Remove('_passwordChanged')   | Out-Null }
                 if ($c.ContainsKey('_plaintextPassword')) { $c.Remove('_plaintextPassword') | Out-Null }
-                # Drop empty passwordEnc fields entirely - keeps the JSON clean and avoids
-                # later passing `""` to DPAPI as a blob.
                 if ($c.ContainsKey('passwordEnc') -and [string]::IsNullOrEmpty($c.passwordEnc)) {
                     $c.Remove('passwordEnc') | Out-Null
                 }
             }
-            Write-CompanyRegistry -Path $RegistryPath -Registry $registry
+            Write-CompanyRegistry -Path $state.RegistryPath -Registry $state.Registry
             & $markClean
-            $word = if ($registry.companies.Count -eq 1) { 'company' } else { 'companies' }
-            [System.Windows.Forms.MessageBox]::Show("Saved $($registry.companies.Count) $word.", 'Saved', 'OK', 'Information') | Out-Null
+            $count = $state.Registry.companies.Count
+            $word = if ($count -eq 1) { 'company' } else { 'companies' }
+            [System.Windows.Forms.MessageBox]::Show("Saved $count $word.", 'Saved', 'OK', 'Information') | Out-Null
             & $refreshGrid
         } catch {
             [System.Windows.Forms.MessageBox]::Show("Save failed: $_", 'Error', 'OK', 'Error') | Out-Null
         }
-    })
+    }.GetNewClosure())
 
     # --- Close (with unsaved-change confirmation) --------------------------
     $btnClose.Add_Click({
-        if ($script:dirty) {
+        if ($state.Dirty) {
             $confirm = [System.Windows.Forms.MessageBox]::Show('You have unsaved changes. Close anyway?', 'Unsaved changes', 'YesNo', 'Warning')
             if ($confirm -ne 'Yes') { return }
         }
         $form.Close()
-    })
+    }.GetNewClosure())
     $form.Add_FormClosing({
         param($s, $e)
-        if ($script:dirty -and $e.CloseReason -eq 'UserClosing') {
+        if ($state.Dirty -and $e.CloseReason -eq 'UserClosing') {
             $confirm = [System.Windows.Forms.MessageBox]::Show('You have unsaved changes. Close anyway?', 'Unsaved changes', 'YesNo', 'Warning')
             if ($confirm -ne 'Yes') { $e.Cancel = $true }
         }
-    })
+    }.GetNewClosure())
 
     [void]$form.ShowDialog()
 }

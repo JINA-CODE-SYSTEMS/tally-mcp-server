@@ -537,14 +537,17 @@ while ($true) {
                                 [TallyUI2]::PressKey([TallyUI2]::VK_ESCAPE)
                                 Start-Sleep -Milliseconds 500
 
-                                # Type the company id directly into the Select Company list (Tally filters as you type)
+                                # Type the company id directly into the Select Company list. Tally auto-jumps
+                                # the highlight to the matching folder as we type.
                                 [TallyUI2]::TypeString($companyId)
                                 Start-Sleep -Milliseconds 800
 
-                                # Tally Prime Edit Log requires TWO Enters: first confirms the search/selection,
-                                # second opens the company (and brings up the credential prompt if protected).
-                                [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
-                                Start-Sleep -Milliseconds 600
+                                # SINGLE Enter to open the highlighted folder. A second Enter would activate
+                                # the right-side action menu (Create / Select Remote / Specify Path / Select
+                                # from Drive) — observed misbehavior where the second Enter selected
+                                # "Specify Path" and the rest of the keystrokes leaked into that dialog as a
+                                # mangled path string. Tally Prime Edit Log shows the credential prompt right
+                                # after this single Enter when the company is password-protected.
                                 [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
                                 Start-Sleep -Milliseconds $waitMsAfterEnter
 
