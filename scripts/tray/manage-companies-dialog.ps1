@@ -45,6 +45,11 @@ function Read-CompanyRegistry {
 # Atomic write of the registry. Creates the parent dir if missing (defensive for dev mode
 # where TALLY_DATA_PATH may not yet exist on disk).
 function Write-CompanyRegistry {
+    # Atomic write: write .tmp, then Move-Item -Force replaces the destination.
+    # -ErrorAction Stop is critical: without it, Move-Item's non-terminating "access
+    # denied" failures silently leave an orphan .tmp and the real .json untouched,
+    # so the dialog reports "Saved" while nothing actually persisted. Pre-deleting
+    # any stale .tmp prevents an old failed-write from polluting the next attempt.
     param([string]$Path, [hashtable]$Registry)
     $dir = Split-Path -Parent $Path
     if ($dir -and -not (Test-Path -LiteralPath $dir)) {
@@ -52,8 +57,9 @@ function Write-CompanyRegistry {
     }
     $json = $Registry | ConvertTo-Json -Depth 8
     $tmp = "$Path.tmp"
-    Set-Content -LiteralPath $tmp -Value $json -Encoding UTF8
-    Move-Item -LiteralPath $tmp -Destination $Path -Force
+    if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    Set-Content -LiteralPath $tmp -Value $json -Encoding UTF8 -ErrorAction Stop
+    Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
 }
 
 # ---------------------------------------------------------------------------
