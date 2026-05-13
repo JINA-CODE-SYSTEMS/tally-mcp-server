@@ -216,6 +216,33 @@ begin
   EditionPage.SelectedValueIndex := 0;
 end;
 
+// Runs after the wizard and before any file copying. Stops the running TallyMCP service
+// and agent/tray scheduled tasks so the installer can overwrite locked DLLs like
+// node_modules\@duckdb\node-bindings-win32-x64\duckdb.dll without hitting
+// "DeleteFile failed; code 5. Access is denied" on existing-install upgrades.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  resultCode: Integer;
+begin
+  Result := '';
+  NeedsRestart := False;
+
+  // Stop the NSSM-registered service. sc.exe handles "service does not exist" gracefully on
+  // fresh installs (non-zero exit code, which we ignore).
+  Exec(ExpandConstant('{cmd}'), '/C sc stop TallyMCP', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+
+  // Stop the at-logon scheduled tasks. /F = force, even if currently running. schtasks also
+  // tolerates missing tasks on fresh installs.
+  Exec(ExpandConstant('{cmd}'), '/C schtasks /End /TN TallyMCPAgent /F', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+  Exec(ExpandConstant('{cmd}'), '/C schtasks /End /TN TallyMCPTray /F',  '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+
+  // Give Windows time to fully release file handles. sc stop is async — the SCM marks the
+  // service as STOPPED only after NSSM's child node.exe exits, which can take a few seconds
+  // for the duckdb in-memory cleanup. 3s is enough in practice; bump if upgrade installs
+  // still hit DeleteFile/Code 5 on @duckdb DLLs.
+  Sleep(3000);
+end;
+
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
   agentUserValue: string;
