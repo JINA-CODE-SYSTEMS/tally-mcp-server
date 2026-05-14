@@ -48,16 +48,61 @@ param(
     # it would be visible to any local process via Get-CimInstance Win32_Process / wmic during
     # the ~30s install window. The file is deleted immediately after read.
     # When the script is re-run interactively (Start Menu "Reconfigure"), this is omitted and we
-    # prompt the operator with Read-Host -AsSecureString instead.
+    # try to preserve the existing PASSWORD from .env before falling back to a prompt.
     [string]$CredentialsFile = '',
-    [string]$TallyEdition   = 'silver',
-    [string]$TallyExePath   = 'C:\Program Files\TallyPrimeEditLog\tally.exe',
-    [string]$TallyDataPath  = 'C:\Users\Public\TallyPrimeEditLog\data',
-    [string]$TallyIniPath   = 'C:\Program Files\TallyPrimeEditLog\tally.ini',
-    [string]$McpDomain      = '',
-    [string]$AgentTaskUser  = $env:USERNAME,
+    # NOTE: the Tally* / McpDomain / AgentTaskUser params have NO defaults here. After the param
+    # block we read the existing .env and apply this fallback chain:
+    #   1. explicitly-passed -Param value (highest priority)
+    #   2. value already in .env (preserved across reconfigures)
+    #   3. hardcoded default (only when .env doesn't have it either)
+    # Without this, re-running the script with just -CredentialsFile + -McpDomain wiped fields
+    # like TALLY_EXE_PATH back to their hardcoded defaults; running without -McpDomain wiped
+    # MCP_DOMAIN entirely, dropping production back to localhost-only.
+    [string]$TallyEdition,
+    [string]$TallyExePath,
+    [string]$TallyDataPath,
+    [string]$TallyIniPath,
+    [string]$McpDomain,
+    [string]$AgentTaskUser,
     [switch]$SkipTrayTask
 )
+
+# --- Preserve-on-reconfigure: read existing .env to fill in any blank params ---
+function _ReadEnvHashtable {
+    param([string]$Path)
+    $h = @{}
+    if (-not (Test-Path -LiteralPath $Path)) { return $h }
+    foreach ($line in (Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue)) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed -or $trimmed.StartsWith('#')) { continue }
+        $eq = $trimmed.IndexOf('=')
+        if ($eq -lt 1) { continue }
+        $k = $trimmed.Substring(0, $eq).Trim()
+        $v = $trimmed.Substring($eq + 1).Trim()
+        if ($v.Length -ge 2 -and $v.StartsWith('"') -and $v.EndsWith('"')) {
+            $v = $v.Substring(1, $v.Length - 2) -replace '\\"', '"'
+        }
+        # Strip inline `# comment` for unquoted values (matches dotenv semantics).
+        if (-not ($trimmed.Substring($eq + 1).Trim().StartsWith('"'))) {
+            $hashIdx = $v.IndexOf('#')
+            if ($hashIdx -ge 0) { $v = $v.Substring(0, $hashIdx).TrimEnd() }
+        }
+        $h[$k] = $v
+    }
+    return $h
+}
+$_existingEnv = _ReadEnvHashtable (Join-Path $InstallDir '.env')
+
+# Helper: pick first non-empty among the candidates.
+function _Coalesce { foreach ($v in $args) { if ($null -ne $v -and "$v" -ne '') { return $v } }; return '' }
+
+$TallyEdition   = _Coalesce $TallyEdition   $_existingEnv['TALLY_EDITION']   'silver'
+$TallyExePath   = _Coalesce $TallyExePath   $_existingEnv['TALLY_EXE_PATH']   'C:\Program Files\TallyPrimeEditLog\tally.exe'
+$TallyDataPath  = _Coalesce $TallyDataPath  $_existingEnv['TALLY_DATA_PATH']  'C:\Users\Public\TallyPrimeEditLog\data'
+$TallyIniPath   = _Coalesce $TallyIniPath   $_existingEnv['TALLY_INI_PATH']   'C:\Program Files\TallyPrimeEditLog\tally.ini'
+# MCP_DOMAIN has no hardcoded default — blank means "localhost-only mode".
+$McpDomain      = _Coalesce $McpDomain      $_existingEnv['MCP_DOMAIN']       ''
+$AgentTaskUser  = _Coalesce $AgentTaskUser  $env:USERNAME
 
 # --- Resolve OAuth password ---
 # Two entry paths:
@@ -96,10 +141,20 @@ if ($CredentialsFile -and $CredentialsFile.Trim().Length -gt 0) {
     $Password = [string]$creds.password
     # Hint to GC: drop the raw JSON string from memory once we've extracted the field.
     $credsRaw = $null
+} elseif ($_existingEnv['PASSWORD']) {
+    # Reconfigure-without-creds path: preserve the existing PASSWORD from .env instead of
+    # prompting for it again. Lets the operator re-run the script (e.g. to update one specific
+    # parameter) without retyping the OAuth password every time.
+    $Password = [string]$_existingEnv['PASSWORD']
+    Write-Host ""
+    Write-Host "Tally MCP Reconfigure" -ForegroundColor Cyan
+    Write-Host "(re-running first-run wizard; preserving OAuth password from existing .env)"
+    Write-Host ""
 } else {
-    # Interactive prompt path. SecureString -> plaintext extraction; SecureString is just a
-    # roadblock here, not real protection (the password ends up in $Password as a plain string
-    # for use in .env-writing). Marshal pattern is the recommended one for Read-Host -AsSecureString.
+    # Interactive prompt path. Reached only when no .env exists yet AND no credentials file was
+    # passed (e.g. fresh install via the Reconfigure shortcut after the .env was deleted).
+    # SecureString -> plaintext extraction; SecureString is just a roadblock here, not real
+    # protection (the password ends up in $Password as a plain string for use in .env-writing).
     Write-Host ""
     Write-Host "Tally MCP Reconfigure" -ForegroundColor Cyan
     Write-Host "(re-running first-run wizard interactively; press Ctrl+C to abort)"
