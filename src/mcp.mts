@@ -667,27 +667,15 @@ async function waitForTallyReady(timeoutMs: number, logs: string[]): Promise<boo
 
 // Wraps handlePull — injects activeCompany as targetCompany fallback when the caller did not specify one.
 async function pull(reportName: string, inputParams: Map<string, any>) {
-  // Default to activeCompany if caller didn't specify one.
+  // Default to activeCompany if caller didn't specify one. activeCompany was
+  // resolved by set-active-company (which does fuzzy + user-confirmation), so
+  // it's always an exact Tally name by the time it lands here. We do NOT
+  // silently fuzzy-resolve a user-supplied targetCompany — that would risk
+  // running the report against the wrong company. If targetCompany is
+  // imprecise, Tally returns empty data; the user is expected to first call
+  // set-active-company which guides them through the fuzzy-match confirmation.
   if (!inputParams.has('targetCompany') && activeCompany) {
     inputParams.set('targetCompany', activeCompany);
-  }
-  // If a targetCompany IS specified, try to fuzzy-resolve it against Tally's
-  // actual loaded companies. Otherwise an imprecise name (e.g. "Ross Computer
-  // Pvt Ltd" when Tally has "ROSS COMPUTERS PVT. LTD.") silently returns
-  // empty data via SVCURRENTCOMPANY mismatch. Best-effort: if the lookup
-  // fails we leave the original name unchanged so the user still gets an
-  // empty result rather than the wrong company's data.
-  const target = inputParams.get('targetCompany');
-  if (typeof target === 'string' && target.length > 0) {
-    try {
-      const loaded = await listLoadedCompanies();
-      const resolved = findMatchingLoadedCompany(target, loaded);
-      if (resolved && resolved !== target) {
-        inputParams.set('targetCompany', resolved);
-      }
-    } catch {
-      // Tally probe failed — fall through with original name.
-    }
   }
   return handlePull(reportName, inputParams);
 }
@@ -1324,36 +1312,68 @@ export async function registerMcpServer(): Promise<McpServer> {
     async (args) => {
       const start = Date.now();
       try {
-        // Tier 1: try the cheap exact-name probe (verifyCompanyLoaded uses
-        // SVCURRENTCOMPANY which requires an exact case-insensitive match).
-        let resolved: string | null = null;
+        // Tier 1: exact name probe (case-insensitive). If Tally accepts it via
+        // SVCURRENTCOMPANY, we're done — set and return success.
         if (await verifyCompanyLoaded(args.companyName)) {
-          resolved = args.companyName;
-        } else {
-          // Tier 2: list everything Tally has loaded and run a fuzzy match.
-          // This catches the common case where the user types
-          // "Ross Computer Pvt Ltd" but Tally has "ROSS COMPUTERS PVT. LTD."
-          // (different case, punctuation, plurals).
-          const loaded = await listLoadedCompanies();
-          resolved = findMatchingLoadedCompany(args.companyName, loaded);
-          if (!resolved) {
-            auditLog('set-active-company', args, 'error', Date.now() - start);
-            const hint = loaded.length > 0
-              ? `Loaded companies in Tally: ${loaded.map(n => `"${n}"`).join(', ')}. Call set-active-company again with one of these exact names, or use open-company to load a different one.`
-              : `No companies are currently loaded in Tally. Use open-company to load one first.`;
-            return {
-              isError: true,
-              content: [{ type: 'text', text: `Company "${args.companyName}" not found. ${hint}` }]
-            };
-          }
+          activeCompany = args.companyName;
+          auditLog('set-active-company', args, 'success', Date.now() - start);
+          return {
+            content: [{ type: 'text', text: `Active company set to "${args.companyName}". Subsequent tools will target this company unless targetCompany is specified explicitly.` }]
+          };
         }
-        activeCompany = resolved;
-        auditLog('set-active-company', args, 'success', Date.now() - start);
-        const matchNote = resolved.toLowerCase() === args.companyName.toLowerCase()
-          ? ''
-          : ` (resolved "${args.companyName}" → "${resolved}")`;
+
+        // Tier 2: list everything Tally has loaded, run a fuzzy match.
+        // We DO NOT auto-resolve — risk of running tools against the wrong
+        // company if the fuzzy match guesses wrong. Instead, surface the
+        // closest candidate(s) so the caller (or the LLM) can confirm and
+        // re-call set-active-company with the exact name.
+        const loaded = await listLoadedCompanies();
+        const closest = findMatchingLoadedCompany(args.companyName, loaded);
+        auditLog('set-active-company', args, 'denied', Date.now() - start);
+
+        if (closest) {
+          // Fuzzy match found — show user/LLM what they searched, what we
+          // found, and ask them to confirm by re-calling with the exact name.
+          return {
+            isError: true,
+            content: [{
+              type: 'text',
+              text:
+`Company "${args.companyName}" was not found as an exact match.
+
+Did you mean "${closest}"?
+  - Searched: "${args.companyName}"
+  - Closest match in Tally: "${closest}"
+
+To confirm and use this company, call set-active-company again with the EXACT name:
+  set-active-company(companyName: "${closest}")
+
+Other companies currently loaded in Tally:
+${loaded.map(n => `  - "${n}"`).join('\n')}`
+            }]
+          };
+        }
+
+        if (loaded.length === 0) {
+          return {
+            isError: true,
+            content: [{ type: 'text', text: `Company "${args.companyName}" not found and no companies are currently loaded in Tally. Use open-company or load-company-by-alias to load one first.` }]
+          };
+        }
+
+        // No fuzzy match either — show what IS loaded.
         return {
-          content: [{ type: 'text', text: `Active company set to "${resolved}"${matchNote}. Subsequent tools will target this company unless targetCompany is specified explicitly.` }]
+          isError: true,
+          content: [{
+            type: 'text',
+            text:
+`Company "${args.companyName}" not found in Tally — and no fuzzy match was close enough to suggest.
+
+Companies currently loaded in Tally:
+${loaded.map(n => `  - "${n}"`).join('\n')}
+
+Call set-active-company again with one of these EXACT names, or use open-company to load a different one.`
+          }]
         };
       } catch (err) {
         auditLog('set-active-company', args, 'error', Date.now() - start);
