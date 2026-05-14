@@ -62,14 +62,99 @@ async function verifyCompanyLoaded(targetName: string): Promise<boolean> {
 }
 
 // Returns the names of companies currently loaded in Tally's UI.
-// Uses handlePull directly (not the wrapper) so SVCURRENTCOMPANY isn't injected — we want all open companies.
+//
+// Uses Tally's raw Collection query (TYPE=Collection) rather than the
+// list-master TDL template. Empirically, the template projection (`$Name` on
+// the Company collection) returns empty rows in several Tally Prime / Edit Log
+// configurations, while the raw Collection query reliably returns each loaded
+// company as `<COMPANY NAME="..." RESERVEDNAME="" />` — with the company name
+// as an XML attribute. We pull the names with a regex rather than instantiating
+// a new XML parser since attribute-form is the only thing we need.
 async function listLoadedCompanies(): Promise<string[]> {
-  const inputParams = new Map<string, any>([['collection', 'company']]);
-  const resp = await handlePull('list-master', inputParams);
-  if (!resp?.data) return [];
-  return resp.data
-    .map((c: any) => String(c.F01 || c.name || '').trim())
-    .filter((n: string) => n.length > 0);
+  const xml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>MCPLoadedCompaniesList</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME="MCPLoadedCompaniesList"><TYPE>Company</TYPE></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+  try {
+    const resp = await postTallyXML(xml);
+    const names: string[] = [];
+    const re = /<COMPANY[^>]*\sNAME\s*=\s*"([^"]+)"/gi;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(resp)) !== null) {
+      const name = match[1].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').trim();
+      if (name && !names.includes(name)) names.push(name);
+    }
+    return names;
+  } catch {
+    return [];
+  }
+}
+
+// Normalize a company name for fuzzy comparison: lowercase, drop everything
+// except letters and digits. Lets us match "Ross Computer Pvt Ltd" against
+// "ROSS COMPUTERS PVT. LTD." despite differing punctuation, case, and plurals
+// (well, almost — plurals still differ; substring match below handles that).
+function normalizeCompanyName(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+// Standard Levenshtein distance — number of single-character edits (insertions,
+// deletions, substitutions) to transform `a` into `b`. O(n*m) memory and time;
+// fine for short strings like company names. Used as the last fuzzy-match tier
+// to catch typos and plural mismatches (e.g. "Computer" vs "Computers").
+function levenshteinDistance(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  const dp: number[][] = [];
+  for (let i = 0; i <= a.length; i++) {
+    dp.push(new Array(b.length + 1).fill(0));
+    dp[i][0] = i;
+  }
+  for (let j = 0; j <= b.length; j++) dp[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1][j - 1]
+        : 1 + Math.min(dp[i - 1][j - 1], dp[i - 1][j], dp[i][j - 1]);
+    }
+  }
+  return dp[a.length][b.length];
+}
+
+// Finds the loaded company that best matches `target`. Returns the EXACT
+// Tally-side name (preserving case + punctuation) so the caller can use it
+// in subsequent queries. Returns null when nothing matches.
+//
+// Match tiers (first one that hits wins):
+//   1. Case-insensitive exact match
+//   2. Normalized exact match (strip case + punctuation + whitespace)
+//   3. Normalized substring match — either direction, so "Ross" matches
+//      "Ross Computers Pvt. Ltd." and vice versa
+//   4. Levenshtein distance ≤ 15% of longer name length (min 2) — catches
+//      single-char typos and plural mismatches like "Computer" vs "Computers"
+export function findMatchingLoadedCompany(target: string, loaded: string[]): string | null {
+  if (!loaded || loaded.length === 0 || !target) return null;
+  const t = target.toLowerCase();
+  for (const c of loaded) {
+    if (c.toLowerCase() === t) return c;
+  }
+  const tn = normalizeCompanyName(target);
+  if (!tn) return null;
+  for (const c of loaded) {
+    if (normalizeCompanyName(c) === tn) return c;
+  }
+  for (const c of loaded) {
+    const cn = normalizeCompanyName(c);
+    if (cn.includes(tn) || tn.includes(cn)) return c;
+  }
+  let best: { name: string; dist: number } | null = null;
+  for (const c of loaded) {
+    const cn = normalizeCompanyName(c);
+    const dist = levenshteinDistance(tn, cn);
+    const maxDist = Math.max(2, Math.floor(Math.max(tn.length, cn.length) * 0.15));
+    if (dist <= maxDist && (!best || dist < best.dist)) {
+      best = { name: c, dist };
+    }
+  }
+  return best ? best.name : null;
 }
 
 // Parses tally.ini content and returns the list of company IDs in `Load=` directives under [TALLY].
@@ -582,8 +667,27 @@ async function waitForTallyReady(timeoutMs: number, logs: string[]): Promise<boo
 
 // Wraps handlePull — injects activeCompany as targetCompany fallback when the caller did not specify one.
 async function pull(reportName: string, inputParams: Map<string, any>) {
+  // Default to activeCompany if caller didn't specify one.
   if (!inputParams.has('targetCompany') && activeCompany) {
     inputParams.set('targetCompany', activeCompany);
+  }
+  // If a targetCompany IS specified, try to fuzzy-resolve it against Tally's
+  // actual loaded companies. Otherwise an imprecise name (e.g. "Ross Computer
+  // Pvt Ltd" when Tally has "ROSS COMPUTERS PVT. LTD.") silently returns
+  // empty data via SVCURRENTCOMPANY mismatch. Best-effort: if the lookup
+  // fails we leave the original name unchanged so the user still gets an
+  // empty result rather than the wrong company's data.
+  const target = inputParams.get('targetCompany');
+  if (typeof target === 'string' && target.length > 0) {
+    try {
+      const loaded = await listLoadedCompanies();
+      const resolved = findMatchingLoadedCompany(target, loaded);
+      if (resolved && resolved !== target) {
+        inputParams.set('targetCompany', resolved);
+      }
+    } catch {
+      // Tally probe failed — fall through with original name.
+    }
   }
   return handlePull(reportName, inputParams);
 }
@@ -1220,18 +1324,36 @@ export async function registerMcpServer(): Promise<McpServer> {
     async (args) => {
       const start = Date.now();
       try {
-        const loaded = await verifyCompanyLoaded(args.companyName);
-        if (!loaded) {
-          auditLog('set-active-company', args, 'error', Date.now() - start);
-          return {
-            isError: true,
-            content: [{ type: 'text', text: `Company "${args.companyName}" is not currently loaded in Tally. Use list-loaded-companies to see available companies, or open-company to load it first.` }]
-          };
+        // Tier 1: try the cheap exact-name probe (verifyCompanyLoaded uses
+        // SVCURRENTCOMPANY which requires an exact case-insensitive match).
+        let resolved: string | null = null;
+        if (await verifyCompanyLoaded(args.companyName)) {
+          resolved = args.companyName;
+        } else {
+          // Tier 2: list everything Tally has loaded and run a fuzzy match.
+          // This catches the common case where the user types
+          // "Ross Computer Pvt Ltd" but Tally has "ROSS COMPUTERS PVT. LTD."
+          // (different case, punctuation, plurals).
+          const loaded = await listLoadedCompanies();
+          resolved = findMatchingLoadedCompany(args.companyName, loaded);
+          if (!resolved) {
+            auditLog('set-active-company', args, 'error', Date.now() - start);
+            const hint = loaded.length > 0
+              ? `Loaded companies in Tally: ${loaded.map(n => `"${n}"`).join(', ')}. Call set-active-company again with one of these exact names, or use open-company to load a different one.`
+              : `No companies are currently loaded in Tally. Use open-company to load one first.`;
+            return {
+              isError: true,
+              content: [{ type: 'text', text: `Company "${args.companyName}" not found. ${hint}` }]
+            };
+          }
         }
-        activeCompany = args.companyName;
+        activeCompany = resolved;
         auditLog('set-active-company', args, 'success', Date.now() - start);
+        const matchNote = resolved.toLowerCase() === args.companyName.toLowerCase()
+          ? ''
+          : ` (resolved "${args.companyName}" → "${resolved}")`;
         return {
-          content: [{ type: 'text', text: `Active company set to "${args.companyName}". Subsequent tools will target this company unless targetCompany is specified explicitly.` }]
+          content: [{ type: 'text', text: `Active company set to "${resolved}"${matchNote}. Subsequent tools will target this company unless targetCompany is specified explicitly.` }]
         };
       } catch (err) {
         auditLog('set-active-company', args, 'error', Date.now() - start);
