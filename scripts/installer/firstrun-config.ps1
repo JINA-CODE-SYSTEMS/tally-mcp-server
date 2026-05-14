@@ -197,7 +197,14 @@ try {
     }
     # icacls /inheritance:r removes inherited ACEs; /grant:r replaces (not adds) the named ACEs.
     # 2>$null suppresses the per-line "Successfully processed..." stdout chatter from icacls.
-    & icacls $registryFile /inheritance:r /grant:r 'SYSTEM:F' 'Administrators:F' 2>$null | Out-Null
+    #
+    # IMPORTANT: also grant the agent task user explicit Full Control. The tray scheduled task
+    # runs with -RunLevel Limited (non-elevated), which filters the Administrators group from
+    # the process token even when the user IS in Administrators. Without an explicit user grant,
+    # the Manage Companies dialog's Move-Item -Force silently fails on overwrite — the .tmp file
+    # gets written but never gets renamed to the real .json, so Save reports success and
+    # nothing actually persists.
+    & icacls $registryFile /inheritance:r /grant:r 'SYSTEM:F' 'Administrators:F' "${AgentTaskUser}:F" 2>$null | Out-Null
     if ($LASTEXITCODE -eq 0) {
         Write-Host "[OK] Locked NTFS ACL on $registryFile (SYSTEM + Administrators only)"
     } else {
