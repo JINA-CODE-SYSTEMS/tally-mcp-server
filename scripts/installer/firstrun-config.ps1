@@ -176,6 +176,21 @@ $transcript = Join-Path $InstallDir 'logs\firstrun-config.log'
 New-Item -ItemType Directory -Force -Path (Split-Path $transcript) | Out-Null
 Start-Transcript -Path $transcript -Append | Out-Null
 
+# Distinguish silent installer-driven runs (Inno passes -CredentialsFile and the
+# window is auto-closed by the installer) from interactive reconfigure runs
+# launched via the Start Menu shortcut. On the interactive path, the PowerShell
+# host closes the window the moment the script returns — success or failure —
+# which is why operators reported "nothing happens, window flashes shut" on the
+# RDC: the script completed, they just couldn't see the output. Pause at the
+# end so they can read it.
+$Script:IsInteractiveRun = [string]::IsNullOrWhiteSpace($CredentialsFile)
+function _PauseIfInteractive {
+    if ($Script:IsInteractiveRun) {
+        Write-Host ""
+        Read-Host "Press Enter to close this window"
+    }
+}
+
 try {
     Write-Host "=== Tally MCP first-run configuration ==="
     Write-Host "InstallDir   = $InstallDir"
@@ -191,7 +206,21 @@ try {
 
     foreach ($p in @($bundledNode, $bundledNssm, $serverEntry, $agentScript)) {
         if (-not (Test-Path -LiteralPath $p)) {
-            throw "Required file missing: $p (installer payload incomplete?)"
+            throw @"
+Required file missing: $p
+
+This script configures an installed Tally MCP deployment (it needs the bundled
+node-portable, nssm, and built dist/ that the .exe installer drops alongside
+itself). It can't run against a bare source checkout.
+
+If you're trying to reconfigure a real installation, launch this from the
+"Reconfigure Tally MCP" Start Menu shortcut (which points at the install dir,
+typically C:\Program Files\TallyMCP\).
+
+If you're a developer testing changes to firstrun-config.ps1 itself, either:
+  - install the .exe first, then run the shortcut, OR
+  - copy this script into an existing install dir and run it from there.
+"@
         }
     }
 
@@ -213,7 +242,8 @@ try {
         "# Edit by hand or re-run scripts\installer\firstrun-config.ps1 to regenerate."
         "PASSWORD=$(_envQuote $Password)"
         "TALLY_EDITION=$TallyEdition"
-        "TALLY_HOST=127.0.0.1:9000"
+        "TALLY_HOST=127.0.0.1"
+        "TALLY_PORT=9000"
         "TALLY_EXE_PATH=$(_envQuote $TallyExePath)"
         "TALLY_DATA_PATH=$(_envQuote $TallyDataPath)"
         "TALLY_INI_PATH=$(_envQuote $TallyIniPath)"
@@ -431,6 +461,16 @@ try {
     Write-Host "NOTE: $transcript captures install activity. Delete it if PowerShell parameter binding"
     Write-Host "      may have logged the OAuth password and the box is shared with other admins."
 }
+catch {
+    # Show the error in the console (PowerShell already prints it but the transcript
+    # may have wrapped it). Then pause so the user can read it before the window closes.
+    Write-Host ""
+    Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Transcript: $transcript"
+    _PauseIfInteractive
+    throw
+}
 finally {
     Stop-Transcript | Out-Null
 }
+_PauseIfInteractive

@@ -148,6 +148,194 @@ function Invoke-LoadCompanyViaAgent {
 }
 
 # ---------------------------------------------------------------------------
+# CSV import
+# ---------------------------------------------------------------------------
+
+# Reads a CSV file and returns parsed rows + validation errors. Does not encrypt
+# passwords or touch the registry. Header row required; recognised columns are
+# alias, folderId, displayName, username, password, extraAliases, notes.
+function Read-CompaniesFromCsv {
+    param([string]$CsvPath)
+    $result = @{ rows = @(); errors = @() }
+    try {
+        $rows = Import-Csv -LiteralPath $CsvPath -Encoding UTF8
+    } catch {
+        $result.errors += "Could not parse CSV: $_"
+        return $result
+    }
+    if (-not $rows -or @($rows).Count -eq 0) {
+        $result.errors += "CSV has no data rows."
+        return $result
+    }
+    $required = @('alias', 'folderId')
+    $known    = @('alias','folderId','displayName','username','password','extraAliases','notes')
+    $headers  = @($rows[0].PSObject.Properties.Name)
+    foreach ($col in $required) {
+        if ($headers -notcontains $col) { $result.errors += "Missing required column: '$col'" }
+    }
+    $unknown = $headers | Where-Object { $known -notcontains $_ }
+    foreach ($u in $unknown) { $result.errors += "Unknown column ignored: '$u'" }
+
+    $seenAliases = @{}
+    $lineNum = 1
+    foreach ($row in $rows) {
+        $lineNum++
+        $alias = ("$($row.alias)").Trim()
+        $folderId = ("$($row.folderId)").Trim()
+        if (-not $alias)    { $result.errors += "Row ${lineNum}: alias is empty"; continue }
+        if (-not $folderId) { $result.errors += "Row ${lineNum}: folderId is empty"; continue }
+        $aliasKey = $alias.ToLower()
+        if ($seenAliases.ContainsKey($aliasKey)) {
+            $result.errors += "Row ${lineNum}: duplicate alias '$alias' (also on row $($seenAliases[$aliasKey]))"
+            continue
+        }
+        $seenAliases[$aliasKey] = $lineNum
+        $extras = @()
+        if ($row.PSObject.Properties.Name -contains 'extraAliases' -and $row.extraAliases) {
+            $extras = @($row.extraAliases.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        }
+        $result.rows += @{
+            alias        = $alias
+            folderId     = $folderId
+            displayName  = ("$($row.displayName)").Trim()
+            username     = ("$($row.username)").Trim()
+            password     = "$($row.password)"
+            extraAliases = $extras
+            notes        = ("$($row.notes)").Trim()
+            _lineNum     = $lineNum
+        }
+    }
+    return $result
+}
+
+# Modal preview grid for CSV import. Shows each parsed row with a Status column
+# (New / Conflict) and asks the user how to resolve conflicts. Returns the
+# chosen mode ('overwrite' or 'skip') or $null on Cancel.
+function Show-CsvImportPreviewDialog {
+    param(
+        [array]$ParsedRows,
+        [array]$ExistingAliases,
+        [array]$ValidationErrors
+    )
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'Import Companies from CSV - Preview'
+    $form.Size = New-Object System.Drawing.Size(820, 560)
+    $form.StartPosition = 'CenterParent'
+    $form.FormBorderStyle = 'Sizable'
+    $form.MinimumSize = New-Object System.Drawing.Size(600, 400)
+    $form.BackColor = [System.Drawing.Color]::White
+    $form.Font = New-Object System.Drawing.Font 'Segoe UI', 9
+
+    $lblSummary = New-Object System.Windows.Forms.Label
+    $existingLower = @($ExistingAliases | ForEach-Object { $_.ToLower() })
+    $newCount      = @($ParsedRows | Where-Object { $existingLower -notcontains $_.alias.ToLower() }).Count
+    $conflictCount = @($ParsedRows | Where-Object { $existingLower -contains  $_.alias.ToLower() }).Count
+    $lblSummary.Text = "$($ParsedRows.Count) rows parsed - $newCount new, $conflictCount conflict with existing aliases."
+    $lblSummary.Location = New-Object System.Drawing.Point(15, 12)
+    $lblSummary.Size = New-Object System.Drawing.Size(780, 22)
+    $lblSummary.Anchor = 'Top,Left,Right'
+    $lblSummary.Font = New-Object System.Drawing.Font 'Segoe UI Semibold', 10
+    $form.Controls.Add($lblSummary)
+
+    if ($ValidationErrors -and $ValidationErrors.Count -gt 0) {
+        $lblErrors = New-Object System.Windows.Forms.Label
+        $errPreview = ($ValidationErrors | Select-Object -First 3) -join '   |   '
+        $lblErrors.Text = "Warnings: $errPreview" + $(if ($ValidationErrors.Count -gt 3) { " (+$($ValidationErrors.Count - 3) more)" } else { '' })
+        $lblErrors.Location = New-Object System.Drawing.Point(15, 36)
+        $lblErrors.Size = New-Object System.Drawing.Size(780, 18)
+        $lblErrors.Anchor = 'Top,Left,Right'
+        $lblErrors.ForeColor = [System.Drawing.Color]::FromArgb(180, 90, 0)
+        $form.Controls.Add($lblErrors)
+    }
+
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Location = New-Object System.Drawing.Point(15, 60)
+    $grid.Size = New-Object System.Drawing.Size(780, 360)
+    $grid.Anchor = 'Top,Left,Right,Bottom'
+    $grid.AllowUserToAddRows = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.AllowUserToResizeRows = $false
+    $grid.ReadOnly = $true
+    $grid.RowHeadersVisible = $false
+    $grid.SelectionMode = 'FullRowSelect'
+    $grid.BackgroundColor = [System.Drawing.Color]::White
+    $grid.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(248, 250, 252)
+    $grid.AutoSizeColumnsMode = 'Fill'
+    [void]$grid.Columns.Add('status', 'Status')
+    [void]$grid.Columns.Add('alias', 'Alias')
+    [void]$grid.Columns.Add('folderId', 'Folder ID')
+    [void]$grid.Columns.Add('displayName', 'Display Name')
+    [void]$grid.Columns.Add('hasPassword', 'Password')
+    [void]$grid.Columns.Add('notes', 'Notes')
+    $grid.Columns['status'].FillWeight = 12
+    $grid.Columns['alias'].FillWeight = 13
+    $grid.Columns['folderId'].FillWeight = 10
+    $grid.Columns['displayName'].FillWeight = 25
+    $grid.Columns['hasPassword'].FillWeight = 10
+    $grid.Columns['notes'].FillWeight = 30
+    foreach ($r in $ParsedRows) {
+        $status = if ($existingLower -contains $r.alias.ToLower()) { 'Conflict' } else { 'New' }
+        $hasPw  = if ($r.password) { 'Yes' } else { 'No' }
+        [void]$grid.Rows.Add($status, $r.alias, $r.folderId, $r.displayName, $hasPw, $r.notes)
+    }
+    foreach ($row in $grid.Rows) {
+        if ($row.Cells['status'].Value -eq 'Conflict') {
+            $row.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 245, 220)
+        }
+    }
+    $form.Controls.Add($grid)
+
+    $gbConflict = New-Object System.Windows.Forms.GroupBox
+    $gbConflict.Text = ' On conflict with existing alias '
+    $gbConflict.Location = New-Object System.Drawing.Point(15, 430)
+    $gbConflict.Size = New-Object System.Drawing.Size(440, 56)
+    $gbConflict.Anchor = 'Bottom,Left'
+    $form.Controls.Add($gbConflict)
+
+    $rbOverwrite = New-Object System.Windows.Forms.RadioButton
+    $rbOverwrite.Text = 'Overwrite existing entry'
+    $rbOverwrite.Location = New-Object System.Drawing.Point(15, 22)
+    $rbOverwrite.Size = New-Object System.Drawing.Size(210, 22)
+    $rbOverwrite.Checked = $true
+    $gbConflict.Controls.Add($rbOverwrite)
+
+    $rbSkip = New-Object System.Windows.Forms.RadioButton
+    $rbSkip.Text = 'Skip (keep existing)'
+    $rbSkip.Location = New-Object System.Drawing.Point(230, 22)
+    $rbSkip.Size = New-Object System.Drawing.Size(180, 22)
+    $gbConflict.Controls.Add($rbSkip)
+
+    $btnImport = New-Object System.Windows.Forms.Button
+    $btnImport.Text = 'Import'
+    $btnImport.Location = New-Object System.Drawing.Point(595, 442)
+    $btnImport.Size = New-Object System.Drawing.Size(95, 32)
+    $btnImport.Anchor = 'Bottom,Right'
+    $btnImport.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
+    $btnImport.ForeColor = [System.Drawing.Color]::White
+    $btnImport.UseVisualStyleBackColor = $false
+    $form.Controls.Add($btnImport)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = 'Cancel'
+    $btnCancel.Location = New-Object System.Drawing.Point(700, 442)
+    $btnCancel.Size = New-Object System.Drawing.Size(95, 32)
+    $btnCancel.Anchor = 'Bottom,Right'
+    $btnCancel.DialogResult = 'Cancel'
+    $form.Controls.Add($btnCancel)
+    $form.CancelButton = $btnCancel
+
+    $state = @{ Mode = $null }
+    $btnImport.Add_Click({
+        $state.Mode = if ($rbOverwrite.Checked) { 'overwrite' } else { 'skip' }
+        $form.DialogResult = 'OK'
+        $form.Close()
+    }.GetNewClosure())
+
+    [void]$form.ShowDialog()
+    return $state.Mode
+}
+
+# ---------------------------------------------------------------------------
 # UI helpers for the edit dialog
 # ---------------------------------------------------------------------------
 
@@ -402,12 +590,14 @@ function Show-ManageCompaniesDialog {
     # a local variable here, and invoke via `& $fnRead` etc. inside handlers.
     # The variables ARE captured by .GetNewClosure(), so the function bodies
     # are reachable from within the module scope.
-    $fnRead       = ${function:Read-CompanyRegistry}
-    $fnWrite      = ${function:Write-CompanyRegistry}
-    $fnProtect    = ${function:Protect-PasswordViaHelper}
-    $fnUnprotect  = ${function:Unprotect-PasswordViaHelper}
-    $fnAgent      = ${function:Invoke-LoadCompanyViaAgent}
-    $fnEditDialog = ${function:Show-CompanyEditDialog}
+    $fnRead         = ${function:Read-CompanyRegistry}
+    $fnWrite        = ${function:Write-CompanyRegistry}
+    $fnProtect      = ${function:Protect-PasswordViaHelper}
+    $fnUnprotect    = ${function:Unprotect-PasswordViaHelper}
+    $fnAgent        = ${function:Invoke-LoadCompanyViaAgent}
+    $fnEditDialog   = ${function:Show-CompanyEditDialog}
+    $fnReadCsv      = ${function:Read-CompaniesFromCsv}
+    $fnPreviewCsv   = ${function:Show-CsvImportPreviewDialog}
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'Manage Companies - TallyMCP'
@@ -520,12 +710,13 @@ function Show-ManageCompaniesDialog {
         $form.Controls.Add($b)
         return $b
     }
-    $btnAdd    = _MakeButton -Text 'Add'    -X  15 -W 90
-    $btnEdit   = _MakeButton -Text 'Edit'   -X 110 -W 90
-    $btnDelete = _MakeButton -Text 'Delete' -X 205 -W 90
-    $btnTest   = _MakeButton -Text 'Test'   -X 300 -W 90
-    $btnClose  = _MakeButton -Text 'Close'  -X 760 -W 95 -Anchor 'Bottom,Right' `
-                  -Back ([System.Drawing.Color]::FromArgb(0, 120, 215)) -Fore ([System.Drawing.Color]::White)
+    $btnAdd       = _MakeButton -Text 'Add'        -X  15 -W 90
+    $btnEdit      = _MakeButton -Text 'Edit'       -X 110 -W 90
+    $btnDelete    = _MakeButton -Text 'Delete'     -X 205 -W 90
+    $btnTest      = _MakeButton -Text 'Test'       -X 300 -W 90
+    $btnImportCsv = _MakeButton -Text 'Import CSV' -X 395 -W 110
+    $btnClose     = _MakeButton -Text 'Close'      -X 760 -W 95 -Anchor 'Bottom,Right' `
+                      -Back ([System.Drawing.Color]::FromArgb(0, 120, 215)) -Fore ([System.Drawing.Color]::White)
 
     # Translate an edit-dialog entry's transient password fields (_passwordChanged /
     # _plaintextPassword) into a clean entry suitable for persistence, encrypting on the fly.
@@ -653,6 +844,85 @@ function Show-ManageCompaniesDialog {
         } finally {
             $form.Cursor = [System.Windows.Forms.Cursors]::Default
             $btnTest.Enabled = $true
+        }
+    }.GetNewClosure())
+
+    # --- Import CSV --------------------------------------------------------
+    # File picker -> parse -> preview -> bulk write. Plaintext passwords in the
+    # CSV are encrypted per-row via the DPAPI helper before persistence.
+    $btnImportCsv.Add_Click({
+        $ofd = New-Object System.Windows.Forms.OpenFileDialog
+        $ofd.Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'
+        $ofd.Title  = 'Select companies CSV'
+        if ($ofd.ShowDialog() -ne 'OK') { return }
+        $csvPath = $ofd.FileName
+
+        $parsed = & $fnReadCsv -CsvPath $csvPath
+        $blockingErrors = @($parsed.errors | Where-Object {
+            $_ -like 'Missing required column:*' -or $_ -like 'Could not parse CSV:*' -or $_ -eq 'CSV has no data rows.'
+        })
+        if ($blockingErrors.Count -gt 0) {
+            [System.Windows.Forms.MessageBox]::Show(($blockingErrors -join "`n"), 'CSV invalid', 'OK', 'Error') | Out-Null
+            return
+        }
+        if ($parsed.rows.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show('No valid rows in the CSV.', 'Nothing to import', 'OK', 'Information') | Out-Null
+            return
+        }
+
+        $live = & $fnRead -Path $RegistryPath
+        $existingAliases = @($live.companies | ForEach-Object { $_.alias })
+        $mode = & $fnPreviewCsv -ParsedRows $parsed.rows -ExistingAliases $existingAliases -ValidationErrors $parsed.errors
+        if (-not $mode) { return }
+
+        $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        $btnImportCsv.Enabled = $false
+        try {
+            $existingLower = @{}
+            for ($i = 0; $i -lt $live.companies.Count; $i++) {
+                $existingLower[$live.companies[$i].alias.ToLower()] = $i
+            }
+            $added = 0; $updated = 0; $skipped = 0
+            foreach ($row in $parsed.rows) {
+                $key = $row.alias.ToLower()
+                $entry = @{
+                    alias        = $row.alias
+                    folderId     = $row.folderId
+                    displayName  = $row.displayName
+                    username     = $row.username
+                    extraAliases = $row.extraAliases
+                    notes        = $row.notes
+                }
+                if ($row.password) {
+                    $entry.passwordEnc = & $fnProtect -HelperPath $DpapiHelperPath -Plaintext $row.password
+                }
+                if ($existingLower.ContainsKey($key)) {
+                    if ($mode -eq 'skip') { $skipped++; continue }
+                    $existingEntry = $live.companies[$existingLower[$key]]
+                    if (-not $entry.passwordEnc -and $existingEntry.passwordEnc) {
+                        $entry.passwordEnc = $existingEntry.passwordEnc
+                    }
+                    $live.companies[$existingLower[$key]] = $entry
+                    $updated++
+                } else {
+                    $live.companies = @($live.companies) + @($entry)
+                    $existingLower[$key] = $live.companies.Count - 1
+                    $added++
+                }
+            }
+            & $fnWrite -Path $RegistryPath -Registry $live
+            & $refreshGrid
+
+            $msg = "Import complete:`n  Added:    $added`n  Updated:  $updated`n  Skipped:  $skipped"
+            if ($parsed.rows | Where-Object { $_.password }) {
+                $msg += "`n`nThe CSV contains plaintext passwords. Delete the file now if you no longer need it:`n  $csvPath"
+            }
+            [System.Windows.Forms.MessageBox]::Show($msg, 'CSV imported', 'OK', 'Information') | Out-Null
+        } catch {
+            [System.Windows.Forms.MessageBox]::Show("Import failed: $_", 'Error', 'OK', 'Error') | Out-Null
+        } finally {
+            $form.Cursor = [System.Windows.Forms.Cursors]::Default
+            $btnImportCsv.Enabled = $true
         }
     }.GetNewClosure())
 
