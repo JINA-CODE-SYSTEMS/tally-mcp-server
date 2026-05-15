@@ -83,6 +83,38 @@ Step "npm run build" {
     if ($LASTEXITCODE -ne 0) { throw "npm run build failed (exit $LASTEXITCODE)" }
 }
 
+# The installer places the running service under a separate tree
+# (typically "C:\Program Files\TallyMCP") and points NSSM's AppDirectory at it.
+# A `npm run build` in the dev tree only updates the dev dist/ — the service
+# keeps running the stale install dist/. Bridge that gap: read AppDirectory
+# from NSSM and, if it differs from $InstallDir, copy fresh dist/ over.
+Step "Sync dist/ to service install dir" {
+    $appDir = ''
+    try {
+        $appDir = (& nssm get $ServiceName AppDirectory 2>$null | Out-String).Trim()
+    } catch {
+        Write-Host "    Could not read NSSM AppDirectory (nssm not on PATH?). Skipping sync." -ForegroundColor Yellow
+        return
+    }
+    if (-not $appDir) {
+        Write-Host "    NSSM AppDirectory is empty. Skipping sync." -ForegroundColor Yellow
+        return
+    }
+    # Compare normalized paths so trailing slashes / case don't trip us.
+    $devDistFull = (Resolve-Path (Join-Path $InstallDir 'dist')).Path.TrimEnd('\')
+    $svcDistFull = (Join-Path $appDir 'dist').TrimEnd('\')
+    if ([string]::Equals($devDistFull, $svcDistFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-Host "    Service runs directly from dev tree ($appDir) — no copy needed." -ForegroundColor DarkGray
+        return
+    }
+    if (-not (Test-Path $svcDistFull)) {
+        Write-Host "    Service dist/ not found at '$svcDistFull'. Creating." -ForegroundColor DarkGray
+        New-Item -ItemType Directory -Path $svcDistFull -Force | Out-Null
+    }
+    Write-Host "    Copying $devDistFull\* -> $svcDistFull\"
+    Copy-Item -Path (Join-Path $devDistFull '*') -Destination $svcDistFull -Recurse -Force
+}
+
 if ($NoRestart) {
     Write-Host "==> Restart (skipped, -NoRestart)" -ForegroundColor DarkGray
 } else {
