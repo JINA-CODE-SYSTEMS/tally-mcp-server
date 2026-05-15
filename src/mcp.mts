@@ -1312,8 +1312,26 @@ export async function registerMcpServer(): Promise<McpServer> {
     async (args) => {
       const start = Date.now();
       try {
-        // Tier 1: exact name probe (case-insensitive). If Tally accepts it via
-        // SVCURRENTCOMPANY, we're done — set and return success.
+        // Tier 1: exact match against the authoritative loaded-companies list.
+        // Case-insensitive + whitespace-normalized so hidden chars (NBSP, CR,
+        // trailing whitespace) don't cause false negatives. This is what closes
+        // the "user confirms the suggested name but still gets a fuzzy loop"
+        // bug: when fuzzy Tier 3 suggests "ROSS COMPUTER PVT. LTD." and the
+        // user re-calls with that exact string, this tier matches and accepts.
+        const normalize = (s: string) => s.replace(/\s+/g, ' ').trim().toLowerCase();
+        const requestedNorm = normalize(args.companyName);
+        const loaded = await listLoadedCompanies();
+        const exactInLoaded = loaded.find(n => normalize(n) === requestedNorm);
+        if (exactInLoaded) {
+          activeCompany = exactInLoaded;
+          auditLog('set-active-company', args, 'success', Date.now() - start);
+          return {
+            content: [{ type: 'text', text: `Active company set to "${exactInLoaded}". Subsequent tools will target this company unless targetCompany is specified explicitly.` }]
+          };
+        }
+
+        // Tier 2: SVCURRENTCOMPANY probe — useful if listLoadedCompanies is
+        // momentarily out of sync with Tally's actual current-company pointer.
         if (await verifyCompanyLoaded(args.companyName)) {
           activeCompany = args.companyName;
           auditLog('set-active-company', args, 'success', Date.now() - start);
@@ -1322,12 +1340,12 @@ export async function registerMcpServer(): Promise<McpServer> {
           };
         }
 
-        // Tier 2: list everything Tally has loaded, run a fuzzy match.
+        // Tier 3: fuzzy match against the loaded list.
         // We DO NOT auto-resolve — risk of running tools against the wrong
         // company if the fuzzy match guesses wrong. Instead, surface the
         // closest candidate(s) so the caller (or the LLM) can confirm and
-        // re-call set-active-company with the exact name.
-        const loaded = await listLoadedCompanies();
+        // re-call set-active-company with the exact name (which Tier 1 will
+        // then accept via normalized comparison).
         const closest = findMatchingLoadedCompany(args.companyName, loaded);
         auditLog('set-active-company', args, 'denied', Date.now() - start);
 
