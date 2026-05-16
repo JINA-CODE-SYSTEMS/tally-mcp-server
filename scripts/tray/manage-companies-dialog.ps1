@@ -601,9 +601,9 @@ function Show-ManageCompaniesDialog {
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'Manage Companies - TallyMCP'
-    $form.Size = New-Object System.Drawing.Size(920, 600)
+    $form.Size = New-Object System.Drawing.Size(920, 650)
     $form.StartPosition = 'CenterScreen'
-    $form.MinimumSize = New-Object System.Drawing.Size(760, 440)
+    $form.MinimumSize = New-Object System.Drawing.Size(760, 480)
     $form.BackColor = [System.Drawing.Color]::White
     $form.Font = New-Object System.Drawing.Font 'Segoe UI', 9
 
