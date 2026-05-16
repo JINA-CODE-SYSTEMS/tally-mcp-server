@@ -715,6 +715,7 @@ function Show-ManageCompaniesDialog {
     $btnDelete    = _MakeButton -Text 'Delete'     -X 205 -W 90
     $btnTest      = _MakeButton -Text 'Test'       -X 300 -W 90
     $btnImportCsv = _MakeButton -Text 'Import CSV' -X 395 -W 110
+    $btnSampleCsv = _MakeButton -Text 'Sample CSV' -X 510 -W 110
     $btnClose     = _MakeButton -Text 'Close'      -X 760 -W 95 -Anchor 'Bottom,Right' `
                       -Back ([System.Drawing.Color]::FromArgb(0, 120, 215)) -Fore ([System.Drawing.Color]::White)
 
@@ -923,6 +924,29 @@ function Show-ManageCompaniesDialog {
         } finally {
             $form.Cursor = [System.Windows.Forms.Cursors]::Default
             $btnImportCsv.Enabled = $true
+        }
+    }.GetNewClosure())
+
+    # --- Sample CSV --------------------------------------------------------
+    # Writes a template CSV with the headers we accept and two example rows.
+    # Lets the user fill in their own data and upload via Import CSV.
+    $btnSampleCsv.Add_Click({
+        $sfd = New-Object System.Windows.Forms.SaveFileDialog
+        $sfd.Filter   = 'CSV files (*.csv)|*.csv'
+        $sfd.Title    = 'Save sample CSV'
+        $sfd.FileName = 'tally-companies-sample.csv'
+        if ($sfd.ShowDialog() -ne 'OK') { return }
+        try {
+            $sample = @(
+                'alias,folderId,displayName,username,password,extraAliases,notes'
+                'main,100000,Acme Industries Pvt Ltd,admin,Welcome@123,"primary,acme",Headquarters'
+                'branch,200000,Acme Branch Office,,,,No security'
+            ) -join "`r`n"
+            Set-Content -LiteralPath $sfd.FileName -Value $sample -Encoding UTF8
+            $msg = "Sample CSV saved to:`n  $($sfd.FileName)`n`nEdit it with the companies you want to register, then use Import CSV to load them.`n`nRequired columns: alias, folderId`nOptional columns: displayName, username, password, extraAliases, notes"
+            [System.Windows.Forms.MessageBox]::Show($msg, 'Sample saved', 'OK', 'Information') | Out-Null
+        } catch {
+            [System.Windows.Forms.MessageBox]::Show("Could not save sample: $_", 'Error', 'OK', 'Error') | Out-Null
         }
     }.GetNewClosure())
 
