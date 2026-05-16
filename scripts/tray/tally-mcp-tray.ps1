@@ -71,15 +71,19 @@ if (Test-Path -LiteralPath $ManageDialogPath) { . $ManageDialogPath }
 # Single Hashtable rather than a class so the script stays easy to copy-paste-debug.
 # ---------------------------------------------------------------------------
 $State = [hashtable]::Synchronized(@{
-    Service       = $null   # ServiceController | $null
-    AgentTask     = $null   # ScheduledTask object | $null
-    AgentProcess  = $null   # Process | $null
-    TallyProcess  = $null   # Process | $null
-    PublicUrl     = ''      # full probe URL or '' if no MCP_DOMAIN set
-    PublicUrlOk   = $null   # $true / $false / $null (not configured)
-    LoadedCompany = ''      # best-effort name of currently loaded company, or ''
-    LastPoll      = $null
-    LastError     = $null
+    Service          = $null   # ServiceController | $null
+    AgentTask        = $null   # ScheduledTask object | $null
+    AgentProcess     = $null   # Process | $null
+    TallyProcess     = $null   # Process | $null
+    PublicUrl        = ''      # full probe URL or '' if no MCP_DOMAIN set
+    PublicUrlOk      = $null   # $true / $false / $null (not configured)
+    LoadedCompany    = ''      # best-effort name of currently loaded company, or ''
+    LastLoadedAlias  = ''      # alias of most recently Test'd company (highest lastLoadedAt in registry)
+    LastPoll         = $null
+    LastError        = $null
+    PreviousStatus   = $null   # for toast on degradation: 'green'/'yellow'/'red'/'gray'
+    AgentWasRunning  = $false  # for toast on agent crash
+    ServiceWasRunning = $false # for toast on service stop
 })
 
 # ---------------------------------------------------------------------------
@@ -208,6 +212,26 @@ function Invoke-StatusPoll {
         $State.PublicUrlOk = $false
     }
 
+    # Pick the alias with the most recent lastLoadedAt timestamp from the company
+    # registry. Used by the "Reload last company" menu item. Silently empty if
+    # the registry file is missing, malformed, or no entries have ever been tested.
+    try {
+        $envFile = Join-Path $InstallDir '.env'
+        $dataPath = Read-EnvValue -EnvPath $envFile -Key 'TALLY_DATA_PATH'
+        if (-not $dataPath) { $dataPath = 'C:\Users\Public\TallyPrimeEditLog\data' }
+        $regPath = Join-Path $dataPath '.tally-mcp-companies.json'
+        if (Test-Path -LiteralPath $regPath) {
+            $raw = (Get-Content -LiteralPath $regPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue) -replace '^﻿', ''
+            if ($raw) {
+                $parsed = $raw | ConvertFrom-Json -ErrorAction Stop
+                $latest = $parsed.companies | Where-Object { $_.lastLoadedAt } |
+                    Sort-Object { try { [datetime]$_.lastLoadedAt } catch { [datetime]::MinValue } } -Descending |
+                    Select-Object -First 1
+                $State.LastLoadedAlias = if ($latest) { [string]$latest.alias } else { '' }
+            }
+        }
+    } catch { $State.LastLoadedAlias = '' }
+
     # Best-effort "what's loaded right now" via the in-process Tally XML server. Fast probe (<200ms
     # when Tally is up; instant timeout when it's not). Skipped if Tally isn't running to avoid
     # poll-interval-sized delays from blocked TCP connects.
@@ -319,6 +343,25 @@ $miOpenLogs.Add_Click({
     }
 })
 
+# Opens File Explorer with the registry .json highlighted. Useful for support
+# scenarios where you need to email someone the file, or hand-edit a stray entry.
+$miOpenRegistry = $menu.Items.Add('Open registry file')
+$miOpenRegistry.Add_Click({
+    $envFile = Join-Path $InstallDir '.env'
+    $dataPath = Read-EnvValue -EnvPath $envFile -Key 'TALLY_DATA_PATH'
+    if (-not $dataPath) { $dataPath = 'C:\Users\Public\TallyPrimeEditLog\data' }
+    $regPath = Join-Path $dataPath '.tally-mcp-companies.json'
+    if (Test-Path -LiteralPath $regPath) {
+        Start-Process -FilePath 'explorer.exe' -ArgumentList "/select,`"$regPath`""
+    } elseif (Test-Path -LiteralPath $dataPath) {
+        $msg = "Registry file does not exist yet:`n  $regPath`n`nIt is created on the first Add or Import CSV. Opening the parent folder instead."
+        [System.Windows.Forms.MessageBox]::Show($msg, 'TallyMCP', 'OK', 'Information') | Out-Null
+        Start-Process -FilePath 'explorer.exe' -ArgumentList $dataPath
+    } else {
+        [System.Windows.Forms.MessageBox]::Show("Registry data folder not found: $dataPath", 'TallyMCP', 'OK', 'Warning') | Out-Null
+    }
+})
+
 $miRestartService = $menu.Items.Add('Restart service')
 $miRestartService.Add_Click({
     try {
@@ -390,6 +433,53 @@ $miLaunchTally.Add_Click({
         Start-Process -FilePath $exe
     } catch {
         [System.Windows.Forms.MessageBox]::Show("Launch failed: $_", 'TallyMCP', 'OK', 'Error') | Out-Null
+    }
+})
+
+# Reloads whichever company was most recently Test'd via the Manage Companies
+# dialog (looked up by max(lastLoadedAt) on each poll). Decrypts the stored
+# password via the DPAPI helper, then hands the load off to the GUI agent IPC
+# (same path the dialog's Test button uses). Disabled when no alias has ever
+# been Test'd or when the helper functions aren't loaded.
+$miReloadLast = $menu.Items.Add('Reload last company')
+$miReloadLast.Enabled = $false
+$miReloadLast.Add_Click({
+    if (-not $State.LastLoadedAlias) { return }
+    $alias = $State.LastLoadedAlias
+    $envFile = Join-Path $InstallDir '.env'
+    $dataPath = Read-EnvValue -EnvPath $envFile -Key 'TALLY_DATA_PATH'
+    if (-not $dataPath) { $dataPath = 'C:\Users\Public\TallyPrimeEditLog\data' }
+    $regPath = Join-Path $dataPath '.tally-mcp-companies.json'
+    $dpapi   = Join-Path $InstallDir 'scripts\dpapi-helper.ps1'
+    if (-not (Get-Command Read-CompanyRegistry -ErrorAction SilentlyContinue) -or
+        -not (Get-Command Invoke-LoadCompanyViaAgent -ErrorAction SilentlyContinue)) {
+        [System.Windows.Forms.MessageBox]::Show("Manage Companies helpers not loaded. Reinstall TallyMCP to restore.", 'TallyMCP', 'OK', 'Warning') | Out-Null
+        return
+    }
+    try {
+        $reg = Read-CompanyRegistry -Path $regPath
+        $entry = $reg.companies | Where-Object { $_.alias -eq $alias } | Select-Object -First 1
+        if (-not $entry) {
+            [System.Windows.Forms.MessageBox]::Show("Alias '$alias' is no longer in the registry.", 'TallyMCP', 'OK', 'Warning') | Out-Null
+            return
+        }
+        $plain = ''
+        if ($entry.passwordEnc) {
+            try { $plain = Unprotect-PasswordViaHelper -HelperPath $dpapi -Blob $entry.passwordEnc }
+            catch {
+                [System.Windows.Forms.MessageBox]::Show("Could not decrypt password for '$alias': $_", 'TallyMCP', 'OK', 'Error') | Out-Null
+                return
+            }
+        }
+        $tray.ShowBalloonTip(2500, 'TallyMCP', "Reloading '$alias'...", [System.Windows.Forms.ToolTipIcon]::Info)
+        $result = Invoke-LoadCompanyViaAgent -RegistryPath $regPath -FolderId $entry.folderId -Username $entry.username -Password $plain
+        if ($result.ok) {
+            $tray.ShowBalloonTip(4000, 'TallyMCP', "Reloaded '$alias': $($result.message)", [System.Windows.Forms.ToolTipIcon]::Info)
+        } else {
+            $tray.ShowBalloonTip(6000, 'TallyMCP - reload failed', "Couldn't reload '$alias' - $($result.message)", [System.Windows.Forms.ToolTipIcon]::Warning)
+        }
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Reload last company failed: $_", 'TallyMCP', 'OK', 'Error') | Out-Null
     }
 })
 
@@ -684,6 +774,42 @@ function Update-TrayUi {
         default  { $tray.Icon = $IconGray.Icon }
     }
     $miHeader.Text = "TallyMCP - $status"
+
+    # "Reload last company" enable + dynamic text
+    if ($State.LastLoadedAlias) {
+        $miReloadLast.Enabled = $true
+        $miReloadLast.Text    = "Reload last company: $($State.LastLoadedAlias)"
+    } else {
+        $miReloadLast.Enabled = $false
+        $miReloadLast.Text    = 'Reload last company (none yet)'
+    }
+
+    # Toast notifications fire only on STATE TRANSITIONS so a sustained bad
+    # state doesn't spam the user. Three triggers:
+    #   1. Overall status degrades from green to anything non-green.
+    #   2. Service was Running and is now anything else.
+    #   3. Agent process was running and has now disappeared.
+    # And one "all clear" trigger when we transition back to green.
+    if ($State.PreviousStatus -and $State.PreviousStatus -ne $status) {
+        if ($status -eq 'red') {
+            $tray.ShowBalloonTip(8000, 'TallyMCP - service down', "The MCP service is not running. Tools will be unreachable.", [System.Windows.Forms.ToolTipIcon]::Error)
+        } elseif ($status -eq 'yellow' -and $State.PreviousStatus -eq 'green') {
+            $tray.ShowBalloonTip(6000, 'TallyMCP - degraded', "Something downstream is unhealthy. Open the dashboard to see details.", [System.Windows.Forms.ToolTipIcon]::Warning)
+        } elseif ($status -eq 'green' -and $State.PreviousStatus -in @('yellow', 'red')) {
+            $tray.ShowBalloonTip(4000, 'TallyMCP - healthy', "All services back up.", [System.Windows.Forms.ToolTipIcon]::Info)
+        }
+    }
+    $serviceRunning = ($State.Service -and $State.Service.Status -eq 'Running')
+    if ($State.ServiceWasRunning -and -not $serviceRunning) {
+        $tray.ShowBalloonTip(8000, 'TallyMCP - service stopped', "The Windows service stopped unexpectedly. Right-click tray > Restart service.", [System.Windows.Forms.ToolTipIcon]::Error)
+    }
+    $agentRunning = ($State.AgentProcess -ne $null)
+    if ($State.AgentWasRunning -and -not $agentRunning) {
+        $tray.ShowBalloonTip(6000, 'TallyMCP - agent stopped', "The GUI agent process is no longer running. Password-protected company loading will fail until restarted.", [System.Windows.Forms.ToolTipIcon]::Warning)
+    }
+    $State.PreviousStatus    = $status
+    $State.ServiceWasRunning = $serviceRunning
+    $State.AgentWasRunning   = $agentRunning
 
     if ($State.Service) {
         $miServiceState.Text = "  Service:  $($State.Service.Status)"
