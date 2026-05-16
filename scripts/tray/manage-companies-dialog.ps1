@@ -601,43 +601,59 @@ function Show-ManageCompaniesDialog {
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'Manage Companies - TallyMCP'
-    $form.Size = New-Object System.Drawing.Size(880, 560)
+    $form.Size = New-Object System.Drawing.Size(920, 600)
     $form.StartPosition = 'CenterScreen'
-    $form.MinimumSize = New-Object System.Drawing.Size(700, 400)
+    $form.MinimumSize = New-Object System.Drawing.Size(760, 440)
     $form.BackColor = [System.Drawing.Color]::White
     $form.Font = New-Object System.Drawing.Font 'Segoe UI', 9
 
-    # Header
+    # Header band: subtle tinted strip behind the title for visual anchor
+    $headerPanel = New-Object System.Windows.Forms.Panel
+    $headerPanel.Location = New-Object System.Drawing.Point(0, 0)
+    $headerPanel.Size = New-Object System.Drawing.Size(920, 78)
+    $headerPanel.BackColor = [System.Drawing.Color]::FromArgb(245, 247, 250)
+    $headerPanel.Anchor = 'Top,Left,Right'
+    $form.Controls.Add($headerPanel)
+
     $lblTitle = New-Object System.Windows.Forms.Label
-    $lblTitle.Text = 'Companies you have configured for Claude'
-    $lblTitle.Location = New-Object System.Drawing.Point(15, 12)
-    $lblTitle.Size = New-Object System.Drawing.Size(820, 24)
-    $lblTitle.Font = New-Object System.Drawing.Font 'Segoe UI Semibold', 11
-    $lblTitle.Anchor = 'Top,Left,Right'
-    $form.Controls.Add($lblTitle)
+    $lblTitle.Text = 'Manage Companies'
+    $lblTitle.Location = New-Object System.Drawing.Point(20, 14)
+    $lblTitle.Size = New-Object System.Drawing.Size(600, 28)
+    $lblTitle.Font = New-Object System.Drawing.Font 'Segoe UI Semibold', 14
+    $lblTitle.ForeColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
+    $headerPanel.Controls.Add($lblTitle)
 
     $lblSub = New-Object System.Windows.Forms.Label
-    $lblSub.Text = "Add an alias (e.g. ""main"") for each Tally company you load often. Then tell Claude ""load main"" and it skips the screenshot loop."
-    $lblSub.Location = New-Object System.Drawing.Point(15, 38)
-    $lblSub.Size = New-Object System.Drawing.Size(820, 18)
+    $lblSub.Text = 'Register a short alias for each Tally company. Then ask Claude to "load <alias>" - no screenshot loop, no manual lookup.'
+    $lblSub.Location = New-Object System.Drawing.Point(20, 44)
+    $lblSub.Size = New-Object System.Drawing.Size(870, 18)
     $lblSub.Font = New-Object System.Drawing.Font 'Segoe UI', 9
     $lblSub.ForeColor = [System.Drawing.Color]::FromArgb(95, 95, 95)
     $lblSub.Anchor = 'Top,Left,Right'
-    $form.Controls.Add($lblSub)
+    $headerPanel.Controls.Add($lblSub)
+
+    $lblCount = New-Object System.Windows.Forms.Label
+    $lblCount.Text = ''
+    $lblCount.Location = New-Object System.Drawing.Point(20, 90)
+    $lblCount.Size = New-Object System.Drawing.Size(400, 18)
+    $lblCount.Font = New-Object System.Drawing.Font 'Segoe UI Semibold', 9
+    $lblCount.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
+    $form.Controls.Add($lblCount)
 
     $lblPath = New-Object System.Windows.Forms.Label
-    $lblPath.Text = "Registry file:  $RegistryPath"
-    $lblPath.Location = New-Object System.Drawing.Point(15, 60)
-    $lblPath.Size = New-Object System.Drawing.Size(820, 18)
+    $lblPath.Text = "Registry: $RegistryPath"
+    $lblPath.Location = New-Object System.Drawing.Point(440, 90)
+    $lblPath.Size = New-Object System.Drawing.Size(460, 18)
     $lblPath.Font = New-Object System.Drawing.Font 'Segoe UI', 8
-    $lblPath.ForeColor = [System.Drawing.Color]::FromArgb(130, 130, 130)
-    $lblPath.Anchor = 'Top,Left,Right'
+    $lblPath.ForeColor = [System.Drawing.Color]::FromArgb(140, 140, 140)
+    $lblPath.TextAlign = 'TopRight'
+    $lblPath.Anchor = 'Top,Right'
     $form.Controls.Add($lblPath)
 
     # Grid
     $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Location = New-Object System.Drawing.Point(15, 90)
-    $grid.Size = New-Object System.Drawing.Size(840, 365)
+    $grid.Location = New-Object System.Drawing.Point(20, 115)
+    $grid.Size = New-Object System.Drawing.Size(880, 395)
     $grid.Anchor = 'Top,Left,Right,Bottom'
     $grid.AllowUserToAddRows = $false
     $grid.AllowUserToDeleteRows = $false
@@ -691,17 +707,28 @@ function Show-ManageCompaniesDialog {
                 }
             }
         }
+        $n = $live.companies.Count
+        $lblCount.Text = if ($n -eq 0) { 'No companies configured yet.' } elseif ($n -eq 1) { '1 company configured' } else { "$n companies configured" }
     }.GetNewClosure()
     & $refreshGrid
 
-    # Buttons
-    $btnY = 470
+    # Thin divider between grid and buttons
+    $divider = New-Object System.Windows.Forms.Panel
+    $divider.Location = New-Object System.Drawing.Point(20, 520)
+    $divider.Size = New-Object System.Drawing.Size(880, 1)
+    $divider.BackColor = [System.Drawing.Color]::FromArgb(230, 232, 236)
+    $divider.Anchor = 'Bottom,Left,Right'
+    $form.Controls.Add($divider)
+
+    # Buttons. Row ops grouped left (Add/Edit/Delete/Test), bulk ops in the
+    # middle (Import/Sample), Close right-anchored.
+    $btnY = 535
     function _MakeButton {
-        param([string]$Text, [int]$X, [int]$W = 100, [string]$Anchor = 'Bottom,Left', [System.Drawing.Color]$Back = ([System.Drawing.Color]::Empty), [System.Drawing.Color]$Fore = ([System.Drawing.Color]::Empty))
+        param([string]$Text, [int]$X, [int]$W = 95, [string]$Anchor = 'Bottom,Left', [System.Drawing.Color]$Back = ([System.Drawing.Color]::Empty), [System.Drawing.Color]$Fore = ([System.Drawing.Color]::Empty))
         $b = New-Object System.Windows.Forms.Button
         $b.Text = $Text
         $b.Location = New-Object System.Drawing.Point($X, $btnY)
-        $b.Size = New-Object System.Drawing.Size($W, 32)
+        $b.Size = New-Object System.Drawing.Size($W, 34)
         $b.Anchor = $Anchor
         $b.Font = New-Object System.Drawing.Font 'Segoe UI', 9
         $b.FlatStyle = 'System'
@@ -710,13 +737,13 @@ function Show-ManageCompaniesDialog {
         $form.Controls.Add($b)
         return $b
     }
-    $btnAdd       = _MakeButton -Text 'Add'        -X  15 -W 90
-    $btnEdit      = _MakeButton -Text 'Edit'       -X 110 -W 90
-    $btnDelete    = _MakeButton -Text 'Delete'     -X 205 -W 90
-    $btnTest      = _MakeButton -Text 'Test'       -X 300 -W 90
-    $btnImportCsv = _MakeButton -Text 'Import CSV' -X 395 -W 110
-    $btnSampleCsv = _MakeButton -Text 'Sample CSV' -X 510 -W 110
-    $btnClose     = _MakeButton -Text 'Close'      -X 760 -W 95 -Anchor 'Bottom,Right' `
+    $btnAdd       = _MakeButton -Text 'Add'        -X  20 -W 90
+    $btnEdit      = _MakeButton -Text 'Edit'       -X 115 -W 90
+    $btnDelete    = _MakeButton -Text 'Delete'     -X 210 -W 90
+    $btnTest      = _MakeButton -Text 'Test'       -X 305 -W 90
+    $btnImportCsv = _MakeButton -Text 'Import CSV' -X 425 -W 110
+    $btnSampleCsv = _MakeButton -Text 'Sample CSV' -X 540 -W 110
+    $btnClose     = _MakeButton -Text 'Close'      -X 805 -W 95 -Anchor 'Bottom,Right' `
                       -Back ([System.Drawing.Color]::FromArgb(0, 120, 215)) -Fore ([System.Drawing.Color]::White)
 
     # Translate an edit-dialog entry's transient password fields (_passwordChanged /
@@ -937,11 +964,7 @@ function Show-ManageCompaniesDialog {
         $sfd.FileName = 'tally-companies-sample.csv'
         if ($sfd.ShowDialog() -ne 'OK') { return }
         try {
-            $sample = @(
-                'alias,folderId,displayName,username,password,extraAliases,notes'
-                'main,100000,Acme Industries Pvt Ltd,admin,Welcome@123,"primary,acme",Headquarters'
-                'branch,200000,Acme Branch Office,,,,No security'
-            ) -join "`r`n"
+            $sample = 'alias,folderId,displayName,username,password,extraAliases,notes'
             Set-Content -LiteralPath $sfd.FileName -Value $sample -Encoding UTF8
             $msg = "Sample CSV saved to:`n  $($sfd.FileName)`n`nEdit it with the companies you want to register, then use Import CSV to load them.`n`nRequired columns: alias, folderId`nOptional columns: displayName, username, password, extraAliases, notes"
             [System.Windows.Forms.MessageBox]::Show($msg, 'Sample saved', 'OK', 'Information') | Out-Null
