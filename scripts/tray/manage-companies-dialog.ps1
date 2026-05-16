@@ -33,6 +33,7 @@ function Read-CompanyRegistry {
                 username     = [string]$c.username
                 passwordEnc  = [string]$c.passwordEnc
                 notes        = [string]$c.notes
+                lastLoadedAt = [string]$c.lastLoadedAt
             }
         }
         $out = @{ schemaVersion = 1; companies = $companies }
@@ -650,17 +651,31 @@ function Show-ManageCompaniesDialog {
     $lblPath.Anchor = 'Top,Right'
     $form.Controls.Add($lblPath)
 
+    # Search bar above the grid - live filter on alias / displayName / notes.
+    $lblSearch = New-Object System.Windows.Forms.Label
+    $lblSearch.Text = 'Filter:'
+    $lblSearch.Location = New-Object System.Drawing.Point(20, 118)
+    $lblSearch.Size = New-Object System.Drawing.Size(45, 22)
+    $lblSearch.Font = New-Object System.Drawing.Font 'Segoe UI Semibold', 9
+    $form.Controls.Add($lblSearch)
+
+    $tbSearch = New-Object System.Windows.Forms.TextBox
+    $tbSearch.Location = New-Object System.Drawing.Point(65, 115)
+    $tbSearch.Size = New-Object System.Drawing.Size(330, 22)
+    $tbSearch.Font = New-Object System.Drawing.Font 'Segoe UI', 9
+    $form.Controls.Add($tbSearch)
+
     # Grid
     $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Location = New-Object System.Drawing.Point(20, 115)
-    $grid.Size = New-Object System.Drawing.Size(880, 395)
+    $grid.Location = New-Object System.Drawing.Point(20, 145)
+    $grid.Size = New-Object System.Drawing.Size(880, 365)
     $grid.Anchor = 'Top,Left,Right,Bottom'
     $grid.AllowUserToAddRows = $false
     $grid.AllowUserToDeleteRows = $false
     $grid.AllowUserToResizeRows = $false
     $grid.ReadOnly = $true
     $grid.SelectionMode = 'FullRowSelect'
-    $grid.MultiSelect = $false
+    $grid.MultiSelect = $true
     $grid.RowHeadersVisible = $false
     $grid.BackgroundColor = [System.Drawing.Color]::White
     $grid.BorderStyle = 'FixedSingle'
@@ -673,44 +688,78 @@ function Show-ManageCompaniesDialog {
     $grid.ColumnHeadersHeight = 32
     $grid.RowTemplate.Height = 28
     $grid.DefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding 6, 0, 0, 0
+    [void]$grid.Columns.Add('test', '')
     [void]$grid.Columns.Add('alias', 'Alias')
     [void]$grid.Columns.Add('folderId', 'Folder ID')
     [void]$grid.Columns.Add('displayName', 'Display Name')
     [void]$grid.Columns.Add('hasPassword', 'Password')
+    [void]$grid.Columns.Add('lastLoaded', 'Last Loaded')
     [void]$grid.Columns.Add('notes', 'Notes')
-    $grid.Columns['alias'].FillWeight = 15
-    $grid.Columns['folderId'].FillWeight = 10
-    $grid.Columns['displayName'].FillWeight = 30
-    $grid.Columns['hasPassword'].FillWeight = 10
-    $grid.Columns['notes'].FillWeight = 35
+    $grid.Columns['test'].FillWeight = 4
+    $grid.Columns['alias'].FillWeight = 12
+    $grid.Columns['folderId'].FillWeight = 9
+    $grid.Columns['displayName'].FillWeight = 24
+    $grid.Columns['hasPassword'].FillWeight = 8
+    $grid.Columns['lastLoaded'].FillWeight = 13
+    $grid.Columns['notes'].FillWeight = 30
+    $grid.Columns['test'].DefaultCellStyle.Alignment = 'MiddleCenter'
+    $grid.Columns['test'].HeaderCell.ToolTipText = 'Test result from this session'
+    foreach ($col in $grid.Columns) { $col.SortMode = 'Automatic' }
+    $grid.Columns['test'].SortMode = 'NotSortable'
     $grid.AutoSizeColumnsMode = 'Fill'
     $form.Controls.Add($grid)
 
-    # The grid renders directly from the file every time. We never carry per-entry mutable
-    # state across handler invocations - each Add/Edit/Delete does its own
-    # read-from-disk, mutate, write-to-disk cycle. This sidesteps the PS5.1
-    # WinForms event-handler closure quirks where in-memory state set by one
-    # handler isn't visible to another.
+    # In-session test status: alias -> 'ok' or 'fail'. Not persisted; reset
+    # when the dialog reopens.
+    $testStatusByAlias = @{}
+
+    # Renders the grid from the live registry file. Applies the current filter
+    # text (alias / displayName / notes substring match, case-insensitive) and
+    # preserves the user's sort column + selected alias across refreshes.
     $refreshGrid = {
-        $selectedAlias = if ($grid.SelectedRows.Count -gt 0) { $grid.SelectedRows[0].Cells['alias'].Value } else { $null }
+        $selectedAliases = @($grid.SelectedRows | ForEach-Object { $_.Cells['alias'].Value })
+        $sortCol   = $grid.SortedColumn
+        $sortOrder = $grid.SortOrder
         $grid.Rows.Clear()
         $live = & $fnRead -Path $RegistryPath
+        $filter = $tbSearch.Text.Trim().ToLower()
+        $visibleCount = 0
         foreach ($c in $live.companies) {
+            if ($filter) {
+                $hay = (("$($c.alias) $($c.displayName) $($c.notes)").ToLower())
+                if ($hay -notlike "*${filter}*") { continue }
+            }
             $hasPw = if ($c.passwordEnc) { 'Yes' } else { 'No' }
-            [void]$grid.Rows.Add($c.alias, $c.folderId, $c.displayName, $hasPw, $c.notes)
+            $last  = if ($c.lastLoadedAt) {
+                try { ([datetime]$c.lastLoadedAt).ToLocalTime().ToString('yyyy-MM-dd HH:mm') } catch { [string]$c.lastLoadedAt }
+            } else { '' }
+            $statusKey = $testStatusByAlias[$c.alias]
+            $statusGlyph = switch ($statusKey) { 'ok' { '*' } 'fail' { 'X' } default { '' } }
+            $rowIdx = $grid.Rows.Add($statusGlyph, $c.alias, $c.folderId, $c.displayName, $hasPw, $last, $c.notes)
+            if ($statusKey -eq 'ok')   { $grid.Rows[$rowIdx].Cells['test'].Style.ForeColor = [System.Drawing.Color]::FromArgb(40, 140, 60) }
+            if ($statusKey -eq 'fail') { $grid.Rows[$rowIdx].Cells['test'].Style.ForeColor = [System.Drawing.Color]::FromArgb(190, 50, 50) }
+            $grid.Rows[$rowIdx].Cells['test'].Style.Font = New-Object System.Drawing.Font 'Segoe UI', 11, ([System.Drawing.FontStyle]::Bold)
+            $visibleCount++
         }
-        if ($selectedAlias) {
+        if ($selectedAliases.Count -gt 0) {
             for ($i = 0; $i -lt $grid.Rows.Count; $i++) {
-                if ($grid.Rows[$i].Cells['alias'].Value -eq $selectedAlias) {
+                if ($selectedAliases -contains $grid.Rows[$i].Cells['alias'].Value) {
                     $grid.Rows[$i].Selected = $true
-                    break
                 }
             }
         }
+        if ($sortCol -and $sortOrder -ne 'None') {
+            $dir = if ($sortOrder -eq 'Ascending') { [System.ComponentModel.ListSortDirection]::Ascending } else { [System.ComponentModel.ListSortDirection]::Descending }
+            $grid.Sort($sortCol, $dir)
+        }
         $n = $live.companies.Count
-        $lblCount.Text = if ($n -eq 0) { 'No companies configured yet.' } elseif ($n -eq 1) { '1 company configured' } else { "$n companies configured" }
+        $countText = if ($n -eq 0) { 'No companies configured yet.' } elseif ($n -eq 1) { '1 company configured' } else { "$n companies configured" }
+        if ($filter -and $visibleCount -ne $n) { $countText += "  -  showing $visibleCount" }
+        $lblCount.Text = $countText
     }.GetNewClosure()
     & $refreshGrid
+
+    $tbSearch.Add_TextChanged({ & $refreshGrid }.GetNewClosure())
 
     # Thin divider between grid and buttons
     $divider = New-Object System.Windows.Forms.Panel
@@ -741,8 +790,9 @@ function Show-ManageCompaniesDialog {
     $btnEdit      = _MakeButton -Text 'Edit'       -X 115 -W 90
     $btnDelete    = _MakeButton -Text 'Delete'     -X 210 -W 90
     $btnTest      = _MakeButton -Text 'Test'       -X 305 -W 90
-    $btnImportCsv = _MakeButton -Text 'Import CSV' -X 425 -W 110
-    $btnSampleCsv = _MakeButton -Text 'Sample CSV' -X 540 -W 110
+    $btnImportCsv = _MakeButton -Text 'Import CSV' -X 425 -W 100
+    $btnExportCsv = _MakeButton -Text 'Export CSV' -X 530 -W 100
+    $btnSampleCsv = _MakeButton -Text 'Sample CSV' -X 635 -W 100
     $btnClose     = _MakeButton -Text 'Close'      -X 805 -W 95 -Anchor 'Bottom,Right' `
                       -Back ([System.Drawing.Color]::FromArgb(0, 120, 215)) -Fore ([System.Drawing.Color]::White)
 
@@ -820,19 +870,25 @@ function Show-ManageCompaniesDialog {
         }
     }.GetNewClosure())
 
-    # --- Delete ------------------------------------------------------------
+    # --- Delete (supports multi-select) ------------------------------------
     $btnDelete.Add_Click({
         if ($grid.SelectedRows.Count -eq 0) {
-            [System.Windows.Forms.MessageBox]::Show('Select a row first.', 'No selection', 'OK', 'Information') | Out-Null
+            [System.Windows.Forms.MessageBox]::Show('Select one or more rows first.', 'No selection', 'OK', 'Information') | Out-Null
             return
         }
-        $aliasToDelete = [string]$grid.SelectedRows[0].Cells['alias'].Value
-        $confirm = [System.Windows.Forms.MessageBox]::Show("Delete '$aliasToDelete'?", 'Confirm delete', 'YesNo', 'Question')
+        $aliasesToDelete = @($grid.SelectedRows | ForEach-Object { [string]$_.Cells['alias'].Value } | Where-Object { $_ })
+        $prompt = if ($aliasesToDelete.Count -eq 1) {
+            "Delete '$($aliasesToDelete[0])'?"
+        } else {
+            "Delete these $($aliasesToDelete.Count) entries?`n  " + ($aliasesToDelete -join "`n  ")
+        }
+        $confirm = [System.Windows.Forms.MessageBox]::Show($prompt, 'Confirm delete', 'YesNo', 'Question')
         if ($confirm -ne 'Yes') { return }
         try {
             $live = & $fnRead -Path $RegistryPath
-            $live.companies = @($live.companies | Where-Object { $_.alias -ne $aliasToDelete })
+            $live.companies = @($live.companies | Where-Object { $aliasesToDelete -notcontains $_.alias })
             & $fnWrite -Path $RegistryPath -Registry $live
+            foreach ($a in $aliasesToDelete) { $testStatusByAlias.Remove($a) | Out-Null }
             & $refreshGrid
         } catch {
             [System.Windows.Forms.MessageBox]::Show("Delete failed: $_", 'Error', 'OK', 'Error') | Out-Null
@@ -865,8 +921,19 @@ function Show-ManageCompaniesDialog {
             }
             $result = & $fnAgent -RegistryPath $RegistryPath -FolderId $entry.folderId -Username $entry.username -Password $plain
             if ($result.ok) {
+                $testStatusByAlias[$aliasToTest] = 'ok'
+                try {
+                    $now = (Get-Date).ToUniversalTime().ToString('o')
+                    for ($i = 0; $i -lt $live.companies.Count; $i++) {
+                        if ($live.companies[$i].alias -eq $aliasToTest) { $live.companies[$i].lastLoadedAt = $now; break }
+                    }
+                    & $fnWrite -Path $RegistryPath -Registry $live
+                } catch { }
+                & $refreshGrid
                 [System.Windows.Forms.MessageBox]::Show("OK - $($result.message)", "Test passed: $aliasToTest", 'OK', 'Information') | Out-Null
             } else {
+                $testStatusByAlias[$aliasToTest] = 'fail'
+                & $refreshGrid
                 [System.Windows.Forms.MessageBox]::Show("FAILED - $($result.message)", "Test failed: $aliasToTest", 'OK', 'Warning') | Out-Null
             }
         } finally {
@@ -971,6 +1038,81 @@ function Show-ManageCompaniesDialog {
         } catch {
             [System.Windows.Forms.MessageBox]::Show("Could not save sample: $_", 'Error', 'OK', 'Error') | Out-Null
         }
+    }.GetNewClosure())
+
+    # --- Export CSV --------------------------------------------------------
+    # Writes the current registry to CSV. Passwords are NOT exported (DPAPI
+    # blobs are per-machine and useless elsewhere); after import on a new
+    # machine the user re-enters passwords via Edit > Change password.
+    $btnExportCsv.Add_Click({
+        $sfd = New-Object System.Windows.Forms.SaveFileDialog
+        $sfd.Filter   = 'CSV files (*.csv)|*.csv'
+        $sfd.Title    = 'Export companies to CSV'
+        $sfd.FileName = "tally-companies-$(Get-Date -Format 'yyyyMMdd').csv"
+        if ($sfd.ShowDialog() -ne 'OK') { return }
+        try {
+            $live = & $fnRead -Path $RegistryPath
+            $rows = foreach ($c in $live.companies) {
+                [pscustomobject]@{
+                    alias        = $c.alias
+                    folderId     = $c.folderId
+                    displayName  = $c.displayName
+                    username     = $c.username
+                    password     = ''
+                    extraAliases = ($c.extraAliases -join ',')
+                    notes        = $c.notes
+                }
+            }
+            if (-not $rows) {
+                'alias,folderId,displayName,username,password,extraAliases,notes' | Set-Content -LiteralPath $sfd.FileName -Encoding UTF8
+            } else {
+                $rows | Export-Csv -LiteralPath $sfd.FileName -NoTypeInformation -Encoding UTF8
+            }
+            [System.Windows.Forms.MessageBox]::Show("Exported $($live.companies.Count) entries to:`n  $($sfd.FileName)`n`nPasswords are NOT included (DPAPI blobs are machine-specific). Re-enter them via Edit on the target machine.", 'Export complete', 'OK', 'Information') | Out-Null
+        } catch {
+            [System.Windows.Forms.MessageBox]::Show("Export failed: $_", 'Error', 'OK', 'Error') | Out-Null
+        }
+    }.GetNewClosure())
+
+    # --- Double-click row -> Edit ------------------------------------------
+    $grid.Add_CellDoubleClick({
+        param($s, $e)
+        if ($e.RowIndex -lt 0) { return }
+        $grid.Rows[$e.RowIndex].Selected = $true
+        $btnEdit.PerformClick()
+    }.GetNewClosure())
+
+    # --- Right-click context menu ------------------------------------------
+    $ctxMenu = New-Object System.Windows.Forms.ContextMenuStrip
+    $miEdit       = $ctxMenu.Items.Add('Edit')
+    $miTest       = $ctxMenu.Items.Add('Test')
+    [void]$ctxMenu.Items.Add('-')
+    $miCopyAlias  = $ctxMenu.Items.Add('Copy alias')
+    [void]$ctxMenu.Items.Add('-')
+    $miDelete     = $ctxMenu.Items.Add('Delete')
+    $miEdit.add_Click(      { $btnEdit.PerformClick() }.GetNewClosure())
+    $miTest.add_Click(      { $btnTest.PerformClick() }.GetNewClosure())
+    $miDelete.add_Click(    { $btnDelete.PerformClick() }.GetNewClosure())
+    $miCopyAlias.add_Click({
+        if ($grid.SelectedRows.Count -eq 0) { return }
+        $a = [string]$grid.SelectedRows[0].Cells['alias'].Value
+        if ($a) { [System.Windows.Forms.Clipboard]::SetText($a) }
+    }.GetNewClosure())
+
+    # Right-click on a cell selects that row first, then shows the menu.
+    $grid.Add_CellMouseDown({
+        param($s, $e)
+        if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Right -or $e.RowIndex -lt 0) { return }
+        if (-not $grid.Rows[$e.RowIndex].Selected) {
+            $grid.ClearSelection()
+            $grid.Rows[$e.RowIndex].Selected = $true
+            $grid.CurrentCell = $grid.Rows[$e.RowIndex].Cells[1]
+        }
+        $multi = $grid.SelectedRows.Count -gt 1
+        $miEdit.Enabled      = -not $multi
+        $miTest.Enabled      = -not $multi
+        $miCopyAlias.Enabled = -not $multi
+        $ctxMenu.Show($grid, $grid.PointToClient([System.Windows.Forms.Cursor]::Position))
     }.GetNewClosure())
 
     # --- Close -------------------------------------------------------------
