@@ -223,24 +223,49 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   resultCode: Integer;
+  installDir: string;
 begin
   Result := '';
   NeedsRestart := False;
+  installDir := ExpandConstant('{app}');
 
-  // Stop the NSSM-registered service. sc.exe handles "service does not exist" gracefully on
-  // fresh installs (non-zero exit code, which we ignore).
+  // 1. Stop and disable the NSSM service so SCM doesn't auto-restart it while we're
+  //    copying files over locked DLLs. Disable is reverted by firstrun-config.ps1's
+  //    `nssm set ... Start SERVICE_AUTO_START` later in the install.
   Exec(ExpandConstant('{cmd}'), '/C sc stop TallyMCP', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+  Exec(ExpandConstant('{cmd}'), '/C sc config TallyMCP start= disabled', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
 
-  // Stop the at-logon scheduled tasks. /F = force, even if currently running. schtasks also
-  // tolerates missing tasks on fresh installs.
+  // 2. End the at-logon scheduled tasks. /F = force, even if currently running. schtasks
+  //    tolerates missing tasks on fresh installs (non-zero exit, ignored).
   Exec(ExpandConstant('{cmd}'), '/C schtasks /End /TN TallyMCPAgent /F', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
   Exec(ExpandConstant('{cmd}'), '/C schtasks /End /TN TallyMCPTray /F',  '', SW_HIDE, ewWaitUntilTerminated, resultCode);
 
-  // Give Windows time to fully release file handles. sc stop is async — the SCM marks the
-  // service as STOPPED only after NSSM's child node.exe exits, which can take a few seconds
-  // for the duckdb in-memory cleanup. 3s is enough in practice; bump if upgrade installs
-  // still hit DeleteFile/Code 5 on @duckdb DLLs.
-  Sleep(3000);
+  // 3. Kill any orphan node.exe (the MCP service child) and any powershell.exe whose
+  //    command line references tally-mcp / TallyMCP (orphan agent / tray instances from a
+  //    crashed earlier run). taskkill /T includes child processes; wmic filters by
+  //    commandline without nested-quote hell.
+  Exec(ExpandConstant('{cmd}'), '/C taskkill /F /IM node.exe /T', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+  Exec(ExpandConstant('{cmd}'), '/C wmic process where "name=''powershell.exe'' and commandline like ''%%tally-mcp%%''" delete', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+  Exec(ExpandConstant('{cmd}'), '/C wmic process where "name=''powershell.exe'' and commandline like ''%%TallyMCP%%''" delete', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+
+  // 4. Wait for the process tear-down to actually release handles. SCM marks STOPPED before
+  //    NSSM's child node.exe exits; duckdb in-memory cleanup adds a couple of seconds.
+  Sleep(5000);
+
+  // 5. On existing installs, grant full control to the install dir so the file copy phase
+  //    can overwrite read-only or restrictive-ACL files (e.g. tray assets that ended up
+  //    owned by SYSTEM after a previous install). Skipped silently on fresh installs.
+  if DirExists(installDir) then
+  begin
+    Exec(ExpandConstant('{cmd}'), '/C icacls "' + installDir + '" /grant Everyone:F /T /C >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+
+    // 6. Pre-delete the files that have historically caused "DeleteFile failed; code 5" on
+    //    upgrade. duckdb.dll is held by the native loader until node.exe is gone; jina-logo.png
+    //    is sometimes locked by Explorer thumbnail cache. Both are safe to remove — the new
+    //    installer copies them back.
+    Exec(ExpandConstant('{cmd}'), '/C del /F /Q "' + installDir + '\scripts\tray\assets\jina-logo.png" >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+    Exec(ExpandConstant('{cmd}'), '/C del /F /Q "' + installDir + '\node_modules\@duckdb\node-bindings-win32-x64\duckdb.dll" >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+  end;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;

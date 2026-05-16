@@ -129,9 +129,9 @@
                     <SYSTEM TYPE="Formulae" NAME="FilterExcludeOrderVch">NOT $$IsOrderVch:$VoucherTypeName</SYSTEM>
                     <SYSTEM TYPE="Formulae" NAME="FilterCancelledVouchers">NOT $IsCancelled</SYSTEM>
                     <SYSTEM TYPE="Formulae" NAME="FilterOptionalVouchers">NOT $IsOptional</SYSTEM>
-                    <SYSTEM TYPE="Formulae" NAME="FilterCGST">$$IsSysNameEqual:$LedgerGSTDutyHead:$$SysName:Central Tax OR $$IsSysNameEqual:$LedgerGSTDutyHead:$$SysName:CGST</SYSTEM>
-                    <SYSTEM TYPE="Formulae" NAME="FilterSGST">$$IsSysNameEqual:$LedgerGSTDutyHead:$$SysName:State Tax OR $$IsSysNameEqual:$LedgerGSTDutyHead:$$SysName:SGST OR $$IsSysNameEqual:$LedgerGSTDutyHead:$$SysName:UTGST</SYSTEM>
-                    <SYSTEM TYPE="Formulae" NAME="FilterIGST">$$IsSysNameEqual:$LedgerGSTDutyHead:$$SysName:Integrated Tax OR $$IsSysNameEqual:$LedgerGSTDutyHead:$$SysName:IGST</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="FilterCGST">$$IsSysNameEqual:$LedgerGSTDutyHead:$$SysName:CGST</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="FilterSGST">$$IsSysNameEqual:$LedgerGSTDutyHead:$$SysName:SGST OR $$IsSysNameEqual:$LedgerGSTDutyHead:$$SysName:UTGST</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="FilterIGST">$$IsSysNameEqual:$LedgerGSTDutyHead:$$SysName:IGST</SYSTEM>
                 </TDLMESSAGE>
             </TDL>
         </DESC>
