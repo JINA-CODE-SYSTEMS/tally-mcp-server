@@ -19,7 +19,7 @@ param(
 # against an agent older than its required minimum (issue #15 - version handshake).
 # Format: MAJOR.MINOR.PATCH. Bump MINOR on any new IPC action or response field;
 # bump PATCH on internal fixes that callers can ignore.
-$Script:AgentVersion = "1.1.0"
+$Script:AgentVersion = "1.2.0"
 
 if (-not $WatchDir) {
     $WatchDir = if ($env:TALLY_DATA_PATH) { $env:TALLY_DATA_PATH } else { "C:\Users\Public\TallyPrimeEditLog\data" }
@@ -537,15 +537,26 @@ while ($true) {
                                 [TallyUI2]::PressKey([TallyUI2]::VK_ESCAPE)
                                 Start-Sleep -Milliseconds 500
 
-                                # Type the company id directly into the Select Company list (Tally filters as you type)
+                                # Type the company id (folder id) directly into the Select Company list.
+                                # Tally auto-jumps the highlight to the matching folder as we type.
                                 [TallyUI2]::TypeString($companyId)
                                 Start-Sleep -Milliseconds 800
 
-                                # Tally Prime Edit Log requires TWO Enters: first confirms the search/selection,
-                                # second opens the company (and brings up the credential prompt if protected).
-                                [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
-                                Start-Sleep -Milliseconds 600
-                                [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
+                                # Tally Prime's standard data layout is folder -> company. The first Enter
+                                # drills into the highlighted folder; the second Enter selects the company
+                                # inside it. After the second Enter, Tally either loads the company directly
+                                # (no password) or shows the credential prompt (password-protected).
+                                # Caller can override the count via $cmd.enterPresses (default: 2).
+                                $enterPresses = if ($cmd.enterPresses) { [int]$cmd.enterPresses } else { 2 }
+                                if ($enterPresses -lt 1) { $enterPresses = 1 }
+                                if ($enterPresses -gt 4) { $enterPresses = 4 }
+                                for ($_ep = 0; $_ep -lt $enterPresses; $_ep++) {
+                                    [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
+                                    if ($_ep -lt ($enterPresses - 1)) {
+                                        # Inter-Enter wait: let Tally render the folder contents before the next Enter.
+                                        Start-Sleep -Milliseconds 1500
+                                    }
+                                }
                                 Start-Sleep -Milliseconds $waitMsAfterEnter
 
                                 # If credentials were supplied, enter them
@@ -575,7 +586,11 @@ while ($true) {
                 "start-tally" {
                     # Spawn tally.exe in this agent's session (which is the user's interactive desktop session).
                     # The MCP service can't do this directly when running in Session 0 - that's why it delegates here.
-                    $exe = if ($cmd.exePath) { [string]$cmd.exePath } else { "C:\Program Files\TallyPrimeEditLog\tally.exe" }
+                    # Security: the executable path comes from trusted local config (TALLY_EXE_PATH from .env,
+                    # else the standard install path), NOT from the IPC command. Honouring $cmd.exePath would let
+                    # any writer of the (previously world-writable) command file launch an arbitrary executable
+                    # in the operator's interactive session.
+                    $exe = if ($env:TALLY_EXE_PATH) { [string]$env:TALLY_EXE_PATH } else { "C:\Program Files\TallyPrimeEditLog\tally.exe" }
                     $waitSec = if ($cmd.waitSec) { [int]$cmd.waitSec } else { 30 }
                     if (-not (Test-Path $exe)) {
                         Write-Result -Status "error" -Message "tally.exe not found at $exe" -Strategy "start-tally" -CommandId $cmdId
@@ -598,6 +613,84 @@ while ($true) {
                         } catch {
                             Write-Result -Status "error" -Message "Start-Process failed: $_" -Strategy "start-tally" -CommandId $cmdId
                         }
+                    }
+                }
+                "press-key" {
+                    # Step-by-step primitive: press one named key. Lets an LLM drive Tally
+                    # interactively (screenshot -> reason -> press a key -> screenshot ->
+                    # reason -> ...) instead of relying on the monolithic
+                    # select-and-unlock-company keystroke blast.
+                    $keyName = if ($cmd.keyName) { [string]$cmd.keyName } else { "" }
+                    $keyMap = @{
+                        "enter" = [TallyUI2]::VK_RETURN; "return" = [TallyUI2]::VK_RETURN
+                        "escape" = [TallyUI2]::VK_ESCAPE; "esc" = [TallyUI2]::VK_ESCAPE
+                        "tab" = [TallyUI2]::VK_TAB; "backspace" = [TallyUI2]::VK_BACK; "back" = [TallyUI2]::VK_BACK
+                        "up" = [TallyUI2]::VK_UP; "down" = [TallyUI2]::VK_DOWN
+                        "left" = [TallyUI2]::VK_LEFT; "right" = [TallyUI2]::VK_RIGHT
+                        "f1" = [TallyUI2]::VK_F1; "f2" = [TallyUI2]::VK_F2; "f3" = [TallyUI2]::VK_F3
+                        "f4" = [TallyUI2]::VK_F4; "f5" = [TallyUI2]::VK_F5
+                        "f10" = [TallyUI2]::VK_F10; "f12" = [TallyUI2]::VK_F12
+                    }
+                    $vk = $keyMap[$keyName.ToLower()]
+                    if (-not $vk) {
+                        $valid = ($keyMap.Keys | Sort-Object) -join ', '
+                        Write-Result -Status "error" -Message "Unknown keyName '$keyName'. Valid: $valid" -Strategy "press-key" -CommandId $cmdId
+                    } else {
+                        try {
+                            $hwnd = Find-TallyWindow
+                            if ($hwnd -eq [IntPtr]::Zero) {
+                                Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "press-key" -CommandId $cmdId
+                            } else {
+                                [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                                Start-Sleep -Milliseconds 300
+                                [TallyUI2]::PressKey($vk)
+                                Start-Sleep -Milliseconds 300
+                                Write-Result -Status "success" -Message "Pressed $keyName" -Strategy "press-key" -CommandId $cmdId
+                            }
+                        } catch {
+                            Write-Result -Status "error" -Message "Exception: $_" -Strategy "press-key" -CommandId $cmdId
+                        }
+                    }
+                }
+                "type-text" {
+                    # Step-by-step primitive: type a string into the current Tally focus.
+                    $text = if ($cmd.text) { [string]$cmd.text } else { "" }
+                    if (-not $text) {
+                        Write-Result -Status "error" -Message "Missing 'text' field" -Strategy "type-text" -CommandId $cmdId
+                    } else {
+                        try {
+                            $hwnd = Find-TallyWindow
+                            if ($hwnd -eq [IntPtr]::Zero) {
+                                Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "type-text" -CommandId $cmdId
+                            } else {
+                                [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                                Start-Sleep -Milliseconds 300
+                                [TallyUI2]::TypeString($text)
+                                Start-Sleep -Milliseconds 300
+                                # Length only - never echo the text itself in case a caller
+                                # routes a password through here.
+                                Write-Result -Status "success" -Message "Typed $($text.Length) chars" -Strategy "type-text" -CommandId $cmdId
+                            }
+                        } catch {
+                            Write-Result -Status "error" -Message "Exception: $_" -Strategy "type-text" -CommandId $cmdId
+                        }
+                    }
+                }
+                "bring-foreground" {
+                    # Quick state probe + focus. Useful before an LLM-driven sequence to make
+                    # sure subsequent press-key / type-text actions land in Tally and not in
+                    # some other window the user accidentally clicked into.
+                    try {
+                        $hwnd = Find-TallyWindow
+                        if ($hwnd -eq [IntPtr]::Zero) {
+                            Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "bring-foreground" -CommandId $cmdId
+                        } else {
+                            [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                            Start-Sleep -Milliseconds 300
+                            Write-Result -Status "success" -Message "Tally brought to foreground" -Strategy "bring-foreground" -CommandId $cmdId
+                        }
+                    } catch {
+                        Write-Result -Status "error" -Message "Exception: $_" -Strategy "bring-foreground" -CommandId $cmdId
                     }
                 }
                 "exit" {

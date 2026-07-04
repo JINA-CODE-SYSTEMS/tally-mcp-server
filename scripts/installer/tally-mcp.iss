@@ -51,6 +51,11 @@ ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 UninstallDisplayIcon={app}\dist\server.mjs
 ChangesEnvironment=yes
+; Jinacode Systems branding. Comma-separated lists let Inno pick the closest size
+; to the user's display scaling — the standard BMP renders on 100% DPI, the @2x
+; variant covers 150-200% scaling without upscale blur.
+WizardImageFile=assets\wizard-sidebar.bmp,assets\wizard-sidebar@2x.bmp
+WizardSmallImageFile=assets\wizard-small.bmp,assets\wizard-small@2x.bmp
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -82,8 +87,27 @@ Source: "{#RepoRoot}\scripts\installer\uninstall-cleanup.ps1";  DestDir: "{app}\
 
 ; --- Tray status app (issue #20). Polls service/agent/Tally health and surfaces a
 ; coloured tray icon + right-click action menu. Registered as a per-user at-logon
-; scheduled task by firstrun-config.ps1. ---
+; scheduled task by firstrun-config.ps1. Double-clicking the tray opens a dashboard
+; window that reads the bundled logo (assets/) and LICENSE file shipped below. ---
 Source: "{#RepoRoot}\scripts\tray\tally-mcp-tray.ps1"; DestDir: "{app}\scripts\tray"; Flags: ignoreversion
+Source: "{#RepoRoot}\scripts\tray\assets\*";           DestDir: "{app}\scripts\tray\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+; --- LICENSE at the install root so the tray dashboard can read it post-install.
+; (LicenseFile= above only feeds the wizard's accept-license page; that copy is not
+; placed on disk.) ---
+Source: "{#RepoRoot}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+
+; --- OAuth password prompt page served by the /authorize endpoint. Without this file,
+; OAuth flow crashes with ENOENT when a client (Claude Desktop / VS Code Copilot / etc.)
+; redirects to the authorize URL. Was missing from the installer for the entire 1.x line. ---
+Source: "{#RepoRoot}\authorize.html"; DestDir: "{app}"; Flags: ignoreversion
+
+; --- DPAPI helper for company registry password encryption. Called by both the MCP service
+; (via Node spawn) and the Manage Companies tray dialog. ---
+Source: "{#RepoRoot}\scripts\dpapi-helper.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
+
+; --- Manage Companies dialog, dot-sourced by tally-mcp-tray.ps1 at startup. ---
+Source: "{#RepoRoot}\scripts\tray\manage-companies-dialog.ps1"; DestDir: "{app}\scripts\tray"; Flags: ignoreversion
 
 ; --- Bundled portable Node.js. Avoids version conflicts with anything else on the box.
 ; The build script populates installer-staging/node-portable/ from the official Node zip. ---
@@ -190,6 +214,63 @@ begin
   EditionPage.Add('Silver (single company resident; load-company always swaps)');
   EditionPage.Add('Gold (multiple companies; load-company is additive unless replace=true)');
   EditionPage.SelectedValueIndex := 0;
+end;
+
+// Runs after the wizard and before any file copying. Stops the running TallyMCP service
+// and agent/tray scheduled tasks so the installer can overwrite locked DLLs like
+// node_modules\@duckdb\node-bindings-win32-x64\duckdb.dll without hitting
+// "DeleteFile failed; code 5. Access is denied" on existing-install upgrades.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  resultCode: Integer;
+  installDir: string;
+begin
+  Result := '';
+  NeedsRestart := False;
+  installDir := ExpandConstant('{app}');
+
+  // 1. Stop and disable the NSSM service so SCM doesn't auto-restart it while we're
+  //    copying files over locked DLLs. Disable is reverted by firstrun-config.ps1's
+  //    `nssm set ... Start SERVICE_AUTO_START` later in the install.
+  Exec(ExpandConstant('{cmd}'), '/C sc stop TallyMCP', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+  Exec(ExpandConstant('{cmd}'), '/C sc config TallyMCP start= disabled', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+
+  // 2. End the at-logon scheduled tasks. /F = force, even if currently running. schtasks
+  //    tolerates missing tasks on fresh installs (non-zero exit, ignored).
+  Exec(ExpandConstant('{cmd}'), '/C schtasks /End /TN TallyMCPAgent /F', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+  Exec(ExpandConstant('{cmd}'), '/C schtasks /End /TN TallyMCPTray /F',  '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+
+  // 3. Kill any orphan node.exe (the MCP service child) and any powershell.exe whose
+  //    command line references tally-mcp / TallyMCP (orphan agent / tray instances from a
+  //    crashed earlier run). taskkill /T includes child processes; wmic filters by
+  //    commandline without nested-quote hell.
+  Exec(ExpandConstant('{cmd}'), '/C taskkill /F /IM node.exe /T', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+  Exec(ExpandConstant('{cmd}'), '/C wmic process where "name=''powershell.exe'' and commandline like ''%%tally-mcp%%''" delete', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+  Exec(ExpandConstant('{cmd}'), '/C wmic process where "name=''powershell.exe'' and commandline like ''%%TallyMCP%%''" delete', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+
+  // 4. Wait for the process tear-down to actually release handles. SCM marks STOPPED before
+  //    NSSM's child node.exe exits; duckdb in-memory cleanup adds a couple of seconds.
+  Sleep(5000);
+
+  // 5. On existing installs, grant full control to the install dir so the file copy phase
+  //    can overwrite read-only or restrictive-ACL files (e.g. tray assets that ended up
+  //    owned by SYSTEM after a previous install). Skipped silently on fresh installs.
+  //    Security: grant Administrators + SYSTEM only (SIDs S-1-5-32-544 / S-1-5-18), NOT Everyone.
+  //    The installer runs elevated so Administrators already suffices to overwrite the files;
+  //    granting Everyone:F /T made the whole tree (node.exe, server.mjs, nssm.exe, .env — later
+  //    executed by the SYSTEM service) world-writable and was never revoked, a local
+  //    privilege-escalation-to-SYSTEM vector.
+  if DirExists(installDir) then
+  begin
+    Exec(ExpandConstant('{cmd}'), '/C icacls "' + installDir + '" /grant *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F /T /C >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+
+    // 6. Pre-delete the files that have historically caused "DeleteFile failed; code 5" on
+    //    upgrade. duckdb.dll is held by the native loader until node.exe is gone; jina-logo.png
+    //    is sometimes locked by Explorer thumbnail cache. Both are safe to remove — the new
+    //    installer copies them back.
+    Exec(ExpandConstant('{cmd}'), '/C del /F /Q "' + installDir + '\scripts\tray\assets\jina-logo.png" >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+    Exec(ExpandConstant('{cmd}'), '/C del /F /Q "' + installDir + '\node_modules\@duckdb\node-bindings-win32-x64\duckdb.dll" >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+  end;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
