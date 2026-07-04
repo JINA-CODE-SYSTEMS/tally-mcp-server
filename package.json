@@ -5,13 +5,17 @@
   "main": "dist/server.mjs",
   "scripts": {
     "build": "tsc",
+    "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev-run-local.ps1",
+    "dev:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev-stop-local.ps1",
+    "dev:server": "node --watch --env-file=.env dist/server.mjs",
+    "dev:build": "tsc --watch",
     "test": "npm run build && find dist -name '*.test.mjs' -exec node --test {} +"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server.git"
   },
-  "author": "Jinacode Systems",
+  "author": "Jina Code Systems LLP",
   "license": "AGPL-3.0-or-later",
   "engines": {
     "node": ">=20.0.0"
