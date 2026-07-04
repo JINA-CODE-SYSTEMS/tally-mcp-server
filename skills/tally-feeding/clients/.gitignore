@@ -1,0 +1,6 @@
+# Real per-client instruction sheets are PRIVATE client data.
+# They must not be committed or distributed with the skill.
+# Keep the folder in git (via .gitkeep) but ignore every sheet inside it.
+*
+!.gitkeep
+!.gitignore
