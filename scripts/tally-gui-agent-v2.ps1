@@ -19,7 +19,7 @@ param(
 # against an agent older than its required minimum (issue #15 - version handshake).
 # Format: MAJOR.MINOR.PATCH. Bump MINOR on any new IPC action or response field;
 # bump PATCH on internal fixes that callers can ignore.
-$Script:AgentVersion = "1.2.0"
+$Script:AgentVersion = "1.3.0"
 
 if (-not $WatchDir) {
     $WatchDir = if ($env:TALLY_DATA_PATH) { $env:TALLY_DATA_PATH } else { "C:\Users\Public\TallyPrimeEditLog\data" }
@@ -257,6 +257,8 @@ function Execute-Action {
             if ($vk) {
                 Write-Host "  Action: Press $($Action.value)"
                 [TallyUI2]::PressKey($vk)
+            } else {
+                Write-Host "  Action: (unmapped key '$($Action.value)' - ignored)"
             }
         }
         "combo" {
@@ -273,11 +275,15 @@ function Execute-Action {
                 if ($mod -and $key) {
                     Write-Host "  Action: Combo $($Action.value)"
                     [TallyUI2]::PressCombo($mod, $key)
+                } else {
+                    Write-Host "  Action: (unmapped combo '$($Action.value)' - ignored)"
                 }
             }
         }
         "type" {
-            Write-Host "  Action: Type '$($Action.value)'"
+            # Log the length only, NEVER the text itself - a caller (gui-send-keys / the LLM loop) may
+            # route a password through here, and Write-Host lands in the agent's console/transcript.
+            Write-Host "  Action: Type ($($Action.value.Length) chars)"
             [TallyUI2]::TypeString($Action.value)
         }
         "wait" {
@@ -597,6 +603,57 @@ while ($true) {
                         pid         = $PID
                     }
                     Write-Result -Status "success" -Message "Agent v2 is alive (LLM: $LLMProvider, version: $Script:AgentVersion)" -Strategy "ping" -CommandId $cmdId -Extra $extra
+                }
+                "screenshot" {
+                    # Capture the current Tally window so the caller (an MCP client / Claude) can SEE the
+                    # on-screen state and choose the next keystrokes - the interactive, human-supervised
+                    # alternative to the blind deterministic select-and-unlock sequence. Pairs with "sendkeys".
+                    try {
+                        $hwnd = Find-TallyWindow
+                        if ($hwnd -eq [IntPtr]::Zero) {
+                            Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "screenshot" -CommandId $cmdId
+                        } else {
+                            [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                            Start-Sleep -Milliseconds 300
+                            $shot = Get-Screenshot -Hwnd $hwnd
+                            if ($shot) {
+                                Write-Result -Status "success" -Message "Captured Tally window" -Strategy "screenshot" -CommandId $cmdId -Extra @{ screenshotFile = (Split-Path $shot -Leaf) }
+                            } else {
+                                Write-Result -Status "error" -Message "Screenshot capture failed (window may be minimized)" -Strategy "screenshot" -CommandId $cmdId
+                            }
+                        }
+                    } catch {
+                        Write-Result -Status "error" -Message "Screenshot exception: $_" -Strategy "screenshot" -CommandId $cmdId
+                    }
+                }
+                "sendkeys" {
+                    # Execute an ordered list of keystroke steps (type / key / combo / wait) in the Tally
+                    # window. Focus is re-asserted before each step so a stray focus-steal can't leak a typed
+                    # password into another window. Reuses Execute-Action, the same primitive the LLM loop uses.
+                    try {
+                        $hwnd = Find-TallyWindow
+                        if ($hwnd -eq [IntPtr]::Zero) {
+                            Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "sendkeys" -CommandId $cmdId
+                        } elseif (-not $cmd.keys) {
+                            Write-Result -Status "error" -Message "No keys provided" -Strategy "sendkeys" -CommandId $cmdId
+                        } else {
+                            [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                            Start-Sleep -Milliseconds 300
+                            $done = 0
+                            foreach ($step in @($cmd.keys)) {
+                                if ($null -eq $step -or -not $step.action) { continue }
+                                if ([TallyUI2]::GetForegroundWindow() -ne $hwnd) {
+                                    [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                                    Start-Sleep -Milliseconds 200
+                                }
+                                Execute-Action -Action $step
+                                $done++
+                            }
+                            Write-Result -Status "success" -Message "Executed $done key action(s)" -Strategy "sendkeys" -CommandId $cmdId -Extra @{ steps = $done }
+                        }
+                    } catch {
+                        Write-Result -Status "error" -Message "sendkeys exception: $_" -Strategy "sendkeys" -CommandId $cmdId
+                    }
                 }
                 "select-and-unlock-company" {
                     # Deterministic keystroke flow: type company id (already at Select Company) -> Enter -> type credentials -> Enter.
