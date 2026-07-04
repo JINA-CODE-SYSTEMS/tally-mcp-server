@@ -51,10 +51,11 @@ this one lies.
 
 ## Fixed on branch `fix/gui-hardening`
 
-Five fixes are applied on this branch. The first three are the highest-leverage items from the
+Six fixes are applied on this branch. The first three are the highest-leverage items from the
 audit: #1 removes the only *dangerous* fragility, #2 unbreaks the default install path, #3
 unblocks every public/domain deployment. #4 and #5 make the GUI-agent IPC channel self-heal so an
-operator never has to run `icacls`/`Remove-Item` by hand.
+operator never has to run `icacls`/`Remove-Item` by hand. #6 gives the app a real "open it"
+entry point (desktop / Start Menu) and makes the tray single-instance.
 
 1. **GUI agent ground-truth verification** — `scripts/tally-gui-agent-v2.ps1`
    After the keystroke sequence and on the LLM's `done`, query the Tally XML server for the
@@ -86,6 +87,12 @@ operator never has to run `icacls`/`Remove-Item` by hand.
    dir ACL, delete stale `_mcp_gui_command.json`/`_mcp_gui_result.json`/`_mcp_screenshot.png` so the
    service recreates them with the correct inherited ACL. Makes the fix an install-time step, not an
    operator shell command. Addresses the repointing finding below.
+
+6. **"Open Dashboard" shortcut + single-instance tray** — `scripts/installer/tally-mcp.iss`, `scripts/tray/tally-mcp-tray.ps1`
+   Adds a Start Menu "Open Tally MCP Dashboard" entry and an optional desktop shortcut so operators
+   can open the app on demand (previously only the auto-started tray icon existed). A session-scoped
+   `Mutex` + `EventWaitHandle` makes the tray single-instance: a second launch signals the running
+   instance to pop its dashboard and exits, instead of stacking a duplicate icon/timer/toast stream.
 
 ---
 
@@ -345,7 +352,7 @@ operator never has to run `icacls`/`Remove-Item` by hand.
 
 ### WinForms lifecycle
 
-- [ ] **No single-instance guard: a second launch spawns a duplicate tray icon, timer, and toast stream** — `scripts/tray/tally-mcp-tray.ps1:313`
+- [x] ✅ **Fixed on `fix/gui-hardening` (session Mutex + Open Dashboard shortcut). No single-instance guard: a second launch spawns a duplicate tray icon, timer, and toast stream** — `scripts/tray/tally-mcp-tray.ps1:313`
   - Why: there's no `Mutex` or singleton check before creating the `NotifyIcon` and starting the timer, despite the per-user at-logon task design; nothing prevents a second concurrent copy.
   - Fails when: the logon task fires and the operator/support also runs the tray manually (or the trigger re-fires on fast-user-switching/RDP reconnect) → two identical icons, two 5s WMI+HTTP poll loops (double load), and every state-transition toast fires twice.
   - Fix: acquire a named `Mutex` (`Global\TallyMCPTray-<user SID>`) at startup; if not acquired, optionally re-show the existing instance and exit; release in cleanup.
