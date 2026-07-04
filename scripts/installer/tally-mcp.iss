@@ -122,7 +122,15 @@ Source: "{#StagingRoot}\nssm.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Name: "{app}\logs"; Permissions: users-modify
 Name: "{app}\data"; Permissions: users-modify
 
+[Tasks]
+Name: "desktopicon"; Description: "Create a &desktop shortcut to open the Tally MCP dashboard"; GroupDescription: "Additional shortcuts:"
+
 [Icons]
+; Primary entry point: opens the status dashboard. The tray script's single-instance guard means this
+; surfaces the already-running tray's dashboard (or starts the tray if it isn't running) rather than
+; launching a duplicate. -WindowStyle Hidden keeps the launcher windowless (brief console flash only).
+Name: "{group}\Open {#MyAppName} Dashboard"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File ""{app}\scripts\tray\tally-mcp-tray.ps1"" -InstallDir ""{app}"" -ShowDashboard"; WorkingDir: "{app}"; Comment: "Open the Tally MCP status dashboard"
+Name: "{autodesktop}\{#MyAppName}";          Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File ""{app}\scripts\tray\tally-mcp-tray.ps1"" -InstallDir ""{app}"" -ShowDashboard"; WorkingDir: "{app}"; Tasks: desktopicon; Comment: "Open the Tally MCP status dashboard"
 Name: "{group}\{#MyAppName} Logs";       Filename: "{app}\logs"
 Name: "{group}\Reconfigure {#MyAppName}"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"""; WorkingDir: "{app}"
 Name: "{group}\Uninstall {#MyAppName}";  Filename: "{uninstallexe}"
