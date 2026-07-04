@@ -2652,5 +2652,95 @@ Call set-active-company again with one of these EXACT names, or use open-company
     }
   );
 
+  // ==================== INTERACTIVE GUI CONTROL TOOLS ====================
+  // Let an MCP client (Claude) drive the Tally window directly: gui-screenshot to SEE the current
+  // screen, gui-send-keys to act on it. This is the adaptive, human-supervised alternative to the
+  // blind select-and-unlock keystroke sequence - Claude reacts to whatever dialog is actually shown
+  // (Select Company, credential prompt, "load anyway?", Gateway of Tally). Both are gated behind
+  // ENABLE_GUI_CONTROL because they expose arbitrary keystroke injection and screenshots that can
+  // include financial data or a credential field.
+  mcpServer.registerTool(
+    'gui-screenshot',
+    {
+      title: 'GUI Screenshot (Tally window)',
+      description: `captures the current Tally Prime window as a PNG so you can SEE its on-screen state — Select Company list, credential prompt, "load anyway?" dialog, Gateway of Tally — and decide the next keystrokes. Pair with gui-send-keys to interactively drive Tally login / company selection instead of a blind fixed sequence. Requires ENABLE_GUI_CONTROL=true and the GUI agent running with Tally open. The image is returned to you and the on-disk copy is deleted immediately (it may show financial data or a credential field).`,
+      inputSchema: {},
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+    },
+    async () => {
+      const start = Date.now();
+      if (process.env.ENABLE_GUI_CONTROL !== 'true') {
+        auditLog('gui-screenshot', {}, 'denied');
+        return { isError: true, content: [{ type: 'text', text: 'GUI control is disabled. Set ENABLE_GUI_CONTROL=true (and restart the service) to enable gui-screenshot / gui-send-keys.' }] };
+      }
+      const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+      const logs: string[] = [];
+      const resp = await callGuiAgent('screenshot', {}, 20, dataPath, logs);
+      // The agent writes the PNG BEFORE writing its result, so a credential/financial frame can be on
+      // disk even on the timeout path. Always clean it up, whatever the outcome - never leave it behind.
+      const shot = path.join(dataPath, '_mcp_screenshot.png');
+      const cleanupShot = () => { try { fs.unlinkSync(shot); } catch {} };
+      if (!resp) {
+        cleanupShot();
+        auditLog('gui-screenshot', {}, 'error', Date.now() - start);
+        return { isError: true, content: [{ type: 'text', text: `GUI agent did not respond. Is it running (tray > Restart GUI agent) and is Tally open?\n${logs.join('\n')}` }] };
+      }
+      if (resp.status !== 'success') {
+        cleanupShot();
+        auditLog('gui-screenshot', {}, 'error', Date.now() - start);
+        return { isError: true, content: [{ type: 'text', text: resp.message || 'Screenshot failed' }] };
+      }
+      if (!fs.existsSync(shot)) {
+        auditLog('gui-screenshot', {}, 'error', Date.now() - start);
+        return { isError: true, content: [{ type: 'text', text: 'Agent reported success but the screenshot file was not found on disk.' }] };
+      }
+      const b64 = fs.readFileSync(shot).toString('base64');
+      cleanupShot();  // don't leave a Tally-screen image (possibly a credential frame) on disk
+      auditLog('gui-screenshot', {}, 'success', Date.now() - start);
+      return { content: [{ type: 'image', data: b64, mimeType: 'image/png' }] };
+    }
+  );
+
+  mcpServer.registerTool(
+    'gui-send-keys',
+    {
+      title: 'GUI Send Keys (Tally window)',
+      description: `sends an ordered sequence of keystrokes / typed text to the Tally Prime window to log in, select a company, or navigate menus. Pair with gui-screenshot to see the result and iterate step by step. Requires ENABLE_GUI_CONTROL=true and the GUI agent running with Tally open. Each step is {action, value}: "type" types the literal string (folder id, username, password); "key" presses ONE of these supported keys — enter, escape, tab, backspace, up, down, left, right, f1, f2, f3, f4, f5, f10, f12; "combo" presses a supported modifier chord — alt/ctrl/shift + one of f1, f2, f3, f4, f5, f10, a, c, v, x (e.g. "alt+f3", "ctrl+a"); "wait" pauses for value milliseconds (useful after an action that triggers a screen change). Keys/combos outside these sets are ignored (logged as unmapped). Focus is re-asserted before each step. Typed values are filtered from audit logs.`,
+      inputSchema: {
+        keys: z.array(z.object({
+          action: z.enum(['type', 'key', 'combo', 'wait']).describe('type = literal text; key = single key; combo = modifier chord (e.g. alt+f3); wait = pause milliseconds'),
+          value: z.string().describe('for type: the text to type; for key: the key name; for combo: e.g. "alt+f3"; for wait: milliseconds as a string')
+        })).describe('ordered keystroke steps to run in the Tally window, e.g. [{action:"type",value:"100000"},{action:"key",value:"enter"}]')
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false }
+    },
+    async (args) => {
+      const start = Date.now();
+      // Redact literal typed text (may be a password) before it reaches the audit log.
+      const redacted = { keys: (args.keys || []).map(k => k.action === 'type' ? { action: 'type', value: '***' } : k) };
+      if (process.env.ENABLE_GUI_CONTROL !== 'true') {
+        auditLog('gui-send-keys', redacted, 'denied');
+        return { isError: true, content: [{ type: 'text', text: 'GUI control is disabled. Set ENABLE_GUI_CONTROL=true (and restart the service) to enable gui-screenshot / gui-send-keys.' }] };
+      }
+      if (!args.keys || args.keys.length === 0) {
+        auditLog('gui-send-keys', redacted, 'denied');
+        return { isError: true, content: [{ type: 'text', text: 'No keys provided.' }] };
+      }
+      const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+      const logs: string[] = [];
+      const resp = await callGuiAgent('sendkeys', { keys: args.keys }, 30, dataPath, logs);
+      if (!resp) {
+        auditLog('gui-send-keys', redacted, 'error', Date.now() - start);
+        return { isError: true, content: [{ type: 'text', text: `GUI agent did not respond. Is it running and is Tally open?\n${logs.join('\n')}` }] };
+      }
+      if (resp.status !== 'success') {
+        auditLog('gui-send-keys', redacted, 'error', Date.now() - start);
+        return { isError: true, content: [{ type: 'text', text: resp.message || 'sendkeys failed' }] };
+      }
+      auditLog('gui-send-keys', redacted, 'success', Date.now() - start);
+      return { content: [{ type: 'text', text: JSON.stringify({ success: true, message: resp.message }) }] };
+    }
+  );
+
   return mcpServer;
 }
