@@ -43,6 +43,11 @@
 param(
     [string]$NodeVersion   = '20.18.1',
     [string]$NssmVersion   = '2.24',
+    # Supply-chain integrity: Node.js is verified against its official SHASUMS256.txt automatically;
+    # override with -NodeSha256 for air-gapped builds. NSSM publishes no signed checksums, so pass
+    # -NssmSha256 <sha256> from a trusted source to enable verification of the NSSM zip.
+    [string]$NodeSha256    = '',
+    [string]$NssmSha256    = '',
     [switch]$DownloadDeps,
     [switch]$SkipBuild,
     [string]$InnoSetupPath = $null
@@ -116,6 +121,26 @@ if ($DownloadDeps) {
         Write-Host "==> Downloading Node.js portable v$NodeVersion" -ForegroundColor Cyan
         Invoke-WebRequest -Uri $nodeUrl -OutFile $nodeZip
     }
+    # Security: verify the zip against Node's official published SHA-256 before expanding it into
+    # the shipped installer, so a tampered/MITM'd runtime is never bundled and later run as SYSTEM.
+    $expectedNodeHash = $NodeSha256
+    if (-not $expectedNodeHash) {
+        $sumsUrl = "https://nodejs.org/dist/v$NodeVersion/SHASUMS256.txt"
+        try {
+            $sums = (Invoke-WebRequest -Uri $sumsUrl -UseBasicParsing).Content
+            $line = ($sums -split "`n") | Where-Object { $_ -match "node-v$NodeVersion-win-x64\.zip" } | Select-Object -First 1
+            if ($line) { $expectedNodeHash = ($line -split '\s+')[0] }
+        } catch {
+            throw "Could not fetch Node SHASUMS256.txt for integrity verification ($sumsUrl): $($_.Exception.Message). Pass -NodeSha256 to override."
+        }
+    }
+    if (-not $expectedNodeHash) { throw "No SHA-256 found for node-v$NodeVersion-win-x64.zip; refusing to bundle an unverified Node runtime. Pass -NodeSha256." }
+    $actualNodeHash = (Get-FileHash -Path $nodeZip -Algorithm SHA256).Hash
+    if ($actualNodeHash.ToUpper() -ne $expectedNodeHash.ToUpper()) {
+        Remove-Item -Path $nodeZip -Force -ErrorAction SilentlyContinue
+        throw "Node.js zip SHA-256 mismatch! expected=$expectedNodeHash actual=$actualNodeHash - aborting to avoid bundling a tampered runtime."
+    }
+    Write-Host "==> Verified Node.js SHA-256 ($actualNodeHash)" -ForegroundColor Green
     Write-Host "==> Expanding Node.js into $nodeStaging" -ForegroundColor Cyan
     Get-ChildItem -Path $nodeStaging -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     Expand-Archive -Path $nodeZip -DestinationPath $staging -Force
@@ -137,9 +162,11 @@ if (-not (Test-Path (Join-Path $nodeStaging 'node.exe'))) {
 $nssmTarget = Join-Path $staging 'nssm.exe'
 if ($DownloadDeps) {
     $nssmZip = Join-Path $staging "nssm-$NssmVersion.zip"
+    # Security: only the canonical HTTPS origin. The former web.archive.org fallback served an
+    # unauthenticated, mutable snapshot with no integrity guarantee — a supply-chain risk for a
+    # binary that gets installed as a SYSTEM service host.
     $nssmUrls = @(
-        "https://nssm.cc/release/nssm-$NssmVersion.zip",
-        "https://web.archive.org/web/2024/https://nssm.cc/release/nssm-$NssmVersion.zip"
+        "https://nssm.cc/release/nssm-$NssmVersion.zip"
     )
     if (-not (Test-Path $nssmZip)) {
         $downloaded = $false
@@ -160,6 +187,19 @@ if ($DownloadDeps) {
         if (-not $downloaded) {
             throw "Could not download NSSM from any source. Manual workaround: download nssm.exe (x64) from any reliable source (e.g. chocolatey: 'choco install nssm', or scoop: 'scoop install nssm'), copy it to '$nssmTarget', then re-run this script WITHOUT -DownloadDeps."
         }
+    }
+    # Security: verify the NSSM zip against a pinned SHA-256 when supplied. nssm.cc publishes no
+    # signed checksums, so pass -NssmSha256 <hash> (obtained from a trusted source) for a
+    # supply-chain-hardened build; without it we warn loudly rather than silently trust the download.
+    if ($NssmSha256) {
+        $actualNssmHash = (Get-FileHash -Path $nssmZip -Algorithm SHA256).Hash
+        if ($actualNssmHash.ToUpper() -ne $NssmSha256.ToUpper()) {
+            Remove-Item -Path $nssmZip -Force -ErrorAction SilentlyContinue
+            throw "NSSM zip SHA-256 mismatch! expected=$NssmSha256 actual=$actualNssmHash - aborting to avoid bundling a tampered service host."
+        }
+        Write-Host "==> Verified NSSM SHA-256 ($actualNssmHash)" -ForegroundColor Green
+    } else {
+        Write-Warning "NSSM SHA-256 not pinned (-NssmSha256 not supplied); bundling without integrity verification. Provide -NssmSha256 for a supply-chain-hardened build."
     }
     $nssmExtracted = Join-Path $staging "nssm-$NssmVersion"
     if (-not (Test-Path $nssmExtracted)) {

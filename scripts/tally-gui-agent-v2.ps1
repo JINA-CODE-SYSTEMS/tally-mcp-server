@@ -586,7 +586,11 @@ while ($true) {
                 "start-tally" {
                     # Spawn tally.exe in this agent's session (which is the user's interactive desktop session).
                     # The MCP service can't do this directly when running in Session 0 - that's why it delegates here.
-                    $exe = if ($cmd.exePath) { [string]$cmd.exePath } else { "C:\Program Files\TallyPrimeEditLog\tally.exe" }
+                    # Security: the executable path comes from trusted local config (TALLY_EXE_PATH from .env,
+                    # else the standard install path), NOT from the IPC command. Honouring $cmd.exePath would let
+                    # any writer of the (previously world-writable) command file launch an arbitrary executable
+                    # in the operator's interactive session.
+                    $exe = if ($env:TALLY_EXE_PATH) { [string]$env:TALLY_EXE_PATH } else { "C:\Program Files\TallyPrimeEditLog\tally.exe" }
                     $waitSec = if ($cmd.waitSec) { [int]$cmd.waitSec } else { 30 }
                     if (-not (Test-Path $exe)) {
                         Write-Result -Status "error" -Message "tally.exe not found at $exe" -Strategy "start-tally" -CommandId $cmdId
