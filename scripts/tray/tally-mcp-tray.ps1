@@ -515,12 +515,14 @@ $miReconfigure.Add_Click({
         return
     }
     # Reconfigure modifies .env and re-registers the NSSM service, both admin-only operations.
-    Start-Process -FilePath 'powershell.exe' -ArgumentList @(
-        '-ExecutionPolicy', 'Bypass', '-NoProfile',
-        '-NoExit',  # leave the window open so the operator can read the result
-        '-File', $script,
-        '-InstallDir', $InstallDir
-    ) -Verb RunAs
+    # Build a single -ArgumentList string with the path values wrapped in embedded double-quotes.
+    # Windows PowerShell 5.1 joins an ARRAY -ArgumentList with single spaces and does NOT quote
+    # elements containing spaces, so the default install path C:\Program Files\TallyMCP (has a
+    # space) would truncate -File / -InstallDir and the elevated window would error out. Mirror
+    # firstrun-config.ps1's idiom (`"$path`"). -NoExit leaves the window open so the operator
+    # can read the result.
+    $reconfigArgs = "-ExecutionPolicy Bypass -NoProfile -NoExit -File `"$script`" -InstallDir `"$InstallDir`""
+    Start-Process -FilePath 'powershell.exe' -ArgumentList $reconfigArgs -Verb RunAs
 })
 
 [void]$menu.Items.Add('-')
