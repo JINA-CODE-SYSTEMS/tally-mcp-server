@@ -361,13 +361,18 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     # keystrokes into the interactive Tally session, so the channel must NOT be world-writable.
     # The default data dir (C:\Users\Public\...\data) grants BUILTIN\Users write by default, so
     # any local user could drop a command file and inject keystrokes. Restrict the directory to
-    # SYSTEM + Administrators + the agent task user, with inheritance so the transient IPC files
-    # created inside are covered. NOTE for reviewers: this changes the ACL of TALLY_DATA_PATH;
-    # validate that Tally (running as the interactive user = agent task user) still has access on
-    # multi-account / service-account deployments.
+    # SYSTEM + Administrators + the agent task user. The (OI)(CI) inheritance flags are REQUIRED and
+    # must be explicit: icacls does NOT reliably default to inheritable ACEs, so a bare "user:F" grants
+    # the FOLDER only. Without (OI)(CI) the transient IPC files the SYSTEM service creates here do not
+    # inherit the agent-user grant, and the GUI agent - which runs under a UAC-filtered (Limited) token
+    # that drops Administrators - fails every read with "Access is denied". (Observed in the field: a
+    # dir ACE of "tapanjain:(F)" instead of "tapanjain:(OI)(CI)(F)" left _mcp_gui_command.json granting
+    # only SYSTEM + Administrators, and load-company looped on Access-denied.) NOTE for reviewers: this
+    # changes the ACL of TALLY_DATA_PATH; validate Tally (interactive user = agent task user) still has
+    # access on multi-account / service-account deployments.
     $ipcDir = Split-Path $registryFile
     if (Test-Path -LiteralPath $ipcDir) {
-        & icacls $ipcDir /inheritance:r /grant:r 'SYSTEM:F' 'Administrators:F' "${AgentTaskUser}:F" 2>$null | Out-Null
+        & icacls $ipcDir /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' "${AgentTaskUser}:(OI)(CI)F" 2>$null | Out-Null
         if ($LASTEXITCODE -eq 0) {
             Write-Host "[OK] Locked NTFS ACL on IPC directory $ipcDir (SYSTEM + Administrators + $AgentTaskUser)"
         } else {
