@@ -47,7 +47,11 @@ param(
     [string]$ServiceName = 'TallyMCP',
     [string]$AgentTaskName = 'TallyMCPAgent',
     [int]$PollIntervalSec = 5,
-    [int]$ProbeTimeoutSec = 3
+    [int]$ProbeTimeoutSec = 3,
+    # Passed by the "Open Tally MCP Dashboard" Start Menu / desktop shortcut. If this process becomes
+    # the singleton tray it opens the dashboard immediately; if a tray is already running it just
+    # signals that instance to show its dashboard and exits (see the single-instance guard below).
+    [switch]$ShowDashboard
 )
 
 # Resolve InstallDir relative to this file when not provided. The tray script lives at
@@ -60,6 +64,24 @@ if (-not $InstallDir -or -not $InstallDir.Trim()) {
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+
+# ---------------------------------------------------------------------------
+# Single-instance guard. Exactly one tray should run per interactive session (the TallyMCPTray
+# at-logon task). The "Open Tally MCP Dashboard" Start Menu / desktop shortcut launches this script
+# too; rather than stack a second tray icon, a second launch signals the running instance to pop its
+# dashboard, then exits. The names have NO "Global\" prefix, so they are scoped to this desktop
+# session - i.e. exactly one tray per logged-in user, which is what we want.
+$script:SingletonMutex      = New-Object System.Threading.Mutex($false, 'TallyMCP.Tray.Singleton.v1')
+$script:ShowDashboardSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'TallyMCP.Tray.ShowDashboard.v1')
+$ownsSingleton = $false
+try   { $ownsSingleton = $script:SingletonMutex.WaitOne(0) }
+catch [System.Threading.AbandonedMutexException] { $ownsSingleton = $true }  # a prior tray died without releasing; we own it now
+if (-not $ownsSingleton) {
+    # Another tray already owns this session. Ask it to show the dashboard, then exit so the shortcut
+    # click behaves like "bring the app to the front" instead of launching a duplicate tray icon.
+    [void]$script:ShowDashboardSignal.Set()
+    return
+}
 
 # Dot-source the Manage Companies dialog (defines Show-ManageCompaniesDialog). Lives next
 # to this script so it ships in the same scripts/tray/ install payload.
@@ -864,6 +886,21 @@ $timer.Add_Tick({
 Invoke-StatusPoll
 Update-TrayUi
 $timer.Start()
+
+# Watch for "show dashboard" requests from a second launch (the Open Dashboard shortcut). Poll the
+# named event on the UI thread so Show-Dashboard runs on the WinForms message-loop thread (WinForms
+# requires UI calls on that thread). WaitOne(0) is a non-blocking kernel check - cheap to poll.
+$showDashTimer = New-Object System.Windows.Forms.Timer
+$showDashTimer.Interval = 400
+$showDashTimer.Add_Tick({
+    try { if ($script:ShowDashboardSignal.WaitOne(0)) { Show-Dashboard } } catch {}
+})
+$showDashTimer.Start()
+
+# Launched via the Open Dashboard shortcut while no tray was running yet -> THIS process is now the
+# singleton tray, so open the dashboard immediately. (When a tray is already running, that launch
+# takes the -not $ownsSingleton branch above and signals us through $ShowDashboardSignal instead.)
+if ($ShowDashboard) { Show-Dashboard }
 
 [System.Windows.Forms.Application]::Run()
 
