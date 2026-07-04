@@ -191,11 +191,23 @@ export function rewriteTallyIniLoads(iniContent: string, companyIds: string[]): 
   return filtered.join(eol);
 }
 
-// Atomically writes content to filePath using a temp-file + rename pattern (no torn writes if the process dies mid-write).
+// Atomically writes content to filePath using a temp-file + rename pattern (no torn writes if the
+// process dies mid-write). Also important for the GUI-agent IPC files (_mcp_gui_command.json): the
+// rename replaces the target with a freshly created inode, so it re-inherits the directory ACL every
+// write. An in-place fs.writeFileSync would preserve a stale/narrower ACL on an existing file, which
+// is how the agent (running under a UAC-filtered "Limited" token that drops Administrators) ends up
+// with "Access is denied" reading commands the SYSTEM service wrote.
 function atomicWriteFile(filePath: string, content: string): void {
   const tmp = `${filePath}.tmp.${process.pid}.${Date.now()}`;
   fs.writeFileSync(tmp, content, 'utf-8');
-  fs.renameSync(tmp, filePath);
+  try {
+    fs.renameSync(tmp, filePath);
+  } catch (e) {
+    // Don't leak the temp file if the rename loses (e.g. target briefly open by the agent's
+    // ReadAllText, or an AV scan) — otherwise .tmp.* orphans accumulate on this high-frequency path.
+    try { fs.unlinkSync(tmp); } catch {}
+    throw e;
+  }
 }
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
@@ -595,7 +607,7 @@ async function callGuiAgent(
 
   try { fs.unlinkSync(resultFile); } catch {}
   const command = JSON.stringify({ action, ...payload, commandId, timestamp: new Date().toISOString() });
-  fs.writeFileSync(commandFile, command, 'utf-8');
+  atomicWriteFile(commandFile, command);
   logs.push(`  [gui-agent] sent action=${action} commandId=${commandId}, waiting up to ${timeoutSec}s`);
 
   for (let i = 0; i < timeoutSec; i++) {
@@ -1000,7 +1012,7 @@ export async function registerMcpServer(): Promise<McpServer> {
           // --- First, ping the agent to check if it's alive ---
           const pingCommandId = createGuiAgentCommandId('ping');
           try { fs.unlinkSync(resultFile); } catch {}
-          fs.writeFileSync(commandFile, JSON.stringify({ action: 'ping', commandId: pingCommandId, timestamp: new Date().toISOString() }), 'utf-8');
+          atomicWriteFile(commandFile, JSON.stringify({ action: 'ping', commandId: pingCommandId, timestamp: new Date().toISOString() }));
           let agentAlive = false;
           for (let i = 0; i < 5; i++) {
             await new Promise(resolve => setTimeout(resolve, 1000));
@@ -1036,7 +1048,7 @@ export async function registerMcpServer(): Promise<McpServer> {
             maxSteps: guiMaxSteps,
             timestamp: new Date().toISOString()
           });
-          fs.writeFileSync(commandFile, command, 'utf-8');
+          atomicWriteFile(commandFile, command);
           logs.push(`  Command sent (commandId=${commandId}, maxSteps=${guiMaxSteps}), waiting for GUI agent (up to ${guiTimeoutSeconds} seconds for LLM-guided actions)...`);
 
           // Poll for result — timeout is configurable because LLM-guided actions can take longer.
