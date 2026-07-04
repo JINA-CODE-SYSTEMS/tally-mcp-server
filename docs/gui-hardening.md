@@ -51,9 +51,10 @@ this one lies.
 
 ## Fixed on branch `fix/gui-hardening`
 
-Three fixes are being applied on this branch now. They are the highest-leverage items from the
+Five fixes are applied on this branch. The first three are the highest-leverage items from the
 audit: #1 removes the only *dangerous* fragility, #2 unbreaks the default install path, #3
-unblocks every public/domain deployment.
+unblocks every public/domain deployment. #4 and #5 make the GUI-agent IPC channel self-heal so an
+operator never has to run `icacls`/`Remove-Item` by hand.
 
 1. **GUI agent ground-truth verification** — `scripts/tally-gui-agent-v2.ps1`
    After the keystroke sequence and on the LLM's `done`, query the Tally XML server for the
@@ -73,6 +74,19 @@ unblocks every public/domain deployment.
    value. Without this, a bare `mcp.acme.com` makes the server throw `Invalid URL` and emit
    schemeless OAuth metadata every client rejects. Addresses finding **#2** (`:261`).
 
+4. **IPC command file written atomically** — `src/mcp.mts`
+   Route the three `_mcp_gui_command.json` writes through the existing `atomicWriteFile` (temp +
+   rename) instead of overwriting in place, so every command file is a fresh inode that re-inherits
+   the directory ACL. Fixes the `Access is denied` the Limited-token agent hits when the file keeps
+   a stale/narrower ACL (the runtime half of the IPC-permissions failure).
+
+5. **Persist `AGENT_TASK_USER` + self-heal stale IPC files** — `scripts/installer/firstrun-config.ps1`
+   Persist `AGENT_TASK_USER` in `.env` and prefer it over `$env:USERNAME` so a reconfigure by a
+   different admin can't repoint the task + ACL grants to the wrong user; and after locking the IPC
+   dir ACL, delete stale `_mcp_gui_command.json`/`_mcp_gui_result.json`/`_mcp_screenshot.png` so the
+   service recreates them with the correct inherited ACL. Makes the fix an install-time step, not an
+   operator shell command. Addresses the repointing finding below.
+
 ---
 
 ## High severity (4)
@@ -91,7 +105,7 @@ unblocks every public/domain deployment.
   - Fails when: operator types `mcp.acme.com` → `new URL()` throws `Invalid URL` on the well-known routes and `/.well-known/oauth-authorization-server` advertises a schemeless issuer that Claude Desktop / VS Code OAuth discovery rejects. Install reports success.
   - Fix: trim, reject internal whitespace, prepend `https://` if schemeless, strip trailing `/`/path, parse with `[uri]`, write through `_envQuote`, and echo the normalized value back to the operator.
 
-- [ ] **Reconfigure run by a different admin silently repoints the GUI agent task and ACLs to the wrong Windows user** — `scripts/installer/firstrun-config.ps1:105`
+- [x] ✅ **Fixed on `fix/gui-hardening`. Reconfigure run by a different admin silently repoints the GUI agent task and ACLs to the wrong Windows user** — `scripts/installer/firstrun-config.ps1:105`
   - Why: `AgentTaskUser` is never persisted in `.env`, so line 105 falls back to `$env:USERNAME` whenever `-AgentTaskUser` is omitted — exactly what the Reconfigure shortcut does — then bakes that user into the task principal and every `icacls` grant.
   - Fails when: a roaming `Administrator` RDPs in and clicks Reconfigure → agent task + `.env`/registry/IPC ACLs re-point from `TallyOperator` to `Administrator`; the agent no longer runs in the interactive session, `load-company` silently stops working.
   - Fix: persist `AGENT_TASK_USER=` in `.env` and add it to the `_Coalesce` chain (param → existing `.env` → `$env:USERNAME`) like the Tally paths.
