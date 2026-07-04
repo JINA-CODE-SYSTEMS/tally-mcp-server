@@ -49,7 +49,9 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
-UninstallDisplayIcon={app}\dist\server.mjs
+UninstallDisplayIcon={app}\assets\tally-mcp.ico
+; Jina Code Systems brand icon for the installer .exe itself (generated from scripts/tray/assets/jina-logo.png).
+SetupIconFile=assets\tally-mcp.ico
 ChangesEnvironment=yes
 ; Jinacode Systems branding. Comma-separated lists let Inno pick the closest size
 ; to the user's display scaling — the standard BMP renders on 100% DPI, the @2x
@@ -92,6 +94,10 @@ Source: "{#RepoRoot}\scripts\installer\uninstall-cleanup.ps1";  DestDir: "{app}\
 Source: "{#RepoRoot}\scripts\tray\tally-mcp-tray.ps1"; DestDir: "{app}\scripts\tray"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\tray\assets\*";           DestDir: "{app}\scripts\tray\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+; --- Brand icon (Jina Code logo) for the Start Menu / desktop shortcuts and the uninstall entry.
+; Shipped to {app}\assets so the shortcut IconFilename points at a file present on the target. ---
+Source: "{#RepoRoot}\scripts\installer\assets\tally-mcp.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
+
 ; --- LICENSE at the install root so the tray dashboard can read it post-install.
 ; (LicenseFile= above only feeds the wizard's accept-license page; that copy is not
 ; placed on disk.) ---
@@ -129,8 +135,8 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut to open the Tally 
 ; Primary entry point: opens the status dashboard. The tray script's single-instance guard means this
 ; surfaces the already-running tray's dashboard (or starts the tray if it isn't running) rather than
 ; launching a duplicate. -WindowStyle Hidden keeps the launcher windowless (brief console flash only).
-Name: "{group}\Open {#MyAppName} Dashboard"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File ""{app}\scripts\tray\tally-mcp-tray.ps1"" -InstallDir ""{app}"" -ShowDashboard"; WorkingDir: "{app}"; Comment: "Open the Tally MCP status dashboard"
-Name: "{autodesktop}\{#MyAppName}";          Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File ""{app}\scripts\tray\tally-mcp-tray.ps1"" -InstallDir ""{app}"" -ShowDashboard"; WorkingDir: "{app}"; Tasks: desktopicon; Comment: "Open the Tally MCP status dashboard"
+Name: "{group}\Open {#MyAppName} Dashboard"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File ""{app}\scripts\tray\tally-mcp-tray.ps1"" -InstallDir ""{app}"" -ShowDashboard"; WorkingDir: "{app}"; IconFilename: "{app}\assets\tally-mcp.ico"; Comment: "Open the Tally MCP status dashboard"
+Name: "{autodesktop}\{#MyAppName}";          Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File ""{app}\scripts\tray\tally-mcp-tray.ps1"" -InstallDir ""{app}"" -ShowDashboard"; WorkingDir: "{app}"; Tasks: desktopicon; IconFilename: "{app}\assets\tally-mcp.ico"; Comment: "Open the Tally MCP status dashboard"
 Name: "{group}\{#MyAppName} Logs";       Filename: "{app}\logs"
 Name: "{group}\Reconfigure {#MyAppName}"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"""; WorkingDir: "{app}"
 Name: "{group}\Uninstall {#MyAppName}";  Filename: "{uninstallexe}"
