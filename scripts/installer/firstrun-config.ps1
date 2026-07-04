@@ -102,7 +102,10 @@ $TallyDataPath  = _Coalesce $TallyDataPath  $_existingEnv['TALLY_DATA_PATH']  'C
 $TallyIniPath   = _Coalesce $TallyIniPath   $_existingEnv['TALLY_INI_PATH']   'C:\Program Files\TallyPrimeEditLog\tally.ini'
 # MCP_DOMAIN has no hardcoded default — blank means "localhost-only mode".
 $McpDomain      = _Coalesce $McpDomain      $_existingEnv['MCP_DOMAIN']       ''
-$AgentTaskUser  = _Coalesce $AgentTaskUser  $env:USERNAME
+# AGENT_TASK_USER is persisted in .env (below) and preferred over $env:USERNAME so a Reconfigure run
+# by a DIFFERENT admin (the bare-InstallDir path omits -AgentTaskUser) does not silently re-point the
+# agent task + all the icacls grants to that admin - which would break the IPC ACL for the real user.
+$AgentTaskUser  = _Coalesce $AgentTaskUser  $_existingEnv['AGENT_TASK_USER']  $env:USERNAME
 
 # --- Resolve OAuth password ---
 # Two entry paths:
@@ -284,6 +287,9 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         "TALLY_EXE_PATH=$(_envQuote $TallyExePath)"
         "TALLY_DATA_PATH=$(_envQuote $TallyDataPath)"
         "TALLY_INI_PATH=$(_envQuote $TallyIniPath)"
+        # Persisted so a later Reconfigure preserves the agent user instead of falling back to
+        # whoever runs the wizard (see the _Coalesce for $AgentTaskUser above).
+        "AGENT_TASK_USER=$(_envQuote $AgentTaskUser)"
     )
     # Bind address (security): only listen on all interfaces when a public domain / reverse proxy
     # is explicitly configured. When MCP_DOMAIN is blank ("localhost-only mode") bind to loopback
@@ -366,6 +372,25 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
             Write-Host "[OK] Locked NTFS ACL on IPC directory $ipcDir (SYSTEM + Administrators + $AgentTaskUser)"
         } else {
             Write-Host "[WARN] icacls exit $LASTEXITCODE on $ipcDir - GUI agent IPC directory is not locked down" -ForegroundColor Yellow
+        }
+
+        # Self-heal: clear any STALE IPC files left by a previous install/reconfigure. The MCP service
+        # overwrites _mcp_gui_command.json IN PLACE, so a file created under an older/narrower ACL (e.g.
+        # before this hardening, or by a reconfigure that ran as a different admin) KEEPS that stale ACL
+        # forever. The GUI agent runs under a UAC-filtered "Limited" token (no Administrators), so if the
+        # file lacks a direct grant to the agent user it fails with "Access is denied" and load-company
+        # silently breaks. Deleting them here means the service recreates them fresh (atomic temp+rename),
+        # inheriting the directory ACL we just set - so the operator never has to touch icacls by hand.
+        foreach ($ipcName in @('_mcp_gui_command.json', '_mcp_gui_result.json', '_mcp_screenshot.png')) {
+            $stale = Join-Path $ipcDir $ipcName
+            if (Test-Path -LiteralPath $stale) {
+                Remove-Item -LiteralPath $stale -Force -ErrorAction SilentlyContinue
+                if (-not (Test-Path -LiteralPath $stale)) {
+                    Write-Host "[OK] Cleared stale IPC file $ipcName (service recreates it with the correct ACL)"
+                } else {
+                    Write-Host "[WARN] Could not remove stale IPC file $stale - a running agent/service may hold it; it will be recreated on next command" -ForegroundColor Yellow
+                }
+            }
         }
     }
 
