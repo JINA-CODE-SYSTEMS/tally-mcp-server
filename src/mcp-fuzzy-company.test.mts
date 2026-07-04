@@ -35,3 +35,13 @@ test('returns null on empty loaded list', () => {
 test('returns null on empty target', () => {
   assert.equal(findMatchingLoadedCompany('', loaded), null);
 });
+
+test('pathologically long target returns null without hanging (self-DoS guard)', () => {
+  // A multi-MB input must not allocate an O(n*m) DP matrix per loaded company.
+  // The length guard short-circuits it; the call should return quickly with no match.
+  const huge = 'a'.repeat(2_000_000);
+  const started = Date.now();
+  assert.equal(findMatchingLoadedCompany(huge, loaded), null);
+  // Comfortably fast — matrix allocation for a 2M-char string would take far longer.
+  assert.ok(Date.now() - started < 1000, 'fuzzy match should short-circuit huge inputs');
+});

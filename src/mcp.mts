@@ -99,10 +99,21 @@ function normalizeCompanyName(name: string): string {
 // deletions, substitutions) to transform `a` into `b`. O(n*m) memory and time;
 // fine for short strings like company names. Used as the last fuzzy-match tier
 // to catch typos and plural mismatches (e.g. "Computer" vs "Computers").
+// Defense-in-depth cap on the O(n*m) DP matrix. Callers should bound their inputs
+// (e.g. set-active-company caps companyName at 256), but this guard makes the
+// function self-safe: a pathological multi-KB string can't allocate a huge matrix.
+// Beyond this length no realistic company name matches anyway, so returning the
+// length delta (a lower bound on the true distance, always > any sane maxDist)
+// safely reports "no fuzzy match" without touching the matrix.
+const LEVENSHTEIN_MAX_LEN = 256;
+
 function levenshteinDistance(a: string, b: string): number {
   if (a === b) return 0;
   if (a.length === 0) return b.length;
   if (b.length === 0) return a.length;
+  if (a.length > LEVENSHTEIN_MAX_LEN || b.length > LEVENSHTEIN_MAX_LEN) {
+    return Math.abs(a.length - b.length) || Math.max(a.length, b.length);
+  }
   const dp: number[][] = [];
   for (let i = 0; i <= a.length; i++) {
     dp.push(new Array(b.length + 1).fill(0));
@@ -1314,7 +1325,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       title: 'Set Active Company',
       description: `sets the active company for subsequent tool calls without invoking the Tally UI. Cheap pointer flip — use this to switch between companies that are already loaded in Tally (e.g. for cross-referencing subsidiaries). Verifies the company is actually loaded via SVCURRENTCOMPANY probe; returns an error suggesting open-company if not. After this succeeds, every subsequent tool call automatically targets this company unless targetCompany is specified explicitly.`,
       inputSchema: {
-        companyName: z.string().describe('exact company name as shown in Tally. Use list-loaded-companies to see what is currently loaded.')
+        companyName: z.string().max(256).describe('exact company name as shown in Tally. Use list-loaded-companies to see what is currently loaded.')
       },
       annotations: {
         readOnlyHint: false,
