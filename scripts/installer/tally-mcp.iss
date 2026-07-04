@@ -255,9 +255,14 @@ begin
   // 5. On existing installs, grant full control to the install dir so the file copy phase
   //    can overwrite read-only or restrictive-ACL files (e.g. tray assets that ended up
   //    owned by SYSTEM after a previous install). Skipped silently on fresh installs.
+  //    Security: grant Administrators + SYSTEM only (SIDs S-1-5-32-544 / S-1-5-18), NOT Everyone.
+  //    The installer runs elevated so Administrators already suffices to overwrite the files;
+  //    granting Everyone:F /T made the whole tree (node.exe, server.mjs, nssm.exe, .env — later
+  //    executed by the SYSTEM service) world-writable and was never revoked, a local
+  //    privilege-escalation-to-SYSTEM vector.
   if DirExists(installDir) then
   begin
-    Exec(ExpandConstant('{cmd}'), '/C icacls "' + installDir + '" /grant Everyone:F /T /C >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+    Exec(ExpandConstant('{cmd}'), '/C icacls "' + installDir + '" /grant *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F /T /C >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
 
     // 6. Pre-delete the files that have historically caused "DeleteFile failed; code 5" on
     //    upgrade. duckdb.dll is held by the native loader until node.exe is gone; jina-logo.png

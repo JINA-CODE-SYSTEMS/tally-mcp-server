@@ -247,23 +247,39 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         "TALLY_EXE_PATH=$(_envQuote $TallyExePath)"
         "TALLY_DATA_PATH=$(_envQuote $TallyDataPath)"
         "TALLY_INI_PATH=$(_envQuote $TallyIniPath)"
-        # The installer's whole reason for existing is "Node + reverse proxy on the same box",
-        # so we bind to all interfaces. The reverse proxy in front (Caddy/IIS/Cloudflare Tunnel)
-        # is responsible for restricting access. Without this, a Caddyfile that says
-        # `reverse_proxy localhost:3000` resolves localhost to ::1 first on Windows, but Node
-        # only listens on 127.0.0.1 (the upstream library default), and Caddy returns 502.
-        "BIND_HOST=0.0.0.0"
     )
+    # Bind address (security): only listen on all interfaces when a public domain / reverse proxy
+    # is explicitly configured. When MCP_DOMAIN is blank ("localhost-only mode") bind to loopback
+    # so the OAuth-gated server is NOT reachable from the LAN. Older versions always wrote
+    # BIND_HOST=0.0.0.0 even in the localhost-only path, silently exposing the server network-wide
+    # (and the adjacent "binds to localhost only" comment was false).
     if ($McpDomain) {
+        # A reverse proxy (Caddy/IIS/Cloudflare Tunnel) sits in front and restricts access.
+        # Node listens only on 127.0.0.1 by default; a proxy that resolves `localhost` to ::1
+        # first on Windows then gets 502, so bind all interfaces for the proxy to reach it.
+        $envLines += "BIND_HOST=0.0.0.0"
         $envLines += "MCP_DOMAIN=$McpDomain"
     } else {
-        $envLines += "# MCP_DOMAIN intentionally unset - server binds to localhost only"
+        $envLines += "BIND_HOST=127.0.0.1"
+        $envLines += "# MCP_DOMAIN intentionally unset - server binds to localhost only (127.0.0.1)"
     }
 
     $envTmp = "$envFile.tmp"
     Set-Content -Path $envTmp -Value $envLines -Encoding UTF8
     Move-Item -Path $envTmp -Destination $envFile -Force
     Write-Host "[OK] Wrote $envFile ($($envLines.Count) lines)"
+
+    # Lock down .env (security): it holds PASSWORD, the sole OAuth gate for every MCP tool.
+    # Without this it inherits the install dir ACL (Program Files grants Users read by default,
+    # and an upgrade previously widened it further), leaving the password readable by any local
+    # user. Strip inheritance and grant only SYSTEM + Administrators + the agent task user,
+    # mirroring the company-registry lockdown below.
+    & icacls $envFile /inheritance:r /grant:r 'SYSTEM:F' 'Administrators:F' "${AgentTaskUser}:F" 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "[OK] Locked NTFS ACL on $envFile (SYSTEM + Administrators only)"
+    } else {
+        Write-Host "[WARN] icacls exit $LASTEXITCODE on $envFile - .env is not locked down" -ForegroundColor Yellow
+    }
 
     # --- 1b. Initialize + lock down the companies registry file -----------
     # The registry stores DPAPI-encrypted passwords for the alias feature. We pre-create an empty
@@ -294,6 +310,26 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         Write-Host "[OK] Locked NTFS ACL on $registryFile (SYSTEM + Administrators only)"
     } else {
         Write-Host "[WARN] icacls exit $LASTEXITCODE on $registryFile - registry file is not locked down" -ForegroundColor Yellow
+    }
+
+    # --- 1c. Lock down the GUI-agent IPC directory ------------------------
+    # Security: the GUI agent and MCP server exchange commands via _mcp_gui_command.json /
+    # _mcp_gui_result.json in the Tally data dir. Those commands type credentials and drive
+    # keystrokes into the interactive Tally session, so the channel must NOT be world-writable.
+    # The default data dir (C:\Users\Public\...\data) grants BUILTIN\Users write by default, so
+    # any local user could drop a command file and inject keystrokes. Restrict the directory to
+    # SYSTEM + Administrators + the agent task user, with inheritance so the transient IPC files
+    # created inside are covered. NOTE for reviewers: this changes the ACL of TALLY_DATA_PATH;
+    # validate that Tally (running as the interactive user = agent task user) still has access on
+    # multi-account / service-account deployments.
+    $ipcDir = Split-Path $registryFile
+    if (Test-Path -LiteralPath $ipcDir) {
+        & icacls $ipcDir /inheritance:r /grant:r 'SYSTEM:F' 'Administrators:F' "${AgentTaskUser}:F" 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "[OK] Locked NTFS ACL on IPC directory $ipcDir (SYSTEM + Administrators + $AgentTaskUser)"
+        } else {
+            Write-Host "[WARN] icacls exit $LASTEXITCODE on $ipcDir - GUI agent IPC directory is not locked down" -ForegroundColor Yellow
+        }
     }
 
     # --- 2. Stop and remove any existing service (idempotent re-runs) ------
