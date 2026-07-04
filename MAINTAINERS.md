@@ -6,7 +6,7 @@
 |------|--------|------|
 | Tapan Jain | [@jain-t](https://github.com/jain-t) | Lead maintainer |
 
-**Organization:** [Jinacode Systems](https://github.com/JINA-CODE-SYSTEMS)
+**Organization:** [Jina Code Systems LLP](https://github.com/JINA-CODE-SYSTEMS)
 
 ## Original Author
 

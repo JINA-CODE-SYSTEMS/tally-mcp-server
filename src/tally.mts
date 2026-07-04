@@ -11,6 +11,16 @@ dotenv.config({ override: true, quiet: true });
 
 const tally_host = process.env.TALLY_HOST || 'localhost'; // default to localhost
 const tally_port = parseInt(process.env.TALLY_PORT || '9000'); // default to 9000 XML port of Tally
+// Hard cap on a single Tally HTTP round trip. Tally's XML server is single-threaded
+// and stops processing any request while a modal dialog (license expiry, "Bad formula",
+// split-period prompts, etc.) is on screen. Without this cap, requests hang
+// indefinitely and pile up. Default 30s — long enough for big balance-sheet pulls,
+// short enough that the MCP client doesn't sit forever on a dead Tally.
+const tally_request_timeout_ms = parseInt(process.env.TALLY_REQUEST_TIMEOUT_MS || '30000');
+// Pre-flight ping timeout. Short — a healthy Tally answers a Collection query in
+// <100ms. If the ping doesn't come back in 3s we treat Tally as wedged and abort
+// the heavy call immediately with a clear error instead of waiting the full 30s.
+const tally_ping_timeout_ms = parseInt(process.env.TALLY_PING_TIMEOUT_MS || '3000');
 const __dirname = import.meta.dirname;
 const lstPullReport: m.ModelPullReportInfo[] = JSON.parse(fs.readFileSync(path.join(__dirname, '../pull/config.json'), 'utf-8'))['reports'];
 const lstPushTemplate: m.ModelPushTemplateInfo[] = JSON.parse(fs.readFileSync(path.join(__dirname, '../push/config.json'), 'utf-8'))['templates'];
@@ -66,6 +76,19 @@ export function handlePull(targetReport: string, inputParams: Map<string, any>):
             data: undefined
         };
         try {
+            // Pre-flight: cheap ping so a wedged Tally fails in ~3s with a clear
+            // message instead of hanging the heavy report query for 30s. Skipping
+            // the ping for the trivial reports that the tray dashboard / health
+            // polls call thousands of times — they already are pings of a sort.
+            const skipPing = targetReport === 'list-companies';
+            if (!skipPing) {
+                const alive = await pingTally();
+                if (!alive) {
+                    retval.error = `Tally is not responding (ping timed out). It may be showing a modal dialog (check the Tally window for popups like license warnings or split-period prompts), or the XML server is wedged. Dismiss any popups and retry, or restart Tally if it stays unresponsive.`;
+                    return resolve(retval);
+                }
+            }
+
             let objReport = lstPullReport.find(p => p.name == targetReport);
 
             if (objReport) {
@@ -83,7 +106,7 @@ export function handlePull(targetReport: string, inputParams: Map<string, any>):
                 for (let i = 0; i < objReport.input.length; i++) {
                     let iName = objReport.input[i].name;
                     let iType = objReport.input[i].datatype;
-
+                    
                     let _value = inputParams.get(iName);
 
                     //check if validation is required
@@ -161,9 +184,13 @@ function sendTally(xml: string, lstVariables: Map<string, any>): Promise<string>
     });
 }
 
-export function postTallyXML(xml: string): Promise<string> {
+export function postTallyXML(xml: string, opts?: { timeoutMs?: number }): Promise<string> {
+    const timeoutMs = opts?.timeoutMs ?? tally_request_timeout_ms;
     return new Promise<string>((resolve, reject) => {
         try {
+
+            let settled = false;
+            const settle = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
 
             let req = http.request({
                 hostname: tally_host,
@@ -184,17 +211,28 @@ export function postTallyXML(xml: string): Promise<string> {
                             data += result;
                         })
                         .on('end', () => {
-                            resolve(data);
+                            settle(() => resolve(data));
                         })
                         .on('error', (httpErr) => {
-                            reject(httpErr);
+                            settle(() => reject(httpErr));
                         });
                 });
             req.on('error', (reqError) => {
                 if (reqError && reqError.message === 'ECONNREFUSED')
-                    reject('Unable to connect to Tally');
+                    settle(() => reject('Unable to connect to Tally'));
                 else
-                    reject(reqError);
+                    settle(() => reject(reqError));
+            });
+            // Hard timeout: socket-level so it covers both the connect phase and a
+            // hung response stream. Without this, a Tally instance showing a modal
+            // dialog or otherwise wedged will leave the request open until the
+            // process exits.
+            req.setTimeout(timeoutMs, () => {
+                req.destroy(new Error(
+                    `Tally did not respond within ${timeoutMs}ms. ` +
+                    `It may be showing a modal dialog (check the Tally window), or the XML server is wedged. ` +
+                    `Dismiss any popups in Tally and retry, or restart Tally if it's unresponsive.`
+                ));
             });
             req.write(xml, 'utf16le');
             req.end();
@@ -203,6 +241,20 @@ export function postTallyXML(xml: string): Promise<string> {
             reject(err);
         }
     });
+}
+
+// Cheap liveness check. Returns true if Tally answers a tiny Collection query
+// within the configured ping timeout. Heavy tools call this first so they can
+// fail fast (~3s) with a clear "Tally not responding" message instead of
+// waiting the full request timeout against a wedged Tally.
+export async function pingTally(timeoutMs: number = tally_ping_timeout_ms): Promise<boolean> {
+    const xml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>MCPPingCollection</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME="MCPPingCollection"><TYPE>Company</TYPE></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+    try {
+        await postTallyXML(xml, { timeoutMs });
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 function substituteTDLParameters(msg: string, substitutions: Map<string, any>): string {
@@ -365,6 +417,16 @@ export function handlePush(templateName: string, inputParams: Map<string, any>):
             lastVchId: 0
         };
         try {
+            // Same pre-flight as handlePull: fail in ~3s if Tally is wedged
+            // instead of waiting the full request timeout against a dead
+            // socket. Writes are even more critical to fail fast on since
+            // a hung push leaves the caller unsure if the voucher saved.
+            const alive = await pingTally();
+            if (!alive) {
+                retval.error = `Tally is not responding (ping timed out). It may be showing a modal dialog (check the Tally window for popups), or the XML server is wedged. Dismiss any popups and retry, or restart Tally if it stays unresponsive.`;
+                return resolve(retval);
+            }
+
             let objTemplate = lstPushTemplate.find(t => t.name == templateName);
 
             if (!objTemplate) {

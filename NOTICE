@@ -1,5 +1,5 @@
 Tally Prime MCP Server
-Copyright (c) 2026 Jinacode Systems
+Copyright (c) 2026 Jina Code Systems LLP
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU Affero General Public License as published by
@@ -15,9 +15,52 @@ You should have received a copy of the GNU Affero General Public License
 along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 ================================================================================
+ADDITIONAL TERMS UNDER AGPL-3.0 SECTION 7(b) - REQUIRED ATTRIBUTION
+================================================================================
+
+In addition to the permissions granted by AGPL-3.0, and as expressly authorised
+by Section 7(b) of that licence, this work imposes the following non-removable
+attribution requirement on all conveyed copies, modified versions, and
+derivative works ("Covered Works"):
+
+    Every Covered Work, when conveyed in source or object form, must
+    preserve the following notice in a reasonably visible location:
+
+        "A Jina Code Systems LLP project.
+         Copyright (c) 2026 Jina Code Systems LLP.
+         Licensed under AGPL-3.0-or-later."
+
+    Specifically:
+
+      (a) in any README, project landing page, or similar user-facing
+          documentation file conveyed with the source;
+      (b) in any "About", "Credits", "--version", or startup banner
+          output produced by the running program; and
+      (c) in any user-facing administrative or status interface (e.g. the
+          MCP server's OAuth metadata, status tray icon menu, or
+          web-based admin console) where the program identifies itself
+          to the user.
+
+    The text above this paragraph (the "Required Attribution") is the
+    "appropriate legal notice" referenced in AGPL-3.0 Section 7(b). It
+    may be supplemented (e.g. with the modifier's own attribution
+    alongside it) but it MAY NOT be removed, replaced, or rendered
+    visually less prominent than other comparable notices.
+
+This Section 7(b) requirement is a "further restriction" within the meaning of
+AGPL-3.0 Section 7 only to the extent necessary to enforce attribution; it does
+not impose any other restriction on the rights granted by AGPL-3.0. Downstream
+recipients are free to remove this paragraph (the "ADDITIONAL TERMS" section)
+itself only if they also keep the Required Attribution intact in the locations
+listed in (a)-(c) above.
+
+================================================================================
 
 This project is based on tally-mcp-server by Dhananjay Gokhale, originally
-released under the MIT License:
+released under the MIT License. The MIT licence below covers Mr. Gokhale's
+original contribution; it does not extend to subsequent modifications by
+Jina Code Systems LLP and other contributors, which are licensed under
+AGPL-3.0-or-later as described above.
 
     MIT License
 

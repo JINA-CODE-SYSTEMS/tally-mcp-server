@@ -221,9 +221,11 @@ const handleMcpRequest = async (req: express.Request, res: express.Response) => 
         // Store the transport by session ID
         transports[sessionId] = transport;
       },
-      // DNS rebinding protection — allow the configured domain hostname
+      // DNS rebinding protection — allow the configured domain host (hostname + port).
+      // The SDK compares against the raw Host header, which always includes the port for
+      // non-default ports, so `.hostname` ('localhost') would never match 'localhost:3000'.
       enableDnsRebindingProtection: true,
-      allowedHosts: [new URL(mcpDomain).hostname],
+      allowedHosts: [new URL(mcpDomain).host],
     });
 
     // Clean up transport when closed
@@ -556,7 +558,13 @@ app.post('/token', authRateLimiter, (req, res) => {
 
 // Bind to 127.0.0.1 — use reverse proxy for external access
 const bindHost = process.env.BIND_HOST || '127.0.0.1';
-const httpServer = app.listen(mcpPort, bindHost, () => console.log(`MCP Server started on ${bindHost}:${mcpPort}`));
+const httpServer = app.listen(mcpPort, bindHost, () => {
+  // Required attribution under AGPL-3.0 § 7(b) (see NOTICE file). Forks must keep this banner;
+  // see scripts/check-attribution.* for the regression check.
+  console.log('Tally Prime MCP Server  -  A Jina Code Systems LLP project');
+  console.log('Copyright (c) 2026 Jina Code Systems LLP. Licensed under AGPL-3.0-or-later.');
+  console.log(`MCP Server started on ${bindHost}:${mcpPort}`);
+});
 
 // Graceful shutdown — without this, NSSM/systemd hang in StopPending until force-killed
 const shutdown = (signal: string) => {

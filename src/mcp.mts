@@ -1,6 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import dotenv from 'dotenv';
-import { execSync } from 'node:child_process';
+import { execSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
@@ -62,14 +62,99 @@ async function verifyCompanyLoaded(targetName: string): Promise<boolean> {
 }
 
 // Returns the names of companies currently loaded in Tally's UI.
-// Uses handlePull directly (not the wrapper) so SVCURRENTCOMPANY isn't injected — we want all open companies.
+//
+// Uses Tally's raw Collection query (TYPE=Collection) rather than the
+// list-master TDL template. Empirically, the template projection (`$Name` on
+// the Company collection) returns empty rows in several Tally Prime / Edit Log
+// configurations, while the raw Collection query reliably returns each loaded
+// company as `<COMPANY NAME="..." RESERVEDNAME="" />` — with the company name
+// as an XML attribute. We pull the names with a regex rather than instantiating
+// a new XML parser since attribute-form is the only thing we need.
 async function listLoadedCompanies(): Promise<string[]> {
-  const inputParams = new Map<string, any>([['collection', 'company']]);
-  const resp = await handlePull('list-master', inputParams);
-  if (!resp?.data) return [];
-  return resp.data
-    .map((c: any) => String(c.F01 || c.name || '').trim())
-    .filter((n: string) => n.length > 0);
+  const xml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>MCPLoadedCompaniesList</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME="MCPLoadedCompaniesList"><TYPE>Company</TYPE></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+  try {
+    const resp = await postTallyXML(xml);
+    const names: string[] = [];
+    const re = /<COMPANY[^>]*\sNAME\s*=\s*"([^"]+)"/gi;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(resp)) !== null) {
+      const name = match[1].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').trim();
+      if (name && !names.includes(name)) names.push(name);
+    }
+    return names;
+  } catch {
+    return [];
+  }
+}
+
+// Normalize a company name for fuzzy comparison: lowercase, drop everything
+// except letters and digits. Lets us match "Ross Computer Pvt Ltd" against
+// "ROSS COMPUTERS PVT. LTD." despite differing punctuation, case, and plurals
+// (well, almost — plurals still differ; substring match below handles that).
+function normalizeCompanyName(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+// Standard Levenshtein distance — number of single-character edits (insertions,
+// deletions, substitutions) to transform `a` into `b`. O(n*m) memory and time;
+// fine for short strings like company names. Used as the last fuzzy-match tier
+// to catch typos and plural mismatches (e.g. "Computer" vs "Computers").
+function levenshteinDistance(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  const dp: number[][] = [];
+  for (let i = 0; i <= a.length; i++) {
+    dp.push(new Array(b.length + 1).fill(0));
+    dp[i][0] = i;
+  }
+  for (let j = 0; j <= b.length; j++) dp[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1][j - 1]
+        : 1 + Math.min(dp[i - 1][j - 1], dp[i - 1][j], dp[i][j - 1]);
+    }
+  }
+  return dp[a.length][b.length];
+}
+
+// Finds the loaded company that best matches `target`. Returns the EXACT
+// Tally-side name (preserving case + punctuation) so the caller can use it
+// in subsequent queries. Returns null when nothing matches.
+//
+// Match tiers (first one that hits wins):
+//   1. Case-insensitive exact match
+//   2. Normalized exact match (strip case + punctuation + whitespace)
+//   3. Normalized substring match — either direction, so "Ross" matches
+//      "Ross Computers Pvt. Ltd." and vice versa
+//   4. Levenshtein distance ≤ 15% of longer name length (min 2) — catches
+//      single-char typos and plural mismatches like "Computer" vs "Computers"
+export function findMatchingLoadedCompany(target: string, loaded: string[]): string | null {
+  if (!loaded || loaded.length === 0 || !target) return null;
+  const t = target.toLowerCase();
+  for (const c of loaded) {
+    if (c.toLowerCase() === t) return c;
+  }
+  const tn = normalizeCompanyName(target);
+  if (!tn) return null;
+  for (const c of loaded) {
+    if (normalizeCompanyName(c) === tn) return c;
+  }
+  for (const c of loaded) {
+    const cn = normalizeCompanyName(c);
+    if (cn.includes(tn) || tn.includes(cn)) return c;
+  }
+  let best: { name: string; dist: number } | null = null;
+  for (const c of loaded) {
+    const cn = normalizeCompanyName(c);
+    const dist = levenshteinDistance(tn, cn);
+    const maxDist = Math.max(2, Math.floor(Math.max(tn.length, cn.length) * 0.15));
+    if (dist <= maxDist && (!best || dist < best.dist)) {
+      best = { name: c, dist };
+    }
+  }
+  return best ? best.name : null;
 }
 
 // Parses tally.ini content and returns the list of company IDs in `Load=` directives under [TALLY].
@@ -173,12 +258,6 @@ export type AvailableCompany = {
 
 // Optional credential-hint config. Mapping of folder id → known credential metadata.
 // Allows callers to know up-front whether to ask the human for credentials (issue #16, piece C).
-// Path: <dataPath>/.tally-mcp-companies.json by default, or override via TALLY_COMPANIES_CONFIG env var.
-// Format:
-//   {
-//     "100000": { "requiresCredentials": true,  "knownUsername": "admin", "notes": "Edit Log w/ user-based security" },
-//     "200000": { "requiresCredentials": false, "notes": "Auto-loads cleanly" }
-//   }
 // We never store passwords here — only the hint that one is needed.
 export type CompaniesConfig = {
   [folderId: string]: {
@@ -188,16 +267,163 @@ export type CompaniesConfig = {
   };
 };
 
+// Company registry entry — one configured alias the user can refer to from an LLM ("load main").
+// Passwords live in `passwordEnc` as a DPAPI-encrypted base64 blob; plaintext never touches disk.
+export type CompanyEntry = {
+  alias: string;
+  extraAliases?: string[];
+  folderId: string;
+  displayName?: string;
+  username?: string;
+  passwordEnc?: string;
+  notes?: string;
+};
+
+// The on-disk shape of .tally-mcp-companies.json after the registry feature.
+// Old-shape files (a flat { folderId: hints } map) are migrated into `legacyHints` on read;
+// `companies` starts empty and is populated via the Manage Companies dashboard.
+// Path: <dataPath>/.tally-mcp-companies.json by default, or override via TALLY_COMPANIES_CONFIG env var.
+export type CompanyRegistry = {
+  schemaVersion: 1;
+  companies: CompanyEntry[];
+  legacyHints?: CompaniesConfig;
+};
+
+export const EMPTY_COMPANY_REGISTRY: CompanyRegistry = {
+  schemaVersion: 1,
+  companies: [],
+};
+
+function isNewRegistryShape(parsed: any): parsed is CompanyRegistry {
+  return !!parsed
+    && typeof parsed === 'object'
+    && !Array.isArray(parsed)
+    && parsed.schemaVersion === 1
+    && Array.isArray(parsed.companies);
+}
+
+// Back-compat reader — returns just the flat hints. Used by scanAvailableCompanies and any other
+// caller that only cares about "does this folderId need a credential prompt." New code should
+// prefer loadCompanyRegistry instead.
 export function loadCompaniesConfig(configPath: string): CompaniesConfig {
   try {
     if (!fs.existsSync(configPath)) return {};
     const raw = fs.readFileSync(configPath, 'utf-8').replace(/^﻿/, '');
     const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as CompaniesConfig;
-    return {};
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    if (isNewRegistryShape(parsed)) return parsed.legacyHints ?? {};
+    return parsed as CompaniesConfig;
   } catch {
     return {};
   }
+}
+
+// Reads the full registry. Migrates old-shape files in-memory only — does NOT write back.
+// Persistence happens through saveCompanyRegistry, called from the Manage Companies dashboard.
+export function loadCompanyRegistry(configPath: string): CompanyRegistry {
+  try {
+    if (!fs.existsSync(configPath)) return { schemaVersion: 1, companies: [] };
+    const raw = fs.readFileSync(configPath, 'utf-8').replace(/^﻿/, '');
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { schemaVersion: 1, companies: [] };
+    }
+    if (isNewRegistryShape(parsed)) return parsed;
+    return {
+      schemaVersion: 1,
+      companies: [],
+      legacyHints: parsed as CompaniesConfig,
+    };
+  } catch {
+    return { schemaVersion: 1, companies: [] };
+  }
+}
+
+// Atomic write of the registry. Used by the Manage Companies dashboard on save.
+// Caller is responsible for ensuring passwordEnc fields are already DPAPI-encrypted —
+// this function never sees plaintext and never transforms entries.
+export function saveCompanyRegistry(configPath: string, registry: CompanyRegistry): void {
+  atomicWriteFile(configPath, JSON.stringify(registry, null, 2) + '\n');
+}
+
+// Case-insensitive exact-match lookup against alias + extraAliases. Returns null if no match —
+// callers should surface the list of valid aliases in the error so the LLM can recover.
+export function findCompanyByAlias(registry: CompanyRegistry, alias: string): CompanyEntry | null {
+  const target = alias.trim().toLowerCase();
+  if (!target) return null;
+  for (const c of registry.companies) {
+    if (c.alias.trim().toLowerCase() === target) return c;
+    if (c.extraAliases?.some(a => a.trim().toLowerCase() === target)) return c;
+  }
+  return null;
+}
+
+// Returns every alias the user could legitimately type — main alias + extra aliases, deduped,
+// in declaration order. Used in error messages when an unknown alias is requested.
+export function listConfiguredAliases(registry: CompanyRegistry): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const c of registry.companies) {
+    for (const a of [c.alias, ...(c.extraAliases ?? [])]) {
+      const key = a.trim().toLowerCase();
+      if (key && !seen.has(key)) {
+        seen.add(key);
+        out.push(a);
+      }
+    }
+  }
+  return out;
+}
+
+// Path to the PowerShell helper that performs the actual DPAPI Protect/Unprotect.
+// Compiled output lives in dist/, so the helper resolves to ../scripts/dpapi-helper.ps1.
+function dpapiHelperPath(): string {
+  return path.resolve(import.meta.dirname, '..', 'scripts', 'dpapi-helper.ps1');
+}
+
+// Spawns the DPAPI helper with input on stdin (never command-line args, so secrets don't
+// appear in process listings). Returns the helper's stdout as a string. Throws if the helper
+// exits non-zero, returns empty output, or cannot be spawned.
+function runDpapiHelper(action: 'encrypt' | 'decrypt', input: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', dpapiHelperPath(), '-Action', action],
+      { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
+    );
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', d => { stdout += d.toString('utf-8'); });
+    child.stderr.on('data', d => { stderr += d.toString('utf-8'); });
+    child.on('error', reject);
+    child.on('close', code => {
+      if (code !== 0) {
+        reject(new Error(`dpapi-helper ${action} exited ${code}: ${stderr.trim() || 'unknown error'}`));
+        return;
+      }
+      if (!stdout) {
+        reject(new Error(`dpapi-helper ${action} returned empty output`));
+        return;
+      }
+      resolve(stdout);
+    });
+    child.stdin.end(input, 'utf-8');
+  });
+}
+
+// Encrypts a password using Windows DPAPI (LocalMachine scope). Returns a base64 blob suitable
+// for storage in CompanyEntry.passwordEnc. The plaintext is passed via stdin to the helper
+// process — it never appears on the command line or in any log.
+export async function encryptPasswordViaDpapi(plaintext: string): Promise<string> {
+  if (!plaintext) throw new Error('encryptPasswordViaDpapi: plaintext is empty');
+  return runDpapiHelper('encrypt', plaintext);
+}
+
+// Decrypts a DPAPI blob previously produced by encryptPasswordViaDpapi. Throws if the blob was
+// encrypted on a different machine, with a different scope, or has been tampered with.
+export async function decryptPasswordViaDpapi(blob: string): Promise<string> {
+  if (!blob) throw new Error('decryptPasswordViaDpapi: blob is empty');
+  return runDpapiHelper('decrypt', blob);
 }
 
 // Recursively scans a Tally data directory for company folders and extracts everything we can
@@ -441,6 +667,13 @@ async function waitForTallyReady(timeoutMs: number, logs: string[]): Promise<boo
 
 // Wraps handlePull — injects activeCompany as targetCompany fallback when the caller did not specify one.
 async function pull(reportName: string, inputParams: Map<string, any>) {
+  // Default to activeCompany if caller didn't specify one. activeCompany was
+  // resolved by set-active-company (which does fuzzy + user-confirmation), so
+  // it's always an exact Tally name by the time it lands here. We do NOT
+  // silently fuzzy-resolve a user-supplied targetCompany — that would risk
+  // running the report against the wrong company. If targetCompany is
+  // imprecise, Tally returns empty data; the user is expected to first call
+  // set-active-company which guides them through the fuzzy-match confirmation.
   if (!inputParams.has('targetCompany') && activeCompany) {
     inputParams.set('targetCompany', activeCompany);
   }
@@ -1079,18 +1312,86 @@ export async function registerMcpServer(): Promise<McpServer> {
     async (args) => {
       const start = Date.now();
       try {
-        const loaded = await verifyCompanyLoaded(args.companyName);
-        if (!loaded) {
-          auditLog('set-active-company', args, 'error', Date.now() - start);
+        // Tier 1: exact match against the authoritative loaded-companies list.
+        // Case-insensitive + whitespace-normalized so hidden chars (NBSP, CR,
+        // trailing whitespace) don't cause false negatives. This is what closes
+        // the "user confirms the suggested name but still gets a fuzzy loop"
+        // bug: when fuzzy Tier 3 suggests "ROSS COMPUTER PVT. LTD." and the
+        // user re-calls with that exact string, this tier matches and accepts.
+        const normalize = (s: string) => s.replace(/\s+/g, ' ').trim().toLowerCase();
+        const requestedNorm = normalize(args.companyName);
+        const loaded = await listLoadedCompanies();
+        const exactInLoaded = loaded.find(n => normalize(n) === requestedNorm);
+        if (exactInLoaded) {
+          activeCompany = exactInLoaded;
+          auditLog('set-active-company', args, 'success', Date.now() - start);
           return {
-            isError: true,
-            content: [{ type: 'text', text: `Company "${args.companyName}" is not currently loaded in Tally. Use list-loaded-companies to see available companies, or open-company to load it first.` }]
+            content: [{ type: 'text', text: `Active company set to "${exactInLoaded}". Subsequent tools will target this company unless targetCompany is specified explicitly.` }]
           };
         }
-        activeCompany = args.companyName;
-        auditLog('set-active-company', args, 'success', Date.now() - start);
+
+        // Tier 2: SVCURRENTCOMPANY probe — useful if listLoadedCompanies is
+        // momentarily out of sync with Tally's actual current-company pointer.
+        if (await verifyCompanyLoaded(args.companyName)) {
+          activeCompany = args.companyName;
+          auditLog('set-active-company', args, 'success', Date.now() - start);
+          return {
+            content: [{ type: 'text', text: `Active company set to "${args.companyName}". Subsequent tools will target this company unless targetCompany is specified explicitly.` }]
+          };
+        }
+
+        // Tier 3: fuzzy match against the loaded list.
+        // We DO NOT auto-resolve — risk of running tools against the wrong
+        // company if the fuzzy match guesses wrong. Instead, surface the
+        // closest candidate(s) so the caller (or the LLM) can confirm and
+        // re-call set-active-company with the exact name (which Tier 1 will
+        // then accept via normalized comparison).
+        const closest = findMatchingLoadedCompany(args.companyName, loaded);
+        auditLog('set-active-company', args, 'denied', Date.now() - start);
+
+        if (closest) {
+          // Fuzzy match found — show user/LLM what they searched, what we
+          // found, and ask them to confirm by re-calling with the exact name.
+          return {
+            isError: true,
+            content: [{
+              type: 'text',
+              text:
+`Company "${args.companyName}" was not found as an exact match.
+
+Did you mean "${closest}"?
+  - Searched: "${args.companyName}"
+  - Closest match in Tally: "${closest}"
+
+To confirm and use this company, call set-active-company again with the EXACT name:
+  set-active-company(companyName: "${closest}")
+
+Other companies currently loaded in Tally:
+${loaded.map(n => `  - "${n}"`).join('\n')}`
+            }]
+          };
+        }
+
+        if (loaded.length === 0) {
+          return {
+            isError: true,
+            content: [{ type: 'text', text: `Company "${args.companyName}" not found and no companies are currently loaded in Tally. Use open-company or load-company-by-alias to load one first.` }]
+          };
+        }
+
+        // No fuzzy match either — show what IS loaded.
         return {
-          content: [{ type: 'text', text: `Active company set to "${args.companyName}". Subsequent tools will target this company unless targetCompany is specified explicitly.` }]
+          isError: true,
+          content: [{
+            type: 'text',
+            text:
+`Company "${args.companyName}" not found in Tally — and no fuzzy match was close enough to suggest.
+
+Companies currently loaded in Tally:
+${loaded.map(n => `  - "${n}"`).join('\n')}
+
+Call set-active-company again with one of these EXACT names, or use open-company to load a different one.`
+          }]
         };
       } catch (err) {
         auditLog('set-active-company', args, 'error', Date.now() - start);
@@ -2221,6 +2522,121 @@ export async function registerMcpServer(): Promise<McpServer> {
       return {
         content: [{ type: 'text', text: JSON.stringify({ success: true, created: resp.created, lastVchId: resp.lastVchId, taxBreakup: { taxableValue, cgstAmount, sgstAmount, igstAmount, totalInvoiceValue } }) }]
       };
+    }
+  );
+
+  // --- Company registry tools (issue: alias-based fast loading) -----------------------------
+  // Resolves the registry path from env, with the same fallback the installer uses.
+  const resolveRegistryPath = (): string => {
+    if (process.env.TALLY_COMPANIES_CONFIG) return process.env.TALLY_COMPANIES_CONFIG;
+    const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+    return path.join(dataPath, '.tally-mcp-companies.json');
+  };
+
+  mcpServer.registerTool(
+    'list-configured-companies',
+    {
+      title: 'List Configured Companies',
+      description: `lists all companies the user has pre-configured in the Tally MCP registry via the tray dashboard's Manage Companies screen. Each entry is a friendly alias (e.g. "main", "branch") the user can refer to when asking to load a company. Use this BEFORE load-company-by-alias when the user says a short name without specifying an exact match — surface the list so they can clarify. Returns alias, displayName, and whether a stored password exists (never the password itself).`,
+      inputSchema: {},
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      try {
+        const registry = loadCompanyRegistry(resolveRegistryPath());
+        const out = registry.companies.map(c => ({
+          alias: c.alias,
+          extraAliases: c.extraAliases ?? [],
+          folderId: c.folderId,
+          displayName: c.displayName ?? '',
+          hasPassword: !!c.passwordEnc,
+          notes: c.notes ?? ''
+        }));
+        auditLog('list-configured-companies', args, 'success', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify({ count: out.length, companies: out }, null, 2) }] };
+      } catch (err) {
+        auditLog('list-configured-companies', args, 'error', Date.now() - start);
+        return { isError: true, content: [{ type: 'text', text: `list-configured-companies failed: ${err}` }] };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'load-company-by-alias',
+    {
+      title: 'Load Company by Alias',
+      description: `fast deterministic load of a Tally company using a pre-configured alias from the registry. Looks up the alias, decrypts any stored password locally, and dispatches a keystroke flow to the GUI agent: types the folder ID, presses Enter, then types username/password if stored. Prefer this over open-company when the user refers to a company by a short name they've configured (use list-configured-companies first to see what's available). Returns success once Tally has accepted the keystrokes. If the alias is unknown, returns an error listing all valid aliases.`,
+      inputSchema: {
+        alias: z.string().describe('the friendly name the user configured (e.g. "main", "branch"). Case-insensitive, matched against alias and extraAliases.')
+      },
+      annotations: {
+        readOnlyHint: false,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      const logs: string[] = [];
+      try {
+        const registry = loadCompanyRegistry(resolveRegistryPath());
+        const entry = findCompanyByAlias(registry, args.alias);
+        if (!entry) {
+          const valid = listConfiguredAliases(registry);
+          const hint = valid.length > 0
+            ? `Valid aliases: ${valid.join(', ')}. Configure new aliases via the tray icon > Manage Companies.`
+            : `No companies configured yet. Open the tray icon > Manage Companies to add one.`;
+          auditLog('load-company-by-alias', args, 'denied', Date.now() - start);
+          return { isError: true, content: [{ type: 'text', text: `Unknown alias "${args.alias}". ${hint}` }] };
+        }
+
+        // Decrypt the stored password just before dispatch. The plaintext lives in this
+        // function's locals for ~milliseconds and is never logged (auditLog strips fields
+        // named 'password'/'secret'/'token' from args before writing).
+        let plaintextPassword = '';
+        if (entry.passwordEnc) {
+          try {
+            plaintextPassword = await decryptPasswordViaDpapi(entry.passwordEnc);
+          } catch (err) {
+            auditLog('load-company-by-alias', args, 'error', Date.now() - start);
+            return {
+              isError: true,
+              content: [{ type: 'text', text: `Decryption failed for alias "${entry.alias}": ${err}. Fix via tray icon > Manage Companies > Edit > tick "Change password".` }]
+            };
+          }
+        }
+
+        const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const timeoutSec = 30;
+        const resp = await callGuiAgent(
+          'select-and-unlock-company',
+          { companyId: entry.folderId, userName: entry.username ?? '', password: plaintextPassword },
+          timeoutSec,
+          dataPath,
+          logs
+        );
+
+        if (!resp) {
+          auditLog('load-company-by-alias', args, 'error', Date.now() - start);
+          return { isError: true, content: [{ type: 'text', text: `GUI agent did not respond within ${timeoutSec}s. Is the agent running? Logs:\n${logs.join('\n')}` }] };
+        }
+        if (resp.status !== 'success') {
+          auditLog('load-company-by-alias', args, 'error', Date.now() - start);
+          return { isError: true, content: [{ type: 'text', text: `Load failed for "${entry.alias}": ${resp.message}. If the password is wrong, fix via tray icon > Manage Companies > Edit > tick "Change password".` }] };
+        }
+
+        activeCompany = entry.displayName || entry.folderId;
+        auditLog('load-company-by-alias', args, 'success', Date.now() - start);
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ success: true, alias: entry.alias, folderId: entry.folderId, displayName: entry.displayName ?? '', agentMessage: resp.message }) }]
+        };
+      } catch (err) {
+        auditLog('load-company-by-alias', args, 'error', Date.now() - start);
+        return { isError: true, content: [{ type: 'text', text: `load-company-by-alias failed: ${err}` }] };
+      }
     }
   );
 
