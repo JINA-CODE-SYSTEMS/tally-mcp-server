@@ -224,6 +224,43 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         }
     }
 
+    # --- 0. Normalize + validate MCP_DOMAIN before it reaches .env ----------
+    # server.mjs builds every OAuth metadata URL by string-concatenating MCP_DOMAIN and also
+    # calls `new URL(mcpDomain)`. A bare host (e.g. tally-mcp.attention.sh) therefore emits
+    # schemeless OAuth metadata that every MCP client rejects, and a malformed value (e.g. an
+    # accidental https:///host from a fat-fingered paste) yields broken metadata or throws at
+    # startup. Operators type this by hand in the wizard, and this script is the single choke
+    # point before the value is persisted, so normalize aggressively here and only fail when the
+    # value is genuinely unparseable. Blank MUST stay blank ("localhost-only mode") - we never
+    # turn an empty value into a scheme-only URL.
+    if ($McpDomain -and $McpDomain.Trim().Length -gt 0) {
+        $McpDomainOriginal = $McpDomain
+        $normalized = $McpDomain.Trim()
+        # 1. Ensure a scheme. A bare host -> https:// (the safe default for a public OAuth server).
+        if ($normalized -notmatch '^https?://') {
+            $normalized = "https://$normalized"
+        }
+        # 2. Collapse an accidental 3+ slashes right after the scheme (https:///host) to exactly two.
+        $normalized = $normalized -replace '^(https?:)/+', '$1//'
+        # 3. Strip trailing slash(es) so downstream string-concatenation doesn't double them.
+        $normalized = $normalized.TrimEnd('/')
+        # 4. Validate: it must parse to an absolute http/https URI with a non-empty host.
+        $parsed = $normalized -as [uri]
+        if (-not $parsed -or -not $parsed.IsAbsoluteUri -or `
+            ($parsed.Scheme -ne 'http' -and $parsed.Scheme -ne 'https') -or `
+            [string]::IsNullOrEmpty($parsed.Host)) {
+            throw "MCP_DOMAIN value '$McpDomainOriginal' could not be normalized into a valid http(s) URL (best effort was '$normalized'). Fix it in the wizard or .env (expected e.g. https://tally-mcp.example.com)."
+        }
+        $McpDomain = $normalized
+        if ($McpDomain -ne $McpDomainOriginal) {
+            Write-Host "[OK] Normalized MCP_DOMAIN '$McpDomainOriginal' -> '$McpDomain'"
+        }
+    } else {
+        # Whitespace-only (e.g. "   ") is not a domain - treat it as blank so the .env write below
+        # takes the localhost-only branch instead of persisting MCP_DOMAIN=<spaces>.
+        $McpDomain = ''
+    }
+
     # --- 1. Write .env -----------------------------------------------------
     # Atomic-ish: write to .tmp, then rename, so a half-written .env never appears.
     # We do NOT log the password itself; the transcript captures parameter binding which

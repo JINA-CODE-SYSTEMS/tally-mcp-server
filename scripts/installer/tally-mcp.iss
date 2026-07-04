@@ -176,7 +176,7 @@ begin
   ConfigPage.Add('Tally executable path:', False);
   ConfigPage.Add('Tally data folder:', False);
   ConfigPage.Add('tally.ini path:', False);
-  ConfigPage.Add('Public domain (leave blank for localhost-only):', False);
+  ConfigPage.Add('Public domain (blank = localhost-only; e.g. https://tally-mcp.example.com):', False);
   ConfigPage.Add('Windows user the GUI agent runs as (default: current user):', False);
 
   // Auto-detect defaults from the box. These are the conventional Tally Prime Edit Log paths;
