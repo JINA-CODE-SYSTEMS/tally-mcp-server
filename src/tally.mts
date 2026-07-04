@@ -9,18 +9,30 @@ import { utility } from './utility.mjs';
 
 dotenv.config({ override: true, quiet: true });
 
+// Parse a positive-integer env var, falling back to `fallback` when the value is
+// missing, non-numeric (NaN), or not strictly positive. Guards against operator
+// misconfig silently defeating hang-protection: a bad TALLY_REQUEST_TIMEOUT_MS
+// parsed straight through parseInt yields NaN, and req.setTimeout(NaN) installs
+// no timeout at all — turning a typo into an unbounded hang. `0`/negative would
+// likewise misbehave (immediate or nonsensical timeout), so both are rejected.
+export function parseIntEnv(raw: string | undefined, fallback: number): number {
+    if (raw === undefined) return fallback;
+    const parsed = parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 const tally_host = process.env.TALLY_HOST || 'localhost'; // default to localhost
-const tally_port = parseInt(process.env.TALLY_PORT || '9000'); // default to 9000 XML port of Tally
+const tally_port = parseIntEnv(process.env.TALLY_PORT, 9000); // default to 9000 XML port of Tally
 // Hard cap on a single Tally HTTP round trip. Tally's XML server is single-threaded
 // and stops processing any request while a modal dialog (license expiry, "Bad formula",
 // split-period prompts, etc.) is on screen. Without this cap, requests hang
 // indefinitely and pile up. Default 30s — long enough for big balance-sheet pulls,
 // short enough that the MCP client doesn't sit forever on a dead Tally.
-const tally_request_timeout_ms = parseInt(process.env.TALLY_REQUEST_TIMEOUT_MS || '30000');
+const tally_request_timeout_ms = parseIntEnv(process.env.TALLY_REQUEST_TIMEOUT_MS, 30000);
 // Pre-flight ping timeout. Short — a healthy Tally answers a Collection query in
 // <100ms. If the ping doesn't come back in 3s we treat Tally as wedged and abort
 // the heavy call immediately with a clear error instead of waiting the full 30s.
-const tally_ping_timeout_ms = parseInt(process.env.TALLY_PING_TIMEOUT_MS || '3000');
+const tally_ping_timeout_ms = parseIntEnv(process.env.TALLY_PING_TIMEOUT_MS, 3000);
 const __dirname = import.meta.dirname;
 const lstPullReport: m.ModelPullReportInfo[] = JSON.parse(fs.readFileSync(path.join(__dirname, '../pull/config.json'), 'utf-8'))['reports'];
 const lstPushTemplate: m.ModelPushTemplateInfo[] = JSON.parse(fs.readFileSync(path.join(__dirname, '../push/config.json'), 'utf-8'))['templates'];
