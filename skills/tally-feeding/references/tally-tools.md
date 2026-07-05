@@ -110,7 +110,7 @@ GST-bearing notes.
 | `list-available-companies` | `dataPath`, `configPath` (optional) | Scan a data path for companies (incl. backups). |
 | `list-configured-companies` | — | Companies with saved credential hints. |
 | `set-active-company` | `companyName` | Switch the default target. |
-| `open-company` | `companyName`, `strategy` (`auto`\|`tdl-load`\|`tdl-connect`\|`gui-agent`) | Open/attach a company. |
+| `open-company` | `companyName`, `strategy` (`auto`\|`verify-svcurrentcompany`\|`verify-in-loaded-list`\|`gui-agent`) | Verify a company is active, or GUI-load it. Only `gui-agent` actually loads; the `verify-*` strategies just check. For a cold load use `load-company` / `load-company-by-alias`. (Old `tdl-load`/`tdl-connect` accepted as deprecated aliases.) |
 | `load-company` / `load-company-by-alias` | `company`, `replace`, `dataPath`, `userName`, `password`, `waitTimeoutSec` | Cold-load via Tally restart (edition-aware). Credentials are filtered from audit logs. |
 | `open-company-debug` | `includeRecentResult`, `watchDir` | Diagnose open/load issues. |
 | `tally-raw-xml-probe` | `xml`, `label` | Debug-only raw XML probe. Not for routine feeding. |
