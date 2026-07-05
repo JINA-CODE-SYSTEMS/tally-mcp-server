@@ -772,11 +772,48 @@ async function push(templateName: string, inputParams: Map<string, any>) {
   return handlePush(templateName, inputParams);
 }
 
+// Static list of external preconditions surfaced by get-context so a fresh agent
+// can learn what must be running before it loads a company — without hitting walls.
+export function getTallyRequirements(): { requirement: string; why: string }[] {
+  return [
+    { requirement: 'Tally Prime running with its XML/HTTP server enabled (default port 9000)', why: 'Every data read (ledgers, vouchers, GST, balance sheet) goes through Tally\'s XML server.' },
+    { requirement: 'GUI automation agent (tally-gui-agent-v2.ps1) running in the interactive desktop session', why: 'Required to load/switch companies and to unlock password-protected companies. Not needed for read-only queries against an already-loaded company.' },
+    { requirement: 'Credentials for password-protected companies', why: 'load-company / load-company-by-alias need userName+password for protected companies; list-available-companies flags which folders require them.' },
+    { requirement: 'Edition awareness (Silver vs Gold)', why: 'Silver keeps only one company resident at a time — loading another replaces it; Gold allows several.' },
+  ];
+}
+
+// Server-level tool-selection guidance delivered to the MCP client (like GitHub's MCP does).
+const TALLY_MCP_INSTRUCTIONS = `Tally Prime MCP server — exposes a local Tally Prime ERP as typed tools (GST returns, balance sheet, vouchers, ledgers, masters).
+
+Getting started:
+- Call \`status\` first: is Tally reachable, is the GUI agent alive, what is the active company, edition (silver/gold), and readonly mode. \`get-context\` returns the same plus the list of external requirements.
+- Find a company with \`list-available-companies\` (flags which need credentials) or \`list-companies\`; switch an already-loaded one with \`set-active-company\`.
+- Cold-load with \`load-company\` / \`load-company-by-alias\` (edition-aware; supply userName+password for protected companies). \`open-company\`'s verify-* strategies only check — they do not load.
+- Once a company is active, all query tools target it unless you pass targetCompany.
+
+Hard preconditions (discover via \`status\`/\`get-context\`, don't hit walls):
+- The Tally XML server must be running for any data read.
+- The GUI automation agent must be running to load/switch companies or unlock protected ones.
+- On Silver only one company is resident at a time; loading another replaces it.
+- Write tools are refused when readonly is true (READONLY_MODE).`;
+
+// Shared liveness probe used by both `status` and `get-context`. Retries each
+// probe so a single transient blip doesn't flip the reported state.
+async function probeLiveness(): Promise<{ tallyReachable: boolean; agentAlive: boolean }> {
+  const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+  const tallyReachable = await probeWithRetry(() => pingTally());
+  const agentAlive = await probeWithRetry(async () => (await pingGuiAgent(tallyDataPath, 2)).alive, 2);
+  return { tallyReachable, agentAlive };
+}
+
 export async function registerMcpServer(): Promise<McpServer> {
   const mcpServer = new McpServer({
     name: 'Tally Prime MCP Server',
     title: 'Tally Prime',
     version: '1.0.0'
+  }, {
+    instructions: TALLY_MCP_INSTRUCTIONS
   });
 
   mcpServer.registerTool(
@@ -1342,12 +1379,7 @@ export async function registerMcpServer(): Promise<McpServer> {
     async (args) => {
       const start = Date.now();
       try {
-        const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
-        // Retry both probes so a single transient miss doesn't flip the reported
-        // state. Tally's ping is cheap when healthy; the agent probe uses a short
-        // per-attempt timeout to bound total latency.
-        const tallyReachable = await probeWithRetry(() => pingTally());
-        const agentAlive = await probeWithRetry(async () => (await pingGuiAgent(tallyDataPath, 2)).alive, 2);
+        const { tallyReachable, agentAlive } = await probeLiveness();
         const status = {
           tallyReachable,
           agentAlive,
@@ -1362,6 +1394,41 @@ export async function registerMcpServer(): Promise<McpServer> {
         return {
           isError: true,
           content: [{ type: 'text', text: `status failed: ${err}` }]
+        };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'get-context',
+    {
+      title: 'Get Context',
+      description: `One-shot environment + requirements snapshot: { edition, readonly, activeCompany, agentAlive, tallyReachable, requirements }. Wraps status (live liveness, retried) and adds the static list of external requirements so a fresh agent can learn what must be running before it can load a company — without triggering a failure first.`,
+      inputSchema: {},
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      try {
+        const { tallyReachable, agentAlive } = await probeLiveness();
+        const context = {
+          edition: getTallyEdition(),
+          readonly: process.env.READONLY_MODE === 'true',
+          activeCompany: activeCompany || null,
+          agentAlive,
+          tallyReachable,
+          requirements: getTallyRequirements()
+        };
+        auditLog('get-context', args, 'success', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify(context, null, 2) }] };
+      } catch (err) {
+        auditLog('get-context', args, 'error', Date.now() - start);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `get-context failed: ${err}` }]
         };
       }
     }
