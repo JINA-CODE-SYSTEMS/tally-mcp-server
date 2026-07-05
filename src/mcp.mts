@@ -168,6 +168,18 @@ export function findMatchingLoadedCompany(target: string, loaded: string[]): str
   return best ? best.name : null;
 }
 
+// open-company strategy renames (#24): the old tdl-* names implied a TDL *load*
+// primitive, but these strategies only verify (no XML/TDL load primitive exists).
+// Old names stay accepted as deprecated aliases for one release.
+const OPEN_COMPANY_STRATEGY_ALIASES: Record<string, string> = {
+  'tdl-load': 'verify-svcurrentcompany',
+  'tdl-connect': 'verify-in-loaded-list',
+};
+export function normalizeOpenCompanyStrategy(s: string): { strategy: string; deprecatedAlias: string | null } {
+  const alias = OPEN_COMPANY_STRATEGY_ALIASES[s];
+  return alias ? { strategy: alias, deprecatedAlias: s } : { strategy: s, deprecatedAlias: null };
+}
+
 // Extracts the <TALLYREQUEST> verb from a raw Tally XML envelope (e.g. "Export",
 // "Import", "Alter", "Delete"), lowercased, or null if none is present. Used to
 // keep the raw-XML debug probe read-only by default: only "export" reads data;
@@ -916,10 +928,10 @@ export async function registerMcpServer(): Promise<McpServer> {
     'open-company',
     {
       title: 'Open Company',
-      description: `loads a company into Tally Prime and sets it as the active company for all subsequent queries. Tries strategies in order: (1) SVCURRENTCOMPANY probe — verifies company is directly accessible (works in Tally server/multi-company mode), (2) open company list check — detects if company is already loaded in Tally UI, (3) GUI automation agent that controls Tally UI via Alt+F3 → Select Company → type name → Enter (requires tally-gui-agent-v2.ps1 to be running in the interactive desktop session). Once open-company succeeds, all other tools automatically target this company unless targetCompany is specified explicitly. Use list-companies first to find available company names.`,
+      description: `Verifies a company is active, or GUI-loads it, and sets it as the active company for subsequent queries. Tries strategies in order: (1) SVCURRENTCOMPANY probe — verifies the company is directly accessible (works in Tally server/multi-company mode; does NOT load), (2) loaded-list check — detects if the company is already loaded in the Tally UI (does NOT load), (3) GUI automation agent that controls the Tally UI via Alt+F3 → Select Company → type name → Enter (requires tally-gui-agent-v2.ps1 running in the interactive desktop session; this is the only strategy that actually loads). For a cold load prefer load-company / load-company-by-alias — open-company's non-gui strategies only verify. Once it succeeds, all other tools automatically target this company unless targetCompany is specified explicitly. Use list-companies first to find available company names.`,
       inputSchema: {
         companyName: z.string().describe('exact company name as shown in Tally (e.g. "My Company Pvt Ltd"). Use list-companies or list-master with collection=company to find names.'),
-        strategy: z.enum(['auto', 'tdl-load', 'tdl-connect', 'gui-agent']).optional().describe('which strategy to use. "auto" tries all in order (default). "tdl-load" uses $$CmpLoadCompany. "tdl-connect" uses $$CmpConnect. "gui-agent" uses GUI automation via companion agent running in the interactive desktop session.')
+        strategy: z.enum(['auto', 'verify-svcurrentcompany', 'verify-in-loaded-list', 'gui-agent', 'tdl-load', 'tdl-connect']).optional().describe('which strategy to use. "auto" tries all in order (default). "verify-svcurrentcompany" reads SVCURRENTCOMPANY — succeeds only if the company is already resident (does NOT load). "verify-in-loaded-list" checks the loaded-company list (does NOT load). "gui-agent" performs the actual load via GUI automation (companion agent must be running). Deprecated aliases (still accepted this release): "tdl-load"→verify-svcurrentcompany, "tdl-connect"→verify-in-loaded-list.')
       },
       annotations: {
         readOnlyHint: false,
@@ -928,9 +940,12 @@ export async function registerMcpServer(): Promise<McpServer> {
     },
     async (args) => {
       const start = Date.now();
-      const strategy = args.strategy || 'auto';
+      const { strategy, deprecatedAlias } = normalizeOpenCompanyStrategy(args.strategy || 'auto');
       let companyName = args.companyName;
       const logs: string[] = [];
+      if (deprecatedAlias) {
+        logs.push(`[deprecation] strategy "${deprecatedAlias}" was renamed to "${strategy}"; the old name still works this release but will be removed. See issue #24.`);
+      }
 
       // --- Resolve folder number to company name if needed ---
       // If input looks like a folder number, try to get the real company name from Tally's own company list
@@ -1151,9 +1166,9 @@ export async function registerMcpServer(): Promise<McpServer> {
       try {
         let success = false;
 
-        if (strategy === 'auto' || strategy === 'tdl-load') {
+        if (strategy === 'auto' || strategy === 'verify-svcurrentcompany') {
           success = await tryTdlLoad();
-          if (success || strategy === 'tdl-load') {
+          if (success || strategy === 'verify-svcurrentcompany') {
             if (success) activeCompany = companyName;
             auditLog('open-company', args, success ? 'success' : 'error', Date.now() - start);
             return {
@@ -1163,9 +1178,9 @@ export async function registerMcpServer(): Promise<McpServer> {
           }
         }
 
-        if (strategy === 'auto' || strategy === 'tdl-connect') {
+        if (strategy === 'auto' || strategy === 'verify-in-loaded-list') {
           success = await tryTdlConnect();
-          if (success || strategy === 'tdl-connect') {
+          if (success || strategy === 'verify-in-loaded-list') {
             if (success) activeCompany = companyName;
             auditLog('open-company', args, success ? 'success' : 'error', Date.now() - start);
             return {
