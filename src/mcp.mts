@@ -868,6 +868,56 @@ async function probeLiveness(): Promise<{ tallyReachable: boolean; agentAlive: b
   return { tallyReachable, agentAlive };
 }
 
+// Server version, read from package.json (single source of truth). Falls back to
+// 0.0.0 if the file can't be read.
+export function getServerVersion(): string {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, '..', 'package.json'), 'utf-8'));
+    return typeof pkg.version === 'string' && pkg.version.length > 0 ? pkg.version : '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+}
+
+// The HTTP /status endpoint (#25) is opt-in: disabled unless STATUS_ENDPOINT_PUBLIC
+// is "1" or "true". Pure so the gating can be unit-tested.
+export function isStatusEndpointEnabled(raw: string | undefined = process.env.STATUS_ENDPOINT_PUBLIC): boolean {
+  const v = String(raw ?? '').trim().toLowerCase();
+  return v === '1' || v === 'true';
+}
+
+// Builds the health report served by the HTTP GET /status endpoint. Richer than the
+// MCP `status` tool's stable contract: includes version, agent version handshake,
+// loaded companies, and optional build info. Reuses the retried Tally probe.
+export async function getHttpStatusReport(): Promise<{
+  ok: boolean;
+  version: string;
+  edition: 'silver' | 'gold';
+  readonly: boolean;
+  activeCompany: string | null;
+  agent: { responding: boolean; version: string | null; versionOk: boolean };
+  tally: { reachable: boolean; loadedCompanies: string[] };
+  build: { commit: string | null; builtAt: string | null };
+}> {
+  const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+  const tallyReachable = await probeWithRetry(() => pingTally());
+  const agentPing = await pingGuiAgent(tallyDataPath, 2);
+  let loadedCompanies: string[] = [];
+  if (tallyReachable) {
+    try { loadedCompanies = await listLoadedCompanies(); } catch { /* leave empty */ }
+  }
+  return {
+    ok: tallyReachable,
+    version: getServerVersion(),
+    edition: getTallyEdition(),
+    readonly: process.env.READONLY_MODE === 'true',
+    activeCompany: activeCompany || null,
+    agent: { responding: agentPing.alive, version: agentPing.agentVersion ?? null, versionOk: agentPing.versionOk },
+    tally: { reachable: tallyReachable, loadedCompanies },
+    build: { commit: process.env.GIT_COMMIT ?? null, builtAt: process.env.BUILD_TIME ?? null },
+  };
+}
+
 export async function registerMcpServer(): Promise<McpServer> {
   const mcpServer = new McpServer({
     name: 'Tally Prime MCP Server',
