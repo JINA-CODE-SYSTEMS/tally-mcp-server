@@ -1423,16 +1423,19 @@ export async function registerMcpServer(): Promise<McpServer> {
 
         if (strategy === 'auto' || strategy === 'gui-agent') {
           success = await tryGuiAgent();
-          if (success) activeCompany = companyName;
-          auditLog('open-company', args, success ? 'success' : 'error', Date.now() - start);
-          return {
-            isError: !success,
-            content: [{ type: 'text', text: logs.join('\n') + (success ? `\n\nCompany "${companyName}" is now active. Subsequent tools will automatically target this company.` : '\n\nAll strategies failed. Ensure tally-gui-agent-v2.ps1 is running in the interactive desktop session, then retry.') }]
-          };
+          if (success) {
+            activeCompany = companyName;
+            auditLog('open-company', args, 'success', Date.now() - start);
+            return {
+              content: [{ type: 'text', text: logs.join('\n') + `\n\nCompany "${companyName}" is now active. Subsequent tools will automatically target this company.` }]
+            };
+          }
+          auditLog('open-company', args, 'error', Date.now() - start);
+          return errorResult('AGENT_UNREACHABLE', { message: 'All strategies failed to open the company.', logs: logs.join('\n') });
         }
 
         auditLog('open-company', args, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: logs.join('\n') + '\n\nAll strategies exhausted.' }] };
+        return errorResult('UNKNOWN', { message: 'All open-company strategies exhausted.', logs: logs.join('\n') });
       } catch (err) {
         auditLog('open-company', args, 'error', Date.now() - start);
         return { isError: true, content: [{ type: 'text', text: `Failed to open company: ${err}\n\n${logs.join('\n')}` }] };
@@ -1830,11 +1833,11 @@ Call set-active-company again with one of these EXACT names, or use open-company
       try {
         if (!fs.existsSync(tallyIniPath)) {
           auditLog('load-company', args, 'error', Date.now() - start);
-          return { isError: true, content: [{ type: 'text', text: `tally.ini not found at ${tallyIniPath}. Set TALLY_INI_PATH env var if it lives elsewhere.` }] };
+          return errorResult('PRECONDITION_FAILED', { message: `tally.ini not found at ${tallyIniPath}.`, remedy: 'Set the TALLY_INI_PATH env var if it lives elsewhere.', retryable: false });
         }
         if (!fs.existsSync(tallyExePath)) {
           auditLog('load-company', args, 'error', Date.now() - start);
-          return { isError: true, content: [{ type: 'text', text: `tally.exe not found at ${tallyExePath}. Set TALLY_EXE_PATH env var if it lives elsewhere.` }] };
+          return errorResult('PRECONDITION_FAILED', { message: `tally.exe not found at ${tallyExePath}.`, remedy: 'Set the TALLY_EXE_PATH env var if it lives elsewhere.', retryable: false });
         }
 
         // Resolve data path: explicit override > tally.ini Data= > env var > built-in default.
@@ -1858,12 +1861,20 @@ Call set-active-company again with one of these EXACT names, or use open-company
           const list = resolved.available.length === 0
             ? '(no folders found in data path)'
             : resolved.available.map(f => `  ${f.folder}\t${f.name || '(no name)'}`).join('\n');
-          return { isError: true, content: [{ type: 'text', text: `Company "${company}" not found.\nData path: ${tallyDataPath} (from ${dataPathSource})\nAvailable folders:\n${list}\n\nProvide either an exact folder id (digits) or a name that matches Company.900 exactly. If the data lives elsewhere, pass dataPath="<absolute path>".` }] };
+          return errorResult('COMPANY_NOT_FOUND', {
+            message: `Company "${company}" not found. Data path: ${tallyDataPath} (from ${dataPathSource}).`,
+            remedy: 'Provide an exact folder id (digits) or a name matching Company.900 exactly; pass dataPath="<absolute path>" if the data lives elsewhere.',
+            logs: `Available folders:\n${list}`,
+          });
         }
         if (resolved.kind === 'ambiguous') {
           auditLog('load-company', args, 'error', Date.now() - start);
           const list = resolved.matches.map(f => `  ${f.folder}\t${f.name}`).join('\n');
-          return { isError: true, content: [{ type: 'text', text: `Multiple companies match the name "${company}":\n${list}\n\nRe-call load-company with the specific folder id (e.g. company: "${resolved.matches[0].folder}") to disambiguate.` }] };
+          return errorResult('AMBIGUOUS', {
+            message: `Multiple companies match the name "${company}".`,
+            remedy: `Re-call load-company with the specific folder id (e.g. company: "${resolved.matches[0].folder}") to disambiguate.`,
+            logs: list,
+          });
         }
         const companyId = resolved.folderId;
         logs.push(`[load-company] input="${company}" matchedBy=${resolved.matchedBy} folderId=${companyId} companyName="${resolved.companyName}" edition=${edition} replace=${replace}${edition === 'silver' && args.replace === false ? ' (Silver: replace forced true)' : ''}`);
@@ -2009,10 +2020,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
         };
       } catch (err) {
         auditLog('load-company', args, 'error', Date.now() - start);
-        return {
-          isError: true,
-          content: [{ type: 'text', text: logs.join('\n') + `\n\nload-company failed: ${err}` }]
-        };
+        return errorResult('UNKNOWN', { message: `load-company failed: ${err}`, logs: logs.join('\n') });
       }
     }
   );
@@ -3024,7 +3032,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
             ? `Valid aliases: ${valid.join(', ')}. Configure new aliases via the tray icon > Manage Companies.`
             : `No companies configured yet. Open the tray icon > Manage Companies to add one.`;
           auditLog('load-company-by-alias', args, 'denied', Date.now() - start);
-          return { isError: true, content: [{ type: 'text', text: `Unknown alias "${args.alias}". ${hint}` }] };
+          return errorResult('COMPANY_NOT_FOUND', { message: `Unknown alias "${args.alias}".`, remedy: hint });
         }
 
         // Decrypt the stored password just before dispatch. The plaintext lives in this
@@ -3036,10 +3044,11 @@ Call set-active-company again with one of these EXACT names, or use open-company
             plaintextPassword = await decryptPasswordViaDpapi(entry.passwordEnc);
           } catch (err) {
             auditLog('load-company-by-alias', args, 'error', Date.now() - start);
-            return {
-              isError: true,
-              content: [{ type: 'text', text: `Decryption failed for alias "${entry.alias}": ${err}. Fix via tray icon > Manage Companies > Edit > tick "Change password".` }]
-            };
+            return errorResult('UNKNOWN', {
+              message: `Decryption failed for alias "${entry.alias}": ${err}.`,
+              remedy: 'Fix via tray icon > Manage Companies > Edit > tick "Change password".',
+              logs: String(err),
+            });
           }
         }
 
@@ -3055,11 +3064,15 @@ Call set-active-company again with one of these EXACT names, or use open-company
 
         if (!resp) {
           auditLog('load-company-by-alias', args, 'error', Date.now() - start);
-          return { isError: true, content: [{ type: 'text', text: `GUI agent did not respond within ${timeoutSec}s. Is the agent running? Logs:\n${logs.join('\n')}` }] };
+          return errorResult('AGENT_UNREACHABLE', { logs: logs.join('\n') });
         }
         if (resp.status !== 'success') {
           auditLog('load-company-by-alias', args, 'error', Date.now() - start);
-          return { isError: true, content: [{ type: 'text', text: `Load failed for "${entry.alias}": ${resp.message}. If the password is wrong, fix via tray icon > Manage Companies > Edit > tick "Change password".` }] };
+          return errorResult('PASSWORD_REQUIRED', {
+            message: `Load failed for "${entry.alias}": ${resp.message}.`,
+            remedy: 'If the password is wrong, fix via tray icon > Manage Companies > Edit > tick "Change password".',
+            logs: logs.join('\n'),
+          });
         }
 
         activeCompany = entry.displayName || entry.folderId;
@@ -3069,7 +3082,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
         };
       } catch (err) {
         auditLog('load-company-by-alias', args, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: `load-company-by-alias failed: ${err}` }] };
+        return errorResult('UNKNOWN', { message: 'load-company-by-alias failed.', logs: String(err) });
       }
     }
   );
