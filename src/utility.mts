@@ -1,5 +1,20 @@
 //Utility (Javascript core functionality extension)
 
+/**
+ * Parse a positive-integer env var, falling back to `fallback` when the value is
+ * missing, non-numeric (NaN), or not strictly positive. Guards against operator
+ * misconfig silently degrading a numeric setting: a bad value parsed straight
+ * through parseInt yields NaN, which then flows into setTimeout/setInterval
+ * (installs no/zero timer), rate-limit windows, token-expiry math, listen(port),
+ * etc. `0`/negative are rejected for the same reason. Shared by tally.mts,
+ * server.mts and database.mts so every numeric env read is guarded the same way.
+ */
+export function parseIntEnv(raw: string | undefined, fallback: number): number {
+    if (raw === undefined) return fallback;
+    const parsed = parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 const msDay = 86400000; //Milliseconds in a day
 const dateExpression = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const monthsShort: string[] = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
