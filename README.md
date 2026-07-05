@@ -86,6 +86,9 @@ Copy `.env.example` to `.env` and configure:
 | **Analytics** | | |
 | `DB_TABLE_RETENTION_MS` | `900000` | DuckDB temp table TTL in ms (15 minutes) |
 | `LOG_RETAIN_COUNT` | `10` | Max rotated log files to keep |
+| **Health endpoint** | | |
+| `STATUS_ENDPOINT_PUBLIC` | *(unset)* | Set to `1`/`true` to expose an unauthenticated `GET /status` health endpoint (disabled by default). |
+| `GIT_COMMIT` / `BUILD_TIME` | *(unset)* | Optional build info surfaced in `/status` `build.commit` / `build.builtAt`. |
 | **GUI Agent (open-company)** | | |
 | `OPEN_COMPANY_GUI_TIMEOUT_SEC` | `180` | GUI agent timeout in seconds (min 90) |
 | `OPEN_COMPANY_GUI_MAX_STEPS` | `25` | Max LLM-guided steps per command (min 12) |
