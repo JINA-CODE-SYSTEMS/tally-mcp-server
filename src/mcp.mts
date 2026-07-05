@@ -292,16 +292,10 @@ export function scanCompanyFolders(dataPath: string): Array<{ folder: string; na
   return entries
     .filter(e => e.isDirectory() && /^\d+$/.test(e.name))
     .map(e => {
-      let name = '';
-      try {
-        const companyFile = path.join(dataPath, e.name, 'Company.900');
-        if (fs.existsSync(companyFile)) {
-          const buf = fs.readFileSync(companyFile);
-          const text = buf.toString('utf16le').replace(/[^\x20-\x7Eऀ-ॿ]/g, ' ').trim();
-          const match = text.match(/[A-Za-zऀ-ॿ][\w\sऀ-ॿ.&(),-]{2,}/);
-          if (match) name = match[0].trim();
-        }
-      } catch {}
+      // Use the shared BFS finder so nested Edit Log layouts (Company.1800 one
+      // level deeper) resolve a name too, instead of leaving it blank.
+      const found = findCompanyMetadataFile(path.join(dataPath, e.name), 3);
+      const name = found ? extractCompanyNameFromMetadataFile(found.metaPath) : '';
       return { folder: e.name, name };
     });
 }
@@ -321,6 +315,36 @@ export function extractCompanyNameFromMetadataFile(filePath: string): string {
   } catch {
     return '';
   }
+}
+
+// Finds the first Company.900 (flat layout) or Company.1800 (Edit Log nested layout)
+// under `root`, BFS to maxDepth. Returns the metadata path + a layout marker
+// (depth 0 = flat, depth >= 1 = nested). Shared by scanAvailableCompanies,
+// scanCompanyFolders, and list-companies so every folder-scanning path recovers
+// names the same robust way (fixes blank names for nested-layout folders).
+export function findCompanyMetadataFile(root: string, maxDepth = 3): { metaPath: string; layout: 'flat' | 'nested' } | null {
+  type Frame = { dir: string; depth: number };
+  const queue: Frame[] = [{ dir: root, depth: 0 }];
+  while (queue.length) {
+    const { dir, depth } = queue.shift()!;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.isFile() && /^Company\.(900|1800)$/i.test(entry.name)) {
+        return { metaPath: path.join(dir, entry.name), layout: depth === 0 ? 'flat' : 'nested' };
+      }
+    }
+    if (depth < maxDepth) {
+      for (const entry of entries) {
+        if (entry.isDirectory()) queue.push({ dir: path.join(dir, entry.name), depth: depth + 1 });
+      }
+    }
+  }
+  return null;
 }
 
 // Describes a discovered company and its load-readiness — the structured shape returned by
@@ -530,39 +554,12 @@ export function scanAvailableCompanies(
 
   const config = configPath ? loadCompaniesConfig(configPath) : {};
 
-  const findMetadataFile = (root: string, maxDepth: number): { metaPath: string; layout: 'flat' | 'nested' } | null => {
-    // BFS down to maxDepth, looking for Company.900 or Company.1800. Return first hit + layout
-    // marker (depth 0 = flat layout, depth >= 1 = nested layout, e.g. Edit Log).
-    type Frame = { dir: string; depth: number };
-    const queue: Frame[] = [{ dir: root, depth: 0 }];
-    while (queue.length) {
-      const { dir, depth } = queue.shift()!;
-      let entries: fs.Dirent[];
-      try {
-        entries = fs.readdirSync(dir, { withFileTypes: true });
-      } catch {
-        continue;
-      }
-      for (const entry of entries) {
-        if (entry.isFile() && /^Company\.(900|1800)$/i.test(entry.name)) {
-          return { metaPath: path.join(dir, entry.name), layout: depth === 0 ? 'flat' : 'nested' };
-        }
-      }
-      if (depth < maxDepth) {
-        for (const entry of entries) {
-          if (entry.isDirectory()) queue.push({ dir: path.join(dir, entry.name), depth: depth + 1 });
-        }
-      }
-    }
-    return null;
-  };
-
   const entries = fs.readdirSync(dataPath, { withFileTypes: true });
   return entries
     .filter(e => e.isDirectory() && /^\d+$/.test(e.name))
     .map(e => {
       const folderPath = path.join(dataPath, e.name);
-      const found = findMetadataFile(folderPath, 3);
+      const found = findCompanyMetadataFile(folderPath, 3);
       const displayName = found ? extractCompanyNameFromMetadataFile(found.metaPath) : '';
 
       const hint = config[e.name] || {};
@@ -616,6 +613,70 @@ export function resolveCompanyInput(input: string, folders: Array<{ folder: stri
   }
   if (nameMatches.length > 1) return { kind: 'ambiguous', matches: nameMatches };
   return { kind: 'not-found', available: folders };
+}
+
+// Enriched, client-facing resolution result for the resolve-company tool (#59):
+// one canonical record per match, joined against the alias registry (alias,
+// isProtected) and the loaded list (isLoaded). Union-typed like the internal
+// resolver so callers can branch on ok / ambiguous / not-found.
+export type ResolvedCompanyRecord = {
+  name: string;
+  folderId: string;
+  alias: string | null;
+  isLoaded: boolean;
+  isProtected: boolean;
+  matchedBy: 'id' | 'name' | 'alias';
+};
+export type ResolveCompanyEnriched =
+  | { kind: 'ok'; company: ResolvedCompanyRecord }
+  | { kind: 'ambiguous'; matches: Array<{ folderId: string; name: string; alias: string | null }> }
+  | { kind: 'not-found'; available: Array<{ folderId: string; name: string; alias: string | null }> };
+
+// Pure resolver used by the resolve-company tool. Resolves a folder id, an exact
+// company name, OR a configured alias to a single enriched record. No I/O — the
+// caller supplies the folder list, the registry, and the loaded-company names.
+export function resolveCompanyEnriched(
+  query: string,
+  folders: Array<{ folder: string; name: string }>,
+  registry: CompanyRegistry,
+  loadedNames: string[]
+): ResolveCompanyEnriched {
+  const aliasFor = (folderId: string): string | null =>
+    registry.companies.find(c => c.folderId === folderId)?.alias ?? null;
+  const isProtectedFor = (folderId: string): boolean => {
+    const entry = registry.companies.find(c => c.folderId === folderId);
+    if (entry && typeof entry.passwordEnc === 'string' && entry.passwordEnc.length > 0) return true;
+    return registry.legacyHints?.[folderId]?.requiresCredentials === true;
+  };
+  const isLoadedName = (name: string): boolean => {
+    const n = name.trim().toLowerCase();
+    return n.length > 0 && loadedNames.some(l => l.trim().toLowerCase() === n);
+  };
+  const record = (folderId: string, name: string, matchedBy: 'id' | 'name' | 'alias'): ResolvedCompanyRecord => ({
+    name,
+    folderId,
+    alias: aliasFor(folderId),
+    isLoaded: isLoadedName(name),
+    isProtected: isProtectedFor(folderId),
+    matchedBy,
+  });
+  const withAlias = (list: Array<{ folder: string; name: string }>) =>
+    list.map(f => ({ folderId: f.folder, name: f.name, alias: aliasFor(f.folder) }));
+
+  const base = resolveCompanyInput(query, folders);
+  if (base.kind === 'ok') {
+    return { kind: 'ok', company: record(base.folderId, base.companyName, base.matchedBy) };
+  }
+  if (base.kind === 'ambiguous') {
+    return { kind: 'ambiguous', matches: withAlias(base.matches) };
+  }
+  // not-found by id/name — try the alias registry before giving up.
+  const entry = findCompanyByAlias(registry, query);
+  if (entry) {
+    const name = folders.find(f => f.folder === entry.folderId)?.name || entry.displayName || '';
+    return { kind: 'ok', company: record(entry.folderId, name, 'alias') };
+  }
+  return { kind: 'not-found', available: withAlias(base.available) };
 }
 
 // Resolves the configured Tally edition from env var. Defaults to "silver" — safer assumption since
@@ -882,25 +943,11 @@ export async function registerMcpServer(): Promise<McpServer> {
             content: [{ type: 'text', text: `Data directory not found: ${tallyDataPath}` }]
           };
         }
-        const entries = fs.readdirSync(tallyDataPath, { withFileTypes: true });
-        const folders = entries
-          .filter(e => e.isDirectory() && /^\d+$/.test(e.name))
-          .map(e => {
-            const folderPath = path.join(tallyDataPath, e.name);
-            let companyName = '';
-            try {
-              // Try to read company name from Company.900 file
-              const companyFile = path.join(folderPath, 'Company.900');
-              if (fs.existsSync(companyFile)) {
-                const buf = fs.readFileSync(companyFile);
-                // Extract readable ASCII/Unicode text for the company name
-                const text = buf.toString('utf16le').replace(/[^\x20-\x7E\u0900-\u097F]/g, ' ').trim();
-                const match = text.match(/[A-Za-z\u0900-\u097F][\w\s\u0900-\u097F.&(),-]{2,}/);
-                if (match) companyName = match[0].trim();
-              }
-            } catch {}
-            return { folder: e.name, name: companyName, path: folderPath };
-          });
+        // Delegate to scanCompanyFolders so names are recovered the same robust way
+        // as list-available-companies (BFS finds nested Edit Log Company.1800 too),
+        // instead of the old flat-only Company.900 read that left names blank.
+        const folders = scanCompanyFolders(tallyDataPath)
+          .map(f => ({ folder: f.folder, name: f.name, path: path.join(tallyDataPath, f.folder) }));
         if (folders.length === 0) {
           auditLog('list-companies', args, 'success', Date.now() - start);
           return { content: [{ type: 'text', text: 'No company folders found in the data directory.' }] };
@@ -2785,6 +2832,44 @@ Call set-active-company again with one of these EXACT names, or use open-company
       } catch (err) {
         auditLog('list-configured-companies', args, 'error', Date.now() - start);
         return { isError: true, content: [{ type: 'text', text: `list-configured-companies failed: ${err}` }] };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'resolve-company',
+    {
+      title: 'Resolve Company',
+      description: `Resolves ONE human string — a folder id (digits), an exact company name, or a configured alias — to a single canonical record: { name, folderId, alias, isLoaded, isProtected, matchedBy }. Prefer this over guessing among the five list-* tools: it returns a typed ok / ambiguous / not-found so you know whether you can act. isLoaded tells you whether set-active-company will work right now; isProtected tells you whether a load will need credentials. On ambiguous/not-found it lists the candidates (with aliases) so you can disambiguate.`,
+      inputSchema: {
+        query: z.string().max(256).describe('folder id (digits), exact company name, or a configured alias to resolve to one company.')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      try {
+        const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const folders = scanCompanyFolders(tallyDataPath);
+        const registry = loadCompanyRegistry(resolveRegistryPath());
+        let loaded: string[] = [];
+        try {
+          loaded = await listLoadedCompanies();
+        } catch {
+          // Tally may be unreachable; isLoaded=false is the safe default.
+        }
+        const result = resolveCompanyEnriched(args.query, folders, registry, loaded);
+        auditLog('resolve-company', args, result.kind === 'not-found' ? 'denied' : 'success', Date.now() - start);
+        return {
+          isError: result.kind === 'not-found',
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+        };
+      } catch (err) {
+        auditLog('resolve-company', args, 'error', Date.now() - start);
+        return { isError: true, content: [{ type: 'text', text: `resolve-company failed: ${err}` }] };
       }
     }
   );
