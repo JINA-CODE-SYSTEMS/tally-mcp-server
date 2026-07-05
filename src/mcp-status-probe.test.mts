@@ -1,6 +1,19 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { probeWithRetry } from './mcp.mjs';
+import { probeWithRetry, getTallyRequirements } from './mcp.mjs';
+
+test('getTallyRequirements lists the hard external preconditions', () => {
+  const reqs = getTallyRequirements();
+  assert.ok(Array.isArray(reqs) && reqs.length >= 3);
+  for (const r of reqs) {
+    assert.equal(typeof r.requirement, 'string');
+    assert.equal(typeof r.why, 'string');
+    assert.ok(r.requirement.length > 0 && r.why.length > 0);
+  }
+  const blob = JSON.stringify(reqs).toLowerCase();
+  assert.ok(blob.includes('xml'), 'mentions the Tally XML server requirement');
+  assert.ok(blob.includes('agent'), 'mentions the GUI agent requirement');
+});
 
 const noSleep = async () => {};
 
