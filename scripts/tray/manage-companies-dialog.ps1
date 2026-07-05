@@ -133,19 +133,27 @@ function Invoke-LoadCompanyViaAgent {
     } | ConvertTo-Json -Compress
     Set-Content -LiteralPath $cmdFile -Value $cmd -Encoding UTF8
 
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    while ((Get-Date) -lt $deadline) {
-        Start-Sleep -Milliseconds 500
-        if (-not (Test-Path $resFile)) { continue }
-        try {
-            $raw = (Get-Content -LiteralPath $resFile -Raw -Encoding UTF8) -replace '^﻿', ''
-            $resp = $raw | ConvertFrom-Json -ErrorAction Stop
-            if ($resp.commandId -ne $commandId) { continue }
-            Remove-Item $resFile -Force -ErrorAction SilentlyContinue
-            return @{ ok = ($resp.status -eq 'success'); message = [string]$resp.message }
-        } catch { continue }
+    try {
+        $deadline = (Get-Date).AddSeconds($TimeoutSec)
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+            if (-not (Test-Path $resFile)) { continue }
+            try {
+                $raw = (Get-Content -LiteralPath $resFile -Raw -Encoding UTF8) -replace '^﻿', ''
+                $resp = $raw | ConvertFrom-Json -ErrorAction Stop
+                if ($resp.commandId -ne $commandId) { continue }
+                Remove-Item $resFile -Force -ErrorAction SilentlyContinue
+                return @{ ok = ($resp.status -eq 'success'); message = [string]$resp.message }
+            } catch { continue }
+        }
+        return @{ ok = $false; message = "GUI agent did not respond within ${TimeoutSec}s. Is the agent running? Is Tally open?" }
     }
-    return @{ ok = $false; message = "GUI agent did not respond within ${TimeoutSec}s. Is the agent running? Is Tally open?" }
+    finally {
+        # The command file carries the decrypted password. Remove it on every exit path
+        # (success, timeout, or error) so plaintext never lingers on disk waiting for the
+        # next command to overwrite it.
+        Remove-Item -LiteralPath $cmdFile -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # ---------------------------------------------------------------------------
