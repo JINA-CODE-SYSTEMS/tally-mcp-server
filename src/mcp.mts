@@ -1021,10 +1021,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       const sqlError = validateSQL(args.sql);
       if (sqlError) {
         auditLog('query-database', args, 'denied');
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `SQL rejected: ${sqlError}` }]
-        };
+        return errorResult('PRECONDITION_FAILED', { message: `SQL rejected: ${sqlError}`, retryable: false });
       }
       try {
         const resp = await executeSQL(args.sql);
@@ -1056,17 +1053,11 @@ export async function registerMcpServer(): Promise<McpServer> {
         const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
         if (!tallyDataPath) {
           auditLog('list-companies', args, 'error', Date.now() - start);
-          return {
-            isError: true,
-            content: [{ type: 'text', text: 'TALLY_DATA_PATH environment variable is not configured. Set it to the Tally Prime data directory (e.g. C:\\Users\\Public\\TallyPrimeEditLog\\data).' }]
-          };
+          return errorResult('PRECONDITION_FAILED', { message: 'TALLY_DATA_PATH environment variable is not configured.', remedy: 'Set it to the Tally Prime data directory (e.g. C:\\Users\\Public\\TallyPrimeEditLog\\data).', retryable: false });
         }
         if (!fs.existsSync(tallyDataPath)) {
           auditLog('list-companies', args, 'error', Date.now() - start);
-          return {
-            isError: true,
-            content: [{ type: 'text', text: `Data directory not found: ${tallyDataPath}` }]
-          };
+          return errorResult('PRECONDITION_FAILED', { message: `Data directory not found: ${tallyDataPath}`, retryable: false });
         }
         // Delegate to scanCompanyFolders so names are recovered the same robust way
         // as list-available-companies (BFS finds nested Edit Log Company.1800 too),
@@ -1117,11 +1108,11 @@ export async function registerMcpServer(): Promise<McpServer> {
         const tallyDataPath = args.dataPath || defaultRoot;
         if (args.dataPath && !isPathWithinRoots(tallyDataPath, allowedRoots).ok) {
           auditLog('list-available-companies', args, 'denied', Date.now() - start);
-          return { isError: true, content: [{ type: 'text', text: `dataPath "${tallyDataPath}" is outside the allowed Tally data root(s). Set TALLY_ALLOWED_DATA_ROOTS to permit additional locations.` }] };
+          return errorResult('PRECONDITION_FAILED', { message: `dataPath "${tallyDataPath}" is outside the allowed Tally data root(s).`, remedy: 'Set TALLY_ALLOWED_DATA_ROOTS to permit additional locations.', retryable: false });
         }
         if (!fs.existsSync(tallyDataPath)) {
           auditLog('list-available-companies', args, 'error', Date.now() - start);
-          return { isError: true, content: [{ type: 'text', text: `Data directory not found: ${tallyDataPath}` }] };
+          return errorResult('PRECONDITION_FAILED', { message: `Data directory not found: ${tallyDataPath}`, retryable: false });
         }
         const configPath = args.configPath
           || process.env.TALLY_COMPANIES_CONFIG
@@ -1129,7 +1120,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         // Confine an explicit configPath the same way (default/env-derived paths are trusted).
         if (args.configPath && !isPathWithinRoots(configPath, allowedRoots).ok) {
           auditLog('list-available-companies', args, 'denied', Date.now() - start);
-          return { isError: true, content: [{ type: 'text', text: `configPath "${configPath}" is outside the allowed Tally data root(s). Set TALLY_ALLOWED_DATA_ROOTS to permit additional locations.` }] };
+          return errorResult('PRECONDITION_FAILED', { message: `configPath "${configPath}" is outside the allowed Tally data root(s).`, remedy: 'Set TALLY_ALLOWED_DATA_ROOTS to permit additional locations.', retryable: false });
         }
         const companies = scanAvailableCompanies(tallyDataPath, configPath);
 
@@ -1147,10 +1138,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         return { content: [{ type: 'text', text: JSON.stringify(summary, null, 2) }] };
       } catch (err) {
         auditLog('list-available-companies', args, 'error', Date.now() - start);
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `list-available-companies failed: ${err}` }]
-        };
+        return errorResult('UNKNOWN', { message: 'list-available-companies failed.', logs: String(err) });
       }
     }
   );
@@ -1438,7 +1426,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         return errorResult('UNKNOWN', { message: 'All open-company strategies exhausted.', logs: logs.join('\n') });
       } catch (err) {
         auditLog('open-company', args, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: `Failed to open company: ${err}\n\n${logs.join('\n')}` }] };
+        return errorResult('UNKNOWN', { message: `Failed to open company: ${err}`, logs: logs.join('\n') });
       }
     }
   );
@@ -1532,10 +1520,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         };
       } catch (err) {
         auditLog('open-company-debug', args, 'error', Date.now() - start);
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `open-company-debug failed: ${err}` }]
-        };
+        return errorResult('UNKNOWN', { message: 'open-company-debug failed.', logs: String(err) });
       }
     }
   );
@@ -1566,10 +1551,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         return { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] };
       } catch (err) {
         auditLog('status', args, 'error', Date.now() - start);
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `status failed: ${err}` }]
-        };
+        return errorResult('UNKNOWN', { message: 'status failed.', logs: String(err) });
       }
     }
   );
@@ -1601,10 +1583,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         return { content: [{ type: 'text', text: JSON.stringify(context, null, 2) }] };
       } catch (err) {
         auditLog('get-context', args, 'error', Date.now() - start);
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `get-context failed: ${err}` }]
-        };
+        return errorResult('UNKNOWN', { message: 'get-context failed.', logs: String(err) });
       }
     }
   );
@@ -1631,19 +1610,13 @@ export async function registerMcpServer(): Promise<McpServer> {
       const auditArgs = { xmlLength: args.xml.length, label: args.label, verb, xml: args.xml };
       if (process.env.TALLY_DEBUG_XML !== '1') {
         auditLog('tally-raw-xml-probe', auditArgs, 'denied', Date.now() - start);
-        return {
-          isError: true,
-          content: [{ type: 'text', text: 'Disabled. Set TALLY_DEBUG_XML=1 in the server env to enable raw XML probes.' }]
-        };
+        return errorResult('PRECONDITION_FAILED', { message: 'Raw XML probe is disabled.', remedy: 'Set TALLY_DEBUG_XML=1 in the server env to enable raw XML probes.', retryable: false });
       }
       // Read-only by default. Export is the only read verb; Import/Alter/Delete mutate
       // Tally data, so refuse them unless the caller explicitly opts in via allowWrite.
       if (verb && verb !== 'export' && args.allowWrite !== true) {
         auditLog('tally-raw-xml-probe', auditArgs, 'denied', Date.now() - start);
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `Refusing TALLYREQUEST verb "${verb}" — this probe is read-only by default and only "Export" is allowed. If you genuinely intend a write (Import/Alter/Delete), re-call with allowWrite: true.` }]
-        };
+        return errorResult('PRECONDITION_FAILED', { message: `Refusing TALLYREQUEST verb "${verb}" — this probe is read-only by default and only "Export" is allowed.`, remedy: 'If you genuinely intend a write (Import/Alter/Delete), re-call with allowWrite: true.', retryable: false });
       }
       try {
         const resp = await postTallyXML(args.xml);
@@ -1655,10 +1628,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         };
       } catch (err) {
         auditLog('tally-raw-xml-probe', auditArgs, 'error', Date.now() - start);
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `tally-raw-xml-probe failed: ${err}` }]
-        };
+        return errorResult('UNKNOWN', { message: 'tally-raw-xml-probe failed.', logs: String(err) });
       }
     }
   );
@@ -1687,10 +1657,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         return { content: [{ type: 'text', text: tsv }] };
       } catch (err) {
         auditLog('list-loaded-companies', args, 'error', Date.now() - start);
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `list-loaded-companies failed: ${err}` }]
-        };
+        return errorResult('UNKNOWN', { message: 'list-loaded-companies failed.', logs: String(err) });
       }
     }
   );
@@ -1749,55 +1716,27 @@ export async function registerMcpServer(): Promise<McpServer> {
         auditLog('set-active-company', args, 'denied', Date.now() - start);
 
         if (closest) {
-          // Fuzzy match found — show user/LLM what they searched, what we
-          // found, and ask them to confirm by re-calling with the exact name.
-          return {
-            isError: true,
-            content: [{
-              type: 'text',
-              text:
-`Company "${args.companyName}" was not found as an exact match.
-
-Did you mean "${closest}"?
-  - Searched: "${args.companyName}"
-  - Closest match in Tally: "${closest}"
-
-To confirm and use this company, call set-active-company again with the EXACT name:
-  set-active-company(companyName: "${closest}")
-
-Other companies currently loaded in Tally:
-${loaded.map(n => `  - "${n}"`).join('\n')}`
-            }]
-          };
+          // Fuzzy match found — surface the closest name as a suggested remedy.
+          return errorResult('COMPANY_NOT_FOUND', {
+            message: `Company "${args.companyName}" was not found as an exact match. Did you mean "${closest}"?`,
+            remedy: `Re-call set-active-company with the EXACT name: set-active-company(companyName: "${closest}").`,
+            logs: `Other companies currently loaded:\n${loaded.map(n => `  - "${n}"`).join('\n')}`,
+          });
         }
 
         if (loaded.length === 0) {
-          return {
-            isError: true,
-            content: [{ type: 'text', text: `Company "${args.companyName}" not found and no companies are currently loaded in Tally. Use open-company or load-company-by-alias to load one first.` }]
-          };
+          return errorResult('COMPANY_NOT_FOUND', { message: `Company "${args.companyName}" not found and no companies are currently loaded in Tally.`, remedy: 'Use open-company or load-company-by-alias to load one first.' });
         }
 
-        // No fuzzy match either — show what IS loaded.
-        return {
-          isError: true,
-          content: [{
-            type: 'text',
-            text:
-`Company "${args.companyName}" not found in Tally — and no fuzzy match was close enough to suggest.
-
-Companies currently loaded in Tally:
-${loaded.map(n => `  - "${n}"`).join('\n')}
-
-Call set-active-company again with one of these EXACT names, or use open-company to load a different one.`
-          }]
-        };
+        // No fuzzy match either — surface the loaded list as context.
+        return errorResult('COMPANY_NOT_FOUND', {
+          message: `Company "${args.companyName}" not found in Tally — and no fuzzy match was close enough to suggest.`,
+          remedy: 'Re-call set-active-company with one of the loaded names (exact), or use open-company to load a different one.',
+          logs: `Companies currently loaded:\n${loaded.map(n => `  - "${n}"`).join('\n')}`,
+        });
       } catch (err) {
         auditLog('set-active-company', args, 'error', Date.now() - start);
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `set-active-company failed: ${err}` }]
-        };
+        return errorResult('UNKNOWN', { message: 'set-active-company failed.', logs: String(err) });
       }
     }
   );
@@ -2046,10 +1985,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       }
       const resp = await pull('list-master', inputParams);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
@@ -2080,10 +2016,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('chart-of-accounts', inputParams);
       const tableId = await cacheTable('chart-of-accounts', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
@@ -2116,10 +2049,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('trial-balance', inputParams);
       const tableId = await cacheTable('trial-balance', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
@@ -2152,10 +2082,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('profit-loss', inputParams);
       const tableId = await cacheTable('profit-loss', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
@@ -2187,10 +2114,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('balance-sheet', inputParams);
       const tableId = await cacheTable('balance-sheet', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
@@ -2223,10 +2147,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('stock-summary', inputParams);
       const tableId = await cacheTable('stock-summary', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
@@ -2258,10 +2179,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       }
       const resp = await pull('ledger-balance', inputParams);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
@@ -2293,10 +2211,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       }
       const resp = await pull('stock-item-balance', inputParams);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
@@ -2329,10 +2244,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('bills-outstanding', inputParams);
       const tableId = await cacheTable('bills-outstanding', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
@@ -2367,10 +2279,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('ledger-account', inputParams);
       const tableId = await cacheTable('ledger-account', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
 
@@ -2412,10 +2321,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('stock-item-account', inputParams);
       const tableId = await cacheTable('stock-item-account', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
 
@@ -2455,10 +2361,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('gst-voucher-details', inputParams);
       const tableId = await cacheTable('gst-voucher-details', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
@@ -2489,10 +2392,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('stock-item-gst', inputParams);
       const tableId = await cacheTable('stock-item-gst', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
@@ -2525,10 +2425,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('gst-hsn-summary', inputParams);
       const tableId = await cacheTable('gst-hsn-summary', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
@@ -2561,10 +2458,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('gstr1-summary', inputParams);
       const tableId = await cacheTable('gstr1-summary', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
@@ -2597,10 +2491,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('gstr2-summary', inputParams);
       const tableId = await cacheTable('gstr2-summary', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
@@ -2642,17 +2533,17 @@ Call set-active-company again with one of these EXACT names, or use open-company
       // validate amount > 0
       if (args.amount <= 0) {
         auditLog('create-voucher', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Amount must be greater than 0' }] };
+        return errorResult('PRECONDITION_FAILED', { message: 'Amount must be greater than 0.', retryable: false });
       }
       // validate debit != credit
       if (args.debitLedger.trim().toLowerCase() === args.creditLedger.trim().toLowerCase()) {
         auditLog('create-voucher', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Debit and credit ledger must be different' }] };
+        return errorResult('PRECONDITION_FAILED', { message: 'Debit and credit ledger must be different.', retryable: false });
       }
       // validate date format
       if (!/^\d{4}-\d{2}-\d{2}$/.test(args.date)) {
         auditLog('create-voucher', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Date must be in YYYY-MM-DD format' }] };
+        return errorResult('PRECONDITION_FAILED', { message: 'Date must be in YYYY-MM-DD format.', retryable: false });
       }
 
       let inputParams = new Map<string, any>([
@@ -2669,7 +2560,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await push('voucher', inputParams);
       if (!resp.success) {
         auditLog('create-voucher', args, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: resp.error || 'Failed to create voucher' }] };
+        return errorResult('UNKNOWN', { message: resp.error || 'Failed to create voucher.' });
       }
       auditLog('create-voucher', args, 'success', Date.now() - start);
       return {
@@ -2706,7 +2597,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       }
       if (!args.name || args.name.trim() === '') {
         auditLog('create-ledger', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Ledger name cannot be empty' }] };
+        return errorResult('PRECONDITION_FAILED', { message: 'Ledger name cannot be empty.', retryable: false });
       }
 
       let inputParams = new Map<string, any>([
@@ -2722,7 +2613,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await push('ledger', inputParams);
       if (!resp.success) {
         auditLog('create-ledger', args, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: resp.error || 'Failed to create ledger' }] };
+        return errorResult('UNKNOWN', { message: resp.error || 'Failed to create ledger.' });
       }
       auditLog('create-ledger', args, 'success', Date.now() - start);
       return {
@@ -2760,7 +2651,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       }
       if (!args.name || args.name.trim() === '') {
         auditLog('create-stock-item', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Stock item name cannot be empty' }] };
+        return errorResult('PRECONDITION_FAILED', { message: 'Stock item name cannot be empty.', retryable: false });
       }
 
       let inputParams = new Map<string, any>([
@@ -2780,7 +2671,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await push('stock-item', inputParams);
       if (!resp.success) {
         auditLog('create-stock-item', args, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: resp.error || 'Failed to create stock item' }] };
+        return errorResult('UNKNOWN', { message: resp.error || 'Failed to create stock item.' });
       }
       auditLog('create-stock-item', args, 'success', Date.now() - start);
       return {
@@ -2828,22 +2719,22 @@ Call set-active-company again with one of these EXACT names, or use open-company
       // validate taxable value
       if (args.taxableValue <= 0) {
         auditLog('create-gst-voucher', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Taxable value must be greater than 0' }] };
+        return errorResult('PRECONDITION_FAILED', { message: 'Taxable value must be greater than 0.', retryable: false });
       }
       // validate GST rate
       if (args.gstRate < 0 || args.gstRate > 100) {
         auditLog('create-gst-voucher', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'GST rate must be between 0 and 100' }] };
+        return errorResult('PRECONDITION_FAILED', { message: 'GST rate must be between 0 and 100.', retryable: false });
       }
       // validate date format
       if (!/^\d{4}-\d{2}-\d{2}$/.test(args.date)) {
         auditLog('create-gst-voucher', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Date must be in YYYY-MM-DD format' }] };
+        return errorResult('PRECONDITION_FAILED', { message: 'Date must be in YYYY-MM-DD format.', retryable: false });
       }
       // validate party != sale/purchase ledger
       if (args.partyLedger.trim().toLowerCase() === args.salePurchaseLedger.trim().toLowerCase()) {
         auditLog('create-gst-voucher', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Party ledger and sale/purchase ledger must be different' }] };
+        return errorResult('PRECONDITION_FAILED', { message: 'Party ledger and sale/purchase ledger must be different.', retryable: false });
       }
 
       // auto-resolve tax ledgers if not provided
@@ -2861,12 +2752,12 @@ Call set-active-company again with one of these EXACT names, or use open-company
           if (!cgstLedger) cgstLedger = gstLedgers.cgst;
           if (!sgstLedger) sgstLedger = gstLedgers.sgst;
           if (!cgstLedger || !sgstLedger) {
-            return { isError: true, content: [{ type: 'text', text: 'Could not auto-resolve CGST/SGST ledger names from Tally. Please provide cgstLedger and sgstLedger explicitly' }] };
+            return errorResult('PRECONDITION_FAILED', { message: 'Could not auto-resolve CGST/SGST ledger names from Tally.', remedy: 'Provide cgstLedger and sgstLedger explicitly.', retryable: false });
           }
         } else {
           if (!igstLedger) igstLedger = gstLedgers.igst;
           if (!igstLedger) {
-            return { isError: true, content: [{ type: 'text', text: 'Could not auto-resolve IGST ledger name from Tally. Please provide igstLedger explicitly' }] };
+            return errorResult('PRECONDITION_FAILED', { message: 'Could not auto-resolve IGST ledger name from Tally.', remedy: 'Provide igstLedger explicitly.', retryable: false });
           }
         }
       }
@@ -2920,7 +2811,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await push('gst-voucher', inputParams);
       if (!resp.success) {
         auditLog('create-gst-voucher', args, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: resp.error || 'Failed to create GST voucher' }] };
+        return errorResult('UNKNOWN', { message: resp.error || 'Failed to create GST voucher.' });
       }
       auditLog('create-gst-voucher', args, 'success', Date.now() - start);
       return {
@@ -2964,7 +2855,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
         return { content: [{ type: 'text', text: JSON.stringify({ count: out.length, companies: out }, null, 2) }] };
       } catch (err) {
         auditLog('list-configured-companies', args, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: `list-configured-companies failed: ${err}` }] };
+        return errorResult('UNKNOWN', { message: 'list-configured-companies failed.', logs: String(err) });
       }
     }
   );
@@ -3002,7 +2893,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
         };
       } catch (err) {
         auditLog('resolve-company', args, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: `resolve-company failed: ${err}` }] };
+        return errorResult('UNKNOWN', { message: 'resolve-company failed.', logs: String(err) });
       }
     }
   );
@@ -3106,7 +2997,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const start = Date.now();
       if (process.env.ENABLE_GUI_CONTROL !== 'true') {
         auditLog('gui-screenshot', {}, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'GUI control is disabled. Set ENABLE_GUI_CONTROL=true (and restart the service) to enable gui-screenshot / gui-send-keys.' }] };
+        return errorResult('PRECONDITION_FAILED', { message: 'GUI control is disabled.', remedy: 'Set ENABLE_GUI_CONTROL=true (and restart the service) to enable gui-screenshot / gui-send-keys.', retryable: false });
       }
       const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
       const logs: string[] = [];
@@ -3118,16 +3009,16 @@ Call set-active-company again with one of these EXACT names, or use open-company
       if (!resp) {
         cleanupShot();
         auditLog('gui-screenshot', {}, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: `GUI agent did not respond. Is it running (tray > Restart GUI agent) and is Tally open?\n${logs.join('\n')}` }] };
+        return errorResult('AGENT_UNREACHABLE', { message: 'GUI agent did not respond. Is it running (tray > Restart GUI agent) and is Tally open?', logs: logs.join('\n') });
       }
       if (resp.status !== 'success') {
         cleanupShot();
         auditLog('gui-screenshot', {}, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: resp.message || 'Screenshot failed' }] };
+        return errorResult('UNKNOWN', { message: resp.message || 'Screenshot failed.' });
       }
       if (!fs.existsSync(shot)) {
         auditLog('gui-screenshot', {}, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: 'Agent reported success but the screenshot file was not found on disk.' }] };
+        return errorResult('UNKNOWN', { message: 'Agent reported success but the screenshot file was not found on disk.' });
       }
       const b64 = fs.readFileSync(shot).toString('base64');
       cleanupShot();  // don't leave a Tally-screen image (possibly a credential frame) on disk
@@ -3155,22 +3046,22 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const redacted = { keys: (args.keys || []).map(k => k.action === 'type' ? { action: 'type', value: '***' } : k) };
       if (process.env.ENABLE_GUI_CONTROL !== 'true') {
         auditLog('gui-send-keys', redacted, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'GUI control is disabled. Set ENABLE_GUI_CONTROL=true (and restart the service) to enable gui-screenshot / gui-send-keys.' }] };
+        return errorResult('PRECONDITION_FAILED', { message: 'GUI control is disabled.', remedy: 'Set ENABLE_GUI_CONTROL=true (and restart the service) to enable gui-screenshot / gui-send-keys.', retryable: false });
       }
       if (!args.keys || args.keys.length === 0) {
         auditLog('gui-send-keys', redacted, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'No keys provided.' }] };
+        return errorResult('PRECONDITION_FAILED', { message: 'No keys provided.', retryable: false });
       }
       const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
       const logs: string[] = [];
       const resp = await callGuiAgent('sendkeys', { keys: args.keys }, 30, dataPath, logs);
       if (!resp) {
         auditLog('gui-send-keys', redacted, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: `GUI agent did not respond. Is it running and is Tally open?\n${logs.join('\n')}` }] };
+        return errorResult('AGENT_UNREACHABLE', { message: 'GUI agent did not respond. Is it running and is Tally open?', logs: logs.join('\n') });
       }
       if (resp.status !== 'success') {
         auditLog('gui-send-keys', redacted, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: resp.message || 'sendkeys failed' }] };
+        return errorResult('UNKNOWN', { message: resp.message || 'sendkeys failed.' });
       }
       auditLog('gui-send-keys', redacted, 'success', Date.now() - start);
       return { content: [{ type: 'text', text: JSON.stringify({ success: true, message: resp.message }) }] };
