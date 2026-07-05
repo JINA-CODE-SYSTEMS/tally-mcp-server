@@ -1,7 +1,23 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import path from 'node:path';
-import { parseTallyRequestVerb, isPathWithinRoots } from './mcp.mjs';
+import { parseTallyRequestVerb, isPathWithinRoots, normalizeOpenCompanyStrategy } from './mcp.mjs';
+
+// --- #24: open-company strategy renames (deprecated aliases) ---
+
+test('normalizeOpenCompanyStrategy maps tdl-load to verify-svcurrentcompany', () => {
+  assert.deepEqual(normalizeOpenCompanyStrategy('tdl-load'), { strategy: 'verify-svcurrentcompany', deprecatedAlias: 'tdl-load' });
+});
+
+test('normalizeOpenCompanyStrategy maps tdl-connect to verify-in-loaded-list', () => {
+  assert.deepEqual(normalizeOpenCompanyStrategy('tdl-connect'), { strategy: 'verify-in-loaded-list', deprecatedAlias: 'tdl-connect' });
+});
+
+test('normalizeOpenCompanyStrategy passes new/other names through unchanged', () => {
+  assert.deepEqual(normalizeOpenCompanyStrategy('verify-svcurrentcompany'), { strategy: 'verify-svcurrentcompany', deprecatedAlias: null });
+  assert.deepEqual(normalizeOpenCompanyStrategy('gui-agent'), { strategy: 'gui-agent', deprecatedAlias: null });
+  assert.deepEqual(normalizeOpenCompanyStrategy('auto'), { strategy: 'auto', deprecatedAlias: null });
+});
 
 // --- #52: raw-xml-probe verb classification ---
 
