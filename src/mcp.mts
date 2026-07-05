@@ -168,6 +168,33 @@ export function findMatchingLoadedCompany(target: string, loaded: string[]): str
   return best ? best.name : null;
 }
 
+// Extracts the <TALLYREQUEST> verb from a raw Tally XML envelope (e.g. "Export",
+// "Import", "Alter", "Delete"), lowercased, or null if none is present. Used to
+// keep the raw-XML debug probe read-only by default: only "export" reads data;
+// Import/Alter/Delete mutate it. Tolerates attributes and surrounding whitespace.
+export function parseTallyRequestVerb(xml: string): string | null {
+  const m = /<TALLYREQUEST\b[^>]*>\s*([^<\s]+)\s*<\/TALLYREQUEST>/i.exec(xml);
+  return m ? m[1].toLowerCase() : null;
+}
+
+// Minimal path interface so the containment check can be unit-tested against
+// both posix and win32 semantics regardless of the host OS.
+type PathLike = { resolve: (...segments: string[]) => string; sep: string };
+
+// Returns true when `candidate` resolves to `root` itself or a path strictly
+// inside it. Canonicalizes both sides and compares on a separator boundary so
+// "/data/../etc" or a sibling like "/data-evil" cannot pass as "/data".
+export function isPathWithinRoots(candidate: string, roots: string[], p: PathLike = path): { ok: boolean; resolved: string } {
+  const resolved = p.resolve(candidate);
+  for (const root of roots) {
+    if (!root) continue;
+    const r = p.resolve(root);
+    const rWithSep = r.endsWith(p.sep) ? r : r + p.sep;
+    if (resolved === r || resolved.startsWith(rWithSep)) return { ok: true, resolved };
+  }
+  return { ok: false, resolved };
+}
+
 // Parses tally.ini content and returns the list of company IDs in `Load=` directives under [TALLY].
 // Tally Prime auto-loads each Load=<id> entry on startup when Default Companies=Yes.
 export function parseTallyIniLoads(iniContent: string): string[] {
@@ -834,7 +861,21 @@ export async function registerMcpServer(): Promise<McpServer> {
     async (args) => {
       const start = Date.now();
       try {
-        const tallyDataPath = args.dataPath || process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const defaultRoot = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        // Confine caller-supplied dataPath/configPath to an allowlist so a
+        // prompt-injected caller can't scan arbitrary directories or JSON-parse an
+        // arbitrary file. Default allowed root is the configured Tally data path;
+        // operators who need to scan a backup drive add roots via
+        // TALLY_ALLOWED_DATA_ROOTS (comma/semicolon-separated).
+        const allowedRoots = [
+          defaultRoot,
+          ...(process.env.TALLY_ALLOWED_DATA_ROOTS || '').split(/[;,]/).map(s => s.trim()).filter(Boolean)
+        ];
+        const tallyDataPath = args.dataPath || defaultRoot;
+        if (args.dataPath && !isPathWithinRoots(tallyDataPath, allowedRoots).ok) {
+          auditLog('list-available-companies', args, 'denied', Date.now() - start);
+          return { isError: true, content: [{ type: 'text', text: `dataPath "${tallyDataPath}" is outside the allowed Tally data root(s). Set TALLY_ALLOWED_DATA_ROOTS to permit additional locations.` }] };
+        }
         if (!fs.existsSync(tallyDataPath)) {
           auditLog('list-available-companies', args, 'error', Date.now() - start);
           return { isError: true, content: [{ type: 'text', text: `Data directory not found: ${tallyDataPath}` }] };
@@ -842,6 +883,11 @@ export async function registerMcpServer(): Promise<McpServer> {
         const configPath = args.configPath
           || process.env.TALLY_COMPANIES_CONFIG
           || path.join(tallyDataPath, '.tally-mcp-companies.json');
+        // Confine an explicit configPath the same way (default/env-derived paths are trusted).
+        if (args.configPath && !isPathWithinRoots(configPath, allowedRoots).ok) {
+          auditLog('list-available-companies', args, 'denied', Date.now() - start);
+          return { isError: true, content: [{ type: 'text', text: `configPath "${configPath}" is outside the allowed Tally data root(s). Set TALLY_ALLOWED_DATA_ROOTS to permit additional locations.` }] };
+        }
         const companies = scanAvailableCompanies(tallyDataPath, configPath);
 
         if (companies.length === 0) {
@@ -1249,10 +1295,11 @@ export async function registerMcpServer(): Promise<McpServer> {
     'tally-raw-xml-probe',
     {
       title: 'Tally Raw XML Probe (debug only)',
-      description: `Posts a raw XML envelope to the Tally XML server and returns the raw response — bypasses all wrapper logic. Used for protocol reverse-engineering and undocumented verb discovery. NOT for normal use; the wrapped tools (list-master, trial-balance, etc.) construct XML safely. Disabled unless TALLY_DEBUG_XML=1 is set in the server env.`,
+      description: `Posts a raw XML envelope to the Tally XML server and returns the raw response — bypasses all wrapper logic. Used for protocol reverse-engineering and undocumented verb discovery. NOT for normal use; the wrapped tools (list-master, trial-balance, etc.) construct XML safely. Disabled unless TALLY_DEBUG_XML=1 is set in the server env. Read-only by default: any non-Export TALLYREQUEST verb (Import/Alter/Delete) is refused unless allowWrite=true is passed explicitly.`,
       inputSchema: {
         xml: z.string().describe('raw XML envelope to POST to the Tally XML server. Standard structure: <ENVELOPE><HEADER>...</HEADER><BODY>...</BODY></ENVELOPE>.'),
-        label: z.string().optional().describe('optional label included in the audit log so probes can be correlated to experiment notes (e.g. "H1-import-variant").')
+        label: z.string().optional().describe('optional label included in the audit log so probes can be correlated to experiment notes (e.g. "H1-import-variant").'),
+        allowWrite: z.boolean().optional().describe('explicit opt-in required to POST a mutating envelope (TALLYREQUEST other than Export, i.e. Import/Alter/Delete). Defaults to false — without it, non-Export verbs are refused so a prompt-injected caller cannot silently mutate Tally data.')
       },
       annotations: {
         readOnlyHint: false,
@@ -1261,12 +1308,23 @@ export async function registerMcpServer(): Promise<McpServer> {
     },
     async (args) => {
       const start = Date.now();
-      const auditArgs = { xmlLength: args.xml.length, label: args.label };
+      const verb = parseTallyRequestVerb(args.xml);
+      // Log the full XML for this debug/write primitive so any mutation is auditable.
+      const auditArgs = { xmlLength: args.xml.length, label: args.label, verb, xml: args.xml };
       if (process.env.TALLY_DEBUG_XML !== '1') {
         auditLog('tally-raw-xml-probe', auditArgs, 'denied', Date.now() - start);
         return {
           isError: true,
           content: [{ type: 'text', text: 'Disabled. Set TALLY_DEBUG_XML=1 in the server env to enable raw XML probes.' }]
+        };
+      }
+      // Read-only by default. Export is the only read verb; Import/Alter/Delete mutate
+      // Tally data, so refuse them unless the caller explicitly opts in via allowWrite.
+      if (verb && verb !== 'export' && args.allowWrite !== true) {
+        auditLog('tally-raw-xml-probe', auditArgs, 'denied', Date.now() - start);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `Refusing TALLYREQUEST verb "${verb}" — this probe is read-only by default and only "Export" is allowed. If you genuinely intend a write (Import/Alter/Delete), re-call with allowWrite: true.` }]
         };
       }
       try {
