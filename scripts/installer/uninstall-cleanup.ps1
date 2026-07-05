@@ -94,5 +94,29 @@ try {
     Write-Host "[WARN] tray process stop raised: $_"
 }
 
+# 6. Scrub the .env file. It holds the OAuth PASSWORD and other secrets; leaving it behind
+#    after uninstall is a stale-credential exposure. Overwrite the bytes first so the plaintext
+#    isn't trivially recoverable from the freed disk blocks, then delete.
+try {
+    $envFile = Join-Path $InstallDir '.env'
+    if (Test-Path -LiteralPath $envFile) {
+        try {
+            $len = (Get-Item -LiteralPath $envFile).Length
+            if ($len -gt 0) {
+                $zeros = New-Object byte[] $len
+                [System.IO.File]::WriteAllBytes($envFile, $zeros)
+            }
+        } catch {
+            Write-Host "[WARN] .env overwrite raised: $_"
+        }
+        Remove-Item -LiteralPath $envFile -Force -ErrorAction SilentlyContinue
+        Write-Host "[OK] .env scrubbed and removed"
+    } else {
+        Write-Host "[*] .env not found - nothing to scrub"
+    }
+} catch {
+    Write-Host "[WARN] .env cleanup raised: $_"
+}
+
 Write-Host "Cleanup complete; Inno Setup will now remove files."
-Write-Host "NOTE: .env (if present) is intentionally preserved - delete manually if a clean wipe is desired."
+Write-Host "NOTE: .env has been scrubbed and removed. If the box is shared, rotate the OAuth password."
