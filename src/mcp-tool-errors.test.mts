@@ -35,6 +35,19 @@ test('remedy/logs omitted when not applicable', () => {
   assert.equal('logs' in e, false);
 });
 
+test('every ToolErrorCode has a usable default message + retryable', () => {
+  const codes = [
+    'PASSWORD_REQUIRED', 'AGENT_UNREACHABLE', 'TALLY_DOWN', 'AGENT_TOO_OLD',
+    'COMPANY_NOT_FOUND', 'AMBIGUOUS', 'PRECONDITION_FAILED', 'READONLY', 'UNKNOWN',
+  ] as const;
+  for (const c of codes) {
+    const e = buildToolError(c);
+    assert.equal(e.code, c);
+    assert.ok(e.message.length > 0, `${c} has a default message`);
+    assert.equal(typeof e.retryable, 'boolean');
+  }
+});
+
 test('errorResult emits isError + structuredContent + machine-parseable JSON text', () => {
   const r = errorResult('TALLY_DOWN', { logs: 'transcript' });
   assert.equal(r.isError, true);
