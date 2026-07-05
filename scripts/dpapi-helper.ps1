@@ -28,16 +28,31 @@ if ([string]::IsNullOrEmpty($inputText)) {
 
 $scope = [System.Security.Cryptography.DataProtectionScope]::LocalMachine
 
+# Application-specific entropy namespaces the protection: an arbitrary unrelated
+# process on the box can no longer ProtectedData.Unprotect a stolen blob without
+# also supplying this value. It is NOT a secret key — it only has to match between
+# Protect and Unprotect — but it removes the "any process can decrypt" weakness of
+# a null entropy under LocalMachine scope. NTFS ACLs remain the primary boundary.
+$entropy = [System.Text.Encoding]::UTF8.GetBytes('TallyMCP.CompanyRegistry.DPAPI.v1')
+
 try {
     switch ($Action) {
         'encrypt' {
             $bytes = [System.Text.Encoding]::UTF8.GetBytes($inputText)
-            $blob = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null, $scope)
+            $blob = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $entropy, $scope)
             [Console]::Out.Write([Convert]::ToBase64String($blob))
         }
         'decrypt' {
             $blob = [Convert]::FromBase64String($inputText)
-            $plain = [System.Security.Cryptography.ProtectedData]::Unprotect($blob, $null, $scope)
+            try {
+                $plain = [System.Security.Cryptography.ProtectedData]::Unprotect($blob, $entropy, $scope)
+            }
+            catch {
+                # Backward compatibility: blobs written before entropy was introduced
+                # used null entropy. Decrypt them so existing stored passwords keep
+                # working; they get re-encrypted with entropy on the next save.
+                $plain = [System.Security.Cryptography.ProtectedData]::Unprotect($blob, $null, $scope)
+            }
             [Console]::Out.Write([System.Text.Encoding]::UTF8.GetString($plain))
         }
     }
