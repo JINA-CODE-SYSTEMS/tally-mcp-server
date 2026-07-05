@@ -5,21 +5,9 @@ import http from 'node:http';
 import path from 'node:path';
 import nunjucks from 'nunjucks';
 import * as m from './models.mjs';
-import { utility } from './utility.mjs';
+import { utility, parseIntEnv } from './utility.mjs';
 
 dotenv.config({ override: true, quiet: true });
-
-// Parse a positive-integer env var, falling back to `fallback` when the value is
-// missing, non-numeric (NaN), or not strictly positive. Guards against operator
-// misconfig silently defeating hang-protection: a bad TALLY_REQUEST_TIMEOUT_MS
-// parsed straight through parseInt yields NaN, and req.setTimeout(NaN) installs
-// no timeout at all — turning a typo into an unbounded hang. `0`/negative would
-// likewise misbehave (immediate or nonsensical timeout), so both are rejected.
-export function parseIntEnv(raw: string | undefined, fallback: number): number {
-    if (raw === undefined) return fallback;
-    const parsed = parseInt(raw, 10);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
 
 const tally_host = process.env.TALLY_HOST || 'localhost'; // default to localhost
 const tally_port = parseIntEnv(process.env.TALLY_PORT, 9000); // default to 9000 XML port of Tally

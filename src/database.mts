@@ -2,6 +2,7 @@ import duckdb from '@duckdb/node-api';
 import crypto from 'node:crypto';
 import { ModelPullReportOutputFieldInfo } from './models.mjs';
 import { reportColumnMetadata } from './tally.mjs';
+import { parseIntEnv } from './utility.mjs';
 
 const instance = await duckdb.DuckDBInstance.create(':memory:');
 const conn = await instance.connect();
@@ -115,7 +116,7 @@ export function cacheTable(reportName: string, data: any[]): Promise<string> {
             dbAppender.closeSync(); // commit output into the table
 
             // set timeout to drop the table after configured retention period
-            const tableRetentionMs = parseInt(process.env.DB_TABLE_RETENTION_MS || '900000'); // default 15 min
+            const tableRetentionMs = parseIntEnv(process.env.DB_TABLE_RETENTION_MS, 900000); // default 15 min
             setTimeout(async () => await conn.run(`DROP TABLE IF EXISTS ${tableId};`), tableRetentionMs);
 
             resolve(tableId);
