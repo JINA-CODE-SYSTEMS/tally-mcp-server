@@ -181,8 +181,12 @@ The server uses OAuth 2.1 with PKCE for authentication. Detailed setup guides:
 
 ### Company Management
 
+> **Recommended flow:** use `resolve-company` to turn a folder id, exact name, or configured alias into one canonical record, then load by alias with `load-company-by-alias`. That's the happy path — no exact-name guessing across the `list-*` tools.
+
 | Tool | Description |
 |------|-------------|
+| `resolve-company` | Resolves one folder id / exact name / configured alias → `{ name, folderId, alias, isLoaded, isProtected }`, typed `ok`/`ambiguous`/`not-found`. The recommended entry point for company identity. |
+| `load-company-by-alias` | Loads a company by its configured alias — the recommended load path (no exact-name matching). |
 | `list-companies` | Lists company folders in the Tally data directory (no open company required) |
 | `list-available-companies` | Recursive scan with display names + credential-requirement hints. Handles both stock layout and Tally Prime Edit Log's nested layout. Use this BEFORE `load-company` so an LLM/human knows which folder to load and whether credentials are needed. |
 | `list-loaded-companies` | Lists companies currently resident in Tally (no restart needed) |

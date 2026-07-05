@@ -103,8 +103,11 @@ GST-bearing notes.
 
 ## Company & session tools
 
+**Recommended flow:** call `resolve-company` to turn any folder id / name / alias into one canonical record, then load by alias with `load-company-by-alias` (the happy path — no exact-name guessing). The five `list-*` tools remain for enumeration/debugging.
+
 | Tool | Key params | Use for |
 |------|-----------|---------|
+| `resolve-company` | `query` | **Start here.** Resolve one folder id / exact name / configured alias → `{ name, folderId, alias, isLoaded, isProtected, matchedBy }`, typed `ok`/`ambiguous`/`not-found`. Avoids guessing among the `list-*` tools. |
 | `list-loaded-companies` | — | What's currently loaded/active. |
 | `list-companies` | — | Companies known to Tally (names + folder IDs). |
 | `list-available-companies` | `dataPath`, `configPath` (optional) | Scan a data path for companies (incl. backups). |
