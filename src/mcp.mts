@@ -918,6 +918,74 @@ export async function getHttpStatusReport(): Promise<{
   };
 }
 
+// ── Typed, machine-readable tool errors (#61) ──────────────────────────────
+// Tool failures used to be free-text log dumps the model had to read "like prose"
+// to decide what to do next. A ToolError gives a machine-readable `code` plus
+// `retryable` and a concrete `remedy`, so callers can branch deterministically;
+// the raw transcript is demoted to a `logs` field instead of being the payload.
+export type ToolErrorCode =
+  | 'PASSWORD_REQUIRED'
+  | 'AGENT_UNREACHABLE'
+  | 'TALLY_DOWN'
+  | 'AGENT_TOO_OLD'
+  | 'COMPANY_NOT_FOUND'
+  | 'AMBIGUOUS'
+  | 'PRECONDITION_FAILED'
+  | 'READONLY'
+  | 'UNKNOWN';
+
+export type ToolErrorEnvelope = {
+  code: ToolErrorCode;
+  message: string;
+  retryable: boolean;
+  remedy?: string;
+  logs?: string;
+};
+
+// Sensible default message / retryable / remedy per code so call sites stay terse.
+const TOOL_ERROR_DEFAULTS: Record<ToolErrorCode, { retryable: boolean; message: string; remedy?: string }> = {
+  PASSWORD_REQUIRED: { retryable: true, message: 'The company appears to be password-protected.', remedy: 'Retry with userName and password arguments.' },
+  AGENT_UNREACHABLE: { retryable: true, message: 'The Tally GUI automation agent is not responding.', remedy: 'Start tally-gui-agent-v2.ps1 in the interactive desktop session (Task Scheduler "At logon"), then retry.' },
+  TALLY_DOWN: { retryable: true, message: 'Tally Prime is not reachable on its XML port.', remedy: 'Ensure Tally Prime is running with the XML/HTTP server enabled, then retry.' },
+  AGENT_TOO_OLD: { retryable: true, message: 'The GUI agent is older than the required version.', remedy: 'Restart the agent to pick up the on-disk update (schtasks /End /TN TallyMCPAgent; schtasks /Run /TN TallyMCPAgent).' },
+  COMPANY_NOT_FOUND: { retryable: false, message: 'No company matched the given identifier.', remedy: 'Use resolve-company or list-available-companies to find the exact id, name, or alias.' },
+  AMBIGUOUS: { retryable: false, message: 'The identifier matched more than one company.', remedy: 'Re-call with the exact folder id or a configured alias.' },
+  PRECONDITION_FAILED: { retryable: true, message: 'A required precondition is not met.' },
+  READONLY: { retryable: false, message: 'Write operations are disabled (READONLY_MODE=true).', remedy: 'Unset READONLY_MODE on the server to allow writes.' },
+  UNKNOWN: { retryable: false, message: 'An unexpected error occurred.' },
+};
+
+// Pure builder — returns the envelope object (tested directly).
+export function buildToolError(
+  code: ToolErrorCode,
+  opts?: { message?: string; retryable?: boolean; remedy?: string; logs?: string }
+): ToolErrorEnvelope {
+  const d = TOOL_ERROR_DEFAULTS[code];
+  const remedy = opts?.remedy ?? d.remedy;
+  const env: ToolErrorEnvelope = {
+    code,
+    message: opts?.message ?? d.message,
+    retryable: opts?.retryable ?? d.retryable,
+  };
+  if (remedy) env.remedy = remedy;
+  if (opts?.logs) env.logs = opts.logs;
+  return env;
+}
+
+// The single helper all classified failures route through: emits the envelope as
+// JSON text (machine-parseable) and as structuredContent, with isError set.
+export function errorResult(
+  code: ToolErrorCode,
+  opts?: { message?: string; retryable?: boolean; remedy?: string; logs?: string }
+) {
+  const env = buildToolError(code, opts);
+  return {
+    isError: true as const,
+    content: [{ type: 'text' as const, text: JSON.stringify(env, null, 2) }],
+    structuredContent: env,
+  };
+}
+
 export async function registerMcpServer(): Promise<McpServer> {
   const mcpServer = new McpServer({
     name: 'Tally Prime MCP Server',
@@ -1802,10 +1870,10 @@ Call set-active-company again with one of these EXACT names, or use open-company
         const agentPing = await pingGuiAgent(agentWatchDir, 4, logs);
         if (!agentPing.alive) {
           auditLog('load-company', args, 'error', Date.now() - start);
-          return {
-            isError: true,
-            content: [{ type: 'text', text: logs.join('\n') + `\n\nGUI agent did not respond at ${agentWatchDir}. Refusing to kill Tally without confirming we can restart it.\n\nTo fix: start tally-gui-agent-v2.ps1 in the user's interactive session (e.g. via Task Scheduler "At logon"). Then retry.` }]
-          };
+          return errorResult('AGENT_UNREACHABLE', {
+            message: `GUI agent did not respond at ${agentWatchDir}. Refusing to kill Tally without confirming we can restart it.`,
+            logs: logs.join('\n'),
+          });
         }
         // Version handshake: refuse to call select-and-unlock-company / start-tally on an agent that
         // predates the IPC fields they rely on. Better to fail fast here than silently mis-key
@@ -1813,10 +1881,10 @@ Call set-active-company again with one of these EXACT names, or use open-company
         if (!agentPing.versionOk) {
           auditLog('load-company', args, 'error', Date.now() - start);
           const reportedVersion = agentPing.agentVersion ?? '(none reported)';
-          return {
-            isError: true,
-            content: [{ type: 'text', text: logs.join('\n') + `\n\nGUI agent is alive but reports version ${reportedVersion}, which is older than the required minimum ${REQUIRED_AGENT_VERSION}. The agent on disk has been updated by a deploy but the running process is stale.\n\nTo fix: stop and restart the agent (Task Scheduler: 'schtasks /End /TN TallyMCPAgent && schtasks /Run /TN TallyMCPAgent'), or just close + relaunch the PowerShell window. The agent self-restarts when its script changes; this only happens if it has been disabled with -NoSelfRestart.` }]
-          };
+          return errorResult('AGENT_TOO_OLD', {
+            message: `GUI agent is alive but reports version ${reportedVersion}, which is older than the required minimum ${REQUIRED_AGENT_VERSION}. The agent on disk has been updated by a deploy but the running process is stale.`,
+            logs: logs.join('\n'),
+          });
         }
         logs.push(`    GUI agent is alive (version ${agentPing.agentVersion ?? '(unknown)'}).`);
 
@@ -1865,10 +1933,10 @@ Call set-active-company again with one of these EXACT names, or use open-company
         const ready = await waitForTallyReady(timeoutMs, logs);
         if (!ready) {
           auditLog('load-company', args, 'error', Date.now() - start);
-          return {
-            isError: true,
-            content: [{ type: 'text', text: logs.join('\n') + '\n\nTally did not become reachable. The MCP service may be in Session 0 (no desktop) — Tally will not show a window in that case. Run the service in the user session, or have a companion process in the user session start tally.exe.' }]
-          };
+          return errorResult('TALLY_DOWN', {
+            message: 'Tally did not become reachable after restart. The MCP service may be in Session 0 (no desktop) — Tally will not show a window in that case. Run the service in the user session, or have a companion process in the user session start tally.exe.',
+            logs: logs.join('\n'),
+          });
         }
 
         // Verify load: Tally silently skips auto-load when data is missing/empty or password-protected,
@@ -1914,10 +1982,10 @@ Call set-active-company again with one of these EXACT names, or use open-company
           const hint = (args.userName || args.password)
             ? 'Even with credentials, the company did not load. Verify the username/password are correct, and that the company is reachable via Alt+F3 → type id → Enter manually.'
             : 'If the company is password-protected, retry with userName and password arguments to use the keystroke fallback.';
-          return {
-            isError: true,
-            content: [{ type: 'text', text: logs.join('\n') + `\n\nTally restarted but the requested company is not in the loaded list. ${hint}` }]
-          };
+          return errorResult('PASSWORD_REQUIRED', {
+            message: `Tally restarted but the requested company is not in the loaded list. ${hint}`,
+            logs: logs.join('\n'),
+          });
         }
 
         // Pick activeCompany: prefer the verified name match; fall back to the only loaded company on Silver/single-load setups.
@@ -2554,7 +2622,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const start = Date.now();
       if (process.env.READONLY_MODE === 'true') {
         auditLog('create-voucher', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Write operations are disabled (READONLY_MODE=true)' }] };
+        return errorResult('READONLY');
       }
       // validate amount > 0
       if (args.amount <= 0) {
@@ -2619,7 +2687,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const start = Date.now();
       if (process.env.READONLY_MODE === 'true') {
         auditLog('create-ledger', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Write operations are disabled (READONLY_MODE=true)' }] };
+        return errorResult('READONLY');
       }
       if (!args.name || args.name.trim() === '') {
         auditLog('create-ledger', args, 'denied');
@@ -2673,7 +2741,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const start = Date.now();
       if (process.env.READONLY_MODE === 'true') {
         auditLog('create-stock-item', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Write operations are disabled (READONLY_MODE=true)' }] };
+        return errorResult('READONLY');
       }
       if (!args.name || args.name.trim() === '') {
         auditLog('create-stock-item', args, 'denied');
@@ -2740,7 +2808,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const start = Date.now();
       if (process.env.READONLY_MODE === 'true') {
         auditLog('create-gst-voucher', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Write operations are disabled (READONLY_MODE=true)' }] };
+        return errorResult('READONLY');
       }
       // validate taxable value
       if (args.taxableValue <= 0) {
