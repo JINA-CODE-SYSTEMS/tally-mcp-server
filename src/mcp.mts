@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import { cacheTable, executeSQL, validateSQL } from './database.mjs';
-import { handlePull, handlePush, jsonToTSV, postTallyXML, resolveGSTLedgers } from './tally.mjs';
+import { handlePull, handlePush, jsonToTSV, pingTally, postTallyXML, resolveGSTLedgers } from './tally.mjs';
 
 dotenv.config({ override: true, quiet: true });
 
@@ -166,6 +166,28 @@ export function findMatchingLoadedCompany(target: string, loaded: string[]): str
     }
   }
   return best ? best.name : null;
+}
+
+// Runs an async boolean probe up to `attempts` times with a small backoff and
+// returns true as soon as any attempt succeeds — used by the `status` tool to
+// absorb a single transient Tally/agent blip so the reported state doesn't flap
+// between calls. A throwing probe counts as a miss. `sleep` is injectable so the
+// retry logic can be unit-tested without real delays.
+export async function probeWithRetry(
+  probe: () => Promise<boolean>,
+  attempts = 3,
+  backoffMs = 150,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise(r => setTimeout(r, ms))
+): Promise<boolean> {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      if (await probe()) return true;
+    } catch {
+      // treat an error as a miss and keep retrying
+    }
+    if (i < attempts - 1) await sleep(backoffMs);
+  }
+  return false;
 }
 
 // open-company strategy renames (#24): the old tdl-* names implied a TDL *load*
@@ -1301,6 +1323,45 @@ export async function registerMcpServer(): Promise<McpServer> {
         return {
           isError: true,
           content: [{ type: 'text', text: `open-company-debug failed: ${err}` }]
+        };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'status',
+    {
+      title: 'Status',
+      description: `Authoritative one-shot health/usability check for this Tally MCP server. Returns a stable five-field contract: { tallyReachable, agentAlive, activeCompany, edition, readonly }. Both liveness probes are retried briefly so a single transient blip doesn't flip the reported state. Call this to answer "is this usable right now, and in what mode?" instead of stitching list-loaded-companies + open-company-debug. Use open-company-debug for the verbose troubleshooting dump (paths, files, agent version, XML sample).`,
+      inputSchema: {},
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      try {
+        const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        // Retry both probes so a single transient miss doesn't flip the reported
+        // state. Tally's ping is cheap when healthy; the agent probe uses a short
+        // per-attempt timeout to bound total latency.
+        const tallyReachable = await probeWithRetry(() => pingTally());
+        const agentAlive = await probeWithRetry(async () => (await pingGuiAgent(tallyDataPath, 2)).alive, 2);
+        const status = {
+          tallyReachable,
+          agentAlive,
+          activeCompany: activeCompany || null,
+          edition: getTallyEdition(),
+          readonly: process.env.READONLY_MODE === 'true'
+        };
+        auditLog('status', args, 'success', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] };
+      } catch (err) {
+        auditLog('status', args, 'error', Date.now() - start);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `status failed: ${err}` }]
         };
       }
     }

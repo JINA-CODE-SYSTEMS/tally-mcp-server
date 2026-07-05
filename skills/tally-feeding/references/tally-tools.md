@@ -112,8 +112,9 @@ GST-bearing notes.
 | `set-active-company` | `companyName` | Switch the default target. |
 | `open-company` | `companyName`, `strategy` (`auto`\|`verify-svcurrentcompany`\|`verify-in-loaded-list`\|`gui-agent`) | Verify a company is active, or GUI-load it. Only `gui-agent` actually loads; the `verify-*` strategies just check. For a cold load use `load-company` / `load-company-by-alias`. (Old `tdl-load`/`tdl-connect` accepted as deprecated aliases.) |
 | `load-company` / `load-company-by-alias` | `company`, `replace`, `dataPath`, `userName`, `password`, `waitTimeoutSec` | Cold-load via Tally restart (edition-aware). Credentials are filtered from audit logs. |
-| `open-company-debug` | `includeRecentResult`, `watchDir` | Diagnose open/load issues. |
-| `tally-raw-xml-probe` | `xml`, `label` | Debug-only raw XML probe. Not for routine feeding. |
+| `status` | — | Authoritative one-shot health check: `{ tallyReachable, agentAlive, activeCompany, edition, readonly }`. Probes are retried to absorb transient blips. Prefer this over stitching `list-loaded-companies` + `open-company-debug`. |
+| `open-company-debug` | `includeRecentResult`, `watchDir` | Verbose troubleshooting dump (paths, files, agent version, XML sample). |
+| `tally-raw-xml-probe` | `xml`, `label`, `allowWrite` | Debug-only raw XML probe (default-off). Read-only unless `allowWrite: true`. Not for routine feeding. |
 
 ## list-master collections
 
