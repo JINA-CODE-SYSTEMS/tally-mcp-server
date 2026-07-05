@@ -8,9 +8,10 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { registerMcpServer } from './mcp.mjs';
+import { parseIntEnv } from './utility.mjs';
 
 
-const mcpPort = parseInt(process.env.PORT || '3000');
+const mcpPort = parseIntEnv(process.env.PORT, 3000);
 const mcpDomain = process.env.MCP_DOMAIN || 'http://localhost:3000';
 const __dirname = import.meta.dirname;
 
@@ -22,7 +23,7 @@ try {
       .filter(f => /^service-\d{8}T\d{6}\.\d+\.log$/.test(f))
       .sort()
       .reverse();
-    const maxKeep = parseInt(process.env.LOG_RETAIN_COUNT || '10');
+    const maxKeep = parseIntEnv(process.env.LOG_RETAIN_COUNT, 10);
     for (const f of logFiles.slice(maxKeep)) {
       fs.unlinkSync(path.join(logsDir, f));
     }
@@ -64,8 +65,8 @@ app.use(cors({
 
 // Rate limiting on auth endpoints
 const authRateLimiter = rateLimit({
-  windowMs: parseInt(process.env.AUTH_RATE_LIMIT_WINDOW_MS || '60000'),
-  max: parseInt(process.env.AUTH_RATE_LIMIT_MAX || '10'),
+  windowMs: parseIntEnv(process.env.AUTH_RATE_LIMIT_WINDOW_MS, 60000),
+  max: parseIntEnv(process.env.AUTH_RATE_LIMIT_MAX, 10),
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests, try again later' }
@@ -172,7 +173,7 @@ setInterval(() => {
     }
   }
 
-}, parseInt(process.env.TOKEN_CLEANUP_INTERVAL_MS || '60000')); // default every minute
+}, parseIntEnv(process.env.TOKEN_CLEANUP_INTERVAL_MS, 60000)); // default every minute
 
 
 // Handle POST requests for client-to-server communication
@@ -384,7 +385,7 @@ app.post('/authorize', authRateLimiter, (req, res) => {
       redirect_uri: redirectUri,
       code_challenge: codeChallenge,
       code_challenge_method: codeChallengeMethod,
-      expires_at: Date.now() + parseInt(process.env.AUTH_CODE_EXPIRY_MS || '600000') // default 10 minutes
+      expires_at: Date.now() + parseIntEnv(process.env.AUTH_CODE_EXPIRY_MS, 600000) // default 10 minutes
     };
     res.status(200).json({ status: isValidated, code });
     
@@ -541,7 +542,7 @@ app.post('/token', authRateLimiter, (req, res) => {
 
   // Generate access token and separate refresh token
   const accessToken = generateSecureToken(32);
-  const expiresIn = parseInt(process.env.ACCESS_TOKEN_EXPIRY_SEC || '3600'); // default 1 hour
+  const expiresIn = parseIntEnv(process.env.ACCESS_TOKEN_EXPIRY_SEC, 3600); // default 1 hour
 
   accessTokens[accessToken] = {
     token: accessToken,
