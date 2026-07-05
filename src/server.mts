@@ -7,7 +7,7 @@ import helmet from 'helmet';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { registerMcpServer } from './mcp.mjs';
+import { registerMcpServer, getHttpStatusReport, isStatusEndpointEnabled } from './mcp.mjs';
 import { parseIntEnv } from './utility.mjs';
 
 
@@ -320,6 +320,23 @@ const handleOAuthAuthorizationServer = (req: express.Request, res: express.Respo
 
 // Handle OAuth Authorization Server
 app.get('/.well-known/oauth-authorization-server', handleOAuthAuthorizationServer);
+
+// Opt-in, unauthenticated health endpoint for uptime monitors / support tooling
+// (#25). Disabled by default; set STATUS_ENDPOINT_PUBLIC=1 to expose it. Returns
+// the server's self-report (agent ping, Tally reachability, edition, build).
+// 200 when healthy, 503 when Tally is unreachable so monitors read green/red.
+app.get('/status', async (_req: express.Request, res: express.Response) => {
+  if (!isStatusEndpointEnabled()) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  try {
+    const report = await getHttpStatusReport();
+    res.status(report.ok ? 200 : 503).json(report);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
 
 
 app.post('/register', authRateLimiter, (req, res) => {
