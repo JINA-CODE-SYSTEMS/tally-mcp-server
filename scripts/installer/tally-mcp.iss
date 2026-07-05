@@ -157,8 +157,10 @@ Filename: "powershell.exe"; \
   Flags: runhidden waituntilterminated
 
 [UninstallDelete]
-; .env is intentionally left behind on uninstall — it contains the OAuth password and other secrets
-; the operator may have rotated. Delete manually if a clean wipe is desired.
+; .env holds the OAuth password and other secrets. uninstall-cleanup.ps1 overwrites and
+; deletes it before this step; this entry is a fallback for the case where that script did
+; not run (e.g. it was removed), so a password-bearing file is never left behind.
+Type: files; Name: "{app}\.env"
 Type: filesandordirs; Name: "{app}\logs"
 Type: filesandordirs; Name: "{app}\node_modules"
 Type: filesandordirs; Name: "{app}\dist"
@@ -254,11 +256,13 @@ begin
   Exec(ExpandConstant('{cmd}'), '/C schtasks /End /TN TallyMCPAgent /F', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
   Exec(ExpandConstant('{cmd}'), '/C schtasks /End /TN TallyMCPTray /F',  '', SW_HIDE, ewWaitUntilTerminated, resultCode);
 
-  // 3. Kill any orphan node.exe (the MCP service child) and any powershell.exe whose
-  //    command line references tally-mcp / TallyMCP (orphan agent / tray instances from a
-  //    crashed earlier run). taskkill /T includes child processes; wmic filters by
-  //    commandline without nested-quote hell.
-  Exec(ExpandConstant('{cmd}'), '/C taskkill /F /IM node.exe /T', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+  // 3. Kill any orphan node.exe belonging to THIS install (the MCP service child) and any
+  //    powershell.exe whose command line references tally-mcp / TallyMCP (orphan agent / tray
+  //    instances from a crashed earlier run). wmic filters by commandline without nested-quote
+  //    hell. The node.exe filter matches this server's own entrypoint (dist\server.mjs) rather
+  //    than the bare image name, so unrelated node processes on the box (dev servers, Electron
+  //    apps, other services) are NOT terminated — the old `taskkill /IM node.exe /T` killed them all.
+  Exec(ExpandConstant('{cmd}'), '/C wmic process where "name=''node.exe'' and commandline like ''%%server.mjs%%''" delete', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
   Exec(ExpandConstant('{cmd}'), '/C wmic process where "name=''powershell.exe'' and commandline like ''%%tally-mcp%%''" delete', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
   Exec(ExpandConstant('{cmd}'), '/C wmic process where "name=''powershell.exe'' and commandline like ''%%TallyMCP%%''" delete', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
 

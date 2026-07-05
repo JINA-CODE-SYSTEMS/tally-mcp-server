@@ -743,33 +743,40 @@ async function callGuiAgent(
   atomicWriteFile(commandFile, command);
   logs.push(`  [gui-agent] sent action=${action} commandId=${commandId}, waiting up to ${timeoutSec}s`);
 
-  for (let i = 0; i < timeoutSec; i++) {
-    await sleep(1000);
-    if (!fs.existsSync(resultFile)) continue;
-    try {
-      // Strip leading BOM defensively — PowerShell's [Encoding]::UTF8 emits a BOM that breaks JSON.parse.
-      const resultText = fs.readFileSync(resultFile, 'utf-8').replace(/^﻿/, '');
-      const result = JSON.parse(resultText);
-      if (!isMatchingGuiAgentCommand(result, commandId)) {
-        logs.push(`  [gui-agent] ignoring stale response for commandId ${result?.commandId || 'unknown'}`);
+  try {
+    for (let i = 0; i < timeoutSec; i++) {
+      await sleep(1000);
+      if (!fs.existsSync(resultFile)) continue;
+      try {
+        // Strip leading BOM defensively — PowerShell's [Encoding]::UTF8 emits a BOM that breaks JSON.parse.
+        const resultText = fs.readFileSync(resultFile, 'utf-8').replace(/^﻿/, '');
+        const result = JSON.parse(resultText);
+        if (!isMatchingGuiAgentCommand(result, commandId)) {
+          logs.push(`  [gui-agent] ignoring stale response for commandId ${result?.commandId || 'unknown'}`);
+          try { fs.unlinkSync(resultFile); } catch {}
+          continue;
+        }
+        const versionStr = typeof result.agentVersion === 'string' ? result.agentVersion : null;
+        logs.push(`  [gui-agent] response: status=${result.status} message=${result.message}${versionStr ? ` agentVersion=${versionStr}` : ''}`);
         try { fs.unlinkSync(resultFile); } catch {}
-        continue;
+        return {
+          status: String(result.status || ''),
+          message: String(result.message || ''),
+          agentVersion: versionStr,
+          raw: result
+        };
+      } catch {
+        try { fs.unlinkSync(resultFile); } catch {}
       }
-      const versionStr = typeof result.agentVersion === 'string' ? result.agentVersion : null;
-      logs.push(`  [gui-agent] response: status=${result.status} message=${result.message}${versionStr ? ` agentVersion=${versionStr}` : ''}`);
-      try { fs.unlinkSync(resultFile); } catch {}
-      return {
-        status: String(result.status || ''),
-        message: String(result.message || ''),
-        agentVersion: versionStr,
-        raw: result
-      };
-    } catch {
-      try { fs.unlinkSync(resultFile); } catch {}
     }
+    logs.push(`  [gui-agent] no response within ${timeoutSec}s`);
+    return null;
+  } finally {
+    // The command file may carry a decrypted password. Never leave it on disk after
+    // we're done — on the agent-down/timeout path nothing else removes it. On success
+    // the agent has already consumed it, so this unlink is a harmless no-op.
+    try { fs.unlinkSync(commandFile); } catch {}
   }
-  logs.push(`  [gui-agent] no response within ${timeoutSec}s`);
-  return null;
 }
 
 // Result of a GUI-agent ping: alive + version + whether version meets the server's required minimum.
