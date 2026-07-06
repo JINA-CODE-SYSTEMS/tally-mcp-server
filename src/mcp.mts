@@ -5,7 +5,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import { cacheTable, executeSQL, validateSQL } from './database.mjs';
-import { handlePull, handlePush, jsonToTSV, pingTally, postTallyXML, resolveGSTLedgers } from './tally.mjs';
+import { handlePull, handlePush, jsonToTSV, pingTally, postTallyXML, pushXml, resolveGSTLedgers } from './tally.mjs';
+import { buildVoucherXml, voucherBalance, type VoucherEntry, type VoucherInput } from './voucher.mjs';
 
 dotenv.config({ override: true, quiet: true });
 
@@ -1160,6 +1161,114 @@ export function errorResult(
     content: [{ type: 'text' as const, text: JSON.stringify(env, null, 2) }],
     structuredContent: env,
   };
+}
+
+// ── voucher schemas + shared executor (#94 H-8, #97 H-11) ──────────────────
+const voucherEntrySchema = z.object({
+  ledger: z.string().describe('exact ledger name (already resolved — no fuzzy matching host-side)'),
+  drCr: z.enum(['dr', 'cr']).describe('dr = debit, cr = credit'),
+  amount: z.number().positive().describe('positive amount; the sign is derived from drCr'),
+  billwise: z.array(z.object({
+    name: z.string(),
+    billType: z.enum(['New Ref', 'Agst Ref', 'Advance', 'On Account']).optional(),
+    amount: z.number()
+  })).optional().describe('bill-wise allocations for a receivable/payable line'),
+  costCentres: z.array(z.object({ category: z.string(), centre: z.string(), amount: z.number() })).optional()
+});
+const inventoryLineSchema = z.object({
+  stockItem: z.string(),
+  quantity: z.number(),
+  rate: z.number().optional(),
+  amount: z.number().optional(),
+  unit: z.string().optional(),
+  godown: z.string().optional(),
+  batch: z.string().optional(),
+  accountingLedger: z.string().optional().describe('sales/purchase ledger this stock value posts to')
+});
+const gstBlockSchema = z.object({
+  placeOfSupply: z.string().optional(),
+  isReverseCharge: z.boolean().optional(),
+  registrationType: z.string().optional()
+});
+// The full voucher shape, shared by create-voucher and create-vouchers.
+const voucherInputShape = {
+  voucherType: z.enum(['Sales', 'Purchase', 'Payment', 'Receipt', 'Contra', 'Journal', 'Debit Note', 'Credit Note']),
+  date: z.string().describe('voucher date in YYYY-MM-DD format'),
+  entries: z.array(voucherEntrySchema).optional().describe('fully-resolved ledger lines; MUST balance (sum of dr amounts == sum of cr amounts). Preferred over the deprecated debitLedger/creditLedger/amount form.'),
+  debitLedger: z.string().optional().describe('DEPRECATED shim — use entries[]. Kept for back-compat: forms a 2-line voucher with creditLedger + amount.'),
+  creditLedger: z.string().optional().describe('DEPRECATED shim — use entries[].'),
+  amount: z.number().optional().describe('DEPRECATED shim — use entries[]. Amount for the debit/credit shim.'),
+  narration: z.string().optional(),
+  voucherNumber: z.string().optional().describe('optional; blank for auto-numbering'),
+  reference: z.string().optional(),
+  partyLedger: z.string().optional().describe('party ledger for GST/invoice vouchers (PARTYLEDGERNAME)'),
+  inventory: z.array(inventoryLineSchema).optional(),
+  gst: gstBlockSchema.optional()
+};
+type VoucherArgs = {
+  voucherType: string; date: string;
+  entries?: VoucherEntry[];
+  debitLedger?: string; creditLedger?: string; amount?: number;
+  narration?: string; voucherNumber?: string; reference?: string; partyLedger?: string;
+  inventory?: VoucherInput['inventory']; gst?: VoucherInput['gst'];
+};
+
+// Normalizes a voucher's ledger lines: prefer entries[]; else fold the deprecated
+// debitLedger/creditLedger/amount shim into a 2-line balanced entry set. Returns a typed error
+// string when neither form is usable. Pure — no I/O.
+export function normalizeVoucherEntries(args: VoucherArgs): { entries: VoucherEntry[] } | { error: string } {
+  if (args.entries && args.entries.length > 0) return { entries: args.entries };
+  if (args.debitLedger && args.creditLedger && typeof args.amount === 'number') {
+    return { entries: [
+      { ledger: args.debitLedger, drCr: 'dr', amount: args.amount },
+      { ledger: args.creditLedger, drCr: 'cr', amount: args.amount },
+    ] };
+  }
+  return { error: 'Provide entries[] (preferred) or the debitLedger + creditLedger + amount shim.' };
+}
+
+type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean; structuredContent?: any };
+
+// Assembles + posts a single voucher, applying the deterministic host invariants (#94/#95). Shared by
+// create-voucher, create-vouchers (#97), and the dryRun path (#96). With opts.dryRun it echoes the
+// exact posting (voucher + rendered XML) and does NOT call Tally. #95 extends the invariant set
+// (date-in-period, master-existence, idempotency) via optional opts.
+export async function executeVoucher(
+  args: VoucherArgs & { targetCompany?: string },
+  opts: { dryRun?: boolean } = {}
+): Promise<ToolResult> {
+  const norm = normalizeVoucherEntries(args);
+  if ('error' in norm) return errorResult('PRECONDITION_FAILED', { message: norm.error, retryable: false });
+  const entries = norm.entries;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(args.date)) {
+    return errorResult('PRECONDITION_FAILED', { message: 'Date must be in YYYY-MM-DD format.', retryable: false });
+  }
+  if (entries.some(e => !(e.amount > 0))) {
+    return errorResult('PRECONDITION_FAILED', { message: 'Every entry amount must be greater than 0.', retryable: false });
+  }
+  // Deterministic balance invariant (#94 H-8): total debits must equal total credits.
+  const bal = voucherBalance(entries);
+  if (!bal.balanced) {
+    return errorResult('UNBALANCED', { message: `Voucher does not balance: debits ${bal.debit} != credits ${bal.credit}.` });
+  }
+  const company = args.targetCompany || activeCompany || undefined;
+  const voucher: VoucherInput = {
+    voucherType: args.voucherType, date: args.date, entries,
+    narration: args.narration, voucherNumber: args.voucherNumber, reference: args.reference,
+    partyLedger: args.partyLedger, inventory: args.inventory, gst: args.gst,
+  };
+  const xml = buildVoucherXml(voucher, company);
+  if (opts.dryRun) {
+    // Echo exactly what would be posted; mutate nothing (#96 H-10).
+    return { content: [{ type: 'text', text: JSON.stringify({ dryRun: true, wouldPost: true, balance: bal, voucher, xml }, null, 2) }] };
+  }
+  const resp = await pushXml(xml);
+  if (!resp.success) {
+    // Re-map Tally's duplicate-voucher signal to the typed DUPLICATE code (#95/#99).
+    if (/duplicat/i.test(resp.error || '')) return errorResult('DUPLICATE', { message: resp.error });
+    return errorResult('UNKNOWN', { message: resp.error || 'Failed to create voucher.' });
+  }
+  return { content: [{ type: 'text', text: JSON.stringify({ success: true, created: resp.created, lastVchId: resp.lastVchId }) }] };
 }
 
 export async function registerMcpServer(): Promise<McpServer> {
@@ -2758,16 +2867,10 @@ export async function registerMcpServer(): Promise<McpServer> {
     'create-voucher',
     {
       title: 'Create Voucher',
-      description: `creates a new voucher entry in Tally Prime. Supports voucher types: Sales, Purchase, Payment, Receipt, Contra, Journal, Debit Note, Credit Note. Debit and credit ledger names must exactly match existing ledgers in Tally — validate using list-master tool with collection as ledger before calling this tool. Amount must be greater than 0. Debit and credit ledger must be different. Returns success status with created voucher ID`,
+      description: `Posts one fully-resolved voucher to Tally. Preferred form: entries[] — an array of { ledger, drCr, amount } lines that MUST balance (sum of debits == sum of credits); the host rejects an unbalanced voucher with UNBALANCED. Supports optional inventory[], per-line billwise / costCentres, partyLedger, gst (placeOfSupply / reverse-charge), narration, voucherNumber, reference — so a plain journal, a GST invoice with stock, and a bill-wise receipt all post through this one tool. Ledger/stock names must already be exact (resolve them session-side; the host does no fuzzy matching). The legacy debitLedger/creditLedger/amount form still works as a 2-line shim. Returns { success, created, lastVchId }.`,
       inputSchema: {
-        targetCompany: z.string().optional().describe('optional company name. leave it blank or skip this to choose for default company'),
-        voucherType: z.enum(['Sales', 'Purchase', 'Payment', 'Receipt', 'Contra', 'Journal', 'Debit Note', 'Credit Note']).describe('type of voucher to create'),
-        date: z.string().describe('voucher date in YYYY-MM-DD format'),
-        debitLedger: z.string().describe('exact debit ledger name — validate using list-master tool with collection as ledger'),
-        creditLedger: z.string().describe('exact credit ledger name — validate using list-master tool with collection as ledger'),
-        amount: z.number().describe('voucher amount, must be greater than 0'),
-        narration: z.string().optional().describe('optional narration / remarks for the voucher'),
-        voucherNumber: z.string().optional().describe('optional voucher number. leave blank for auto-numbering')
+        targetCompany: z.string().optional().describe('optional company name; defaults to the active company'),
+        ...voucherInputShape,
       },
       annotations: {
         readOnlyHint: false,
@@ -2781,42 +2884,9 @@ export async function registerMcpServer(): Promise<McpServer> {
         auditLog('create-voucher', args, 'denied');
         return errorResult('READONLY');
       }
-      // validate amount > 0
-      if (args.amount <= 0) {
-        auditLog('create-voucher', args, 'denied');
-        return errorResult('PRECONDITION_FAILED', { message: 'Amount must be greater than 0.', retryable: false });
-      }
-      // validate debit != credit
-      if (args.debitLedger.trim().toLowerCase() === args.creditLedger.trim().toLowerCase()) {
-        auditLog('create-voucher', args, 'denied');
-        return errorResult('PRECONDITION_FAILED', { message: 'Debit and credit ledger must be different.', retryable: false });
-      }
-      // validate date format
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(args.date)) {
-        auditLog('create-voucher', args, 'denied');
-        return errorResult('PRECONDITION_FAILED', { message: 'Date must be in YYYY-MM-DD format.', retryable: false });
-      }
-
-      let inputParams = new Map<string, any>([
-        ['voucherType', args.voucherType],
-        ['date', args.date],
-        ['debitLedger', args.debitLedger],
-        ['creditLedger', args.creditLedger],
-        ['amount', args.amount]
-      ]);
-      if (args.targetCompany) inputParams.set('targetCompany', args.targetCompany);
-      if (args.narration) inputParams.set('narration', args.narration);
-      if (args.voucherNumber) inputParams.set('voucherNumber', args.voucherNumber);
-
-      const resp = await push('voucher', inputParams);
-      if (!resp.success) {
-        auditLog('create-voucher', args, 'error', Date.now() - start);
-        return errorResult('UNKNOWN', { message: resp.error || 'Failed to create voucher.' });
-      }
-      auditLog('create-voucher', args, 'success', Date.now() - start);
-      return {
-        content: [{ type: 'text', text: JSON.stringify({ success: true, created: resp.created, lastVchId: resp.lastVchId }) }]
-      };
+      const result = await executeVoucher(args);
+      auditLog('create-voucher', args, result.isError ? 'error' : 'success', Date.now() - start);
+      return result;
     }
   );
 

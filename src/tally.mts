@@ -526,6 +526,57 @@ export function handlePush(templateName: string, inputParams: Map<string, any>):
     });
 }
 
+// Posts a fully pre-rendered Import envelope (e.g. the full-fidelity voucher XML built in mcp.mts,
+// which the flat template/config system can't express) and parses Tally's RESPONSE exactly like
+// handlePush. Pings first (fail fast if Tally is wedged) and injects company credentials if set.
+export function pushXml(xml: string): Promise<m.ModelPushResponse> {
+    return new Promise<m.ModelPushResponse>(async (resolve) => {
+        const retval: m.ModelPushResponse = { success: false, created: 0, altered: 0, lastVchId: 0 };
+        try {
+            const alive = await pingTally();
+            if (!alive) {
+                retval.error = 'Tally is not responding (ping timed out). Dismiss any Tally popups and retry, or restart Tally.';
+                return resolve(retval);
+            }
+            let xmlRequest = xml;
+            const companyUser = process.env.TALLY_COMPANY_USER || '';
+            const companyPassword = process.env.TALLY_COMPANY_PASSWORD || '';
+            if (companyUser && xmlRequest.includes('</STATICVARIABLES>')) {
+                xmlRequest = xmlRequest.replace('</STATICVARIABLES>',
+                    `<SVCOMPANYUSER>${utility.String.escapeHTML(companyUser)}</SVCOMPANYUSER>` +
+                    `<SVCOMPANYPASSWORD>${utility.String.escapeHTML(companyPassword)}</SVCOMPANYPASSWORD>` +
+                    '</STATICVARIABLES>');
+            }
+            const respContent = await postTallyXML(xmlRequest);
+            if (!respContent) {
+                retval.error = 'Empty response received from Tally';
+                return resolve(retval);
+            }
+            const xmlParser = new XMLParser({ parseTagValue: false });
+            const resultObj = xmlParser.parse(respContent);
+            if (resultObj['RESPONSE']) {
+                const resp = resultObj['RESPONSE'];
+                retval.created = parseInt(resp['CREATED'] || '0');
+                retval.altered = parseInt(resp['ALTERED'] || '0');
+                retval.lastVchId = parseInt(resp['LASTVCHID'] || '0');
+                const errors = parseInt(resp['ERRORS'] || '0');
+                if (errors > 0 || (retval.created === 0 && retval.altered === 0)) {
+                    retval.success = false;
+                    retval.error = resp['LINEERROR'] || `Tally returned ${errors} error(s). Check if ledger/item names are valid`;
+                } else {
+                    retval.success = true;
+                }
+            } else {
+                retval.error = 'Unexpected response format from Tally';
+            }
+        } catch (err) {
+            retval.error = 'Server exception';
+        } finally {
+            resolve(retval);
+        }
+    });
+}
+
 /**
  * Fetches chart-of-accounts from Tally and builds a lookup map
  * that resolves any group name to its primary ancestor group
