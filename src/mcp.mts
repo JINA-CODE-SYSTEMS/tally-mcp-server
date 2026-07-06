@@ -1079,15 +1079,29 @@ export async function getHttpStatusReport(): Promise<{
 // to decide what to do next. A ToolError gives a machine-readable `code` plus
 // `retryable` and a concrete `remedy`, so callers can branch deterministically;
 // the raw transcript is demoted to a `logs` field instead of being the payload.
+// The spec's fixed code enum (H-14): 10 codes the session can branch on deterministically.
+// The first block is the 10 spec codes; the second is documented HOST EXTENSIONS that predate the
+// spec and stay for backward-compat (they are NOT part of the spec-10):
+//   - AGENT_TOO_OLD    — version-handshake failure (a specific AGENT_UNREACHABLE sub-case)
+//   - COMPANY_NOT_FOUND— company-scoped not-found (distinct from master-scoped MASTER_NOT_FOUND)
+//   - AMBIGUOUS        — company-match ambiguity (distinct from the general, host-deterministic AMBIGUOUS_INPUT)
+//   - UNKNOWN          — unclassified fallback; every use is a candidate to reclassify onto a typed code
 export type ToolErrorCode =
-  | 'PASSWORD_REQUIRED'
+  // ── spec-10 (H-14) ──
   | 'AGENT_UNREACHABLE'
   | 'TALLY_DOWN'
+  | 'PASSWORD_REQUIRED'
+  | 'OUT_OF_PERIOD'
+  | 'MASTER_NOT_FOUND'
+  | 'AMBIGUOUS_INPUT'
+  | 'UNBALANCED'
+  | 'DUPLICATE'
+  | 'READONLY'
+  | 'PRECONDITION_FAILED'
+  // ── host extensions (not in the spec-10) ──
   | 'AGENT_TOO_OLD'
   | 'COMPANY_NOT_FOUND'
   | 'AMBIGUOUS'
-  | 'PRECONDITION_FAILED'
-  | 'READONLY'
   | 'UNKNOWN';
 
 export type ToolErrorEnvelope = {
@@ -1108,6 +1122,12 @@ const TOOL_ERROR_DEFAULTS: Record<ToolErrorCode, { retryable: boolean; message: 
   AMBIGUOUS: { retryable: false, message: 'The identifier matched more than one company.', remedy: 'Re-call with the exact folder id or a configured alias.' },
   PRECONDITION_FAILED: { retryable: true, message: 'A required precondition is not met.' },
   READONLY: { retryable: false, message: 'Write operations are disabled (READONLY_MODE=true).', remedy: 'Unset READONLY_MODE on the server to allow writes.' },
+  // spec-10 deterministic-invariant codes (H-14 / H-9)
+  OUT_OF_PERIOD: { retryable: false, message: 'The voucher date is outside the company\'s open period.', remedy: 'Use get-period and date the voucher within booksFrom..fyTo.' },
+  MASTER_NOT_FOUND: { retryable: false, message: 'A referenced ledger or stock item does not exist.', remedy: 'Create the master first (create-ledger / create-stock-item) or correct the exact name via search-master.' },
+  AMBIGUOUS_INPUT: { retryable: false, message: 'The input matched more than one master on an exact key.', remedy: 'Disambiguate with the exact, fully-qualified name.' },
+  UNBALANCED: { retryable: false, message: 'Voucher entries do not balance (total debits != total credits).', remedy: 'Adjust the entries so debits equal credits before retrying.' },
+  DUPLICATE: { retryable: false, message: 'A voucher or master with the same deterministic key already exists.', remedy: 'Use a different voucher number / master name, or reverse-voucher to cancel the existing one.' },
   UNKNOWN: { retryable: false, message: 'An unexpected error occurred.' },
 };
 
