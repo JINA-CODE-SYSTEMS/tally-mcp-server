@@ -765,7 +765,9 @@ function Show-Dashboard {
                 try { [System.Windows.Forms.Clipboard]::SetText($State.PublicUrl) } catch {}
             }
         } },
-        @{ Text = 'Manage Companies...'; X =  16; Y = 104; Click = { $miManageCompanies.PerformClick() } }
+        @{ Text = 'Manage Companies...'; X =  16; Y = 104; Click = { $miManageCompanies.PerformClick() } },
+        @{ Text = 'Stop service';        X = 210; Y = 104; Click = { $miStopService.PerformClick() } },
+        @{ Text = 'Claude GUI control...'; X = 404; Y = 104; Click = { $miGuiControl.PerformClick() } }
     )
     foreach ($spec in $btnSpecs) {
         $btn = New-Object System.Windows.Forms.Button
