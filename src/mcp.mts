@@ -615,6 +615,17 @@ export function findCompanyByAlias(registry: CompanyRegistry, alias: string): Co
   return null;
 }
 
+// Resolves a vault entry for unlock-stored-credentials from an alias, folder id, or display name
+// (deterministic, exact — no fuzzy matching). Returns null when nothing configured matches.
+export function resolveVaultEntry(registry: CompanyRegistry, company: string): CompanyEntry | null {
+  const byAlias = findCompanyByAlias(registry, company);
+  if (byAlias) return byAlias;
+  const id = (company ?? '').trim();
+  const q = id.toLowerCase();
+  if (!q) return null;
+  return registry.companies.find(c => c.folderId === id || (c.displayName ?? '').trim().toLowerCase() === q) ?? null;
+}
+
 // Returns every alias the user could legitimately type — main alias + extra aliases, deduped,
 // in declaration order. Used in error messages when an unknown alias is requested.
 export function listConfiguredAliases(registry: CompanyRegistry): string[] {
@@ -1055,7 +1066,14 @@ Hard preconditions (discover via \`status\`/\`get-context\`, don't hit walls):
 - The Tally XML server must be running for any data read.
 - The GUI automation agent must be running to load/switch companies or unlock protected ones.
 - On Silver only one company is resident at a time; loading another replaces it.
-- Write tools are refused when readonly is true (READONLY_MODE).`;
+- Write tools are refused when readonly is true (READONLY_MODE).
+
+Driving the Tally GUI (only when ENABLE_GUI_CONTROL=true) — YOU drive it, look-verify-act, never blind:
+- Use \`gui-screenshot\` as your eyes and \`gui-send-keys\` as your hands. Screenshot → confirm which screen you're on → send ONE step → screenshot → confirm the transition. Never send a relative sequence into an unknown screen.
+- Anchor first: press Escape back to the Gateway of Tally and confirm you're there before navigating.
+- Keystrokes are for LOGIN and COMPANY SELECTION only. NEVER keystroke a data write. All vouchers/masters go through the deterministic tools (create-voucher, create-ledger, …) which use Tally's XML API — never the GUI.
+- Fail closed: if a screenshot shows an unexpected screen (especially any Create/Alter master screen), STOP, press Escape back to the anchor, and return the problem — do NOT push more keys into the void.
+- Unlocking a protected company: when the password prompt is visible (confirm via screenshot first), call \`unlock-stored-credentials\` — the SERVER decrypts and types the vaulted password locally; the plaintext never comes to you and is never logged. If it returns noStoredCredentials or failed, ask the user for the password, then type it and verify by screenshot.`;
 
 // Shared liveness probe used by both `status` and `get-context`. Retries each
 // probe so a single transient blip doesn't flip the reported state.
@@ -3832,6 +3850,70 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
       auditLog('gui-send-keys', redacted, 'success', Date.now() - start);
       return { content: [{ type: 'text', text: JSON.stringify({ success: true, message: resp.message }) }] };
+    }
+  );
+
+  mcpServer.registerTool(
+    'unlock-stored-credentials',
+    {
+      title: 'Unlock with Stored Credentials',
+      description: `When a company's password prompt is on screen — CONFIRM that via gui-screenshot FIRST — this types the stored vault password locally so you never see the plaintext. The server looks up the company's saved credentials, decrypts them, and types them into the focused Tally window; it returns ONLY { unlocked } / { noStoredCredentials } / { failed } — the password never comes back to you and is never logged. On noStoredCredentials or failed, ask the user for the password and type it via gui-send-keys, then verify by screenshot. Requires ENABLE_GUI_CONTROL=true. This does NOT navigate — it types into whatever is focused, so only call it once you've visually confirmed the password prompt. Part of the look-verify-act GUI loop; never call it blind.`,
+      inputSchema: {
+        company: z.string().describe('the company to unlock — a configured alias, folder id, or display name')
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      const auditArgs = { company: args.company }; // never the password
+      if (process.env.ENABLE_GUI_CONTROL !== 'true') {
+        auditLog('unlock-stored-credentials', auditArgs, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: 'Claude-driven GUI control is disabled.', remedy: 'Set ENABLE_GUI_CONTROL=true (and restart the service) to enable it.', retryable: false });
+      }
+      try {
+        const registry = loadCompanyRegistry(resolveRegistryPath());
+        const entry = resolveVaultEntry(registry, args.company);
+        if (!entry) {
+          auditLog('unlock-stored-credentials', auditArgs, 'denied', Date.now() - start);
+          return { content: [{ type: 'text', text: JSON.stringify({ noStoredCredentials: true, reason: 'no configured company matched — ask the user for the password', company: args.company }) }] };
+        }
+        if (!entry.passwordEnc) {
+          auditLog('unlock-stored-credentials', auditArgs, 'success', Date.now() - start);
+          return { content: [{ type: 'text', text: JSON.stringify({ noStoredCredentials: true, reason: 'company configured but has no stored password — ask the user', alias: entry.alias }) }] };
+        }
+        let plaintextPassword = '';
+        try {
+          plaintextPassword = await decryptPasswordViaDpapi(entry.passwordEnc);
+        } catch {
+          auditLog('unlock-stored-credentials', auditArgs, 'error', Date.now() - start);
+          return { content: [{ type: 'text', text: JSON.stringify({ failed: true, reason: 'stored password could not be decrypted — ask the user, or fix via tray > Manage Companies' }) }], isError: true };
+        }
+        // Type the creds locally via the agent's sendkeys action. The secret is injected server-side
+        // into the IPC and is never returned to the caller nor logged. This does NOT navigate — it
+        // assumes the caller already confirmed (via gui-screenshot) the password prompt is focused.
+        const keys = (entry.username ? `${entry.username}{ENTER}` : '') + plaintextPassword + '{ENTER}';
+        const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const logs: string[] = [];
+        const resp = await callGuiAgent('sendkeys', { keys }, 15, dataPath, logs);
+        plaintextPassword = ''; // drop the secret from locals ASAP
+        if (!resp) {
+          auditLog('unlock-stored-credentials', auditArgs, 'error', Date.now() - start);
+          return errorResult('AGENT_UNREACHABLE', { message: 'GUI agent did not respond.' });
+        }
+        if (resp.status !== 'success') {
+          auditLog('unlock-stored-credentials', auditArgs, 'error', Date.now() - start);
+          return { content: [{ type: 'text', text: JSON.stringify({ failed: true, reason: resp.message }) }], isError: true };
+        }
+        auditLog('unlock-stored-credentials', auditArgs, 'success', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify({ unlocked: true, hint: 'Confirm with gui-screenshot that the company loaded.' }) }] };
+      } catch {
+        auditLog('unlock-stored-credentials', auditArgs, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: 'unlock-stored-credentials failed.' });
+      }
     }
   );
 
