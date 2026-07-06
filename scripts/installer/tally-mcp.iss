@@ -178,6 +178,20 @@ Type: filesandordirs; Name: "{app}\bin"
 var
   ConfigPage: TInputQueryWizardPage;
   EditionPage: TInputOptionWizardPage;
+  AgentUserOverride: TNewCheckBox;
+
+// Toggle the agent-user field's editability from the "advanced" checkbox. Locked (disabled) by
+// default so the Tab-selects-all-then-overwrite trap can't silently replace the correct logon; when
+// the operator opts in we enable + focus it, and when they opt back out we restore the current-user
+// default so a half-typed override can't leak into .env. See issue #79.
+procedure AgentUserOverrideClick(Sender: TObject);
+begin
+  ConfigPage.Edits[5].Enabled := AgentUserOverride.Checked;
+  if AgentUserOverride.Checked then
+    ConfigPage.Edits[5].SetFocus
+  else
+    ConfigPage.Values[5] := GetUserNameString();
+end;
 
 procedure InitializeWizard;
 var
@@ -221,6 +235,20 @@ begin
   ConfigPage.Values[3] := DefaultIniPath;
   ConfigPage.Values[4] := DefaultDomain;
   ConfigPage.Values[5] := DefaultUser;
+
+  // Harden the agent-user field (issue #79): it is pre-filled with the current user and LOCKED by
+  // default. Windows edit controls select-all on Tab-in, so a stray keystroke would otherwise
+  // overwrite the correct logon (observed: "taal" replacing "tapanjain") and break GUI-agent task
+  // registration. Only the explicit checkbox below unlocks it.
+  ConfigPage.Edits[5].Enabled := False;
+  AgentUserOverride := TNewCheckBox.Create(ConfigPage);
+  AgentUserOverride.Parent := ConfigPage.Surface;
+  AgentUserOverride.Left := ConfigPage.Edits[5].Left;
+  AgentUserOverride.Top := ConfigPage.Edits[5].Top + ConfigPage.Edits[5].Height + ScaleY(4);
+  AgentUserOverride.Width := ConfigPage.SurfaceWidth;
+  AgentUserOverride.Caption := 'Run the GUI agent as a different Windows user (advanced)';
+  AgentUserOverride.Checked := False;
+  AgentUserOverride.OnClick := @AgentUserOverrideClick;
 
   EditionPage := CreateInputOptionPage(ConfigPage.ID,
     'Tally Edition',
@@ -313,9 +341,11 @@ begin
     agentUserValue := Trim(ConfigPage.Values[5]);
     if Length(agentUserValue) = 0 then
     begin
-      MsgBox('Windows user (last field) cannot be empty.', mbError, MB_OK);
-      Result := False;
-      exit;
+      // Blank (e.g. cleared while overriding) — restore the current-user default rather than block.
+      // The field is locked to the current user unless the "advanced" checkbox is ticked (issue #79),
+      // so an empty value here is a mistake we can safely auto-correct.
+      ConfigPage.Values[5] := GetUserNameString();
+      agentUserValue := Trim(ConfigPage.Values[5]);
     end;
     // ShellExec runs `net user "<name>"` quietly; exit code 0 = user exists.
     if not ShellExec('open', 'cmd.exe', '/c net user "' + agentUserValue + '" >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, errCode) then
