@@ -92,8 +92,10 @@ async function listLoadedCompanies(): Promise<string[]> {
 // a voucher outside the open financial year.
 export type CompanyPeriod = {
   company: string | null;
-  fyFrom: string | null;       // financial-year start, ISO YYYY-MM-DD
+  fyFrom: string | null;       // financial-year start ($StartingFrom), ISO YYYY-MM-DD
   fyTo: string | null;         // financial-year end, ISO YYYY-MM-DD
+  booksFrom: string | null;    // books-beginning date ($BooksFrom); earliest valid voucher date when a
+                               // company started keeping books partway through the FY (distinct from fyFrom)
   currentDate: string | null;  // Tally's working/current date
   lastEntryDate: string | null;// date of the most recent voucher
   fyToInferred: boolean;       // true when fyTo was computed from fyFrom (Tally left $EndingAt empty)
@@ -130,7 +132,7 @@ export function normalizeTallyDate(raw: string | null | undefined): string | nul
 // FY convention: 1-Apr-2026 → 31-Mar-2027) and fyToInferred is set. Kept pure so it's unit-testable
 // without a live Tally.
 export function parseCompanyPeriod(xml: string, preferCompany?: string | null): CompanyPeriod {
-  const empty: CompanyPeriod = { company: null, fyFrom: null, fyTo: null, currentDate: null, lastEntryDate: null, fyToInferred: false };
+  const empty: CompanyPeriod = { company: null, fyFrom: null, fyTo: null, booksFrom: null, currentDate: null, lastEntryDate: null, fyToInferred: false };
   if (!xml) return empty;
   const rows = xml.match(/<ROW>[\s\S]*?<\/ROW>/gi) || [];
   if (rows.length === 0) return empty;
@@ -164,6 +166,7 @@ export function parseCompanyPeriod(xml: string, preferCompany?: string | null): 
     company: field(chosen, 'F01'),
     fyFrom,
     fyTo,
+    booksFrom: normalizeTallyDate(field(chosen, 'F06')),
     currentDate: normalizeTallyDate(field(chosen, 'F04')),
     lastEntryDate: normalizeTallyDate(field(chosen, 'F05')),
     fyToInferred
@@ -176,7 +179,7 @@ async function fetchCompanyPeriod(companyName: string | null): Promise<CompanyPe
   const svCompany = companyName
     ? `<SVCURRENTCOMPANY>${companyName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</SVCURRENTCOMPANY>`
     : '';
-  const xml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPPeriodReport</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>${svCompany}</STATICVARIABLES><TDL><TDLMESSAGE><REPORT NAME="MCPPeriodReport"><FORMS>MCPPeriodForm</FORMS></REPORT><FORM NAME="MCPPeriodForm"><PARTS>MCPPeriodPart</PARTS><XMLTAG>DATA</XMLTAG></FORM><PART NAME="MCPPeriodPart"><LINES>MCPPeriodLine</LINES><REPEAT>MCPPeriodLine : MCPPeriodColl</REPEAT><SCROLLED>Vertical</SCROLLED></PART><LINE NAME="MCPPeriodLine"><FIELDS>FCname,FCfrom,FCto,FCcur,FClast</FIELDS><XMLTAG>ROW</XMLTAG></LINE><FIELD NAME="FCname"><SET>$Name</SET><XMLTAG>F01</XMLTAG></FIELD><FIELD NAME="FCfrom"><SET>$StartingFrom</SET><XMLTAG>F02</XMLTAG></FIELD><FIELD NAME="FCto"><SET>$EndingAt</SET><XMLTAG>F03</XMLTAG></FIELD><FIELD NAME="FCcur"><SET>##SVCurrentDate</SET><XMLTAG>F04</XMLTAG></FIELD><FIELD NAME="FClast"><SET>$LastVoucherDate</SET><XMLTAG>F05</XMLTAG></FIELD><COLLECTION NAME="MCPPeriodColl"><TYPE>Company</TYPE></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+  const xml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPPeriodReport</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>${svCompany}</STATICVARIABLES><TDL><TDLMESSAGE><REPORT NAME="MCPPeriodReport"><FORMS>MCPPeriodForm</FORMS></REPORT><FORM NAME="MCPPeriodForm"><PARTS>MCPPeriodPart</PARTS><XMLTAG>DATA</XMLTAG></FORM><PART NAME="MCPPeriodPart"><LINES>MCPPeriodLine</LINES><REPEAT>MCPPeriodLine : MCPPeriodColl</REPEAT><SCROLLED>Vertical</SCROLLED></PART><LINE NAME="MCPPeriodLine"><FIELDS>FCname,FCfrom,FCto,FCcur,FClast,FCbooks</FIELDS><XMLTAG>ROW</XMLTAG></LINE><FIELD NAME="FCname"><SET>$Name</SET><XMLTAG>F01</XMLTAG></FIELD><FIELD NAME="FCfrom"><SET>$StartingFrom</SET><XMLTAG>F02</XMLTAG></FIELD><FIELD NAME="FCto"><SET>$EndingAt</SET><XMLTAG>F03</XMLTAG></FIELD><FIELD NAME="FCcur"><SET>##SVCurrentDate</SET><XMLTAG>F04</XMLTAG></FIELD><FIELD NAME="FClast"><SET>$LastVoucherDate</SET><XMLTAG>F05</XMLTAG></FIELD><FIELD NAME="FCbooks"><SET>$BooksFrom</SET><XMLTAG>F06</XMLTAG></FIELD><COLLECTION NAME="MCPPeriodColl"><TYPE>Company</TYPE></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
   const resp = await postTallyXML(xml);
   return parseCompanyPeriod(resp, companyName);
 }
@@ -1686,7 +1689,7 @@ export async function registerMcpServer(): Promise<McpServer> {
     'get-period',
     {
       title: 'Get Period',
-      description: `Returns the active company's period so you never have to infer valid dates: { company, fyFrom, fyTo, currentDate, lastEntryDate, fyToInferred }. fyFrom/fyTo are the financial year (ISO YYYY-MM-DD); currentDate is Tally's working date; lastEntryDate is the most recent voucher's date. fyToInferred=true means Tally left the FY-end blank (ongoing year) and it was computed as fyFrom + 1 year − 1 day. Call this before posting a voucher (date it inside fyFrom..fyTo) or running a report, instead of guessing dates or reading them off a screenshot. Pass targetCompany to query a specific loaded company; defaults to the active company.`,
+      description: `Returns the active company's period so you never have to infer valid dates: { company, fyFrom, fyTo, booksFrom, currentDate, lastEntryDate, fyToInferred }. fyFrom/fyTo are the financial year (ISO YYYY-MM-DD); booksFrom is the books-beginning date (the earliest valid voucher date — may be later than fyFrom if the company started mid-year); currentDate is Tally's working date; lastEntryDate is the most recent voucher's date. fyToInferred=true means Tally left the FY-end blank (ongoing year) and it was computed as fyFrom + 1 year − 1 day. Call this before posting a voucher (date it inside booksFrom..fyTo) or running a report, instead of guessing dates or reading them off a screenshot. Pass targetCompany to query a specific loaded company; defaults to the active company.`,
       inputSchema: {
         targetCompany: z.string().optional().describe('Exact loaded-company name to query. Defaults to the active company.')
       },

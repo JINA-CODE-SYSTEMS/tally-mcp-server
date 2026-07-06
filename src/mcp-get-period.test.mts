@@ -25,8 +25,8 @@ test('normalizeTallyDate returns null for empty/garbage', () => {
 });
 
 // ── parseCompanyPeriod ─────────────────────────────────────────────────────
-const row = (name: string, from: string, to: string, cur: string, last: string) =>
-  `<ROW><F01>${name}</F01><F02>${from}</F02><F03>${to}</F03><F04>${cur}</F04><F05>${last}</F05></ROW>`;
+const row = (name: string, from: string, to: string, cur: string, last: string, books = from) =>
+  `<ROW><F01>${name}</F01><F02>${from}</F02><F03>${to}</F03><F04>${cur}</F04><F05>${last}</F05><F06>${books}</F06></ROW>`;
 const wrap = (...rows: string[]) => `<DATA>${rows.join('')}</DATA>`;
 
 test('parses a single company period row', () => {
@@ -35,9 +35,24 @@ test('parses a single company period row', () => {
   assert.equal(p.company, 'Ross Industries');
   assert.equal(p.fyFrom, '2026-04-01');
   assert.equal(p.fyTo, '2027-03-31');
+  assert.equal(p.booksFrom, '2026-04-01');
   assert.equal(p.currentDate, '2026-10-10');
   assert.equal(p.lastEntryDate, '2026-10-10');
   assert.equal(p.fyToInferred, false);
+});
+
+test('parses booksFrom when it differs from fyFrom (company started mid-year)', () => {
+  const xml = wrap(row('New Co', '1-Apr-2026', '31-Mar-2027', '1-Sep-2026', '1-Sep-2026', '1-Sep-2026'));
+  const p = parseCompanyPeriod(xml);
+  assert.equal(p.fyFrom, '2026-04-01');
+  assert.equal(p.booksFrom, '2026-09-01'); // later than fyFrom — the real earliest valid date
+});
+
+test('booksFrom is null when Tally supplies none', () => {
+  const xml = wrap('<ROW><F01>No Books Co</F01><F02>1-Apr-2026</F02><F03>31-Mar-2027</F03><F04>1-Apr-2026</F04><F05>1-Apr-2026</F05><F06></F06></ROW>');
+  const p = parseCompanyPeriod(xml);
+  assert.equal(p.fyFrom, '2026-04-01');
+  assert.equal(p.booksFrom, null);
 });
 
 test('infers fyTo (fyFrom + 1 year − 1 day) when Tally leaves $EndingAt empty', () => {
