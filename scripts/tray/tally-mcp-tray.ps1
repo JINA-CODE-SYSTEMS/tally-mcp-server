@@ -432,6 +432,32 @@ Start-Sleep -Seconds 3
     }
 })
 
+# Fully stop the service (leaves it Stopped, not respawned). Use 'Restart service' to start it again.
+$miStopService = $menu.Items.Add('Stop service')
+$miStopService.Add_Click({
+    try {
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "Stop the TallyMCP service?`n`nAll MCP tools become unavailable (any Claude session using them will fail) until you start it again with `"Restart service`".",
+            'TallyMCP', 'OKCancel', 'Warning')
+        if ($confirm -ne 'OK') { return }
+        # Elevated, like Restart. Use `sc.exe stop` (non-blocking — it sends the STOP control and
+        # returns immediately, so this can't hang the hidden window in StopPending), which puts NSSM
+        # into stopping mode, then taskkill node as a fallback: on a pre-#23 install whose graceful
+        # stop stalls, killing node lets NSSM finish reaching Stopped. Because the service is already
+        # stopping, NSSM will NOT respawn the killed process.
+        $cmd = @"
+sc.exe stop '$ServiceName' | Out-Null
+Start-Sleep -Seconds 2
+taskkill /F /IM node.exe 2>`$null | Out-Null
+Start-Sleep -Seconds 2
+sc.exe query '$ServiceName' | Out-String | Write-Host
+"@
+        Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', $cmd) -Verb RunAs -WindowStyle Hidden
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Stop failed: $_", 'TallyMCP', 'OK', 'Error') | Out-Null
+    }
+})
+
 $miRestartAgent = $menu.Items.Add('Restart GUI agent')
 $miRestartAgent.Add_Click({
     try {
