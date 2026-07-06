@@ -496,10 +496,17 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         $taskAction = New-ScheduledTaskAction `
             -Execute 'powershell.exe' `
             -Argument "-ExecutionPolicy Bypass -NoProfile -WindowStyle Minimized -File `"$agentScript`""
-        $taskTrigger = New-ScheduledTaskTrigger -AtLogOn -User $AgentTaskUser
+        # Two triggers: at logon (initial) + a repeating heartbeat that re-fires the task. The task
+        # engine no-ops the heartbeat when the agent is already Running (MultipleInstances=IgnoreNew),
+        # but respawns it within ~1 min if it crashed — the crash-supervision H-2 asked for, native to
+        # Task Scheduler so it doesn't depend on the tray being open. RestartCount/Interval additionally
+        # retries a failed launch. Parity with the NSSM service's AppExit=Restart supervision.
+        $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $AgentTaskUser
+        $heartbeatTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration ([TimeSpan]::MaxValue)
         $taskPrincipal = New-ScheduledTaskPrincipal -UserId $AgentTaskUser -LogonType Interactive -RunLevel Limited
-        $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-        $taskDef = New-ScheduledTask -Action $taskAction -Trigger $taskTrigger -Principal $taskPrincipal -Settings $taskSettings -Description "Tally MCP GUI agent (companion to TallyMCP service; spawns Tally + keystrokes credentials in user session)"
+        $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
+            -MultipleInstances IgnoreNew -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
+        $taskDef = New-ScheduledTask -Action $taskAction -Trigger $logonTrigger, $heartbeatTrigger -Principal $taskPrincipal -Settings $taskSettings -Description "Tally MCP GUI agent (companion to TallyMCP service; spawns Tally + keystrokes credentials in user session). Auto-respawns within ~1 min if it crashes."
         Register-ScheduledTask -TaskName $AgentTaskName -InputObject $taskDef -Force | Out-Null
         $taskRegistered = $true
         Write-Host "[OK] Scheduled task '$AgentTaskName' registered (runs at logon, as $AgentTaskUser)"
