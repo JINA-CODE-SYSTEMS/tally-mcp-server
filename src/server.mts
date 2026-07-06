@@ -125,7 +125,17 @@ interface AccessToken {
   expires_at: number;
 }
 
+interface RefreshToken {
+  token: string;
+  client_id: string;
+  expires_at: number;
+}
+
 const clientsFilePath = path.join(__dirname, '../.oauth-clients.json');
+// Bearer + refresh secrets are persisted so a server restart / redeploy doesn't drop live sessions
+// (which would force every connected client to re-authenticate). Same directory + trust level as
+// .oauth-clients.json, which already persists client secrets.
+const tokensFilePath = path.join(__dirname, '../.oauth-tokens.json');
 
 // Load persisted clients from file
 function loadClients(): { [client_id: string]: RegisteredClient } {
@@ -151,7 +161,30 @@ function saveClients(): void {
 const registeredClients: { [client_id: string]: RegisteredClient } = loadClients();
 console.log(`[oauth] Loaded ${Object.keys(registeredClients).length} persisted client(s)`);
 const authorizationCodes: { [code: string]: AuthorizationCode } = {};
-const accessTokens: { [token: string]: AccessToken } = {};
+
+// Persisted token store: access + refresh tokens survive a restart so existing sessions stay valid.
+function loadTokens(): { accessTokens: { [t: string]: AccessToken }; refreshTokens: { [t: string]: RefreshToken } } {
+  try {
+    if (fs.existsSync(tokensFilePath)) {
+      const parsed = JSON.parse(fs.readFileSync(tokensFilePath, 'utf-8'));
+      return { accessTokens: parsed.accessTokens || {}, refreshTokens: parsed.refreshTokens || {} };
+    }
+  } catch (e) {
+    console.error('[oauth] Failed to load tokens file:', e);
+  }
+  return { accessTokens: {}, refreshTokens: {} };
+}
+function saveTokens(): void {
+  try {
+    fs.writeFileSync(tokensFilePath, JSON.stringify({ accessTokens, refreshTokens }, null, 2), 'utf-8');
+  } catch (e) {
+    console.error('[oauth] Failed to save tokens file:', e);
+  }
+}
+const _persistedTokens = loadTokens();
+const accessTokens: { [token: string]: AccessToken } = _persistedTokens.accessTokens;
+const refreshTokens: { [token: string]: RefreshToken } = _persistedTokens.refreshTokens;
+console.log(`[oauth] Loaded ${Object.keys(accessTokens).length} access + ${Object.keys(refreshTokens).length} refresh token(s)`);
 
 const transports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
 
@@ -179,12 +212,15 @@ setInterval(() => {
     }
   }
 
-  // Clean expired access tokens
+  // Clean expired access + refresh tokens, persisting the store if anything changed.
+  let tokensChanged = false;
   for (const [token, data] of Object.entries(accessTokens)) {
-    if (data.expires_at < now) {
-      delete accessTokens[token];
-    }
+    if (data.expires_at < now) { delete accessTokens[token]; tokensChanged = true; }
   }
+  for (const [token, data] of Object.entries(refreshTokens)) {
+    if (data.expires_at < now) { delete refreshTokens[token]; tokensChanged = true; }
+  }
+  if (tokensChanged) saveTokens();
 
 }, parseIntEnv(process.env.TOKEN_CLEANUP_INTERVAL_MS, 60000)); // default every minute
 
@@ -324,7 +360,7 @@ const handleOAuthAuthorizationServer = (req: express.Request, res: express.Respo
       registration_endpoint: `${mcpDomain}/register`,
       response_types_supported: ['code'],
       response_modes_supported: ['query'],
-      grant_types_supported: ['authorization_code'],
+      grant_types_supported: ['authorization_code', 'refresh_token'],
       token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post'],
       code_challenge_methods_supported: ['S256']
     }
@@ -517,11 +553,38 @@ app.post('/token', authRateLimiter, (req, res) => {
     });
   }
 
+  // Refresh-token grant: mint a fresh access token from a valid, unexpired refresh token so the
+  // client renews silently without re-auth. Rotates the refresh token (one-time use) for security.
+  if (grantType === 'refresh_token') {
+    const providedRefresh = req.body['refresh_token'];
+    const stored = providedRefresh ? refreshTokens[providedRefresh] : undefined;
+    if (!stored || stored.expires_at < Date.now() || stored.client_id !== clientId) {
+      return res.status(400).json({
+        error: 'invalid_grant',
+        error_description: 'Invalid or expired refresh token'
+      });
+    }
+    delete refreshTokens[providedRefresh]; // rotate
+    const newAccess = generateSecureToken(32);
+    const newRefresh = generateSecureToken(32);
+    const expiresIn = parseIntEnv(process.env.ACCESS_TOKEN_EXPIRY_SEC, 3600);
+    const refreshExpiresIn = parseIntEnv(process.env.REFRESH_TOKEN_EXPIRY_SEC, 2592000); // default 30 days
+    accessTokens[newAccess] = { token: newAccess, client_id: clientId, expires_at: Date.now() + expiresIn * 1000 };
+    refreshTokens[newRefresh] = { token: newRefresh, client_id: clientId, expires_at: Date.now() + refreshExpiresIn * 1000 };
+    saveTokens();
+    return res.json({
+      access_token: newAccess,
+      token_type: 'Bearer',
+      expires_in: expiresIn,
+      refresh_token: newRefresh
+    });
+  }
+
   // Validate grant type
   if (grantType !== 'authorization_code') {
     return res.status(400).json({
       error: 'unsupported_grant_type',
-      error_description: 'Only authorization_code grant type is supported'
+      error_description: 'Supported grant types: authorization_code, refresh_token'
     });
   }
 
@@ -570,20 +633,30 @@ app.post('/token', authRateLimiter, (req, res) => {
   // Delete the used authorization code
   delete authorizationCodes[code];
 
-  // Generate access token and separate refresh token
+  // Generate an access token + a long-lived refresh token so the client can renew silently, and
+  // persist both so a server restart / redeploy doesn't drop the session.
   const accessToken = generateSecureToken(32);
+  const refreshToken = generateSecureToken(32);
   const expiresIn = parseIntEnv(process.env.ACCESS_TOKEN_EXPIRY_SEC, 3600); // default 1 hour
+  const refreshExpiresIn = parseIntEnv(process.env.REFRESH_TOKEN_EXPIRY_SEC, 2592000); // default 30 days
 
   accessTokens[accessToken] = {
     token: accessToken,
     client_id: clientId,
     expires_at: Date.now() + (expiresIn * 1000)
   };
+  refreshTokens[refreshToken] = {
+    token: refreshToken,
+    client_id: clientId,
+    expires_at: Date.now() + (refreshExpiresIn * 1000)
+  };
+  saveTokens();
 
   res.json({
     access_token: accessToken,
     token_type: 'Bearer',
-    expires_in: expiresIn
+    expires_in: expiresIn,
+    refresh_token: refreshToken
   });
 });
 

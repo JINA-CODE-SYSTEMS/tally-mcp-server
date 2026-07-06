@@ -5,6 +5,7 @@ dist/
 !.env.example
 data/
 .oauth-clients.json
+.oauth-tokens.json
 .DS_Store
 scripts/TallyUI.dll
 *.log
