@@ -183,14 +183,12 @@ var
 
 // Toggle the agent-user field's editability from the "advanced" checkbox. Locked (disabled) by
 // default so the Tab-selects-all-then-overwrite trap can't silently replace the correct logon; when
-// the operator opts in we enable + focus it, and when they opt back out we restore the current-user
-// default so a half-typed override can't leak into .env. See issue #79.
+// the operator opts back out we restore the current-user default so a half-typed override can't leak
+// into .env. See issue #79.
 procedure AgentUserOverrideClick(Sender: TObject);
 begin
   ConfigPage.Edits[5].Enabled := AgentUserOverride.Checked;
-  if AgentUserOverride.Checked then
-    ConfigPage.Edits[5].SetFocus
-  else
+  if not AgentUserOverride.Checked then
     ConfigPage.Values[5] := GetUserNameString();
 end;
 
@@ -269,11 +267,10 @@ begin
   GuiControlOptIn := TNewCheckBox.Create(EditionPage);
   GuiControlOptIn.Parent := EditionPage.Surface;
   GuiControlOptIn.Left := EditionPage.CheckListBox.Left;
-  GuiControlOptIn.Top := EditionPage.Surface.Height - ScaleY(40);
+  GuiControlOptIn.Top := EditionPage.Surface.Height - ScaleY(38);
   GuiControlOptIn.Width := EditionPage.SurfaceWidth;
-  GuiControlOptIn.Height := ScaleY(40);
-  GuiControlOptIn.WordWrap := True;
-  GuiControlOptIn.Caption := 'Allow Claude to control Tally directly — screenshots + keystrokes (advanced; off by default). You can change this later from the tray or Reconfigure.';
+  GuiControlOptIn.Height := ScaleY(32);
+  GuiControlOptIn.Caption := 'Allow Claude to control Tally directly (screenshots + keystrokes) — advanced, off by default';
   GuiControlOptIn.Checked := False;
 end;
 
