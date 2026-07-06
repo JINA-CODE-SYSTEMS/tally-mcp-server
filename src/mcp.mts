@@ -1358,6 +1358,54 @@ function dryRunEcho(template: string, inputParams: Map<string, any>, extra?: obj
   return { content: [{ type: 'text', text: JSON.stringify({ dryRun: true, wouldPost: true, template, posting: Object.fromEntries(inputParams), ...(extra || {}) }, null, 2) }] };
 }
 
+// ── batch voucher execution (#97 H-11) ─────────────────────────────────────
+type BatchRow = { index: number; status: 'success' | 'error'; code?: string; message?: string; retryable?: boolean; created?: number; lastVchId?: number };
+
+// Flattens a single executeVoucher result into a per-row batch entry.
+function rowResult(index: number, r: ToolResult): BatchRow {
+  if (r.isError) {
+    const e: any = r.structuredContent || {};
+    return { index, status: 'error', code: e.code ?? 'UNKNOWN', message: e.message, retryable: e.retryable };
+  }
+  const body = JSON.parse(r.content[0]!.text) as { created?: number; lastVchId?: number };
+  return { index, status: 'success', created: body.created, lastVchId: body.lastVchId };
+}
+
+export type BatchResult = { atomic: boolean; aborted: boolean; posted: number; results: BatchRow[] };
+
+// Executes a batch of vouchers. atomic=true: validate ALL rows first (via the deterministic dryRun
+// path); if any fails, abort and post NOTHING. Otherwise post each and report per row (best-effort).
+// Reuses the shared per-voucher invariants (executeVoucher). Note: Tally has no cross-voucher
+// rollback, so an atomic batch guarantees "don't start posting unless all rows pass deterministic
+// validation" — a mid-batch WRITE failure (Tally-side) can still leave earlier rows posted; that is
+// surfaced in the per-row results.
+export async function executeVoucherBatch(
+  vouchers: Array<VoucherArgs & { targetCompany?: string }>,
+  opts: { atomic?: boolean } & VoucherExecOpts
+): Promise<BatchResult> {
+  const { atomic, dryRun, ...baseOpts } = opts;
+  if (atomic) {
+    const checks: BatchRow[] = [];
+    for (let i = 0; i < vouchers.length; i++) {
+      checks.push(rowResult(i, await executeVoucher(vouchers[i]!, { ...baseOpts, dryRun: true })));
+    }
+    if (checks.some(c => c.status === 'error')) {
+      return { atomic: true, aborted: true, posted: 0, results: checks };
+    }
+    if (dryRun) return { atomic: true, aborted: false, posted: 0, results: checks };
+    const results: BatchRow[] = [];
+    for (let i = 0; i < vouchers.length; i++) {
+      results.push(rowResult(i, await executeVoucher(vouchers[i]!, baseOpts)));
+    }
+    return { atomic: true, aborted: false, posted: results.filter(r => r.status === 'success').length, results };
+  }
+  const results: BatchRow[] = [];
+  for (let i = 0; i < vouchers.length; i++) {
+    results.push(rowResult(i, await executeVoucher(vouchers[i]!, { ...baseOpts, dryRun })));
+  }
+  return { atomic: false, aborted: false, posted: results.filter(r => r.status === 'success').length, results };
+}
+
 export async function registerMcpServer(): Promise<McpServer> {
   const mcpServer = new McpServer({
     name: 'Tally Prime MCP Server',
@@ -2977,6 +3025,58 @@ export async function registerMcpServer(): Promise<McpServer> {
       const result = await executeVoucher(args, { ...execOpts, dryRun: args.dryRun });
       auditLog('create-voucher', args, args.dryRun ? 'dryrun' : (result.isError ? 'error' : 'success'), Date.now() - start);
       return result;
+    }
+  );
+
+  mcpServer.registerTool(
+    'create-vouchers',
+    {
+      title: 'Create Vouchers (batch)',
+      description: `Posts a batch of vouchers, each the same shape as create-voucher (entries[] + optional blocks). Returns per-row typed results aligned to the input. atomic=true validates EVERY row first (deterministic invariants) and posts NOTHING if any fails — but note Tally has no cross-voucher rollback, so a mid-batch Tally-side write failure can leave earlier rows posted (surfaced per-row). atomic=false (default) posts each independently; a failed row doesn't stop the rest. idempotencyKey makes a replayed batch return the prior result without re-posting. Session assembles the well-formed vouchers[]; the host executes deterministically.`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name; defaults to the active company'),
+        vouchers: z.array(z.object(voucherInputShape)).min(1).describe('array of vouchers, each the create-voucher shape (entries[] + optional blocks)'),
+        atomic: z.boolean().optional().describe('true = all-or-nothing validation (post nothing if any row fails deterministic checks). Default false = best-effort per row.'),
+        idempotencyKey: z.string().optional().describe('optional; replaying the same key returns the prior batch result without re-posting'),
+        dryRun: z.boolean().optional().describe('if true, validate all rows and echo per-row results WITHOUT writing to Tally')
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      if (process.env.READONLY_MODE === 'true') {
+        auditLog('create-vouchers', { count: args.vouchers.length }, 'denied');
+        return errorResult('READONLY');
+      }
+      const store = getIdempotencyStore();
+      const batchKey = args.idempotencyKey ? `batch:${args.idempotencyKey}` : '';
+      if (batchKey) {
+        const prior = store.get(batchKey);
+        if (prior) {
+          auditLog('create-vouchers', { count: args.vouchers.length, idempotentReplay: true }, 'success', Date.now() - start);
+          return { content: [{ type: 'text', text: JSON.stringify({ idempotentReplay: true, result: prior.result }) }] };
+        }
+      }
+      const company = args.targetCompany || activeCompany || undefined;
+      // One invariant context for the whole batch (fetch period + masters once).
+      const anyInventory = args.vouchers.some(v => (v.inventory as unknown[] | undefined)?.length);
+      const [period, knownLedgers, knownStockItems] = await Promise.all([
+        fetchPeriodForWrite(company),
+        fetchMasterNames('ledger', company),
+        anyInventory ? fetchMasterNames('stockitem', company) : Promise.resolve<string[]>([]),
+      ]);
+      const rows = args.vouchers.map(v => ({ ...(v as VoucherArgs), targetCompany: company }));
+      const batch = await executeVoucherBatch(rows, { atomic: args.atomic ?? false, dryRun: args.dryRun, period, knownLedgers, knownStockItems });
+      if (batchKey && !args.dryRun && !batch.aborted) {
+        try { store.put(batchKey, batch, new Date().toISOString()); } catch {}
+      }
+      const status = args.dryRun ? 'dryrun' : (batch.aborted || batch.posted < args.vouchers.length ? 'error' : 'success');
+      auditLog('create-vouchers', { count: args.vouchers.length, atomic: args.atomic, dryRun: args.dryRun }, status, Date.now() - start);
+      return { content: [{ type: 'text', text: JSON.stringify(batch, null, 2) }], isError: batch.aborted };
     }
   );
 
