@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildVoucherXml, voucherBalance, toTallyDate, type VoucherInput } from './voucher.mjs';
+import { buildVoucherXml, buildCancelVoucherXml, voucherBalance, toTallyDate, type VoucherInput } from './voucher.mjs';
+
+test('buildCancelVoucherXml marks the located voucher cancelled (#98)', () => {
+  const xml = buildCancelVoucherXml({ voucherType: 'Sales', voucherNumber: 'INV-42', date: '2026-10-10' }, 'Ross');
+  assert.match(xml, /<VOUCHER ACTION="Cancel" VCHTYPE="Sales">/);
+  assert.match(xml, /<VOUCHERNUMBER>INV-42<\/VOUCHERNUMBER>/);
+  assert.match(xml, /<ISCANCELLED>Yes<\/ISCANCELLED>/);
+  assert.match(xml, /<DATE>20261010<\/DATE>/);
+  assert.match(xml, /<SVCURRENTCOMPANY>Ross<\/SVCURRENTCOMPANY>/);
+});
 
 test('toTallyDate: ISO → YYYYMMDD, invalid → empty', () => {
   assert.equal(toTallyDate('2026-10-10'), '20261010');

@@ -202,3 +202,25 @@ export function buildVoucherXml(v: VoucherInput, targetCompany?: string): string
     `<REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF">${body}</TALLYMESSAGE></REQUESTDATA>` +
     `</IMPORTDATA></BODY></ENVELOPE>`;
 }
+
+// Builds a cancel envelope for reverse-voucher (#98 H-12), mark-cancelled semantics (Edit-Log-safe):
+// ACTION="Cancel" + ISCANCELLED on the target voucher, located by type + number + original date.
+// A reversing-entry (contra) reversal is just a normal create-voucher with swapped dr/cr, so it is
+// not duplicated here.
+export function buildCancelVoucherXml(v: { voucherType: string; voucherNumber: string; date: string }, targetCompany?: string): string {
+  const tallyDate = toTallyDate(v.date);
+  const svCompany = targetCompany ? `<SVCURRENTCOMPANY>${escapeXml(targetCompany)}</SVCURRENTCOMPANY>` : '';
+  const body =
+    `<VOUCHER ACTION="Cancel" VCHTYPE="${escapeXml(v.voucherType)}">` +
+    `<DATE>${tallyDate}</DATE>` +
+    `<VOUCHERTYPENAME>${escapeXml(v.voucherType)}</VOUCHERTYPENAME>` +
+    `<VOUCHERNUMBER>${escapeXml(v.voucherNumber)}</VOUCHERNUMBER>` +
+    `<ISCANCELLED>Yes</ISCANCELLED>` +
+    `</VOUCHER>`;
+  return `<?xml version="1.0" encoding="utf-8"?>` +
+    `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>` +
+    `<BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME>` +
+    `<STATICVARIABLES>${svCompany}</STATICVARIABLES></REQUESTDESC>` +
+    `<REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF">${body}</TALLYMESSAGE></REQUESTDATA>` +
+    `</IMPORTDATA></BODY></ENVELOPE>`;
+}
