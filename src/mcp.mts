@@ -1035,10 +1035,46 @@ async function pull(reportName: string, inputParams: Map<string, any>) {
 }
 
 // Wraps handlePush — injects activeCompany as targetCompany fallback when the caller did not specify one.
-async function push(templateName: string, inputParams: Map<string, any>) {
-  if (!inputParams.has('targetCompany') && activeCompany) {
-    inputParams.set('targetCompany', activeCompany);
+// Reconciles the intended company (a targetCompany arg, or activeCompany — which may be a registry
+// alias/displayName that differs from the exact loaded name) to the EXACT name currently loaded in
+// Tally. Writes MUST be stamped with a name Tally will match: a Tally IMPORT whose SVCURRENTCOMPANY
+// doesn't exactly match a loaded company is accepted and writes into the void ("0 error(s)", nothing
+// created) — whereas a read (Export) falls back to the open company, which is why reads work but
+// writes silently no-op. Returns the exact name, or a message to fail closed on.
+export type LoadedCompanyPick = { ok: true; name: string } | { ok: false; message: string };
+
+// Pure decision (unit-tested): given the intended name and the live loaded list, pick the EXACT
+// loaded name to stamp a write with, or fail closed. Blank intended + exactly one loaded → that one.
+export function pickLoadedCompany(intended: string | null, loaded: string[]): LoadedCompanyPick {
+  if (loaded.length === 0) {
+    return { ok: false, message: 'No company is loaded in Tally — a write would go into the void. Load a company (use-company / load-company) first.' };
   }
+  if (!intended || !intended.trim()) {
+    if (loaded.length === 1) return { ok: true, name: loaded[0]! };
+    return { ok: false, message: `No active company set and ${loaded.length} are loaded (${loaded.join(', ')}). Call set-active-company or pass targetCompany.` };
+  }
+  const match = findMatchingLoadedCompany(intended, loaded);
+  if (!match) {
+    return { ok: false, message: `"${intended}" is not currently loaded in Tally (loaded: ${loaded.join(', ')}). A master/voucher import stamped with a non-loaded name silently no-ops — load/activate it (use-company) or pass the exact loaded name.` };
+  }
+  return { ok: true, name: match };
+}
+
+async function resolveExactLoadedCompany(intended: string | null): Promise<LoadedCompanyPick> {
+  let loaded: string[] = [];
+  try { loaded = await listLoadedCompanies(); } catch {}
+  return pickLoadedCompany(intended, loaded);
+}
+
+async function push(templateName: string, inputParams: Map<string, any>) {
+  // Stamp the write with the EXACT loaded company name (not a registry alias/displayName), and fail
+  // closed if the target isn't actually loaded — otherwise Tally accepts the import and no-ops.
+  const intended = (inputParams.has('targetCompany') ? String(inputParams.get('targetCompany')) : activeCompany) ?? null;
+  const target = await resolveExactLoadedCompany(intended);
+  if (!target.ok) {
+    return { success: false, created: 0, altered: 0, lastVchId: 0, error: target.message };
+  }
+  inputParams.set('targetCompany', target.name);
   return handlePush(templateName, inputParams);
 }
 
@@ -1302,6 +1338,10 @@ export type VoucherExecOpts = {
   knownStockItems?: string[];
   // Idempotency: replay the stored result for a repeated key instead of re-posting (#95/#97).
   idempotency?: { store: IdempotencyStore; now: string };
+  // The EXACT loaded company name to stamp the import with (resolved by the handler). When provided,
+  // executeVoucher skips its own reconciliation. When resolution failed, companyError holds why.
+  exactCompany?: string;
+  companyError?: string;
 };
 
 export async function executeVoucher(
@@ -1329,7 +1369,14 @@ export async function executeVoucher(
   if (!bal.balanced) {
     return errorResult('UNBALANCED', { message: `Voucher does not balance: debits ${bal.debit} != credits ${bal.credit}.` });
   }
-  const company = args.targetCompany || activeCompany || undefined;
+  // Stamp the import with the EXACT loaded company name (not a registry alias/displayName) and fail
+  // closed if it isn't loaded — otherwise Tally accepts the voucher and writes into the void. The
+  // reconciliation happens at the handler boundary (buildVoucherExecOpts / the batch handler) and is
+  // passed in via opts.exactCompany / opts.companyError; a direct caller without it uses the raw name.
+  if (opts.companyError) {
+    return errorResult('COMPANY_NOT_FOUND', { message: opts.companyError, retryable: false });
+  }
+  const company: string | undefined = opts.exactCompany ?? args.targetCompany ?? activeCompany ?? undefined;
   const voucher: VoucherInput = {
     voucherType: args.voucherType, date: args.date, entries,
     narration: args.narration, voucherNumber: args.voucherNumber, reference: args.reference,
@@ -1401,13 +1448,19 @@ async function fetchPeriodForWrite(company?: string): Promise<{ fyFrom: string |
 // Assembles the deterministic write-invariant context (#95 H-9) for a voucher write: open period +
 // known ledger names (+ stock item names only when inventory is present). All fetches are tolerant.
 async function buildVoucherExecOpts(args: { targetCompany?: string; inventory?: unknown[]; idempotencyKey?: string }): Promise<VoucherExecOpts> {
-  const company = args.targetCompany || activeCompany || undefined;
+  // Resolve the EXACT loaded company FIRST so the invariant fetches (period, masters) run against the
+  // same company the import will be stamped with — and so a not-loaded target fails closed.
+  const target = await resolveExactLoadedCompany(args.targetCompany || activeCompany || null);
+  if (!target.ok) {
+    return { companyError: target.message, idempotency: { store: getIdempotencyStore(), now: new Date().toISOString() } };
+  }
+  const company = target.name;
   const [period, knownLedgers, knownStockItems] = await Promise.all([
     fetchPeriodForWrite(company),
     fetchMasterNames('ledger', company),
     (args.inventory && (args.inventory as unknown[]).length) ? fetchMasterNames('stockitem', company) : Promise.resolve<string[]>([]),
   ]);
-  return { period, knownLedgers, knownStockItems, idempotency: { store: getIdempotencyStore(), now: new Date().toISOString() } };
+  return { exactCompany: company, period, knownLedgers, knownStockItems, idempotency: { store: getIdempotencyStore(), now: new Date().toISOString() } };
 }
 
 // Echoes the exact posting a write WOULD make, without calling Tally (#96 H-10). Used by
@@ -3119,7 +3172,13 @@ export async function registerMcpServer(): Promise<McpServer> {
           return { content: [{ type: 'text', text: JSON.stringify({ idempotentReplay: true, result: prior.result }) }] };
         }
       }
-      const company = args.targetCompany || activeCompany || undefined;
+      // Resolve the EXACT loaded company once for the whole batch, and fail closed if not loaded.
+      const target = await resolveExactLoadedCompany(args.targetCompany || activeCompany || null);
+      if (!target.ok) {
+        auditLog('create-vouchers', { count: args.vouchers.length }, 'error', Date.now() - start);
+        return errorResult('COMPANY_NOT_FOUND', { message: target.message, retryable: false });
+      }
+      const company = target.name;
       // One invariant context for the whole batch (fetch period + masters once).
       const anyInventory = args.vouchers.some(v => (v.inventory as unknown[] | undefined)?.length);
       const [period, knownLedgers, knownStockItems] = await Promise.all([
@@ -3128,7 +3187,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         anyInventory ? fetchMasterNames('stockitem', company) : Promise.resolve<string[]>([]),
       ]);
       const rows = args.vouchers.map(v => ({ ...(v as VoucherArgs), targetCompany: company }));
-      const batch = await executeVoucherBatch(rows, { atomic: args.atomic ?? false, dryRun: args.dryRun, period, knownLedgers, knownStockItems });
+      const batch = await executeVoucherBatch(rows, { atomic: args.atomic ?? false, dryRun: args.dryRun, period, knownLedgers, knownStockItems, exactCompany: company });
       if (batchKey && !args.dryRun && !batch.aborted) {
         try { store.put(batchKey, batch, new Date().toISOString()); } catch {}
       }
