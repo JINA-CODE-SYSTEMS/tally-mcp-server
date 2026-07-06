@@ -461,6 +461,15 @@ sc.exe query '$ServiceName' | Out-String | Write-Host
 $miRestartAgent = $menu.Items.Add('Restart GUI agent')
 $miRestartAgent.Add_Click({
     try {
+        # If the agent task was never registered (e.g. the install didn't finish the agent step),
+        # Start-ScheduledTask below throws a cryptic "cannot find the file specified". Detect that
+        # up front and point the operator at Reconfigure, which registers the task.
+        if (-not (Get-ScheduledTask -TaskName $AgentTaskName -ErrorAction SilentlyContinue)) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "The GUI agent scheduled task ('$AgentTaskName') is not registered, so there is nothing to restart.`n`nRun `"Reconfigure...`" to register it (or re-run the installer). Make sure the Windows user shown in the wizard is your actual logon name.",
+                'TallyMCP', 'OK', 'Warning') | Out-Null
+            return
+        }
         # Agent task runs as the current user already, so no elevation needed.
         Stop-ScheduledTask -TaskName $AgentTaskName -ErrorAction SilentlyContinue
         # Also kill any leftover powershell.exe instances running the agent script - Stop-ScheduledTask
