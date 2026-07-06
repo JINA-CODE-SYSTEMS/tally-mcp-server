@@ -12,7 +12,7 @@ import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
 dotenv.config({ override: true, quiet: true });
 
 // Audit logging — logs every tool invocation
-function auditLog(toolName: string, args: Record<string, any>, status: 'success' | 'error' | 'denied', durationMs?: number): void {
+function auditLog(toolName: string, args: Record<string, any>, status: 'success' | 'error' | 'denied' | 'dryrun', durationMs?: number): void {
   const entry = {
     timestamp: new Date().toISOString(),
     tool: toolName,
@@ -1350,6 +1350,12 @@ async function buildVoucherExecOpts(args: { targetCompany?: string; inventory?: 
     (args.inventory && (args.inventory as unknown[]).length) ? fetchMasterNames('stockitem', company) : Promise.resolve<string[]>([]),
   ]);
   return { period, knownLedgers, knownStockItems, idempotency: { store: getIdempotencyStore(), now: new Date().toISOString() } };
+}
+
+// Echoes the exact posting a write WOULD make, without calling Tally (#96 H-10). Used by
+// create-ledger / create-stock-item / create-gst-voucher after their invariants pass.
+function dryRunEcho(template: string, inputParams: Map<string, any>, extra?: object): ToolResult {
+  return { content: [{ type: 'text', text: JSON.stringify({ dryRun: true, wouldPost: true, template, posting: Object.fromEntries(inputParams), ...(extra || {}) }, null, 2) }] };
 }
 
 export async function registerMcpServer(): Promise<McpServer> {
@@ -2953,6 +2959,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         targetCompany: z.string().optional().describe('optional company name; defaults to the active company'),
         ...voucherInputShape,
         idempotencyKey: z.string().optional().describe('optional; replaying the same key returns the prior result without re-posting'),
+        dryRun: z.boolean().optional().describe('if true, run all invariants and echo the exact posting (voucher + XML) WITHOUT writing to Tally'),
       },
       annotations: {
         readOnlyHint: false,
@@ -2967,8 +2974,8 @@ export async function registerMcpServer(): Promise<McpServer> {
         return errorResult('READONLY');
       }
       const execOpts = await buildVoucherExecOpts(args);
-      const result = await executeVoucher(args, execOpts);
-      auditLog('create-voucher', args, result.isError ? 'error' : 'success', Date.now() - start);
+      const result = await executeVoucher(args, { ...execOpts, dryRun: args.dryRun });
+      auditLog('create-voucher', args, args.dryRun ? 'dryrun' : (result.isError ? 'error' : 'success'), Date.now() - start);
       return result;
     }
   );
@@ -2985,7 +2992,8 @@ export async function registerMcpServer(): Promise<McpServer> {
         openingBalance: z.number().optional().describe('optional opening balance. negative = debit, positive = credit'),
         mailingName: z.string().optional().describe('optional mailing name / display name'),
         gstRegistrationType: z.enum(['Regular', 'Composition', 'Unregistered', 'Consumer', 'Unknown']).optional().describe('optional GST registration type for party ledgers'),
-        gstin: z.string().optional().describe('optional GSTIN number for party ledgers')
+        gstin: z.string().optional().describe('optional GSTIN number for party ledgers'),
+        dryRun: z.boolean().optional().describe('if true, validate and echo the posting WITHOUT writing to Tally')
       },
       annotations: {
         readOnlyHint: false,
@@ -3014,6 +3022,10 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (args.gstRegistrationType) inputParams.set('gstRegistrationType', args.gstRegistrationType);
       if (args.gstin) inputParams.set('gstin', args.gstin);
 
+      if (args.dryRun) {
+        auditLog('create-ledger', args, 'dryrun', Date.now() - start);
+        return dryRunEcho('ledger', inputParams);
+      }
       const resp = await push('ledger', inputParams);
       if (!resp.success) {
         auditLog('create-ledger', args, 'error', Date.now() - start);
@@ -3039,7 +3051,8 @@ export async function registerMcpServer(): Promise<McpServer> {
         openingQuantity: z.number().optional().describe('optional opening quantity'),
         openingRate: z.number().optional().describe('optional opening rate per unit'),
         hsnCode: z.string().optional().describe('optional HSN/SAC code for GST'),
-        gstRate: z.number().optional().describe('optional GST rate percentage')
+        gstRate: z.number().optional().describe('optional GST rate percentage'),
+        dryRun: z.boolean().optional().describe('if true, validate and echo the posting WITHOUT writing to Tally')
       },
       annotations: {
         readOnlyHint: false,
@@ -3072,6 +3085,10 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (args.hsnCode) inputParams.set('hsnCode', args.hsnCode);
       if (args.gstRate !== undefined) inputParams.set('gstRate', args.gstRate);
 
+      if (args.dryRun) {
+        auditLog('create-stock-item', args, 'dryrun', Date.now() - start);
+        return dryRunEcho('stock-item', inputParams);
+      }
       const resp = await push('stock-item', inputParams);
       if (!resp.success) {
         auditLog('create-stock-item', args, 'error', Date.now() - start);
@@ -3104,6 +3121,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         voucherNumber: z.string().optional().describe('optional voucher number. leave blank for auto-numbering'),
         originalInvoiceNumber: z.string().optional().describe('original invoice number — required for Debit Note / Credit Note to link back to the original invoice'),
         originalInvoiceDate: z.string().optional().describe('original invoice date in YYYY-MM-DD format — optional for Debit Note / Credit Note'),
+        dryRun: z.boolean().optional().describe('if true, run all invariants + tax computation and echo the posting (incl. taxBreakup) WITHOUT writing to Tally'),
         cgstLedger: z.string().optional().describe('optional exact CGST ledger name. if not provided, auto-resolved from Tally'),
         sgstLedger: z.string().optional().describe('optional exact SGST ledger name. if not provided, auto-resolved from Tally'),
         igstLedger: z.string().optional().describe('optional exact IGST ledger name. if not provided, auto-resolved from Tally')
@@ -3221,6 +3239,10 @@ export async function registerMcpServer(): Promise<McpServer> {
         inputParams.set('igstAmount', igstAmount);
       }
 
+      if (args.dryRun) {
+        auditLog('create-gst-voucher', args, 'dryrun', Date.now() - start);
+        return dryRunEcho('gst-voucher', inputParams, { taxBreakup: { taxableValue, cgstAmount, sgstAmount, igstAmount, totalInvoiceValue } });
+      }
       const resp = await push('gst-voucher', inputParams);
       if (!resp.success) {
         auditLog('create-gst-voucher', args, 'error', Date.now() - start);
