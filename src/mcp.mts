@@ -850,6 +850,26 @@ export function resolveCompanyEnriched(
   return { kind: 'not-found', available: withAlias(base.available) };
 }
 
+// ── use-company orchestration (#87 H-1) ────────────────────────────────────
+export type UseCompanyPlan =
+  | { action: 'set-active'; company: ResolvedCompanyRecord }
+  | { action: 'load-vault'; company: ResolvedCompanyRecord }    // configured registry entry → vault select-and-unlock
+  | { action: 'load-restart'; company: ResolvedCompanyRecord }  // not resident, no vault entry → tally.ini restart
+  | { action: 'error'; code: 'AMBIGUOUS' | 'COMPANY_NOT_FOUND' };
+
+// Pure routing for use-company: given a resolved company, decide the single deterministic next action.
+//   already loaded            → set-active (fast path: no restart, no keystrokes)
+//   configured (has alias/vault) → load-vault (stored-credential select-and-unlock)
+//   otherwise                 → load-restart (tally.ini rewrite + Tally restart)
+export function planUseCompany(resolved: ResolveCompanyEnriched): UseCompanyPlan {
+  if (resolved.kind === 'ambiguous') return { action: 'error', code: 'AMBIGUOUS' };
+  if (resolved.kind === 'not-found') return { action: 'error', code: 'COMPANY_NOT_FOUND' };
+  const c = resolved.company;
+  if (c.isLoaded) return { action: 'set-active', company: c };
+  if (c.alias) return { action: 'load-vault', company: c };
+  return { action: 'load-restart', company: c };
+}
+
 // Resolves the configured Tally edition from env var. Defaults to "silver" — safer assumption since
 // Silver is more restrictive (single company resident); Gold treated as Silver still works, just slower than necessary.
 // Anything other than "gold" (case-insensitive) is treated as Silver.
@@ -3500,6 +3520,75 @@ export async function registerMcpServer(): Promise<McpServer> {
       } catch (err) {
         auditLog('resolve-company', args, 'error', Date.now() - start);
         return errorResult('UNKNOWN', { message: 'resolve-company failed.', logs: String(err) });
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'use-company',
+    {
+      title: 'Use Company',
+      description: `One call to bring a known company to ACTIVE from an EXACT folder id / name / configured alias (no fuzzy matching — resolve fuzzily session-side first). Deterministically: resolves the query → if already loaded, just sets it active (fast path, no restart/keystrokes) → else routes to the right load path. Returns the final typed status: success, or a single typed error naming the one remaining blocker (AMBIGUOUS / COMPANY_NOT_FOUND / TALLY_DOWN / and, for a not-resident company, the exact load tool to call). Prefer this over hand-orchestrating resolve-company + set-active-company + load-*.`,
+      inputSchema: {
+        query: z.string().max(256).describe('EXACT folder id (digits), company name, or configured alias. Not fuzzy.')
+      },
+      annotations: {
+        readOnlyHint: false,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      try {
+        const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const folders = scanCompanyFolders(tallyDataPath);
+        const registry = loadCompanyRegistry(resolveRegistryPath());
+        let loaded: string[] = [];
+        try { loaded = await listLoadedCompanies(); } catch { /* Tally maybe down; isLoaded=false */ }
+        const resolved = resolveCompanyEnriched(args.query, folders, registry, loaded);
+        const plan = planUseCompany(resolved);
+
+        if (plan.action === 'error') {
+          auditLog('use-company', args, 'denied', Date.now() - start);
+          return errorResult(plan.code, { logs: JSON.stringify(resolved) });
+        }
+
+        // Fast path: already loaded → verify + set active (bounded transient retry on the verify).
+        if (plan.action === 'set-active') {
+          const { result: ok } = await retryForResult(
+            () => verifyCompanyLoaded(plan.company.name).then(v => (v ? true : null)),
+            (v) => v === true, 3
+          );
+          if (ok) {
+            activeCompany = plan.company.name;
+            auditLog('use-company', args, 'success', Date.now() - start);
+            return { content: [{ type: 'text', text: JSON.stringify({ success: true, activeCompany, folderId: plan.company.folderId, path: 'already-loaded' }) }] };
+          }
+          // isLoaded was stale — fall through to the appropriate load path below.
+          plan.company.isLoaded = false;
+        }
+
+        // Not resident: name the single remaining action deterministically. The actual destructive
+        // load (tally.ini restart) / DPAPI vault-unlock stay in their dedicated, Windows-validated
+        // tools; use-company routes to exactly one of them so the caller isn't guessing.
+        const c = plan.company;
+        if (c.alias) {
+          auditLog('use-company', args, 'denied', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', {
+            message: `"${c.name}" (folder ${c.folderId}) is configured but not resident. Bring it active with load-company-by-alias.`,
+            remedy: `Call load-company-by-alias with alias "${c.alias}" (uses the stored vault credentials).`,
+            retryable: false
+          });
+        }
+        auditLog('use-company', args, 'denied', Date.now() - start);
+        return errorResult('PRECONDITION_FAILED', {
+          message: `"${c.name}" (folder ${c.folderId}) is not resident and has no vault entry.`,
+          remedy: `Call load-company (folderId "${c.folderId}"${c.isProtected ? ', with userName + password — it is protected' : ''}) — note it restarts Tally. Or configure it in the tray so it can vault-unlock.`,
+          retryable: false
+        });
+      } catch (err) {
+        auditLog('use-company', args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: 'use-company failed.', logs: String(err) });
       }
     }
   );
