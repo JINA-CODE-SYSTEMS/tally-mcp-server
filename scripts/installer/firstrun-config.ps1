@@ -496,17 +496,35 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         $taskAction = New-ScheduledTaskAction `
             -Execute 'powershell.exe' `
             -Argument "-ExecutionPolicy Bypass -NoProfile -WindowStyle Minimized -File `"$agentScript`""
-        # Two triggers: at logon (initial) + a repeating heartbeat that re-fires the task. The task
-        # engine no-ops the heartbeat when the agent is already Running (MultipleInstances=IgnoreNew),
-        # but respawns it within ~1 min if it crashed — the crash-supervision H-2 asked for, native to
-        # Task Scheduler so it doesn't depend on the tray being open. RestartCount/Interval additionally
-        # retries a failed launch. Parity with the NSSM service's AppExit=Restart supervision.
+        # At-logon trigger is the reliable baseline. Crash-supervision (#88 H-2) is added on top via
+        # RestartCount/Interval + an optional 1-min heartbeat — but BOTH are built best-effort so a
+        # picky Windows build can never abort registration (which previously left the task unregistered).
         $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $AgentTaskUser
-        $heartbeatTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration ([TimeSpan]::MaxValue)
         $taskPrincipal = New-ScheduledTaskPrincipal -UserId $AgentTaskUser -LogonType Interactive -RunLevel Limited
-        $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
-            -MultipleInstances IgnoreNew -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
-        $taskDef = New-ScheduledTask -Action $taskAction -Trigger $logonTrigger, $heartbeatTrigger -Principal $taskPrincipal -Settings $taskSettings -Description "Tally MCP GUI agent (companion to TallyMCP service; spawns Tally + keystrokes credentials in user session). Auto-respawns within ~1 min if it crashes."
+
+        # Supervision settings: respawn ~1 min after an abnormal exit; IgnoreNew avoids a double-instance.
+        # Fall back to basic settings if the enhanced set is rejected.
+        try {
+            $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
+                -MultipleInstances IgnoreNew -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
+        } catch {
+            Write-Host "[WARN] enhanced task settings unavailable; using basic: $_" -ForegroundColor Yellow
+            $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+        }
+
+        # Optional heartbeat trigger — re-fires the task every minute as a belt for the "process gone
+        # but the engine thinks it completed" case. Some Windows builds reject the repetition params,
+        # so build it in a try/catch and register logon-only if it fails (RestartCount still covers crashes).
+        # NOTE: use a finite 10-year duration, NOT [TimeSpan]::MaxValue, which overflows and threw here.
+        $taskTriggers = @($logonTrigger)
+        try {
+            $heartbeatTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3650)
+            $taskTriggers += $heartbeatTrigger
+        } catch {
+            Write-Host "[WARN] heartbeat trigger unavailable (crash-respawn still covered by RestartCount): $_" -ForegroundColor Yellow
+        }
+
+        $taskDef = New-ScheduledTask -Action $taskAction -Trigger $taskTriggers -Principal $taskPrincipal -Settings $taskSettings -Description "Tally MCP GUI agent (companion to TallyMCP service; spawns Tally + keystrokes credentials in user session). Auto-respawns within ~1 min if it crashes."
         Register-ScheduledTask -TaskName $AgentTaskName -InputObject $taskDef -Force | Out-Null
         $taskRegistered = $true
         Write-Host "[OK] Scheduled task '$AgentTaskName' registered (runs at logon, as $AgentTaskUser)"
