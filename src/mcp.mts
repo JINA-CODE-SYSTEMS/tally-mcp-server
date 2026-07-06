@@ -319,6 +319,26 @@ export async function probeWithRetry(
   return false;
 }
 
+// Like probeWithRetry but returns the produced value: retries an operation up to `attempts` times
+// until `isSuccess` holds, with backoff. Used for the self-healing unlock loop (#89 H-3) — on a
+// keystroke miss the whole select-and-unlock is re-dispatched (the agent re-keys + re-verifies each
+// attempt) before the host surrenders PASSWORD_REQUIRED. Returns the last value + the attempt count.
+export async function retryForResult<T>(
+  attempt: () => Promise<T | null>,
+  isSuccess: (r: T | null) => boolean,
+  attempts = 3,
+  backoffMs = 400,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise(r => setTimeout(r, ms))
+): Promise<{ result: T | null; attempts: number }> {
+  let last: T | null = null;
+  for (let i = 0; i < attempts; i++) {
+    try { last = await attempt(); } catch { last = null; }
+    if (isSuccess(last)) return { result: last, attempts: i + 1 };
+    if (i < attempts - 1) await sleep(backoffMs);
+  }
+  return { result: last, attempts };
+}
+
 // open-company strategy renames (#24): the old tdl-* names implied a TDL *load*
 // primitive, but these strategies only verify (no XML/TDL load primitive exists).
 // Old names stay accepted as deprecated aliases for one release.
@@ -3531,13 +3551,16 @@ export async function registerMcpServer(): Promise<McpServer> {
 
         const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
         const timeoutSec = 30;
-        const resp = await callGuiAgent(
-          'select-and-unlock-company',
-          { companyId: entry.folderId, userName: entry.username ?? '', password: plaintextPassword },
-          timeoutSec,
-          dataPath,
-          logs
+        // Self-healing unlock (#89 H-3): a keystroke miss is transient, so re-dispatch the whole
+        // select-and-unlock up to N times (the agent re-keys + re-verifies each attempt) before
+        // surrendering PASSWORD_REQUIRED — so a transient miss isn't reported like a wrong password.
+        const maxRetries = Math.max(1, parseInt(process.env.UNLOCK_MAX_RETRIES || '3', 10) || 3);
+        const { result: resp, attempts } = await retryForResult(
+          () => callGuiAgent('select-and-unlock-company', { companyId: entry.folderId, userName: entry.username ?? '', password: plaintextPassword }, timeoutSec, dataPath, logs),
+          (r) => !!r && r.status === 'success',
+          maxRetries
         );
+        logs.push(`  [unlock] select-and-unlock-company: ${attempts} attempt(s)`);
 
         if (!resp) {
           auditLog('load-company-by-alias', args, 'error', Date.now() - start);
@@ -3546,7 +3569,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         if (resp.status !== 'success') {
           auditLog('load-company-by-alias', args, 'error', Date.now() - start);
           return errorResult('PASSWORD_REQUIRED', {
-            message: `Load failed for "${entry.alias}": ${resp.message}.`,
+            message: `Load failed for "${entry.alias}" after ${attempts} attempt(s): ${resp.message}.`,
             remedy: 'If the password is wrong, fix via tray icon > Manage Companies > Edit > tick "Change password".',
             logs: logs.join('\n'),
           });
