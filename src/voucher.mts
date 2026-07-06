@@ -63,6 +63,43 @@ export function voucherBalance(entries: VoucherEntry[]): { debit: number; credit
   return { debit, credit, balanced: debit === credit };
 }
 
+// Deterministic period-window check (#95 H-9 → OUT_OF_PERIOD). The lower bound is booksFrom (the
+// real earliest valid date) when known, else fyFrom. Returns true (don't block) when the period is
+// unknown. ISO YYYY-MM-DD compares correctly as strings.
+export function isDateInOpenPeriod(
+  dateIso: string,
+  period: { fyFrom: string | null; fyTo: string | null; booksFrom?: string | null }
+): boolean {
+  const lower = period.booksFrom || period.fyFrom;
+  const upper = period.fyTo;
+  if (!lower && !upper) return true;
+  if (lower && dateIso < lower) return false;
+  if (upper && dateIso > upper) return false;
+  return true;
+}
+
+// Deterministic exact-name master existence (#95 H-9 → MASTER_NOT_FOUND). Case-insensitive exact
+// match — NO fuzzy matching (that's session-side). Returns the referenced names missing from `known`.
+// An empty `known` list means "unknown" → returns [] (don't block on an unavailable master list).
+export function findMissingMasters(referenced: string[], known: string[]): string[] {
+  if (!known.length) return [];
+  const set = new Set(known.map(k => k.trim().toLowerCase()));
+  const missing: string[] = [];
+  for (const r of referenced) {
+    const n = (r ?? '').trim().toLowerCase();
+    if (n && !set.has(n) && !missing.includes(r)) missing.push(r);
+  }
+  return missing;
+}
+
+// Collects the ledger names a voucher references (entries + inventory accounting ledgers + party).
+export function referencedLedgers(v: VoucherInput): string[] {
+  const names = v.entries.map(e => e.ledger);
+  if (v.partyLedger) names.push(v.partyLedger);
+  for (const inv of v.inventory || []) if (inv.accountingLedger) names.push(inv.accountingLedger);
+  return names;
+}
+
 function signedAmount(entry: VoucherEntry): string {
   // debit → negative, credit → positive (Tally convention, see push/voucher.xml)
   return entry.drCr === 'dr' ? `-${entry.amount}` : `${entry.amount}`;
