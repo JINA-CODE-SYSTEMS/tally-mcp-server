@@ -184,6 +184,36 @@ async function fetchCompanyPeriod(companyName: string | null): Promise<CompanyPe
   return parseCompanyPeriod(resp, companyName);
 }
 
+// ── read-surface helpers (#92 H-6, #93 H-7) ────────────────────────────────
+// Explicit row count so an empty-but-successful read (count:0) is distinguishable from a failure
+// (which routes through errorResult). Non-arrays → 0.
+export function rowCount(data: unknown): number {
+  return Array.isArray(data) ? data.length : 0;
+}
+
+// The display name of a master row, defensively: prefer a `name` field, else the first column value.
+function masterRowName(row: unknown): string {
+  if (row && typeof row === 'object') {
+    const r = row as Record<string, unknown>;
+    if ('name' in r) return String(r.name ?? '');
+    const vals = Object.values(r);
+    return vals.length ? String(vals[0] ?? '') : '';
+  }
+  return String(row ?? '');
+}
+
+// Dumb, deterministic filter for search-master (#93): case-insensitive substring or prefix match on
+// the row name only. NO ranking, NO fuzzy scoring, NO reordering — matches are returned in source
+// order. Empty/blank query returns all rows unchanged (behaves like list-master).
+export function filterMasterRows<T>(rows: T[], query: string, mode: 'substring' | 'prefix' = 'substring'): T[] {
+  const q = (query ?? '').trim().toLowerCase();
+  if (!q) return rows;
+  return rows.filter(row => {
+    const name = masterRowName(row).toLowerCase();
+    return mode === 'prefix' ? name.startsWith(q) : name.includes(q);
+  });
+}
+
 // Normalize a company name for fuzzy comparison: lowercase, drop everything
 // except letters and digits. Lets us match "Ross Computer Pvt Ltd" against
 // "ROSS COMPUTERS PVT. LTD." despite differing punctuation, case, and plurals
@@ -1122,9 +1152,13 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
       try {
         const resp = await executeSQL(args.sql);
+        // resp is header-line + one line per row (header-only on empty). count = data rows so a
+        // zero-row query is distinguishable from a failure (#92).
+        const trimmed = resp.replace(/\n+$/, '');
+        const count = trimmed.includes('\n') ? trimmed.split('\n').length - 1 : 0;
         auditLog('query-database', args, 'success', Date.now() - start);
         return {
-          content: [{ type: 'text', text: resp }]
+          content: [{ type: 'text', text: JSON.stringify({ count, rows: resp }) }]
         };
       } catch (err) {
         auditLog('query-database', args, 'error', Date.now() - start);
@@ -2126,8 +2160,46 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
       else {
         return {
-          content: [{ type: 'text', text: jsonToTSV(resp.data) }]
+          content: [{ type: 'text', text: JSON.stringify({ count: rowCount(resp.data), rows: jsonToTSV(resp.data) }) }]
         };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'search-master',
+    {
+      title: 'Search Masters',
+      description: `Like list-master but filtered by a plain case-insensitive substring (or prefix) match on the master NAME — a convenience so you don't have to pull the whole collection. This is a DUMB filter: no ranking, no fuzzy scoring, no reordering; matches are returned in Tally's source order. For fuzzy/best-match selection, pull list-master and match session-side. Returns { count, rows } (TSV) — the same row shape as list-master, filtered. Blank query returns everything.`,
+      inputSchema: {
+        collection: z.enum(['group', 'ledger', 'vouchertype', 'unit', 'godown', 'stockgroup', 'stockitem', 'costcategory', 'costcentre', 'attendancetype', 'company', 'currency', 'gstin', 'gstclassification']),
+        query: z.string().describe('case-insensitive substring (or prefix) to match against the master name. Blank returns all rows (same as list-master).'),
+        mode: z.enum(['substring', 'prefix']).optional().describe('match mode; defaults to substring'),
+        targetCompany: z.string().optional().describe('optional company name; defaults to the active company')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      const inputParams = new Map<string, any>([['collection', args.collection]]);
+      if (args.targetCompany) inputParams.set('targetCompany', args.targetCompany);
+      try {
+        const resp = await pull('list-master', inputParams);
+        if (resp.error) {
+          auditLog('search-master', args, 'error', Date.now() - start);
+          return errorResult('UNKNOWN', { message: resp.error });
+        }
+        const filtered = filterMasterRows(Array.isArray(resp.data) ? resp.data : [], args.query, args.mode ?? 'substring');
+        auditLog('search-master', args, 'success', Date.now() - start);
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ count: rowCount(filtered), rows: jsonToTSV(filtered) }) }]
+        };
+      } catch (err) {
+        auditLog('search-master', args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: 'search-master failed.', logs: String(err) });
       }
     }
   );
@@ -2157,7 +2229,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
@@ -2190,7 +2262,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
@@ -2223,7 +2295,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
@@ -2255,7 +2327,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
@@ -2288,7 +2360,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
@@ -2320,7 +2392,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify(resp.data) }]
+          content: [{ type: 'text', text: JSON.stringify({ count: rowCount(resp.data), rows: resp.data }) }]
         };
       }
     }
@@ -2352,7 +2424,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify(resp.data) }]
+          content: [{ type: 'text', text: JSON.stringify({ count: rowCount(resp.data), rows: resp.data }) }]
         };
       }
     }
@@ -2385,7 +2457,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
@@ -2426,7 +2498,7 @@ export async function registerMcpServer(): Promise<McpServer> {
           resp.data.unshift(lastItem);
         }
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
 
@@ -2468,7 +2540,7 @@ export async function registerMcpServer(): Promise<McpServer> {
           resp.data.unshift(lastItem);
         }
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
 
@@ -2502,7 +2574,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
@@ -2533,7 +2605,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
@@ -2566,7 +2638,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
@@ -2599,7 +2671,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
@@ -2632,7 +2704,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
