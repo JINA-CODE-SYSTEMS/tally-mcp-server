@@ -779,14 +779,33 @@ export function resolveCompanyEnriched(
     const n = name.trim().toLowerCase();
     return n.length > 0 && loadedNames.some(l => l.trim().toLowerCase() === n);
   };
-  const record = (folderId: string, name: string, matchedBy: 'id' | 'name' | 'alias'): ResolvedCompanyRecord => ({
-    name,
-    folderId,
-    alias: aliasFor(folderId),
-    isLoaded: isLoadedName(name),
-    isProtected: isProtectedFor(folderId),
-    matchedBy,
-  });
+  // Resolve the real canonical display name by DETERMINISTIC precedence (#90 H-4), instead of
+  // trusting the heuristic byte-scrape of the binary Company.900/1800 metadata (which can truncate
+  // or garble the name):
+  //   1. the live Tally-reported name if this company is loaded (authoritative exact casing),
+  //   2. else the registry-configured displayName for this folderId (deterministic, user-set),
+  //   3. else fall back to the scraped folder name.
+  const canonicalName = (folderId: string, scrapedName: string): string => {
+    const n = scrapedName.trim().toLowerCase();
+    if (n) {
+      const live = loadedNames.find(l => l.trim().toLowerCase() === n);
+      if (live) return live;
+    }
+    const disp = registry.companies.find(c => c.folderId === folderId)?.displayName;
+    if (disp && disp.trim()) return disp;
+    return scrapedName;
+  };
+  const record = (folderId: string, name: string, matchedBy: 'id' | 'name' | 'alias'): ResolvedCompanyRecord => {
+    const canonical = canonicalName(folderId, name);
+    return {
+      name: canonical,
+      folderId,
+      alias: aliasFor(folderId),
+      isLoaded: isLoadedName(canonical),
+      isProtected: isProtectedFor(folderId),
+      matchedBy,
+    };
+  };
   const withAlias = (list: Array<{ folder: string; name: string }>) =>
     list.map(f => ({ folderId: f.folder, name: f.name, alias: aliasFor(f.folder) }));
 
@@ -800,8 +819,11 @@ export function resolveCompanyEnriched(
   // not-found by id/name — try the alias registry before giving up.
   const entry = findCompanyByAlias(registry, query);
   if (entry) {
-    const name = folders.find(f => f.folder === entry.folderId)?.name || entry.displayName || '';
-    return { kind: 'ok', company: record(entry.folderId, name, 'alias') };
+    // Pass the SCRAPED name; record()/canonicalName apply the deterministic precedence
+    // (live Tally name → registry displayName → scrape), so a garbled scrape can't win over
+    // the configured displayName (#90 H-4).
+    const scraped = folders.find(f => f.folder === entry.folderId)?.name || '';
+    return { kind: 'ok', company: record(entry.folderId, scraped, 'alias') };
   }
   return { kind: 'not-found', available: withAlias(base.available) };
 }
