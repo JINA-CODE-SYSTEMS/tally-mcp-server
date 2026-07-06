@@ -6,7 +6,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import { cacheTable, executeSQL, validateSQL } from './database.mjs';
 import { handlePull, handlePush, jsonToTSV, pingTally, postTallyXML, pushXml, resolveGSTLedgers } from './tally.mjs';
-import { buildVoucherXml, voucherBalance, isDateInOpenPeriod, findMissingMasters, referencedLedgers, type VoucherEntry, type VoucherInput } from './voucher.mjs';
+import { buildVoucherXml, buildCancelVoucherXml, voucherBalance, isDateInOpenPeriod, findMissingMasters, referencedLedgers, type VoucherEntry, type VoucherInput } from './voucher.mjs';
 import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
 
 dotenv.config({ override: true, quiet: true });
@@ -3077,6 +3077,57 @@ export async function registerMcpServer(): Promise<McpServer> {
       const status = args.dryRun ? 'dryrun' : (batch.aborted || batch.posted < args.vouchers.length ? 'error' : 'success');
       auditLog('create-vouchers', { count: args.vouchers.length, atomic: args.atomic, dryRun: args.dryRun }, status, Date.now() - start);
       return { content: [{ type: 'text', text: JSON.stringify(batch, null, 2) }], isError: batch.aborted };
+    }
+  );
+
+  mcpServer.registerTool(
+    'reverse-voucher',
+    {
+      title: 'Reverse / Cancel Voucher',
+      description: `Cancels a posted voucher (mark-cancelled: ACTION="Cancel" + ISCANCELLED — Edit-Log-safe, keeps the row with a cancellation trail). Locate the target deterministically by voucherType + voucherNumber + its original date; no fuzzy matching (resolve the exact voucher session-side). mode defaults to 'cancel'. For a reversing contra entry instead, post a normal create-voucher with the dr/cr swapped. Refused when READONLY_MODE=true. Returns { success, altered }.`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name; defaults to the active company'),
+        voucherType: z.enum(['Sales', 'Purchase', 'Payment', 'Receipt', 'Contra', 'Journal', 'Debit Note', 'Credit Note']).describe('voucher type of the target voucher'),
+        voucherNumber: z.string().describe('exact voucher number to cancel'),
+        date: z.string().describe('the target voucher\'s original date (YYYY-MM-DD), used to locate it'),
+        mode: z.enum(['cancel', 'reversing-entry']).optional().describe("defaults to 'cancel' (mark-cancelled). 'reversing-entry' is not posted here — use create-voucher with the dr/cr swapped.")
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      if (process.env.READONLY_MODE === 'true') {
+        auditLog('reverse-voucher', args, 'denied');
+        return errorResult('READONLY');
+      }
+      if (args.mode === 'reversing-entry') {
+        auditLog('reverse-voucher', args, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: 'reversing-entry mode is not posted here — create a contra voucher via create-voucher with the dr/cr swapped.', retryable: false });
+      }
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(args.date)) {
+        auditLog('reverse-voucher', args, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: 'Date must be in YYYY-MM-DD format.', retryable: false });
+      }
+      if (!args.voucherNumber.trim()) {
+        auditLog('reverse-voucher', args, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: 'voucherNumber is required to locate the voucher.', retryable: false });
+      }
+      const company = args.targetCompany || activeCompany || undefined;
+      const xml = buildCancelVoucherXml({ voucherType: args.voucherType, voucherNumber: args.voucherNumber, date: args.date }, company);
+      const resp = await pushXml(xml);
+      if (!resp.success || (resp.altered === 0 && resp.created === 0)) {
+        auditLog('reverse-voucher', args, 'error', Date.now() - start);
+        return errorResult('PRECONDITION_FAILED', {
+          message: resp.error || `Could not locate voucher ${args.voucherType} #${args.voucherNumber} dated ${args.date} to cancel.`,
+          retryable: false
+        });
+      }
+      auditLog('reverse-voucher', args, 'success', Date.now() - start);
+      return { content: [{ type: 'text', text: JSON.stringify({ success: true, altered: resp.altered, cancelled: args.voucherNumber }) }] };
     }
   );
 
