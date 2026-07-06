@@ -157,6 +157,11 @@ if ($SkipAgentTask) {
         $taskAction = "powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Minimized -File `"$agentScript`""
         # /RL LIMITED so the task runs with the user's normal token (admin keystrokes don't reach
         # non-elevated Tally windows due to UIPI, and Tally Prime ships unelevated by default).
+        # NOTE (#88 H-2): this legacy schtasks path registers an at-logon trigger only — no native
+        # crash supervision (schtasks.exe can't set RestartCount / a safe IgnoreNew heartbeat without
+        # risking a double-launch). The shipped Inno installer path (firstrun-config.ps1) uses the
+        # ScheduledTasks cmdlets with a 1-min heartbeat trigger + -MultipleInstances IgnoreNew +
+        # -RestartCount to auto-respawn the agent within ~1 min of a crash. Prefer that installer.
         & schtasks /Create /TN $AgentTaskName /SC ONLOGON /RU $AgentTaskUser /RL LIMITED /TR $taskAction /F | Out-Null
         if ($LASTEXITCODE -eq 0) {
             Write-Host "[OK] Scheduled task '$AgentTaskName' registered (runs at logon, as $AgentTaskUser)" -ForegroundColor Green
