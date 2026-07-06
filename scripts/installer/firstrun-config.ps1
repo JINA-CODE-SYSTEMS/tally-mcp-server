@@ -64,6 +64,9 @@ param(
     [string]$TallyIniPath,
     [string]$McpDomain,
     [string]$AgentTaskUser,
+    # Opt-in for Claude-driven GUI control (gui-screenshot / gui-send-keys). Wizard passes
+    # 'true'/'false'; a bare Reconfigure omits it, so we preserve the existing .env value below.
+    [string]$EnableGuiControl,
     [switch]$SkipTrayTask
 )
 
@@ -106,6 +109,10 @@ $McpDomain      = _Coalesce $McpDomain      $_existingEnv['MCP_DOMAIN']       ''
 # by a DIFFERENT admin (the bare-InstallDir path omits -AgentTaskUser) does not silently re-point the
 # agent task + all the icacls grants to that admin - which would break the IPC ACL for the real user.
 $AgentTaskUser  = _Coalesce $AgentTaskUser  $_existingEnv['AGENT_TASK_USER']  $env:USERNAME
+# ENABLE_GUI_CONTROL is off by default (arbitrary keystroke injection + screenshots). Preserve the
+# existing value on a bare Reconfigure; normalize anything that isn't the literal 'true' to 'false'.
+$EnableGuiControl = _Coalesce $EnableGuiControl $_existingEnv['ENABLE_GUI_CONTROL'] 'false'
+if ($EnableGuiControl -ne 'true') { $EnableGuiControl = 'false' }
 
 # --- Resolve OAuth password ---
 # Two entry paths:
@@ -290,6 +297,8 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         # Persisted so a later Reconfigure preserves the agent user instead of falling back to
         # whoever runs the wizard (see the _Coalesce for $AgentTaskUser above).
         "AGENT_TASK_USER=$(_envQuote $AgentTaskUser)"
+        # Claude-driven GUI control (gui-screenshot / gui-send-keys). Off unless the operator opted in.
+        "ENABLE_GUI_CONTROL=$EnableGuiControl"
     )
     # Bind address (security): only listen on all interfaces when a public domain / reverse proxy
     # is explicitly configured. When MCP_DOMAIN is blank ("localhost-only mode") bind to loopback
