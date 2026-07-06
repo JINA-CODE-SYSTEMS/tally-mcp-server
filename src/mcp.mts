@@ -87,6 +87,100 @@ async function listLoadedCompanies(): Promise<string[]> {
   }
 }
 
+// ── get-period (#82) ───────────────────────────────────────────────────────
+// The active company's period, so callers never infer valid dates or risk posting
+// a voucher outside the open financial year.
+export type CompanyPeriod = {
+  company: string | null;
+  fyFrom: string | null;       // financial-year start, ISO YYYY-MM-DD
+  fyTo: string | null;         // financial-year end, ISO YYYY-MM-DD
+  currentDate: string | null;  // Tally's working/current date
+  lastEntryDate: string | null;// date of the most recent voucher
+  fyToInferred: boolean;       // true when fyTo was computed from fyFrom (Tally left $EndingAt empty)
+};
+
+const TALLY_MONTHS: Record<string, string> = {
+  jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
+  jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12'
+};
+
+// Normalizes a Tally date to ISO YYYY-MM-DD. Tally emits dates as `d-MMM-yyyy` (e.g. "1-Apr-2026");
+// also tolerates `d-MMM-yy` and already-ISO input. Returns null for empty/unparseable values.
+export function normalizeTallyDate(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  let m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  m = s.match(/^(\d{1,2})-([A-Za-z]{3,})-(\d{2,4})$/);
+  if (m) {
+    const day = m[1].padStart(2, '0');
+    const mon = TALLY_MONTHS[m[2].slice(0, 3).toLowerCase()];
+    if (!mon) return null;
+    let year = m[3];
+    if (year.length === 2) year = (Number(year) >= 70 ? '19' : '20') + year;
+    return `${year}-${mon}-${day}`;
+  }
+  return null;
+}
+
+// Pure parser for the get-period Tally XML response. Picks the row matching `preferCompany`
+// (case-insensitive) or the first row, mapping F01..F05 → the period contract. When Tally leaves
+// $EndingAt (F03) empty for an ongoing year, fyTo is inferred as fyFrom + 1 year − 1 day (the Indian
+// FY convention: 1-Apr-2026 → 31-Mar-2027) and fyToInferred is set. Kept pure so it's unit-testable
+// without a live Tally.
+export function parseCompanyPeriod(xml: string, preferCompany?: string | null): CompanyPeriod {
+  const empty: CompanyPeriod = { company: null, fyFrom: null, fyTo: null, currentDate: null, lastEntryDate: null, fyToInferred: false };
+  if (!xml) return empty;
+  const rows = xml.match(/<ROW>[\s\S]*?<\/ROW>/gi) || [];
+  if (rows.length === 0) return empty;
+  const field = (row: string, tag: string): string | null => {
+    const m = row.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'i'));
+    if (!m) return null;
+    const v = m[1].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').trim();
+    return v || null;
+  };
+  const first = rows[0];
+  if (first === undefined) return empty;
+  let chosen: string = first;
+  if (preferCompany) {
+    const want = preferCompany.trim().toLowerCase();
+    const match = rows.find(r => (field(r, 'F01') || '').toLowerCase() === want);
+    if (match) chosen = match;
+  }
+  const fyFrom = normalizeTallyDate(field(chosen, 'F02'));
+  let fyTo = normalizeTallyDate(field(chosen, 'F03'));
+  let fyToInferred = false;
+  if (!fyTo && fyFrom) {
+    const m = fyFrom.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (m) {
+      const d = new Date(Date.UTC(Number(m[1]) + 1, Number(m[2]) - 1, Number(m[3])));
+      d.setUTCDate(d.getUTCDate() - 1);
+      fyTo = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+      fyToInferred = true;
+    }
+  }
+  return {
+    company: field(chosen, 'F01'),
+    fyFrom,
+    fyTo,
+    currentDate: normalizeTallyDate(field(chosen, 'F04')),
+    lastEntryDate: normalizeTallyDate(field(chosen, 'F05')),
+    fyToInferred
+  };
+}
+
+// Builds the period report envelope, posts it, and parses. Injects SVCURRENTCOMPANY only when a
+// company is given; omitting it lets Tally use its current company (repo convention).
+async function fetchCompanyPeriod(companyName: string | null): Promise<CompanyPeriod> {
+  const svCompany = companyName
+    ? `<SVCURRENTCOMPANY>${companyName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</SVCURRENTCOMPANY>`
+    : '';
+  const xml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPPeriodReport</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>${svCompany}</STATICVARIABLES><TDL><TDLMESSAGE><REPORT NAME="MCPPeriodReport"><FORMS>MCPPeriodForm</FORMS></REPORT><FORM NAME="MCPPeriodForm"><PARTS>MCPPeriodPart</PARTS><XMLTAG>DATA</XMLTAG></FORM><PART NAME="MCPPeriodPart"><LINES>MCPPeriodLine</LINES><REPEAT>MCPPeriodLine : MCPPeriodColl</REPEAT><SCROLLED>Vertical</SCROLLED></PART><LINE NAME="MCPPeriodLine"><FIELDS>FCname,FCfrom,FCto,FCcur,FClast</FIELDS><XMLTAG>ROW</XMLTAG></LINE><FIELD NAME="FCname"><SET>$Name</SET><XMLTAG>F01</XMLTAG></FIELD><FIELD NAME="FCfrom"><SET>$StartingFrom</SET><XMLTAG>F02</XMLTAG></FIELD><FIELD NAME="FCto"><SET>$EndingAt</SET><XMLTAG>F03</XMLTAG></FIELD><FIELD NAME="FCcur"><SET>##SVCurrentDate</SET><XMLTAG>F04</XMLTAG></FIELD><FIELD NAME="FClast"><SET>$LastVoucherDate</SET><XMLTAG>F05</XMLTAG></FIELD><COLLECTION NAME="MCPPeriodColl"><TYPE>Company</TYPE></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+  const resp = await postTallyXML(xml);
+  return parseCompanyPeriod(resp, companyName);
+}
+
 // Normalize a company name for fuzzy comparison: lowercase, drop everything
 // except letters and digits. Lets us match "Ross Computer Pvt Ltd" against
 // "ROSS COMPUTERS PVT. LTD." despite differing punctuation, case, and plurals
@@ -1584,6 +1678,46 @@ export async function registerMcpServer(): Promise<McpServer> {
       } catch (err) {
         auditLog('get-context', args, 'error', Date.now() - start);
         return errorResult('UNKNOWN', { message: 'get-context failed.', logs: String(err) });
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'get-period',
+    {
+      title: 'Get Period',
+      description: `Returns the active company's period so you never have to infer valid dates: { company, fyFrom, fyTo, currentDate, lastEntryDate, fyToInferred }. fyFrom/fyTo are the financial year (ISO YYYY-MM-DD); currentDate is Tally's working date; lastEntryDate is the most recent voucher's date. fyToInferred=true means Tally left the FY-end blank (ongoing year) and it was computed as fyFrom + 1 year − 1 day. Call this before posting a voucher (date it inside fyFrom..fyTo) or running a report, instead of guessing dates or reading them off a screenshot. Pass targetCompany to query a specific loaded company; defaults to the active company.`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('Exact loaded-company name to query. Defaults to the active company.')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      try {
+        if (!(await pingTally(4000))) {
+          auditLog('get-period', args, 'error', Date.now() - start);
+          return errorResult('TALLY_DOWN', { logs: 'pingTally failed before get-period.' });
+        }
+        const company = (args.targetCompany && args.targetCompany.trim()) || activeCompany || null;
+        const period = await fetchCompanyPeriod(company);
+        if (!period.company && !period.fyFrom) {
+          auditLog('get-period', args, 'error', Date.now() - start);
+          return errorResult('COMPANY_NOT_FOUND', {
+            message: company
+              ? `No period returned for company "${company}" — is it loaded?`
+              : 'No active company, and no targetCompany was given.',
+            remedy: 'Load a company (load-company / load-company-by-alias) or pass targetCompany, then retry.'
+          });
+        }
+        auditLog('get-period', args, 'success', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify(period, null, 2) }], structuredContent: period };
+      } catch (err) {
+        auditLog('get-period', args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: 'get-period failed.', logs: String(err) });
       }
     }
   );
