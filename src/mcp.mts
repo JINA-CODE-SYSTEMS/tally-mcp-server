@@ -3594,6 +3594,75 @@ export async function registerMcpServer(): Promise<McpServer> {
   );
 
   mcpServer.registerTool(
+    'open-tally',
+    {
+      title: 'Open Tally',
+      description: `Launches Tally Prime if it is not already running, and waits until its XML server is reachable. Idempotent: if Tally is already up it returns immediately without relaunching. Because the MCP service runs in Windows Session 0 (no desktop), it can't spawn a GUI app itself — it dispatches the launch to the GUI agent running in the interactive session, so that agent must be alive (AGENT_UNREACHABLE otherwise). Call this before load-company / use-company / any read when Tally may be closed.`,
+      inputSchema: {
+        waitTimeoutSec: z.number().optional().describe('how long to wait for Tally to become reachable after launch (default 60)')
+      },
+      annotations: {
+        readOnlyHint: false,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      const logs: string[] = [];
+      try {
+        // Fast path: already reachable → nothing to do (no agent needed).
+        if (await pingTally()) {
+          auditLog('open-tally', args, 'success', Date.now() - start);
+          return { content: [{ type: 'text', text: JSON.stringify({ success: true, alreadyRunning: true }) }] };
+        }
+        const tallyExePath = process.env.TALLY_EXE_PATH || 'C:\\Program Files\\TallyPrimeEditLog\\tally.exe';
+        if (!fs.existsSync(tallyExePath)) {
+          auditLog('open-tally', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `tally.exe not found at ${tallyExePath}.`, remedy: 'Set TALLY_EXE_PATH in .env (via Reconfigure) if Tally lives elsewhere.', retryable: false });
+        }
+        // The service is in Session 0, so the launch must go through the interactive-session agent.
+        const agentWatchDir = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        logs.push('  Pinging GUI agent (needed to launch Tally in the interactive session)...');
+        const agentPing = await pingGuiAgent(agentWatchDir, 4, logs);
+        if (!agentPing.alive) {
+          auditLog('open-tally', args, 'error', Date.now() - start);
+          return errorResult('AGENT_UNREACHABLE', {
+            message: `GUI agent did not respond at ${agentWatchDir}, so Tally can't be launched into the desktop session.`,
+            logs: logs.join('\n'),
+          });
+        }
+        if (!agentPing.versionOk) {
+          auditLog('open-tally', args, 'error', Date.now() - start);
+          return errorResult('AGENT_TOO_OLD', {
+            message: `GUI agent is alive but reports version ${agentPing.agentVersion ?? '(none)'}, older than the required ${REQUIRED_AGENT_VERSION}.`,
+            logs: logs.join('\n'),
+          });
+        }
+        logs.push(`  Starting Tally via GUI agent (${tallyExePath})...`);
+        const agentResp = await callGuiAgent('start-tally', { exePath: tallyExePath, waitSec: 30 }, 35, agentWatchDir, logs);
+        if (!agentResp || agentResp.status !== 'success') {
+          logs.push(`    GUI agent: ${agentResp ? agentResp.message : 'no response'}`);
+        }
+        const timeoutMs = (args.waitTimeoutSec ?? 60) * 1000;
+        logs.push(`  Polling Tally XML server (timeout ${args.waitTimeoutSec ?? 60}s)...`);
+        const ready = await waitForTallyReady(timeoutMs, logs);
+        if (!ready) {
+          auditLog('open-tally', args, 'error', Date.now() - start);
+          return errorResult('TALLY_DOWN', {
+            message: 'Tally was launched but did not become reachable in time. If the service runs in Session 0, Tally won\'t show a window there — the GUI agent must launch it in the user session.',
+            logs: logs.join('\n'),
+          });
+        }
+        auditLog('open-tally', args, 'success', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify({ success: true, alreadyRunning: false, launched: true, agentMessage: agentResp?.message ?? '' }) }] };
+      } catch (err) {
+        auditLog('open-tally', args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: 'open-tally failed.', logs: logs.join('\n') + '\n' + String(err) });
+      }
+    }
+  );
+
+  mcpServer.registerTool(
     'load-company-by-alias',
     {
       title: 'Load Company by Alias',
