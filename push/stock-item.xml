@@ -16,6 +16,7 @@
             <REQUESTDATA>
                 <TALLYMESSAGE xmlns:UDF="TallyUDF">
                     <STOCKITEM NAME="{{name | escape}}" ACTION="Create">
+                        <NAME>{{name | escape}}</NAME>
                         <nunjuck>if parentGroup</nunjuck>
                         <PARENT>{{parentGroup | escape}}</PARENT>
                         <nunjuck>endif</nunjuck>
