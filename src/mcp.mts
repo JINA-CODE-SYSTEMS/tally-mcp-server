@@ -6,7 +6,8 @@ import path from 'node:path';
 import { z } from 'zod';
 import { cacheTable, executeSQL, validateSQL } from './database.mjs';
 import { handlePull, handlePush, jsonToTSV, pingTally, postTallyXML, pushXml, resolveGSTLedgers } from './tally.mjs';
-import { buildVoucherXml, voucherBalance, type VoucherEntry, type VoucherInput } from './voucher.mjs';
+import { buildVoucherXml, voucherBalance, isDateInOpenPeriod, findMissingMasters, referencedLedgers, type VoucherEntry, type VoucherInput } from './voucher.mjs';
+import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
 
 dotenv.config({ override: true, quiet: true });
 
@@ -1233,10 +1234,29 @@ type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean
 // create-voucher, create-vouchers (#97), and the dryRun path (#96). With opts.dryRun it echoes the
 // exact posting (voucher + rendered XML) and does NOT call Tally. #95 extends the invariant set
 // (date-in-period, master-existence, idempotency) via optional opts.
+export type VoucherExecOpts = {
+  dryRun?: boolean;
+  // Active company's open period for the OUT_OF_PERIOD check (fetched by the handler via get-period).
+  period?: { fyFrom: string | null; fyTo: string | null; booksFrom?: string | null } | null;
+  // Exact known master names for the MASTER_NOT_FOUND check. Empty/omitted → skip (don't block on an
+  // unavailable list). Fetched by the handler via list-master.
+  knownLedgers?: string[];
+  knownStockItems?: string[];
+  // Idempotency: replay the stored result for a repeated key instead of re-posting (#95/#97).
+  idempotency?: { store: IdempotencyStore; now: string };
+};
+
 export async function executeVoucher(
-  args: VoucherArgs & { targetCompany?: string },
-  opts: { dryRun?: boolean } = {}
+  args: VoucherArgs & { targetCompany?: string; idempotencyKey?: string },
+  opts: VoucherExecOpts = {}
 ): Promise<ToolResult> {
+  // Idempotent replay: a repeated key returns the prior result, posts nothing.
+  if (args.idempotencyKey && opts.idempotency) {
+    const prior = opts.idempotency.store.get(args.idempotencyKey);
+    if (prior) {
+      return { content: [{ type: 'text', text: JSON.stringify({ idempotentReplay: true, result: prior.result }) }] };
+    }
+  }
   const norm = normalizeVoucherEntries(args);
   if ('error' in norm) return errorResult('PRECONDITION_FAILED', { message: norm.error, retryable: false });
   const entries = norm.entries;
@@ -1246,7 +1266,7 @@ export async function executeVoucher(
   if (entries.some(e => !(e.amount > 0))) {
     return errorResult('PRECONDITION_FAILED', { message: 'Every entry amount must be greater than 0.', retryable: false });
   }
-  // Deterministic balance invariant (#94 H-8): total debits must equal total credits.
+  // (a) balance invariant (#94 H-8): total debits must equal total credits.
   const bal = voucherBalance(entries);
   if (!bal.balanced) {
     return errorResult('UNBALANCED', { message: `Voucher does not balance: debits ${bal.debit} != credits ${bal.credit}.` });
@@ -1257,6 +1277,21 @@ export async function executeVoucher(
     narration: args.narration, voucherNumber: args.voucherNumber, reference: args.reference,
     partyLedger: args.partyLedger, inventory: args.inventory, gst: args.gst,
   };
+  // (b) date within the open period (#95 H-9 → OUT_OF_PERIOD).
+  if (opts.period && !isDateInOpenPeriod(args.date, opts.period)) {
+    const lo = opts.period.booksFrom || opts.period.fyFrom;
+    return errorResult('OUT_OF_PERIOD', { message: `Voucher date ${args.date} is outside the open period (${lo}..${opts.period.fyTo}).` });
+  }
+  // (c) referenced masters exist (#95 H-9 → MASTER_NOT_FOUND). Exact-name only; skipped when the
+  // known list is unavailable so a fetch failure never blocks a legitimate write.
+  if (opts.knownLedgers?.length) {
+    const missing = findMissingMasters(referencedLedgers(voucher), opts.knownLedgers);
+    if (missing.length) return errorResult('MASTER_NOT_FOUND', { message: `Unknown ledger(s): ${missing.join(', ')}.` });
+  }
+  if (opts.knownStockItems?.length && voucher.inventory?.length) {
+    const missing = findMissingMasters(voucher.inventory.map(i => i.stockItem), opts.knownStockItems);
+    if (missing.length) return errorResult('MASTER_NOT_FOUND', { message: `Unknown stock item(s): ${missing.join(', ')}.` });
+  }
   const xml = buildVoucherXml(voucher, company);
   if (opts.dryRun) {
     // Echo exactly what would be posted; mutate nothing (#96 H-10).
@@ -1268,7 +1303,53 @@ export async function executeVoucher(
     if (/duplicat/i.test(resp.error || '')) return errorResult('DUPLICATE', { message: resp.error });
     return errorResult('UNKNOWN', { message: resp.error || 'Failed to create voucher.' });
   }
-  return { content: [{ type: 'text', text: JSON.stringify({ success: true, created: resp.created, lastVchId: resp.lastVchId }) }] };
+  const result = { success: true, created: resp.created, lastVchId: resp.lastVchId };
+  // (d) record the idempotency key so a replay short-circuits (#95/#97).
+  if (args.idempotencyKey && opts.idempotency) {
+    try { opts.idempotency.store.put(args.idempotencyKey, result, opts.idempotency.now); } catch {}
+  }
+  return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+}
+
+// File-backed idempotency store singleton (lives in TALLY_DATA_PATH when set, else next to dist/).
+let _idempotencyStore: IdempotencyStore | null = null;
+function getIdempotencyStore(): IdempotencyStore {
+  if (!_idempotencyStore) {
+    const dir = process.env.TALLY_DATA_PATH || path.join(import.meta.dirname, '..');
+    _idempotencyStore = makeIdempotencyStore(path.join(dir, '.tally-mcp-idempotency.json'));
+  }
+  return _idempotencyStore;
+}
+
+// Fetches exact master names for the MASTER_NOT_FOUND check. Tolerant: any failure → [] (skip).
+async function fetchMasterNames(collection: string, company?: string): Promise<string[]> {
+  try {
+    const p = new Map<string, any>([['collection', collection]]);
+    if (company) p.set('targetCompany', company);
+    const resp = await pull('list-master', p);
+    if (resp.error || !Array.isArray(resp.data)) return [];
+    return resp.data.map((r: any) => String(r?.name ?? '')).filter((s: string) => s.length > 0);
+  } catch { return []; }
+}
+
+// Fetches the active/target company's open period for the OUT_OF_PERIOD check. Tolerant: null on error.
+async function fetchPeriodForWrite(company?: string): Promise<{ fyFrom: string | null; fyTo: string | null; booksFrom: string | null } | null> {
+  try {
+    const p = await fetchCompanyPeriod(company ?? activeCompany ?? null);
+    return { fyFrom: p.fyFrom, fyTo: p.fyTo, booksFrom: p.booksFrom };
+  } catch { return null; }
+}
+
+// Assembles the deterministic write-invariant context (#95 H-9) for a voucher write: open period +
+// known ledger names (+ stock item names only when inventory is present). All fetches are tolerant.
+async function buildVoucherExecOpts(args: { targetCompany?: string; inventory?: unknown[]; idempotencyKey?: string }): Promise<VoucherExecOpts> {
+  const company = args.targetCompany || activeCompany || undefined;
+  const [period, knownLedgers, knownStockItems] = await Promise.all([
+    fetchPeriodForWrite(company),
+    fetchMasterNames('ledger', company),
+    (args.inventory && (args.inventory as unknown[]).length) ? fetchMasterNames('stockitem', company) : Promise.resolve<string[]>([]),
+  ]);
+  return { period, knownLedgers, knownStockItems, idempotency: { store: getIdempotencyStore(), now: new Date().toISOString() } };
 }
 
 export async function registerMcpServer(): Promise<McpServer> {
@@ -2871,6 +2952,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       inputSchema: {
         targetCompany: z.string().optional().describe('optional company name; defaults to the active company'),
         ...voucherInputShape,
+        idempotencyKey: z.string().optional().describe('optional; replaying the same key returns the prior result without re-posting'),
       },
       annotations: {
         readOnlyHint: false,
@@ -2884,7 +2966,8 @@ export async function registerMcpServer(): Promise<McpServer> {
         auditLog('create-voucher', args, 'denied');
         return errorResult('READONLY');
       }
-      const result = await executeVoucher(args);
+      const execOpts = await buildVoucherExecOpts(args);
+      const result = await executeVoucher(args, execOpts);
       auditLog('create-voucher', args, result.isError ? 'error' : 'success', Date.now() - start);
       return result;
     }
@@ -3051,6 +3134,15 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(args.date)) {
         auditLog('create-gst-voucher', args, 'denied');
         return errorResult('PRECONDITION_FAILED', { message: 'Date must be in YYYY-MM-DD format.', retryable: false });
+      }
+      // date within the open period (#95 H-9 → OUT_OF_PERIOD). Tolerant: skipped if period unknown.
+      {
+        const period = await fetchPeriodForWrite(args.targetCompany || activeCompany || undefined);
+        if (period && !isDateInOpenPeriod(args.date, period)) {
+          auditLog('create-gst-voucher', args, 'denied');
+          const lo = period.booksFrom || period.fyFrom;
+          return errorResult('OUT_OF_PERIOD', { message: `Voucher date ${args.date} is outside the open period (${lo}..${period.fyTo}).` });
+        }
       }
       // validate party != sale/purchase ledger
       if (args.partyLedger.trim().toLowerCase() === args.salePurchaseLedger.trim().toLowerCase()) {
