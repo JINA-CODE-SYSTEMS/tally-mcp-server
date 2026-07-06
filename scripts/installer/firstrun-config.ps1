@@ -447,6 +447,24 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     & $bundledNssm set $ServiceName AppStdoutCreationDisposition 4                      | Out-Null
     & $bundledNssm set $ServiceName AppStderrCreationDisposition 4                      | Out-Null
 
+    # --- Shutdown + restart behaviour (issue #23) --------------------------
+    # Stop the service by sending a console Ctrl-C FIRST: Node receives it as SIGINT and runs the
+    # graceful-shutdown path in server.mts (which drops MCP connections and exits in <1s). Only if
+    # that stalls does NSSM escalate to WM_CLOSE -> thread messages -> TerminateProcess. Bounding the
+    # console wait to 6s (and the next two stages to 1.5s each) keeps Stop-Service returning inside
+    # ~10s even in the worst case, instead of hanging in StopPending until a manual taskkill.
+    & $bundledNssm set $ServiceName AppStopMethodSkip    0     | Out-Null   # 0 = try every stop method
+    & $bundledNssm set $ServiceName AppStopMethodConsole 6000  | Out-Null   # graceful Ctrl-C window
+    & $bundledNssm set $ServiceName AppStopMethodWindow  1500  | Out-Null
+    & $bundledNssm set $ServiceName AppStopMethodThreads 1500  | Out-Null
+    # On an unexpected exit, restart with a sane delay rather than hammering. Throttle detection
+    # (AppThrottle) means a process that keeps dying fast is left stopped instead of respawned into
+    # the "Running but nothing listening" limbo we saw on cold installs — the real error then shows
+    # up in logs/service.log (e.g. the PASSWORD FATAL line) instead of a silent crash-loop.
+    & $bundledNssm set $ServiceName AppExit Default Restart    | Out-Null
+    & $bundledNssm set $ServiceName AppRestartDelay 2000       | Out-Null
+    & $bundledNssm set $ServiceName AppThrottle 5000           | Out-Null
+
     # Hand .env values to the service through NSSM's AppEnvironmentExtra. NSSM expects a
     # newline-separated list of KEY=VALUE pairs.
     $nssmEnv = ($envLines | Where-Object { $_ -and -not $_.StartsWith('#') }) -join "`n"
