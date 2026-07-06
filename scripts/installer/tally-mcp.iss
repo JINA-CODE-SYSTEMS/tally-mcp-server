@@ -144,7 +144,7 @@ Name: "{group}\Uninstall {#MyAppName}";  Filename: "{uninstallexe}"
 [Run]
 ; --- 1. First-run wizard: writes .env from collected wizard inputs and registers the NSSM service ---
 Filename: "powershell.exe"; \
-  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"" -CredentialsFile ""{code:GetCredentialsFilePath}"" -TallyEdition ""{code:GetWizardEdition}"" -TallyExePath ""{code:GetWizardExePath}"" -TallyDataPath ""{code:GetWizardDataPath}"" -TallyIniPath ""{code:GetWizardIniPath}"" -McpDomain ""{code:GetWizardDomain}"" -AgentTaskUser ""{code:GetWizardAgentUser}"""; \
+  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"" -CredentialsFile ""{code:GetCredentialsFilePath}"" -TallyEdition ""{code:GetWizardEdition}"" -TallyExePath ""{code:GetWizardExePath}"" -TallyDataPath ""{code:GetWizardDataPath}"" -TallyIniPath ""{code:GetWizardIniPath}"" -McpDomain ""{code:GetWizardDomain}"" -AgentTaskUser ""{code:GetWizardAgentUser}"" -EnableGuiControl ""{code:GetWizardGuiControl}"""; \
   WorkingDir: "{app}"; \
   StatusMsg: "Configuring service and writing .env..."; \
   Flags: runhidden waituntilterminated
@@ -179,6 +179,7 @@ var
   ConfigPage: TInputQueryWizardPage;
   EditionPage: TInputOptionWizardPage;
   AgentUserOverride: TNewCheckBox;
+  GuiControlOptIn: TNewCheckBox;
 
 // Toggle the agent-user field's editability from the "advanced" checkbox. Locked (disabled) by
 // default so the Tab-selects-all-then-overwrite trap can't silently replace the correct logon; when
@@ -258,6 +259,22 @@ begin
   EditionPage.Add('Silver (single company resident; load-company always swaps)');
   EditionPage.Add('Gold (multiple companies; load-company is additive unless replace=true)');
   EditionPage.SelectedValueIndex := 0;
+
+  // Opt-in for Claude-driven GUI control (issue #81). OFF by default: it exposes arbitrary keystroke
+  // injection + screenshots of the desktop. Writes ENABLE_GUI_CONTROL=true/false to .env via
+  // firstrun-config.ps1. Placed on the roomy Edition page rather than the crowded config page.
+  // Reserve the bottom strip of the surface for the checkbox and shrink the option list to fit above
+  // it, so placement is robust regardless of how tall Inno sized the CheckListBox.
+  EditionPage.CheckListBox.Height := EditionPage.Surface.Height - ScaleY(52);
+  GuiControlOptIn := TNewCheckBox.Create(EditionPage);
+  GuiControlOptIn.Parent := EditionPage.Surface;
+  GuiControlOptIn.Left := EditionPage.CheckListBox.Left;
+  GuiControlOptIn.Top := EditionPage.Surface.Height - ScaleY(40);
+  GuiControlOptIn.Width := EditionPage.SurfaceWidth;
+  GuiControlOptIn.Height := ScaleY(40);
+  GuiControlOptIn.WordWrap := True;
+  GuiControlOptIn.Caption := 'Allow Claude to control Tally directly — screenshots + keystrokes (advanced; off by default). You can change this later from the tray or Reconfigure.';
+  GuiControlOptIn.Checked := False;
 end;
 
 // Runs after the wizard and before any file copying. Stops the running TallyMCP service
@@ -425,6 +442,14 @@ end;
 function GetWizardAgentUser(Param: string): string;
 begin
   Result := ConfigPage.Values[5];
+end;
+
+function GetWizardGuiControl(Param: string): string;
+begin
+  if GuiControlOptIn.Checked then
+    Result := 'true'
+  else
+    Result := 'false';
 end;
 
 function GetWizardEdition(Param: string): string;

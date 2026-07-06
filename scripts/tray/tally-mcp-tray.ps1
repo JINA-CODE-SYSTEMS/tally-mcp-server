@@ -139,6 +139,31 @@ function Read-EnvValue {
     return ''
 }
 
+# Write (replace or append) a single KEY=VALUE in .env, preserving all other lines. Writes in place
+# rather than tmp+rename: firstrun-config.ps1 grants the agent user FullControl on the .env FILE
+# (icacls ${AgentTaskUser}:F) but not the Program Files directory, so we can rewrite the file but not
+# create a sibling .tmp there. Used by the "Allow Claude to control Tally" toggle.
+function Set-EnvValue {
+    param([string]$EnvPath, [string]$Key, [string]$Value)
+    $lines = @()
+    if (Test-Path -LiteralPath $EnvPath) { $lines = @(Get-Content -LiteralPath $EnvPath -ErrorAction SilentlyContinue) }
+    $replaced = $false
+    $out = foreach ($line in $lines) {
+        $trimmed = $line.Trim()
+        if ($trimmed -and -not $trimmed.StartsWith('#')) {
+            $eq = $trimmed.IndexOf('=')
+            if ($eq -ge 1 -and $trimmed.Substring(0, $eq).Trim() -eq $Key) {
+                $replaced = $true
+                "$Key=$Value"
+                continue
+            }
+        }
+        $line
+    }
+    if (-not $replaced) { $out = @($out) + "$Key=$Value" }
+    Set-Content -LiteralPath $EnvPath -Value $out -Encoding UTF8
+}
+
 # ---------------------------------------------------------------------------
 # Icon drawing. WinForms wants a System.Drawing.Icon, so we draw a 16x16 bitmap
 # with a coloured filled circle and convert via Icon.FromHandle. We allocate
@@ -439,6 +464,34 @@ $miRestartAgent.Add_Click({
         Start-ScheduledTask -TaskName $AgentTaskName -ErrorAction Stop
     } catch {
         [System.Windows.Forms.MessageBox]::Show("Restart agent failed: $_", 'TallyMCP', 'OK', 'Error') | Out-Null
+    }
+})
+
+# Toggle Claude-driven GUI control (ENABLE_GUI_CONTROL). Checkable; reflects current .env at build
+# time. Enabling warns (arbitrary keystroke injection + screenshots) and restarts the service so the
+# server re-reads .env. Since #23 the server loads .env by absolute path, so a plain restart applies it.
+$miGuiControl = $menu.Items.Add('Allow Claude to control Tally (advanced)')
+$miGuiControl.Checked = ((Read-EnvValue -EnvPath (Join-Path $InstallDir '.env') -Key 'ENABLE_GUI_CONTROL') -eq 'true')
+$miGuiControl.Add_Click({
+    try {
+        $envFile = Join-Path $InstallDir '.env'
+        $cur = Read-EnvValue -EnvPath $envFile -Key 'ENABLE_GUI_CONTROL'
+        $newVal = if ($cur -eq 'true') { 'false' } else { 'true' }
+        if ($newVal -eq 'true') {
+            $warn = "Enable Claude-driven GUI control?`n`nThis lets Claude capture screenshots of the Tally window and send arbitrary keystrokes to it. Only enable on a machine you trust.`n`nThe service will restart to apply the change."
+            if ([System.Windows.Forms.MessageBox]::Show($warn, 'TallyMCP', 'OKCancel', 'Warning') -ne 'OK') { return }
+        }
+        Set-EnvValue -EnvPath $envFile -Key 'ENABLE_GUI_CONTROL' -Value $newVal
+        $this.Checked = ($newVal -eq 'true')
+        # Same elevated restart as 'Restart service' (node-under-NSSM: taskkill + Start-Service).
+        $cmd = @"
+taskkill /F /IM node.exe 2>`$null | Out-Null
+Start-Sleep -Seconds 3
+Start-Service -Name '$ServiceName' -ErrorAction Stop
+"@
+        Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', $cmd) -Verb RunAs -WindowStyle Hidden
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Toggle GUI control failed: $_", 'TallyMCP', 'OK', 'Error') | Out-Null
     }
 })
 
