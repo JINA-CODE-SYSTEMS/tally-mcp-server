@@ -86,6 +86,18 @@ nssm set $ServiceName AppRotateBytes 5242880
 nssm set $ServiceName AppStdoutCreationDisposition 4
 nssm set $ServiceName AppStderrCreationDisposition 4
 
+# Shutdown + restart behaviour (issue #23): stop via console Ctrl-C (Node -> SIGINT -> graceful
+# shutdown in server.mts), escalate only if it stalls, and bound each stage so Stop-Service returns
+# within ~10s instead of hanging in StopPending. Restart with a delay + throttle so a fast-dying
+# process is left stopped (error visible in logs) rather than respawned into "Running but no port".
+nssm set $ServiceName AppStopMethodSkip 0
+nssm set $ServiceName AppStopMethodConsole 6000
+nssm set $ServiceName AppStopMethodWindow 1500
+nssm set $ServiceName AppStopMethodThreads 1500
+nssm set $ServiceName AppExit Default Restart
+nssm set $ServiceName AppRestartDelay 2000
+nssm set $ServiceName AppThrottle 5000
+
 # Create logs directory
 New-Item -ItemType Directory -Force -Path "$InstallDir\logs" | Out-Null
 
