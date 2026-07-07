@@ -47,6 +47,19 @@ test('live loaded Tally name wins over registry displayName (authoritative casin
   }
 });
 
+// Report #2: use-company("ross") wrongly said "not resident" because the alias displayName
+// ("Ross Computer Pvt Ltd") differs from the loaded name — isLoaded came back false.
+test('alias with a mismatched displayName resolves to the exact loaded name AND isLoaded=true', () => {
+  const f = [{ folder: '100000', name: '' }]; // empty/garbled scrape
+  const reg: CompanyRegistry = { schemaVersion: 1, companies: [{ alias: 'ross', folderId: '100000', displayName: 'Ross Computer Pvt Ltd' }] };
+  const r = resolveCompanyEnriched('ross', f, reg, ['ROSS COMPUTERS PVT. LTD.']);
+  assert.equal(r.kind, 'ok');
+  if (r.kind === 'ok') {
+    assert.equal(r.company.name, 'ROSS COMPUTERS PVT. LTD.'); // fuzzy-matched displayName → exact loaded
+    assert.equal(r.company.isLoaded, true);                    // so use-company sees it as resident
+  }
+});
+
 test('falls back to the scrape when neither loaded nor a registry displayName exists', () => {
   const bareRegistry: CompanyRegistry = { schemaVersion: 1, companies: [] };
   const r = resolveCompanyEnriched('100000', folders, bareRegistry, []);
