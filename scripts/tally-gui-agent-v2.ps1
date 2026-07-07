@@ -19,7 +19,7 @@ param(
 # against an agent older than its required minimum (issue #15 - version handshake).
 # Format: MAJOR.MINOR.PATCH. Bump MINOR on any new IPC action or response field;
 # bump PATCH on internal fixes that callers can ignore.
-$Script:AgentVersion = "1.3.0"
+$Script:AgentVersion = "1.4.0"
 
 if (-not $WatchDir) {
     $WatchDir = if ($env:TALLY_DATA_PATH) { $env:TALLY_DATA_PATH } else { "C:\Users\Public\TallyPrimeEditLog\data" }
@@ -284,7 +284,23 @@ function Execute-Action {
             # Log the length only, NEVER the text itself - a caller (gui-send-keys / the LLM loop) may
             # route a password through here, and Write-Host lands in the agent's console/transcript.
             Write-Host "  Action: Type ($($Action.value.Length) chars)"
-            [TallyUI2]::TypeString($Action.value)
+            # PREFER clipboard paste: char-by-char keybd_event double-registers/drops on Tally's UI
+            # ("JJINAA CODE..."), which is unacceptable for masked fields (a mistyped password = lockout).
+            # Paste sets the field atomically. Fall back to (scan-code) char typing only if the clipboard
+            # is unavailable. NOTE: a few Tally fields (e.g. TallyVault) may block paste — the caller must
+            # screenshot-verify the field after a masked entry.
+            $text = $Action.value
+            $pasted = $false
+            try { Set-Clipboard -Value $text -ErrorAction Stop; $pasted = $true } catch {
+                try { $text | clip.exe; if ($LASTEXITCODE -eq 0) { $pasted = $true } } catch {}
+            }
+            if ($pasted) {
+                Start-Sleep -Milliseconds 120
+                [TallyUI2]::PressCombo([TallyUI2]::VK_CONTROL, 0x56)  # Ctrl+V
+            } else {
+                Write-Host "  (clipboard unavailable - falling back to char typing)"
+                [TallyUI2]::TypeString($text)
+            }
         }
         "wait" {
             $ms = [int]$Action.value
