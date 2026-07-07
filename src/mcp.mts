@@ -3845,7 +3845,13 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
       const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
       const logs: string[] = [];
-      const resp = await callGuiAgent('screenshot', {}, 20, dataPath, logs);
+      // Capture can intermittently fail (e.g. "window may be minimized") and succeed on an immediate
+      // retry (#5) — retry up to 3× so a transient miss isn't surfaced as a hard error.
+      const { result: resp } = await retryForResult(
+        () => callGuiAgent('screenshot', {}, 20, dataPath, logs),
+        (r) => !!r && r.status === 'success',
+        3, 300
+      );
       // The agent writes the PNG BEFORE writing its result, so a credential/financial frame can be on
       // disk even on the timeout path. Always clean it up, whatever the outcome - never leave it behind.
       const shot = path.join(dataPath, '_mcp_screenshot.png');
