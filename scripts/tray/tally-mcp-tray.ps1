@@ -47,7 +47,11 @@ param(
     [string]$ServiceName = 'TallyMCP',
     [string]$AgentTaskName = 'TallyMCPAgent',
     [int]$PollIntervalSec = 5,
-    [int]$ProbeTimeoutSec = 3
+    [int]$ProbeTimeoutSec = 3,
+    # Passed by the "Open Tally MCP Dashboard" Start Menu / desktop shortcut. If this process becomes
+    # the singleton tray it opens the dashboard immediately; if a tray is already running it just
+    # signals that instance to show its dashboard and exits (see the single-instance guard below).
+    [switch]$ShowDashboard
 )
 
 # Resolve InstallDir relative to this file when not provided. The tray script lives at
@@ -60,6 +64,24 @@ if (-not $InstallDir -or -not $InstallDir.Trim()) {
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+
+# ---------------------------------------------------------------------------
+# Single-instance guard. Exactly one tray should run per interactive session (the TallyMCPTray
+# at-logon task). The "Open Tally MCP Dashboard" Start Menu / desktop shortcut launches this script
+# too; rather than stack a second tray icon, a second launch signals the running instance to pop its
+# dashboard, then exits. The names have NO "Global\" prefix, so they are scoped to this desktop
+# session - i.e. exactly one tray per logged-in user, which is what we want.
+$script:SingletonMutex      = New-Object System.Threading.Mutex($false, 'TallyMCP.Tray.Singleton.v1')
+$script:ShowDashboardSignal = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'TallyMCP.Tray.ShowDashboard.v1')
+$ownsSingleton = $false
+try   { $ownsSingleton = $script:SingletonMutex.WaitOne(0) }
+catch [System.Threading.AbandonedMutexException] { $ownsSingleton = $true }  # a prior tray died without releasing; we own it now
+if (-not $ownsSingleton) {
+    # Another tray already owns this session. Ask it to show the dashboard, then exit so the shortcut
+    # click behaves like "bring the app to the front" instead of launching a duplicate tray icon.
+    [void]$script:ShowDashboardSignal.Set()
+    return
+}
 
 # Dot-source the Manage Companies dialog (defines Show-ManageCompaniesDialog). Lives next
 # to this script so it ships in the same scripts/tray/ install payload.
@@ -115,6 +137,31 @@ function Read-EnvValue {
         return $v
     }
     return ''
+}
+
+# Write (replace or append) a single KEY=VALUE in .env, preserving all other lines. Writes in place
+# rather than tmp+rename: firstrun-config.ps1 grants the agent user FullControl on the .env FILE
+# (icacls ${AgentTaskUser}:F) but not the Program Files directory, so we can rewrite the file but not
+# create a sibling .tmp there. Used by the "Allow Claude to control Tally" toggle.
+function Set-EnvValue {
+    param([string]$EnvPath, [string]$Key, [string]$Value)
+    $lines = @()
+    if (Test-Path -LiteralPath $EnvPath) { $lines = @(Get-Content -LiteralPath $EnvPath -ErrorAction SilentlyContinue) }
+    $replaced = $false
+    $out = foreach ($line in $lines) {
+        $trimmed = $line.Trim()
+        if ($trimmed -and -not $trimmed.StartsWith('#')) {
+            $eq = $trimmed.IndexOf('=')
+            if ($eq -ge 1 -and $trimmed.Substring(0, $eq).Trim() -eq $Key) {
+                $replaced = $true
+                "$Key=$Value"
+                continue
+            }
+        }
+        $line
+    }
+    if (-not $replaced) { $out = @($out) + "$Key=$Value" }
+    Set-Content -LiteralPath $EnvPath -Value $out -Encoding UTF8
 }
 
 # ---------------------------------------------------------------------------
@@ -385,9 +432,44 @@ Start-Sleep -Seconds 3
     }
 })
 
+# Fully stop the service (leaves it Stopped, not respawned). Use 'Restart service' to start it again.
+$miStopService = $menu.Items.Add('Stop service')
+$miStopService.Add_Click({
+    try {
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "Stop the TallyMCP service?`n`nAll MCP tools become unavailable (any Claude session using them will fail) until you start it again with `"Restart service`".",
+            'TallyMCP', 'OKCancel', 'Warning')
+        if ($confirm -ne 'OK') { return }
+        # Elevated, like Restart. Use `sc.exe stop` (non-blocking — it sends the STOP control and
+        # returns immediately, so this can't hang the hidden window in StopPending), which puts NSSM
+        # into stopping mode, then taskkill node as a fallback: on a pre-#23 install whose graceful
+        # stop stalls, killing node lets NSSM finish reaching Stopped. Because the service is already
+        # stopping, NSSM will NOT respawn the killed process.
+        $cmd = @"
+sc.exe stop '$ServiceName' | Out-Null
+Start-Sleep -Seconds 2
+taskkill /F /IM node.exe 2>`$null | Out-Null
+Start-Sleep -Seconds 2
+sc.exe query '$ServiceName' | Out-String | Write-Host
+"@
+        Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', $cmd) -Verb RunAs -WindowStyle Hidden
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Stop failed: $_", 'TallyMCP', 'OK', 'Error') | Out-Null
+    }
+})
+
 $miRestartAgent = $menu.Items.Add('Restart GUI agent')
 $miRestartAgent.Add_Click({
     try {
+        # If the agent task was never registered (e.g. the install didn't finish the agent step),
+        # Start-ScheduledTask below throws a cryptic "cannot find the file specified". Detect that
+        # up front and point the operator at Reconfigure, which registers the task.
+        if (-not (Get-ScheduledTask -TaskName $AgentTaskName -ErrorAction SilentlyContinue)) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "The GUI agent scheduled task ('$AgentTaskName') is not registered, so there is nothing to restart.`n`nRun `"Reconfigure...`" to register it (or re-run the installer). Make sure the Windows user shown in the wizard is your actual logon name.",
+                'TallyMCP', 'OK', 'Warning') | Out-Null
+            return
+        }
         # Agent task runs as the current user already, so no elevation needed.
         Stop-ScheduledTask -TaskName $AgentTaskName -ErrorAction SilentlyContinue
         # Also kill any leftover powershell.exe instances running the agent script - Stop-ScheduledTask
@@ -417,6 +499,34 @@ $miRestartAgent.Add_Click({
         Start-ScheduledTask -TaskName $AgentTaskName -ErrorAction Stop
     } catch {
         [System.Windows.Forms.MessageBox]::Show("Restart agent failed: $_", 'TallyMCP', 'OK', 'Error') | Out-Null
+    }
+})
+
+# Toggle Claude-driven GUI control (ENABLE_GUI_CONTROL). Checkable; reflects current .env at build
+# time. Enabling warns (arbitrary keystroke injection + screenshots) and restarts the service so the
+# server re-reads .env. Since #23 the server loads .env by absolute path, so a plain restart applies it.
+$miGuiControl = $menu.Items.Add('Allow Claude to control Tally (advanced)')
+$miGuiControl.Checked = ((Read-EnvValue -EnvPath (Join-Path $InstallDir '.env') -Key 'ENABLE_GUI_CONTROL') -eq 'true')
+$miGuiControl.Add_Click({
+    try {
+        $envFile = Join-Path $InstallDir '.env'
+        $cur = Read-EnvValue -EnvPath $envFile -Key 'ENABLE_GUI_CONTROL'
+        $newVal = if ($cur -eq 'true') { 'false' } else { 'true' }
+        if ($newVal -eq 'true') {
+            $warn = "Enable Claude-driven GUI control?`n`nThis lets Claude capture screenshots of the Tally window and send arbitrary keystrokes to it. Only enable on a machine you trust.`n`nThe service will restart to apply the change."
+            if ([System.Windows.Forms.MessageBox]::Show($warn, 'TallyMCP', 'OKCancel', 'Warning') -ne 'OK') { return }
+        }
+        Set-EnvValue -EnvPath $envFile -Key 'ENABLE_GUI_CONTROL' -Value $newVal
+        $this.Checked = ($newVal -eq 'true')
+        # Same elevated restart as 'Restart service' (node-under-NSSM: taskkill + Start-Service).
+        $cmd = @"
+taskkill /F /IM node.exe 2>`$null | Out-Null
+Start-Sleep -Seconds 3
+Start-Service -Name '$ServiceName' -ErrorAction Stop
+"@
+        Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', $cmd) -Verb RunAs -WindowStyle Hidden
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Toggle GUI control failed: $_", 'TallyMCP', 'OK', 'Error') | Out-Null
     }
 })
 
@@ -515,12 +625,14 @@ $miReconfigure.Add_Click({
         return
     }
     # Reconfigure modifies .env and re-registers the NSSM service, both admin-only operations.
-    Start-Process -FilePath 'powershell.exe' -ArgumentList @(
-        '-ExecutionPolicy', 'Bypass', '-NoProfile',
-        '-NoExit',  # leave the window open so the operator can read the result
-        '-File', $script,
-        '-InstallDir', $InstallDir
-    ) -Verb RunAs
+    # Build a single -ArgumentList string with the path values wrapped in embedded double-quotes.
+    # Windows PowerShell 5.1 joins an ARRAY -ArgumentList with single spaces and does NOT quote
+    # elements containing spaces, so the default install path C:\Program Files\TallyMCP (has a
+    # space) would truncate -File / -InstallDir and the elevated window would error out. Mirror
+    # firstrun-config.ps1's idiom (`"$path`"). -NoExit leaves the window open so the operator
+    # can read the result.
+    $reconfigArgs = "-ExecutionPolicy Bypass -NoProfile -NoExit -File `"$script`" -InstallDir `"$InstallDir`""
+    Start-Process -FilePath 'powershell.exe' -ArgumentList $reconfigArgs -Verb RunAs
 })
 
 [void]$menu.Items.Add('-')
@@ -662,7 +774,9 @@ function Show-Dashboard {
                 try { [System.Windows.Forms.Clipboard]::SetText($State.PublicUrl) } catch {}
             }
         } },
-        @{ Text = 'Manage Companies...'; X =  16; Y = 104; Click = { $miManageCompanies.PerformClick() } }
+        @{ Text = 'Manage Companies...'; X =  16; Y = 104; Click = { $miManageCompanies.PerformClick() } },
+        @{ Text = 'Stop service';        X = 210; Y = 104; Click = { $miStopService.PerformClick() } },
+        @{ Text = 'Claude GUI control...'; X = 404; Y = 104; Click = { $miGuiControl.PerformClick() } }
     )
     foreach ($spec in $btnSpecs) {
         $btn = New-Object System.Windows.Forms.Button
@@ -862,6 +976,21 @@ $timer.Add_Tick({
 Invoke-StatusPoll
 Update-TrayUi
 $timer.Start()
+
+# Watch for "show dashboard" requests from a second launch (the Open Dashboard shortcut). Poll the
+# named event on the UI thread so Show-Dashboard runs on the WinForms message-loop thread (WinForms
+# requires UI calls on that thread). WaitOne(0) is a non-blocking kernel check - cheap to poll.
+$showDashTimer = New-Object System.Windows.Forms.Timer
+$showDashTimer.Interval = 400
+$showDashTimer.Add_Tick({
+    try { if ($script:ShowDashboardSignal.WaitOne(0)) { Show-Dashboard } } catch {}
+})
+$showDashTimer.Start()
+
+# Launched via the Open Dashboard shortcut while no tray was running yet -> THIS process is now the
+# singleton tray, so open the dashboard immediately. (When a tray is already running, that launch
+# takes the -not $ownsSingleton branch above and signals us through $ShowDashboardSignal instead.)
+if ($ShowDashboard) { Show-Dashboard }
 
 [System.Windows.Forms.Application]::Run()
 

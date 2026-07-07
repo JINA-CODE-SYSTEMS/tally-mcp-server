@@ -86,6 +86,18 @@ nssm set $ServiceName AppRotateBytes 5242880
 nssm set $ServiceName AppStdoutCreationDisposition 4
 nssm set $ServiceName AppStderrCreationDisposition 4
 
+# Shutdown + restart behaviour (issue #23): stop via console Ctrl-C (Node -> SIGINT -> graceful
+# shutdown in server.mts), escalate only if it stalls, and bound each stage so Stop-Service returns
+# within ~10s instead of hanging in StopPending. Restart with a delay + throttle so a fast-dying
+# process is left stopped (error visible in logs) rather than respawned into "Running but no port".
+nssm set $ServiceName AppStopMethodSkip 0
+nssm set $ServiceName AppStopMethodConsole 6000
+nssm set $ServiceName AppStopMethodWindow 1500
+nssm set $ServiceName AppStopMethodThreads 1500
+nssm set $ServiceName AppExit Default Restart
+nssm set $ServiceName AppRestartDelay 2000
+nssm set $ServiceName AppThrottle 5000
+
 # Create logs directory
 New-Item -ItemType Directory -Force -Path "$InstallDir\logs" | Out-Null
 
@@ -145,6 +157,11 @@ if ($SkipAgentTask) {
         $taskAction = "powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Minimized -File `"$agentScript`""
         # /RL LIMITED so the task runs with the user's normal token (admin keystrokes don't reach
         # non-elevated Tally windows due to UIPI, and Tally Prime ships unelevated by default).
+        # NOTE (#88 H-2): this legacy schtasks path registers an at-logon trigger only — no native
+        # crash supervision (schtasks.exe can't set RestartCount / a safe IgnoreNew heartbeat without
+        # risking a double-launch). The shipped Inno installer path (firstrun-config.ps1) uses the
+        # ScheduledTasks cmdlets with a 1-min heartbeat trigger + -MultipleInstances IgnoreNew +
+        # -RestartCount to auto-respawn the agent within ~1 min of a crash. Prefer that installer.
         & schtasks /Create /TN $AgentTaskName /SC ONLOGON /RU $AgentTaskUser /RL LIMITED /TR $taskAction /F | Out-Null
         if ($LASTEXITCODE -eq 0) {
             Write-Host "[OK] Scheduled task '$AgentTaskName' registered (runs at logon, as $AgentTaskUser)" -ForegroundColor Green

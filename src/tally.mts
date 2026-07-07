@@ -5,22 +5,22 @@ import http from 'node:http';
 import path from 'node:path';
 import nunjucks from 'nunjucks';
 import * as m from './models.mjs';
-import { utility } from './utility.mjs';
+import { utility, parseIntEnv } from './utility.mjs';
 
 dotenv.config({ override: true, quiet: true });
 
 const tally_host = process.env.TALLY_HOST || 'localhost'; // default to localhost
-const tally_port = parseInt(process.env.TALLY_PORT || '9000'); // default to 9000 XML port of Tally
+const tally_port = parseIntEnv(process.env.TALLY_PORT, 9000); // default to 9000 XML port of Tally
 // Hard cap on a single Tally HTTP round trip. Tally's XML server is single-threaded
 // and stops processing any request while a modal dialog (license expiry, "Bad formula",
 // split-period prompts, etc.) is on screen. Without this cap, requests hang
 // indefinitely and pile up. Default 30s — long enough for big balance-sheet pulls,
 // short enough that the MCP client doesn't sit forever on a dead Tally.
-const tally_request_timeout_ms = parseInt(process.env.TALLY_REQUEST_TIMEOUT_MS || '30000');
+const tally_request_timeout_ms = parseIntEnv(process.env.TALLY_REQUEST_TIMEOUT_MS, 30000);
 // Pre-flight ping timeout. Short — a healthy Tally answers a Collection query in
 // <100ms. If the ping doesn't come back in 3s we treat Tally as wedged and abort
 // the heavy call immediately with a clear error instead of waiting the full 30s.
-const tally_ping_timeout_ms = parseInt(process.env.TALLY_PING_TIMEOUT_MS || '3000');
+const tally_ping_timeout_ms = parseIntEnv(process.env.TALLY_PING_TIMEOUT_MS, 3000);
 const __dirname = import.meta.dirname;
 const lstPullReport: m.ModelPullReportInfo[] = JSON.parse(fs.readFileSync(path.join(__dirname, '../pull/config.json'), 'utf-8'))['reports'];
 const lstPushTemplate: m.ModelPushTemplateInfo[] = JSON.parse(fs.readFileSync(path.join(__dirname, '../push/config.json'), 'utf-8'))['templates'];
@@ -518,6 +518,57 @@ export function handlePush(templateName: string, inputParams: Map<string, any>):
                 retval.error = 'Unexpected response format from Tally';
             }
 
+        } catch (err) {
+            retval.error = 'Server exception';
+        } finally {
+            resolve(retval);
+        }
+    });
+}
+
+// Posts a fully pre-rendered Import envelope (e.g. the full-fidelity voucher XML built in mcp.mts,
+// which the flat template/config system can't express) and parses Tally's RESPONSE exactly like
+// handlePush. Pings first (fail fast if Tally is wedged) and injects company credentials if set.
+export function pushXml(xml: string): Promise<m.ModelPushResponse> {
+    return new Promise<m.ModelPushResponse>(async (resolve) => {
+        const retval: m.ModelPushResponse = { success: false, created: 0, altered: 0, lastVchId: 0 };
+        try {
+            const alive = await pingTally();
+            if (!alive) {
+                retval.error = 'Tally is not responding (ping timed out). Dismiss any Tally popups and retry, or restart Tally.';
+                return resolve(retval);
+            }
+            let xmlRequest = xml;
+            const companyUser = process.env.TALLY_COMPANY_USER || '';
+            const companyPassword = process.env.TALLY_COMPANY_PASSWORD || '';
+            if (companyUser && xmlRequest.includes('</STATICVARIABLES>')) {
+                xmlRequest = xmlRequest.replace('</STATICVARIABLES>',
+                    `<SVCOMPANYUSER>${utility.String.escapeHTML(companyUser)}</SVCOMPANYUSER>` +
+                    `<SVCOMPANYPASSWORD>${utility.String.escapeHTML(companyPassword)}</SVCOMPANYPASSWORD>` +
+                    '</STATICVARIABLES>');
+            }
+            const respContent = await postTallyXML(xmlRequest);
+            if (!respContent) {
+                retval.error = 'Empty response received from Tally';
+                return resolve(retval);
+            }
+            const xmlParser = new XMLParser({ parseTagValue: false });
+            const resultObj = xmlParser.parse(respContent);
+            if (resultObj['RESPONSE']) {
+                const resp = resultObj['RESPONSE'];
+                retval.created = parseInt(resp['CREATED'] || '0');
+                retval.altered = parseInt(resp['ALTERED'] || '0');
+                retval.lastVchId = parseInt(resp['LASTVCHID'] || '0');
+                const errors = parseInt(resp['ERRORS'] || '0');
+                if (errors > 0 || (retval.created === 0 && retval.altered === 0)) {
+                    retval.success = false;
+                    retval.error = resp['LINEERROR'] || `Tally returned ${errors} error(s). Check if ledger/item names are valid`;
+                } else {
+                    retval.success = true;
+                }
+            } else {
+                retval.error = 'Unexpected response format from Tally';
+            }
         } catch (err) {
             retval.error = 'Server exception';
         } finally {

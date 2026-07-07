@@ -16,6 +16,7 @@
             <REQUESTDATA>
                 <TALLYMESSAGE xmlns:UDF="TallyUDF">
                     <LEDGER NAME="{{name | escape}}" ACTION="Create">
+                        <NAME>{{name | escape}}</NAME>
                         <PARENT>{{parentGroup | escape}}</PARENT>
                         <nunjuck>if openingBalance</nunjuck>
                         <OPENINGBALANCE>{{openingBalance}}</OPENINGBALANCE>
