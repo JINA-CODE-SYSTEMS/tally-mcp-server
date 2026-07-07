@@ -19,7 +19,7 @@ param(
 # against an agent older than its required minimum (issue #15 - version handshake).
 # Format: MAJOR.MINOR.PATCH. Bump MINOR on any new IPC action or response field;
 # bump PATCH on internal fixes that callers can ignore.
-$Script:AgentVersion = "1.2.0"
+$Script:AgentVersion = "1.3.0"
 
 if (-not $WatchDir) {
     $WatchDir = if ($env:TALLY_DATA_PATH) { $env:TALLY_DATA_PATH } else { "C:\Users\Public\TallyPrimeEditLog\data" }
@@ -257,6 +257,8 @@ function Execute-Action {
             if ($vk) {
                 Write-Host "  Action: Press $($Action.value)"
                 [TallyUI2]::PressKey($vk)
+            } else {
+                Write-Host "  Action: (unmapped key '$($Action.value)' - ignored)"
             }
         }
         "combo" {
@@ -273,11 +275,15 @@ function Execute-Action {
                 if ($mod -and $key) {
                     Write-Host "  Action: Combo $($Action.value)"
                     [TallyUI2]::PressCombo($mod, $key)
+                } else {
+                    Write-Host "  Action: (unmapped combo '$($Action.value)' - ignored)"
                 }
             }
         }
         "type" {
-            Write-Host "  Action: Type '$($Action.value)'"
+            # Log the length only, NEVER the text itself - a caller (gui-send-keys / the LLM loop) may
+            # route a password through here, and Write-Host lands in the agent's console/transcript.
+            Write-Host "  Action: Type ($($Action.value.Length) chars)"
             [TallyUI2]::TypeString($Action.value)
         }
         "wait" {
@@ -315,6 +321,94 @@ function Write-Result {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($ResultFile, $result, $utf8NoBom)
     Write-Host "[$Status] $Message (commandId: $CommandId)"
+}
+
+# --- Ground-truth load verification -----------------------------------------------------------------
+# The keystroke-driven load flows (deterministic select-and-unlock, and the LLM "done" path) are
+# open-loop: they blast keys and used to report success without ever confirming Tally accepted them.
+# A wrong/rejected password, an unfocused list, or a premature LLM "done" would still be reported as
+# success. These helpers close the loop by asking Tally itself what is loaded.
+
+# Query Tally's in-process XML server for the companies currently loaded in memory. Mirrors the probe
+# the status tray uses (scripts/tray/tally-mcp-tray.ps1 ~L238-251): same "List of Companies" Export
+# envelope and same <NAME>...</NAME> regex, so both components agree on what "loaded" means.
+# Returns @{ Queried = <bool>; Companies = @(names) }:
+#   Queried = $false -> the query itself failed/timed out (Tally not answering on :9000); ground truth
+#                       is UNKNOWN and callers must NOT treat that as either success or a load failure.
+#   Queried = $true  -> Companies holds the loaded company names (empty array = nothing loaded).
+function Get-LoadedCompanyNames {
+    $body = '<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>List of Companies</ID></HEADER></ENVELOPE>'
+    try {
+        $resp = Invoke-WebRequest -Uri 'http://127.0.0.1:9000/' -Method POST -Body $body -ContentType 'text/xml; charset=utf-8' -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+        $names = @()
+        foreach ($m in [regex]::Matches([string]$resp.Content, '<NAME>([^<]+)</NAME>', 'IgnoreCase')) {
+            $n = $m.Groups[1].Value.Trim()
+            if ($n) { $names += $n }
+        }
+        return @{ Queried = $true; Companies = $names }
+    } catch {
+        return @{ Queried = $false; Companies = @() }
+    }
+}
+
+# Verify a company actually loaded, THEN write the appropriate result - never report a blind success.
+# $Requested is the caller's identifier for the target: a folder id (select-and-unlock) or a company
+# name (LLM path). Matching is deliberately loose because a folder id rarely equals the display name.
+# Never echoes credentials - messages only ever contain the requested id and the loaded company names.
+function Write-VerifiedLoadResult {
+    param(
+        [string]$Requested,
+        [string]$Strategy,
+        [string]$CommandId = "",
+        [string]$Context = ""     # short, non-secret suffix e.g. " with credentials" or " (LLM: ...)"
+    )
+
+    $probe     = Get-LoadedCompanyNames
+    $loaded     = @($probe.Companies)
+    $loadedStr  = if ($loaded.Count) { $loaded -join ', ' } else { '(none)' }
+    $extra      = @{ verified = $false; loadedCompanies = $loaded }
+
+    if (-not $probe.Queried) {
+        # The verification query itself failed - Tally's XML server on 127.0.0.1:9000 did not answer.
+        # We genuinely cannot confirm the outcome; distinct 'unverified' status so this is not read as
+        # a confirmed success (downstream treats any non-'success' as a load failure - fails closed).
+        Write-Result -Status "unverified" -Message "Keystrokes sent for '$Requested'$Context, but could not verify: Tally XML server (127.0.0.1:9000) did not respond. Company may or may not be loaded." -Strategy $Strategy -CommandId $CommandId -Extra $extra
+        return
+    }
+
+    if ($loaded.Count -eq 0) {
+        # Ground truth: nothing is loaded. The keystrokes did not take - wrong credentials, a dialog
+        # that never accepted input, or the wrong screen. Report an actionable error, NOT success.
+        Write-Result -Status "error" -Message "Keystrokes sent but no company appears loaded - credentials may be wrong or the dialog did not accept input (requested '$Requested')." -Strategy $Strategy -CommandId $CommandId -Extra $extra
+        return
+    }
+
+    # Loose match: the requested id/name may be a substring of a loaded display name (or vice versa).
+    $matched = $false
+    if ($Requested) {
+        foreach ($c in $loaded) {
+            if ($c -and ($c -eq $Requested -or $c -like "*$Requested*" -or $Requested -like "*$c*")) { $matched = $true; break }
+        }
+    }
+
+    if ($matched) {
+        $extra.verified = $true
+        Write-Result -Status "success" -Message "Company '$Requested' loaded and verified$Context (loaded: $loadedStr)." -Strategy $Strategy -CommandId $CommandId -Extra $extra
+        return
+    }
+
+    if ($loaded.Count -eq 1) {
+        # Exactly one company loaded but its name doesn't obviously match the requested id (a folder id
+        # is rarely the display name). Right after our own keystrokes the single loaded company is very
+        # likely the one we opened - accept as success but name what actually loaded for sanity-checking.
+        $extra.verified = $true
+        Write-Result -Status "success" -Message "Company loaded and verified$Context (requested '$Requested', loaded '$($loaded[0])')." -Strategy $Strategy -CommandId $CommandId -Extra $extra
+        return
+    }
+
+    # Several companies loaded and none matched the request - cannot tell which one the caller wanted.
+    # Do NOT report plain success on a possible mismatch; flag unverified so downstream fails closed.
+    Write-Result -Status "unverified" -Message "Keystrokes sent for '$Requested'$Context; $($loaded.Count) companies loaded ($loadedStr) but none matched the request - cannot confirm the correct company loaded." -Strategy $Strategy -CommandId $CommandId -Extra $extra
 }
 
 # Self-update detection: tracks the script's mtime at startup. If the file changes on disk
@@ -410,7 +504,11 @@ function Invoke-LLMGuidedAction {
         # Check if done or failed
         if ($llmAction.action -eq "done") {
             Write-Host "  LLM says DONE: $($llmAction.reason)"
-            Write-Result -Status "success" -Message "Company '$CompanyName' loaded. LLM: $($llmAction.reason)" -Strategy "llm-gui" -CommandId $CommandId
+            # The model saying "done" is a claim, not proof - a hallucinated or premature "done" would
+            # otherwise surface as a false success. Confirm against Tally's loaded-company list before
+            # reporting success; the verifier downgrades to error/unverified if nothing (or the wrong
+            # thing) is actually loaded.
+            Write-VerifiedLoadResult -Requested $CompanyName -Strategy "llm-gui" -CommandId $CommandId -Context " (LLM: $($llmAction.reason))"
             return
         }
         if ($llmAction.action -eq "fail") {
@@ -506,6 +604,57 @@ while ($true) {
                     }
                     Write-Result -Status "success" -Message "Agent v2 is alive (LLM: $LLMProvider, version: $Script:AgentVersion)" -Strategy "ping" -CommandId $cmdId -Extra $extra
                 }
+                "screenshot" {
+                    # Capture the current Tally window so the caller (an MCP client / Claude) can SEE the
+                    # on-screen state and choose the next keystrokes - the interactive, human-supervised
+                    # alternative to the blind deterministic select-and-unlock sequence. Pairs with "sendkeys".
+                    try {
+                        $hwnd = Find-TallyWindow
+                        if ($hwnd -eq [IntPtr]::Zero) {
+                            Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "screenshot" -CommandId $cmdId
+                        } else {
+                            [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                            Start-Sleep -Milliseconds 300
+                            $shot = Get-Screenshot -Hwnd $hwnd
+                            if ($shot) {
+                                Write-Result -Status "success" -Message "Captured Tally window" -Strategy "screenshot" -CommandId $cmdId -Extra @{ screenshotFile = (Split-Path $shot -Leaf) }
+                            } else {
+                                Write-Result -Status "error" -Message "Screenshot capture failed (window may be minimized)" -Strategy "screenshot" -CommandId $cmdId
+                            }
+                        }
+                    } catch {
+                        Write-Result -Status "error" -Message "Screenshot exception: $_" -Strategy "screenshot" -CommandId $cmdId
+                    }
+                }
+                "sendkeys" {
+                    # Execute an ordered list of keystroke steps (type / key / combo / wait) in the Tally
+                    # window. Focus is re-asserted before each step so a stray focus-steal can't leak a typed
+                    # password into another window. Reuses Execute-Action, the same primitive the LLM loop uses.
+                    try {
+                        $hwnd = Find-TallyWindow
+                        if ($hwnd -eq [IntPtr]::Zero) {
+                            Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "sendkeys" -CommandId $cmdId
+                        } elseif (-not $cmd.keys) {
+                            Write-Result -Status "error" -Message "No keys provided" -Strategy "sendkeys" -CommandId $cmdId
+                        } else {
+                            [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                            Start-Sleep -Milliseconds 300
+                            $done = 0
+                            foreach ($step in @($cmd.keys)) {
+                                if ($null -eq $step -or -not $step.action) { continue }
+                                if ([TallyUI2]::GetForegroundWindow() -ne $hwnd) {
+                                    [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                                    Start-Sleep -Milliseconds 200
+                                }
+                                Execute-Action -Action $step
+                                $done++
+                            }
+                            Write-Result -Status "success" -Message "Executed $done key action(s)" -Strategy "sendkeys" -CommandId $cmdId -Extra @{ steps = $done }
+                        }
+                    } catch {
+                        Write-Result -Status "error" -Message "sendkeys exception: $_" -Strategy "sendkeys" -CommandId $cmdId
+                    }
+                }
                 "select-and-unlock-company" {
                     # Deterministic keystroke flow: type company id (already at Select Company) -> Enter -> type credentials -> Enter.
                     # IMPORTANT: do NOT send Alt+F3 first - on Tally Prime Edit Log it activates a "Specify Path" sub-mode,
@@ -567,6 +716,14 @@ while ($true) {
                                     Start-Sleep -Milliseconds 300
                                 }
                                 if ($password) {
+                                    # Re-assert focus right before typing the password so a stray click or
+                                    # focus-steal between the Enters above and now doesn't leak the password
+                                    # into another window. Cheap re-check with existing helpers; ForceForeground
+                                    # is a no-op when Tally is already the foreground window.
+                                    if ([TallyUI2]::GetForegroundWindow() -ne $hwnd) {
+                                        [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                                        Start-Sleep -Milliseconds 300
+                                    }
                                     [TallyUI2]::TypeString($password)
                                     Start-Sleep -Milliseconds 300
                                 }
@@ -575,8 +732,13 @@ while ($true) {
                                     Start-Sleep -Milliseconds $waitMsAfterCreds
                                 }
 
-                                $msg = "Keystrokes sent for company $companyId" + $(if ($userName -or $password) { " with credentials" } else { "" })
-                                Write-Result -Status "success" -Message $msg -Strategy "select-and-unlock" -CommandId $cmdId
+                                # VERIFY GROUND TRUTH before claiming success. Everything above is open-loop:
+                                # Tally may have rejected the password, the list may never have had focus, or
+                                # the wrong folder/company may have been highlighted. Ask Tally what is actually
+                                # loaded and let the verifier report success / error / unverified accordingly,
+                                # instead of unconditionally reporting "keystrokes sent" as success.
+                                $ctx = if ($userName -or $password) { " with credentials" } else { "" }
+                                Write-VerifiedLoadResult -Requested $companyId -Strategy "select-and-unlock" -CommandId $cmdId -Context $ctx
                             }
                         } catch {
                             Write-Result -Status "error" -Message "Exception: $_" -Strategy "select-and-unlock" -CommandId $cmdId

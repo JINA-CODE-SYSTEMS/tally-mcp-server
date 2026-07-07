@@ -64,6 +64,9 @@ param(
     [string]$TallyIniPath,
     [string]$McpDomain,
     [string]$AgentTaskUser,
+    # Opt-in for Claude-driven GUI control (gui-screenshot / gui-send-keys). Wizard passes
+    # 'true'/'false'; a bare Reconfigure omits it, so we preserve the existing .env value below.
+    [string]$EnableGuiControl,
     [switch]$SkipTrayTask
 )
 
@@ -102,7 +105,14 @@ $TallyDataPath  = _Coalesce $TallyDataPath  $_existingEnv['TALLY_DATA_PATH']  'C
 $TallyIniPath   = _Coalesce $TallyIniPath   $_existingEnv['TALLY_INI_PATH']   'C:\Program Files\TallyPrimeEditLog\tally.ini'
 # MCP_DOMAIN has no hardcoded default — blank means "localhost-only mode".
 $McpDomain      = _Coalesce $McpDomain      $_existingEnv['MCP_DOMAIN']       ''
-$AgentTaskUser  = _Coalesce $AgentTaskUser  $env:USERNAME
+# AGENT_TASK_USER is persisted in .env (below) and preferred over $env:USERNAME so a Reconfigure run
+# by a DIFFERENT admin (the bare-InstallDir path omits -AgentTaskUser) does not silently re-point the
+# agent task + all the icacls grants to that admin - which would break the IPC ACL for the real user.
+$AgentTaskUser  = _Coalesce $AgentTaskUser  $_existingEnv['AGENT_TASK_USER']  $env:USERNAME
+# ENABLE_GUI_CONTROL is off by default (arbitrary keystroke injection + screenshots). Preserve the
+# existing value on a bare Reconfigure; normalize anything that isn't the literal 'true' to 'false'.
+$EnableGuiControl = _Coalesce $EnableGuiControl $_existingEnv['ENABLE_GUI_CONTROL'] 'false'
+if ($EnableGuiControl -ne 'true') { $EnableGuiControl = 'false' }
 
 # --- Resolve OAuth password ---
 # Two entry paths:
@@ -224,6 +234,43 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         }
     }
 
+    # --- 0. Normalize + validate MCP_DOMAIN before it reaches .env ----------
+    # server.mjs builds every OAuth metadata URL by string-concatenating MCP_DOMAIN and also
+    # calls `new URL(mcpDomain)`. A bare host (e.g. tally-mcp.attention.sh) therefore emits
+    # schemeless OAuth metadata that every MCP client rejects, and a malformed value (e.g. an
+    # accidental https:///host from a fat-fingered paste) yields broken metadata or throws at
+    # startup. Operators type this by hand in the wizard, and this script is the single choke
+    # point before the value is persisted, so normalize aggressively here and only fail when the
+    # value is genuinely unparseable. Blank MUST stay blank ("localhost-only mode") - we never
+    # turn an empty value into a scheme-only URL.
+    if ($McpDomain -and $McpDomain.Trim().Length -gt 0) {
+        $McpDomainOriginal = $McpDomain
+        $normalized = $McpDomain.Trim()
+        # 1. Ensure a scheme. A bare host -> https:// (the safe default for a public OAuth server).
+        if ($normalized -notmatch '^https?://') {
+            $normalized = "https://$normalized"
+        }
+        # 2. Collapse an accidental 3+ slashes right after the scheme (https:///host) to exactly two.
+        $normalized = $normalized -replace '^(https?:)/+', '$1//'
+        # 3. Strip trailing slash(es) so downstream string-concatenation doesn't double them.
+        $normalized = $normalized.TrimEnd('/')
+        # 4. Validate: it must parse to an absolute http/https URI with a non-empty host.
+        $parsed = $normalized -as [uri]
+        if (-not $parsed -or -not $parsed.IsAbsoluteUri -or `
+            ($parsed.Scheme -ne 'http' -and $parsed.Scheme -ne 'https') -or `
+            [string]::IsNullOrEmpty($parsed.Host)) {
+            throw "MCP_DOMAIN value '$McpDomainOriginal' could not be normalized into a valid http(s) URL (best effort was '$normalized'). Fix it in the wizard or .env (expected e.g. https://tally-mcp.example.com)."
+        }
+        $McpDomain = $normalized
+        if ($McpDomain -ne $McpDomainOriginal) {
+            Write-Host "[OK] Normalized MCP_DOMAIN '$McpDomainOriginal' -> '$McpDomain'"
+        }
+    } else {
+        # Whitespace-only (e.g. "   ") is not a domain - treat it as blank so the .env write below
+        # takes the localhost-only branch instead of persisting MCP_DOMAIN=<spaces>.
+        $McpDomain = ''
+    }
+
     # --- 1. Write .env -----------------------------------------------------
     # Atomic-ish: write to .tmp, then rename, so a half-written .env never appears.
     # We do NOT log the password itself; the transcript captures parameter binding which
@@ -247,6 +294,11 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         "TALLY_EXE_PATH=$(_envQuote $TallyExePath)"
         "TALLY_DATA_PATH=$(_envQuote $TallyDataPath)"
         "TALLY_INI_PATH=$(_envQuote $TallyIniPath)"
+        # Persisted so a later Reconfigure preserves the agent user instead of falling back to
+        # whoever runs the wizard (see the _Coalesce for $AgentTaskUser above).
+        "AGENT_TASK_USER=$(_envQuote $AgentTaskUser)"
+        # Claude-driven GUI control (gui-screenshot / gui-send-keys). Off unless the operator opted in.
+        "ENABLE_GUI_CONTROL=$EnableGuiControl"
     )
     # Bind address (security): only listen on all interfaces when a public domain / reverse proxy
     # is explicitly configured. When MCP_DOMAIN is blank ("localhost-only mode") bind to loopback
@@ -318,17 +370,41 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     # keystrokes into the interactive Tally session, so the channel must NOT be world-writable.
     # The default data dir (C:\Users\Public\...\data) grants BUILTIN\Users write by default, so
     # any local user could drop a command file and inject keystrokes. Restrict the directory to
-    # SYSTEM + Administrators + the agent task user, with inheritance so the transient IPC files
-    # created inside are covered. NOTE for reviewers: this changes the ACL of TALLY_DATA_PATH;
-    # validate that Tally (running as the interactive user = agent task user) still has access on
-    # multi-account / service-account deployments.
+    # SYSTEM + Administrators + the agent task user. The (OI)(CI) inheritance flags are REQUIRED and
+    # must be explicit: icacls does NOT reliably default to inheritable ACEs, so a bare "user:F" grants
+    # the FOLDER only. Without (OI)(CI) the transient IPC files the SYSTEM service creates here do not
+    # inherit the agent-user grant, and the GUI agent - which runs under a UAC-filtered (Limited) token
+    # that drops Administrators - fails every read with "Access is denied". (Observed in the field: a
+    # dir ACE of "tapanjain:(F)" instead of "tapanjain:(OI)(CI)(F)" left _mcp_gui_command.json granting
+    # only SYSTEM + Administrators, and load-company looped on Access-denied.) NOTE for reviewers: this
+    # changes the ACL of TALLY_DATA_PATH; validate Tally (interactive user = agent task user) still has
+    # access on multi-account / service-account deployments.
     $ipcDir = Split-Path $registryFile
     if (Test-Path -LiteralPath $ipcDir) {
-        & icacls $ipcDir /inheritance:r /grant:r 'SYSTEM:F' 'Administrators:F' "${AgentTaskUser}:F" 2>$null | Out-Null
+        & icacls $ipcDir /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' "${AgentTaskUser}:(OI)(CI)F" 2>$null | Out-Null
         if ($LASTEXITCODE -eq 0) {
             Write-Host "[OK] Locked NTFS ACL on IPC directory $ipcDir (SYSTEM + Administrators + $AgentTaskUser)"
         } else {
             Write-Host "[WARN] icacls exit $LASTEXITCODE on $ipcDir - GUI agent IPC directory is not locked down" -ForegroundColor Yellow
+        }
+
+        # Self-heal: clear any STALE IPC files left by a previous install/reconfigure. The MCP service
+        # overwrites _mcp_gui_command.json IN PLACE, so a file created under an older/narrower ACL (e.g.
+        # before this hardening, or by a reconfigure that ran as a different admin) KEEPS that stale ACL
+        # forever. The GUI agent runs under a UAC-filtered "Limited" token (no Administrators), so if the
+        # file lacks a direct grant to the agent user it fails with "Access is denied" and load-company
+        # silently breaks. Deleting them here means the service recreates them fresh (atomic temp+rename),
+        # inheriting the directory ACL we just set - so the operator never has to touch icacls by hand.
+        foreach ($ipcName in @('_mcp_gui_command.json', '_mcp_gui_result.json', '_mcp_screenshot.png')) {
+            $stale = Join-Path $ipcDir $ipcName
+            if (Test-Path -LiteralPath $stale) {
+                Remove-Item -LiteralPath $stale -Force -ErrorAction SilentlyContinue
+                if (-not (Test-Path -LiteralPath $stale)) {
+                    Write-Host "[OK] Cleared stale IPC file $ipcName (service recreates it with the correct ACL)"
+                } else {
+                    Write-Host "[WARN] Could not remove stale IPC file $stale - a running agent/service may hold it; it will be recreated on next command" -ForegroundColor Yellow
+                }
+            }
         }
     }
 
@@ -380,6 +456,24 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     & $bundledNssm set $ServiceName AppStdoutCreationDisposition 4                      | Out-Null
     & $bundledNssm set $ServiceName AppStderrCreationDisposition 4                      | Out-Null
 
+    # --- Shutdown + restart behaviour (issue #23) --------------------------
+    # Stop the service by sending a console Ctrl-C FIRST: Node receives it as SIGINT and runs the
+    # graceful-shutdown path in server.mts (which drops MCP connections and exits in <1s). Only if
+    # that stalls does NSSM escalate to WM_CLOSE -> thread messages -> TerminateProcess. Bounding the
+    # console wait to 6s (and the next two stages to 1.5s each) keeps Stop-Service returning inside
+    # ~10s even in the worst case, instead of hanging in StopPending until a manual taskkill.
+    & $bundledNssm set $ServiceName AppStopMethodSkip    0     | Out-Null   # 0 = try every stop method
+    & $bundledNssm set $ServiceName AppStopMethodConsole 6000  | Out-Null   # graceful Ctrl-C window
+    & $bundledNssm set $ServiceName AppStopMethodWindow  1500  | Out-Null
+    & $bundledNssm set $ServiceName AppStopMethodThreads 1500  | Out-Null
+    # On an unexpected exit, restart with a sane delay rather than hammering. Throttle detection
+    # (AppThrottle) means a process that keeps dying fast is left stopped instead of respawned into
+    # the "Running but nothing listening" limbo we saw on cold installs — the real error then shows
+    # up in logs/service.log (e.g. the PASSWORD FATAL line) instead of a silent crash-loop.
+    & $bundledNssm set $ServiceName AppExit Default Restart    | Out-Null
+    & $bundledNssm set $ServiceName AppRestartDelay 2000       | Out-Null
+    & $bundledNssm set $ServiceName AppThrottle 5000           | Out-Null
+
     # Hand .env values to the service through NSSM's AppEnvironmentExtra. NSSM expects a
     # newline-separated list of KEY=VALUE pairs.
     $nssmEnv = ($envLines | Where-Object { $_ -and -not $_.StartsWith('#') }) -join "`n"
@@ -402,10 +496,35 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         $taskAction = New-ScheduledTaskAction `
             -Execute 'powershell.exe' `
             -Argument "-ExecutionPolicy Bypass -NoProfile -WindowStyle Minimized -File `"$agentScript`""
-        $taskTrigger = New-ScheduledTaskTrigger -AtLogOn -User $AgentTaskUser
+        # At-logon trigger is the reliable baseline. Crash-supervision (#88 H-2) is added on top via
+        # RestartCount/Interval + an optional 1-min heartbeat — but BOTH are built best-effort so a
+        # picky Windows build can never abort registration (which previously left the task unregistered).
+        $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $AgentTaskUser
         $taskPrincipal = New-ScheduledTaskPrincipal -UserId $AgentTaskUser -LogonType Interactive -RunLevel Limited
-        $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-        $taskDef = New-ScheduledTask -Action $taskAction -Trigger $taskTrigger -Principal $taskPrincipal -Settings $taskSettings -Description "Tally MCP GUI agent (companion to TallyMCP service; spawns Tally + keystrokes credentials in user session)"
+
+        # Supervision settings: respawn ~1 min after an abnormal exit; IgnoreNew avoids a double-instance.
+        # Fall back to basic settings if the enhanced set is rejected.
+        try {
+            $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
+                -MultipleInstances IgnoreNew -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
+        } catch {
+            Write-Host "[WARN] enhanced task settings unavailable; using basic: $_" -ForegroundColor Yellow
+            $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+        }
+
+        # Optional heartbeat trigger — re-fires the task every minute as a belt for the "process gone
+        # but the engine thinks it completed" case. Some Windows builds reject the repetition params,
+        # so build it in a try/catch and register logon-only if it fails (RestartCount still covers crashes).
+        # NOTE: use a finite 10-year duration, NOT [TimeSpan]::MaxValue, which overflows and threw here.
+        $taskTriggers = @($logonTrigger)
+        try {
+            $heartbeatTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3650)
+            $taskTriggers += $heartbeatTrigger
+        } catch {
+            Write-Host "[WARN] heartbeat trigger unavailable (crash-respawn still covered by RestartCount): $_" -ForegroundColor Yellow
+        }
+
+        $taskDef = New-ScheduledTask -Action $taskAction -Trigger $taskTriggers -Principal $taskPrincipal -Settings $taskSettings -Description "Tally MCP GUI agent (companion to TallyMCP service; spawns Tally + keystrokes credentials in user session). Auto-respawns within ~1 min if it crashes."
         Register-ScheduledTask -TaskName $AgentTaskName -InputObject $taskDef -Force | Out-Null
         $taskRegistered = $true
         Write-Host "[OK] Scheduled task '$AgentTaskName' registered (runs at logon, as $AgentTaskUser)"

@@ -5,12 +5,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import { cacheTable, executeSQL, validateSQL } from './database.mjs';
-import { handlePull, handlePush, jsonToTSV, postTallyXML, resolveGSTLedgers } from './tally.mjs';
+import { handlePull, handlePush, jsonToTSV, pingTally, postTallyXML, pushXml, resolveGSTLedgers } from './tally.mjs';
+import { buildVoucherXml, buildCancelVoucherXml, voucherBalance, isDateInOpenPeriod, findMissingMasters, referencedLedgers, type VoucherEntry, type VoucherInput } from './voucher.mjs';
+import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
 
 dotenv.config({ override: true, quiet: true });
 
 // Audit logging — logs every tool invocation
-function auditLog(toolName: string, args: Record<string, any>, status: 'success' | 'error' | 'denied', durationMs?: number): void {
+function auditLog(toolName: string, args: Record<string, any>, status: 'success' | 'error' | 'denied' | 'dryrun', durationMs?: number): void {
   const entry = {
     timestamp: new Date().toISOString(),
     tool: toolName,
@@ -87,6 +89,133 @@ async function listLoadedCompanies(): Promise<string[]> {
   }
 }
 
+// ── get-period (#82) ───────────────────────────────────────────────────────
+// The active company's period, so callers never infer valid dates or risk posting
+// a voucher outside the open financial year.
+export type CompanyPeriod = {
+  company: string | null;
+  fyFrom: string | null;       // financial-year start ($StartingFrom), ISO YYYY-MM-DD
+  fyTo: string | null;         // financial-year end, ISO YYYY-MM-DD
+  booksFrom: string | null;    // books-beginning date ($BooksFrom); earliest valid voucher date when a
+                               // company started keeping books partway through the FY (distinct from fyFrom)
+  currentDate: string | null;  // Tally's working/current date
+  lastEntryDate: string | null;// date of the most recent voucher
+  fyToInferred: boolean;       // true when fyTo was computed from fyFrom (Tally left $EndingAt empty)
+};
+
+const TALLY_MONTHS: Record<string, string> = {
+  jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
+  jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12'
+};
+
+// Normalizes a Tally date to ISO YYYY-MM-DD. Tally emits dates as `d-MMM-yyyy` (e.g. "1-Apr-2026");
+// also tolerates `d-MMM-yy` and already-ISO input. Returns null for empty/unparseable values.
+export function normalizeTallyDate(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  let m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  m = s.match(/^(\d{1,2})-([A-Za-z]{3,})-(\d{2,4})$/);
+  if (m) {
+    const day = m[1].padStart(2, '0');
+    const mon = TALLY_MONTHS[m[2].slice(0, 3).toLowerCase()];
+    if (!mon) return null;
+    let year = m[3];
+    if (year.length === 2) year = (Number(year) >= 70 ? '19' : '20') + year;
+    return `${year}-${mon}-${day}`;
+  }
+  return null;
+}
+
+// Pure parser for the get-period Tally XML response. Picks the row matching `preferCompany`
+// (case-insensitive) or the first row, mapping F01..F05 → the period contract. When Tally leaves
+// $EndingAt (F03) empty for an ongoing year, fyTo is inferred as fyFrom + 1 year − 1 day (the Indian
+// FY convention: 1-Apr-2026 → 31-Mar-2027) and fyToInferred is set. Kept pure so it's unit-testable
+// without a live Tally.
+export function parseCompanyPeriod(xml: string, preferCompany?: string | null): CompanyPeriod {
+  const empty: CompanyPeriod = { company: null, fyFrom: null, fyTo: null, booksFrom: null, currentDate: null, lastEntryDate: null, fyToInferred: false };
+  if (!xml) return empty;
+  const rows = xml.match(/<ROW>[\s\S]*?<\/ROW>/gi) || [];
+  if (rows.length === 0) return empty;
+  const field = (row: string, tag: string): string | null => {
+    const m = row.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'i'));
+    if (!m) return null;
+    const v = m[1].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').trim();
+    return v || null;
+  };
+  const first = rows[0];
+  if (first === undefined) return empty;
+  let chosen: string = first;
+  if (preferCompany) {
+    const want = preferCompany.trim().toLowerCase();
+    const match = rows.find(r => (field(r, 'F01') || '').toLowerCase() === want);
+    if (match) chosen = match;
+  }
+  const fyFrom = normalizeTallyDate(field(chosen, 'F02'));
+  let fyTo = normalizeTallyDate(field(chosen, 'F03'));
+  let fyToInferred = false;
+  if (!fyTo && fyFrom) {
+    const m = fyFrom.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (m) {
+      const d = new Date(Date.UTC(Number(m[1]) + 1, Number(m[2]) - 1, Number(m[3])));
+      d.setUTCDate(d.getUTCDate() - 1);
+      fyTo = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+      fyToInferred = true;
+    }
+  }
+  return {
+    company: field(chosen, 'F01'),
+    fyFrom,
+    fyTo,
+    booksFrom: normalizeTallyDate(field(chosen, 'F06')),
+    currentDate: normalizeTallyDate(field(chosen, 'F04')),
+    lastEntryDate: normalizeTallyDate(field(chosen, 'F05')),
+    fyToInferred
+  };
+}
+
+// Builds the period report envelope, posts it, and parses. Injects SVCURRENTCOMPANY only when a
+// company is given; omitting it lets Tally use its current company (repo convention).
+async function fetchCompanyPeriod(companyName: string | null): Promise<CompanyPeriod> {
+  const svCompany = companyName
+    ? `<SVCURRENTCOMPANY>${companyName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</SVCURRENTCOMPANY>`
+    : '';
+  const xml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPPeriodReport</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>${svCompany}</STATICVARIABLES><TDL><TDLMESSAGE><REPORT NAME="MCPPeriodReport"><FORMS>MCPPeriodForm</FORMS></REPORT><FORM NAME="MCPPeriodForm"><PARTS>MCPPeriodPart</PARTS><XMLTAG>DATA</XMLTAG></FORM><PART NAME="MCPPeriodPart"><LINES>MCPPeriodLine</LINES><REPEAT>MCPPeriodLine : MCPPeriodColl</REPEAT><SCROLLED>Vertical</SCROLLED></PART><LINE NAME="MCPPeriodLine"><FIELDS>FCname,FCfrom,FCto,FCcur,FClast,FCbooks</FIELDS><XMLTAG>ROW</XMLTAG></LINE><FIELD NAME="FCname"><SET>$Name</SET><XMLTAG>F01</XMLTAG></FIELD><FIELD NAME="FCfrom"><SET>$StartingFrom</SET><XMLTAG>F02</XMLTAG></FIELD><FIELD NAME="FCto"><SET>$EndingAt</SET><XMLTAG>F03</XMLTAG></FIELD><FIELD NAME="FCcur"><SET>##SVCurrentDate</SET><XMLTAG>F04</XMLTAG></FIELD><FIELD NAME="FClast"><SET>$LastVoucherDate</SET><XMLTAG>F05</XMLTAG></FIELD><FIELD NAME="FCbooks"><SET>$BooksFrom</SET><XMLTAG>F06</XMLTAG></FIELD><COLLECTION NAME="MCPPeriodColl"><TYPE>Company</TYPE></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+  const resp = await postTallyXML(xml);
+  return parseCompanyPeriod(resp, companyName);
+}
+
+// ── read-surface helpers (#92 H-6, #93 H-7) ────────────────────────────────
+// Explicit row count so an empty-but-successful read (count:0) is distinguishable from a failure
+// (which routes through errorResult). Non-arrays → 0.
+export function rowCount(data: unknown): number {
+  return Array.isArray(data) ? data.length : 0;
+}
+
+// The display name of a master row, defensively: prefer a `name` field, else the first column value.
+function masterRowName(row: unknown): string {
+  if (row && typeof row === 'object') {
+    const r = row as Record<string, unknown>;
+    if ('name' in r) return String(r.name ?? '');
+    const vals = Object.values(r);
+    return vals.length ? String(vals[0] ?? '') : '';
+  }
+  return String(row ?? '');
+}
+
+// Dumb, deterministic filter for search-master (#93): case-insensitive substring or prefix match on
+// the row name only. NO ranking, NO fuzzy scoring, NO reordering — matches are returned in source
+// order. Empty/blank query returns all rows unchanged (behaves like list-master).
+export function filterMasterRows<T>(rows: T[], query: string, mode: 'substring' | 'prefix' = 'substring'): T[] {
+  const q = (query ?? '').trim().toLowerCase();
+  if (!q) return rows;
+  return rows.filter(row => {
+    const name = masterRowName(row).toLowerCase();
+    return mode === 'prefix' ? name.startsWith(q) : name.includes(q);
+  });
+}
+
 // Normalize a company name for fuzzy comparison: lowercase, drop everything
 // except letters and digits. Lets us match "Ross Computer Pvt Ltd" against
 // "ROSS COMPUTERS PVT. LTD." despite differing punctuation, case, and plurals
@@ -99,10 +228,21 @@ function normalizeCompanyName(name: string): string {
 // deletions, substitutions) to transform `a` into `b`. O(n*m) memory and time;
 // fine for short strings like company names. Used as the last fuzzy-match tier
 // to catch typos and plural mismatches (e.g. "Computer" vs "Computers").
+// Defense-in-depth cap on the O(n*m) DP matrix. Callers should bound their inputs
+// (e.g. set-active-company caps companyName at 256), but this guard makes the
+// function self-safe: a pathological multi-KB string can't allocate a huge matrix.
+// Beyond this length no realistic company name matches anyway, so returning the
+// length delta (a lower bound on the true distance, always > any sane maxDist)
+// safely reports "no fuzzy match" without touching the matrix.
+const LEVENSHTEIN_MAX_LEN = 256;
+
 function levenshteinDistance(a: string, b: string): number {
   if (a === b) return 0;
   if (a.length === 0) return b.length;
   if (b.length === 0) return a.length;
+  if (a.length > LEVENSHTEIN_MAX_LEN || b.length > LEVENSHTEIN_MAX_LEN) {
+    return Math.abs(a.length - b.length) || Math.max(a.length, b.length);
+  }
   const dp: number[][] = [];
   for (let i = 0; i <= a.length; i++) {
     dp.push(new Array(b.length + 1).fill(0));
@@ -157,6 +297,87 @@ export function findMatchingLoadedCompany(target: string, loaded: string[]): str
   return best ? best.name : null;
 }
 
+// Runs an async boolean probe up to `attempts` times with a small backoff and
+// returns true as soon as any attempt succeeds — used by the `status` tool to
+// absorb a single transient Tally/agent blip so the reported state doesn't flap
+// between calls. A throwing probe counts as a miss. `sleep` is injectable so the
+// retry logic can be unit-tested without real delays.
+export async function probeWithRetry(
+  probe: () => Promise<boolean>,
+  attempts = 3,
+  backoffMs = 150,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise(r => setTimeout(r, ms))
+): Promise<boolean> {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      if (await probe()) return true;
+    } catch {
+      // treat an error as a miss and keep retrying
+    }
+    if (i < attempts - 1) await sleep(backoffMs);
+  }
+  return false;
+}
+
+// Like probeWithRetry but returns the produced value: retries an operation up to `attempts` times
+// until `isSuccess` holds, with backoff. Used for the self-healing unlock loop (#89 H-3) — on a
+// keystroke miss the whole select-and-unlock is re-dispatched (the agent re-keys + re-verifies each
+// attempt) before the host surrenders PASSWORD_REQUIRED. Returns the last value + the attempt count.
+export async function retryForResult<T>(
+  attempt: () => Promise<T | null>,
+  isSuccess: (r: T | null) => boolean,
+  attempts = 3,
+  backoffMs = 400,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise(r => setTimeout(r, ms))
+): Promise<{ result: T | null; attempts: number }> {
+  let last: T | null = null;
+  for (let i = 0; i < attempts; i++) {
+    try { last = await attempt(); } catch { last = null; }
+    if (isSuccess(last)) return { result: last, attempts: i + 1 };
+    if (i < attempts - 1) await sleep(backoffMs);
+  }
+  return { result: last, attempts };
+}
+
+// open-company strategy renames (#24): the old tdl-* names implied a TDL *load*
+// primitive, but these strategies only verify (no XML/TDL load primitive exists).
+// Old names stay accepted as deprecated aliases for one release.
+const OPEN_COMPANY_STRATEGY_ALIASES: Record<string, string> = {
+  'tdl-load': 'verify-svcurrentcompany',
+  'tdl-connect': 'verify-in-loaded-list',
+};
+export function normalizeOpenCompanyStrategy(s: string): { strategy: string; deprecatedAlias: string | null } {
+  const alias = OPEN_COMPANY_STRATEGY_ALIASES[s];
+  return alias ? { strategy: alias, deprecatedAlias: s } : { strategy: s, deprecatedAlias: null };
+}
+
+// Extracts the <TALLYREQUEST> verb from a raw Tally XML envelope (e.g. "Export",
+// "Import", "Alter", "Delete"), lowercased, or null if none is present. Used to
+// keep the raw-XML debug probe read-only by default: only "export" reads data;
+// Import/Alter/Delete mutate it. Tolerates attributes and surrounding whitespace.
+export function parseTallyRequestVerb(xml: string): string | null {
+  const m = /<TALLYREQUEST\b[^>]*>\s*([^<\s]+)\s*<\/TALLYREQUEST>/i.exec(xml);
+  return m ? m[1].toLowerCase() : null;
+}
+
+// Minimal path interface so the containment check can be unit-tested against
+// both posix and win32 semantics regardless of the host OS.
+type PathLike = { resolve: (...segments: string[]) => string; sep: string };
+
+// Returns true when `candidate` resolves to `root` itself or a path strictly
+// inside it. Canonicalizes both sides and compares on a separator boundary so
+// "/data/../etc" or a sibling like "/data-evil" cannot pass as "/data".
+export function isPathWithinRoots(candidate: string, roots: string[], p: PathLike = path): { ok: boolean; resolved: string } {
+  const resolved = p.resolve(candidate);
+  for (const root of roots) {
+    if (!root) continue;
+    const r = p.resolve(root);
+    const rWithSep = r.endsWith(p.sep) ? r : r + p.sep;
+    if (resolved === r || resolved.startsWith(rWithSep)) return { ok: true, resolved };
+  }
+  return { ok: false, resolved };
+}
+
 // Parses tally.ini content and returns the list of company IDs in `Load=` directives under [TALLY].
 // Tally Prime auto-loads each Load=<id> entry on startup when Default Companies=Yes.
 export function parseTallyIniLoads(iniContent: string): string[] {
@@ -191,11 +412,23 @@ export function rewriteTallyIniLoads(iniContent: string, companyIds: string[]): 
   return filtered.join(eol);
 }
 
-// Atomically writes content to filePath using a temp-file + rename pattern (no torn writes if the process dies mid-write).
+// Atomically writes content to filePath using a temp-file + rename pattern (no torn writes if the
+// process dies mid-write). Also important for the GUI-agent IPC files (_mcp_gui_command.json): the
+// rename replaces the target with a freshly created inode, so it re-inherits the directory ACL every
+// write. An in-place fs.writeFileSync would preserve a stale/narrower ACL on an existing file, which
+// is how the agent (running under a UAC-filtered "Limited" token that drops Administrators) ends up
+// with "Access is denied" reading commands the SYSTEM service wrote.
 function atomicWriteFile(filePath: string, content: string): void {
   const tmp = `${filePath}.tmp.${process.pid}.${Date.now()}`;
   fs.writeFileSync(tmp, content, 'utf-8');
-  fs.renameSync(tmp, filePath);
+  try {
+    fs.renameSync(tmp, filePath);
+  } catch (e) {
+    // Don't leak the temp file if the rename loses (e.g. target briefly open by the agent's
+    // ReadAllText, or an AV scan) — otherwise .tmp.* orphans accumulate on this high-frequency path.
+    try { fs.unlinkSync(tmp); } catch {}
+    throw e;
+  }
 }
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
@@ -208,16 +441,10 @@ export function scanCompanyFolders(dataPath: string): Array<{ folder: string; na
   return entries
     .filter(e => e.isDirectory() && /^\d+$/.test(e.name))
     .map(e => {
-      let name = '';
-      try {
-        const companyFile = path.join(dataPath, e.name, 'Company.900');
-        if (fs.existsSync(companyFile)) {
-          const buf = fs.readFileSync(companyFile);
-          const text = buf.toString('utf16le').replace(/[^\x20-\x7Eऀ-ॿ]/g, ' ').trim();
-          const match = text.match(/[A-Za-zऀ-ॿ][\w\sऀ-ॿ.&(),-]{2,}/);
-          if (match) name = match[0].trim();
-        }
-      } catch {}
+      // Use the shared BFS finder so nested Edit Log layouts (Company.1800 one
+      // level deeper) resolve a name too, instead of leaving it blank.
+      const found = findCompanyMetadataFile(path.join(dataPath, e.name), 3);
+      const name = found ? extractCompanyNameFromMetadataFile(found.metaPath) : '';
       return { folder: e.name, name };
     });
 }
@@ -237,6 +464,36 @@ export function extractCompanyNameFromMetadataFile(filePath: string): string {
   } catch {
     return '';
   }
+}
+
+// Finds the first Company.900 (flat layout) or Company.1800 (Edit Log nested layout)
+// under `root`, BFS to maxDepth. Returns the metadata path + a layout marker
+// (depth 0 = flat, depth >= 1 = nested). Shared by scanAvailableCompanies,
+// scanCompanyFolders, and list-companies so every folder-scanning path recovers
+// names the same robust way (fixes blank names for nested-layout folders).
+export function findCompanyMetadataFile(root: string, maxDepth = 3): { metaPath: string; layout: 'flat' | 'nested' } | null {
+  type Frame = { dir: string; depth: number };
+  const queue: Frame[] = [{ dir: root, depth: 0 }];
+  while (queue.length) {
+    const { dir, depth } = queue.shift()!;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.isFile() && /^Company\.(900|1800)$/i.test(entry.name)) {
+        return { metaPath: path.join(dir, entry.name), layout: depth === 0 ? 'flat' : 'nested' };
+      }
+    }
+    if (depth < maxDepth) {
+      for (const entry of entries) {
+        if (entry.isDirectory()) queue.push({ dir: path.join(dir, entry.name), depth: depth + 1 });
+      }
+    }
+  }
+  return null;
 }
 
 // Describes a discovered company and its load-readiness — the structured shape returned by
@@ -358,6 +615,17 @@ export function findCompanyByAlias(registry: CompanyRegistry, alias: string): Co
   return null;
 }
 
+// Resolves a vault entry for unlock-stored-credentials from an alias, folder id, or display name
+// (deterministic, exact — no fuzzy matching). Returns null when nothing configured matches.
+export function resolveVaultEntry(registry: CompanyRegistry, company: string): CompanyEntry | null {
+  const byAlias = findCompanyByAlias(registry, company);
+  if (byAlias) return byAlias;
+  const id = (company ?? '').trim();
+  const q = id.toLowerCase();
+  if (!q) return null;
+  return registry.companies.find(c => c.folderId === id || (c.displayName ?? '').trim().toLowerCase() === q) ?? null;
+}
+
 // Returns every alias the user could legitimately type — main alias + extra aliases, deduped,
 // in declaration order. Used in error messages when an unknown alias is requested.
 export function listConfiguredAliases(registry: CompanyRegistry): string[] {
@@ -446,39 +714,12 @@ export function scanAvailableCompanies(
 
   const config = configPath ? loadCompaniesConfig(configPath) : {};
 
-  const findMetadataFile = (root: string, maxDepth: number): { metaPath: string; layout: 'flat' | 'nested' } | null => {
-    // BFS down to maxDepth, looking for Company.900 or Company.1800. Return first hit + layout
-    // marker (depth 0 = flat layout, depth >= 1 = nested layout, e.g. Edit Log).
-    type Frame = { dir: string; depth: number };
-    const queue: Frame[] = [{ dir: root, depth: 0 }];
-    while (queue.length) {
-      const { dir, depth } = queue.shift()!;
-      let entries: fs.Dirent[];
-      try {
-        entries = fs.readdirSync(dir, { withFileTypes: true });
-      } catch {
-        continue;
-      }
-      for (const entry of entries) {
-        if (entry.isFile() && /^Company\.(900|1800)$/i.test(entry.name)) {
-          return { metaPath: path.join(dir, entry.name), layout: depth === 0 ? 'flat' : 'nested' };
-        }
-      }
-      if (depth < maxDepth) {
-        for (const entry of entries) {
-          if (entry.isDirectory()) queue.push({ dir: path.join(dir, entry.name), depth: depth + 1 });
-        }
-      }
-    }
-    return null;
-  };
-
   const entries = fs.readdirSync(dataPath, { withFileTypes: true });
   return entries
     .filter(e => e.isDirectory() && /^\d+$/.test(e.name))
     .map(e => {
       const folderPath = path.join(dataPath, e.name);
-      const found = findMetadataFile(folderPath, 3);
+      const found = findCompanyMetadataFile(folderPath, 3);
       const displayName = found ? extractCompanyNameFromMetadataFile(found.metaPath) : '';
 
       const hint = config[e.name] || {};
@@ -532,6 +773,112 @@ export function resolveCompanyInput(input: string, folders: Array<{ folder: stri
   }
   if (nameMatches.length > 1) return { kind: 'ambiguous', matches: nameMatches };
   return { kind: 'not-found', available: folders };
+}
+
+// Enriched, client-facing resolution result for the resolve-company tool (#59):
+// one canonical record per match, joined against the alias registry (alias,
+// isProtected) and the loaded list (isLoaded). Union-typed like the internal
+// resolver so callers can branch on ok / ambiguous / not-found.
+export type ResolvedCompanyRecord = {
+  name: string;
+  folderId: string;
+  alias: string | null;
+  isLoaded: boolean;
+  isProtected: boolean;
+  matchedBy: 'id' | 'name' | 'alias';
+};
+export type ResolveCompanyEnriched =
+  | { kind: 'ok'; company: ResolvedCompanyRecord }
+  | { kind: 'ambiguous'; matches: Array<{ folderId: string; name: string; alias: string | null }> }
+  | { kind: 'not-found'; available: Array<{ folderId: string; name: string; alias: string | null }> };
+
+// Pure resolver used by the resolve-company tool. Resolves a folder id, an exact
+// company name, OR a configured alias to a single enriched record. No I/O — the
+// caller supplies the folder list, the registry, and the loaded-company names.
+export function resolveCompanyEnriched(
+  query: string,
+  folders: Array<{ folder: string; name: string }>,
+  registry: CompanyRegistry,
+  loadedNames: string[]
+): ResolveCompanyEnriched {
+  const aliasFor = (folderId: string): string | null =>
+    registry.companies.find(c => c.folderId === folderId)?.alias ?? null;
+  const isProtectedFor = (folderId: string): boolean => {
+    const entry = registry.companies.find(c => c.folderId === folderId);
+    if (entry && typeof entry.passwordEnc === 'string' && entry.passwordEnc.length > 0) return true;
+    return registry.legacyHints?.[folderId]?.requiresCredentials === true;
+  };
+  const isLoadedName = (name: string): boolean => {
+    const n = name.trim().toLowerCase();
+    return n.length > 0 && loadedNames.some(l => l.trim().toLowerCase() === n);
+  };
+  // Resolve the real canonical display name by DETERMINISTIC precedence (#90 H-4), instead of
+  // trusting the heuristic byte-scrape of the binary Company.900/1800 metadata (which can truncate
+  // or garble the name):
+  //   1. the live Tally-reported name if this company is loaded (authoritative exact casing),
+  //   2. else the registry-configured displayName for this folderId (deterministic, user-set),
+  //   3. else fall back to the scraped folder name.
+  const canonicalName = (folderId: string, scrapedName: string): string => {
+    const n = scrapedName.trim().toLowerCase();
+    if (n) {
+      const live = loadedNames.find(l => l.trim().toLowerCase() === n);
+      if (live) return live;
+    }
+    const disp = registry.companies.find(c => c.folderId === folderId)?.displayName;
+    if (disp && disp.trim()) return disp;
+    return scrapedName;
+  };
+  const record = (folderId: string, name: string, matchedBy: 'id' | 'name' | 'alias'): ResolvedCompanyRecord => {
+    const canonical = canonicalName(folderId, name);
+    return {
+      name: canonical,
+      folderId,
+      alias: aliasFor(folderId),
+      isLoaded: isLoadedName(canonical),
+      isProtected: isProtectedFor(folderId),
+      matchedBy,
+    };
+  };
+  const withAlias = (list: Array<{ folder: string; name: string }>) =>
+    list.map(f => ({ folderId: f.folder, name: f.name, alias: aliasFor(f.folder) }));
+
+  const base = resolveCompanyInput(query, folders);
+  if (base.kind === 'ok') {
+    return { kind: 'ok', company: record(base.folderId, base.companyName, base.matchedBy) };
+  }
+  if (base.kind === 'ambiguous') {
+    return { kind: 'ambiguous', matches: withAlias(base.matches) };
+  }
+  // not-found by id/name — try the alias registry before giving up.
+  const entry = findCompanyByAlias(registry, query);
+  if (entry) {
+    // Pass the SCRAPED name; record()/canonicalName apply the deterministic precedence
+    // (live Tally name → registry displayName → scrape), so a garbled scrape can't win over
+    // the configured displayName (#90 H-4).
+    const scraped = folders.find(f => f.folder === entry.folderId)?.name || '';
+    return { kind: 'ok', company: record(entry.folderId, scraped, 'alias') };
+  }
+  return { kind: 'not-found', available: withAlias(base.available) };
+}
+
+// ── use-company orchestration (#87 H-1) ────────────────────────────────────
+export type UseCompanyPlan =
+  | { action: 'set-active'; company: ResolvedCompanyRecord }
+  | { action: 'load-vault'; company: ResolvedCompanyRecord }    // configured registry entry → vault select-and-unlock
+  | { action: 'load-restart'; company: ResolvedCompanyRecord }  // not resident, no vault entry → tally.ini restart
+  | { action: 'error'; code: 'AMBIGUOUS' | 'COMPANY_NOT_FOUND' };
+
+// Pure routing for use-company: given a resolved company, decide the single deterministic next action.
+//   already loaded            → set-active (fast path: no restart, no keystrokes)
+//   configured (has alias/vault) → load-vault (stored-credential select-and-unlock)
+//   otherwise                 → load-restart (tally.ini rewrite + Tally restart)
+export function planUseCompany(resolved: ResolveCompanyEnriched): UseCompanyPlan {
+  if (resolved.kind === 'ambiguous') return { action: 'error', code: 'AMBIGUOUS' };
+  if (resolved.kind === 'not-found') return { action: 'error', code: 'COMPANY_NOT_FOUND' };
+  const c = resolved.company;
+  if (c.isLoaded) return { action: 'set-active', company: c };
+  if (c.alias) return { action: 'load-vault', company: c };
+  return { action: 'load-restart', company: c };
 }
 
 // Resolves the configured Tally edition from env var. Defaults to "silver" — safer assumption since
@@ -595,36 +942,43 @@ async function callGuiAgent(
 
   try { fs.unlinkSync(resultFile); } catch {}
   const command = JSON.stringify({ action, ...payload, commandId, timestamp: new Date().toISOString() });
-  fs.writeFileSync(commandFile, command, 'utf-8');
+  atomicWriteFile(commandFile, command);
   logs.push(`  [gui-agent] sent action=${action} commandId=${commandId}, waiting up to ${timeoutSec}s`);
 
-  for (let i = 0; i < timeoutSec; i++) {
-    await sleep(1000);
-    if (!fs.existsSync(resultFile)) continue;
-    try {
-      // Strip leading BOM defensively — PowerShell's [Encoding]::UTF8 emits a BOM that breaks JSON.parse.
-      const resultText = fs.readFileSync(resultFile, 'utf-8').replace(/^﻿/, '');
-      const result = JSON.parse(resultText);
-      if (!isMatchingGuiAgentCommand(result, commandId)) {
-        logs.push(`  [gui-agent] ignoring stale response for commandId ${result?.commandId || 'unknown'}`);
+  try {
+    for (let i = 0; i < timeoutSec; i++) {
+      await sleep(1000);
+      if (!fs.existsSync(resultFile)) continue;
+      try {
+        // Strip leading BOM defensively — PowerShell's [Encoding]::UTF8 emits a BOM that breaks JSON.parse.
+        const resultText = fs.readFileSync(resultFile, 'utf-8').replace(/^﻿/, '');
+        const result = JSON.parse(resultText);
+        if (!isMatchingGuiAgentCommand(result, commandId)) {
+          logs.push(`  [gui-agent] ignoring stale response for commandId ${result?.commandId || 'unknown'}`);
+          try { fs.unlinkSync(resultFile); } catch {}
+          continue;
+        }
+        const versionStr = typeof result.agentVersion === 'string' ? result.agentVersion : null;
+        logs.push(`  [gui-agent] response: status=${result.status} message=${result.message}${versionStr ? ` agentVersion=${versionStr}` : ''}`);
         try { fs.unlinkSync(resultFile); } catch {}
-        continue;
+        return {
+          status: String(result.status || ''),
+          message: String(result.message || ''),
+          agentVersion: versionStr,
+          raw: result
+        };
+      } catch {
+        try { fs.unlinkSync(resultFile); } catch {}
       }
-      const versionStr = typeof result.agentVersion === 'string' ? result.agentVersion : null;
-      logs.push(`  [gui-agent] response: status=${result.status} message=${result.message}${versionStr ? ` agentVersion=${versionStr}` : ''}`);
-      try { fs.unlinkSync(resultFile); } catch {}
-      return {
-        status: String(result.status || ''),
-        message: String(result.message || ''),
-        agentVersion: versionStr,
-        raw: result
-      };
-    } catch {
-      try { fs.unlinkSync(resultFile); } catch {}
     }
+    logs.push(`  [gui-agent] no response within ${timeoutSec}s`);
+    return null;
+  } finally {
+    // The command file may carry a decrypted password. Never leave it on disk after
+    // we're done — on the agent-down/timeout path nothing else removes it. On success
+    // the agent has already consumed it, so this unlink is a harmless no-op.
+    try { fs.unlinkSync(commandFile); } catch {}
   }
-  logs.push(`  [gui-agent] no response within ${timeoutSec}s`);
-  return null;
 }
 
 // Result of a GUI-agent ping: alive + version + whether version meets the server's required minimum.
@@ -681,11 +1035,486 @@ async function pull(reportName: string, inputParams: Map<string, any>) {
 }
 
 // Wraps handlePush — injects activeCompany as targetCompany fallback when the caller did not specify one.
-async function push(templateName: string, inputParams: Map<string, any>) {
-  if (!inputParams.has('targetCompany') && activeCompany) {
-    inputParams.set('targetCompany', activeCompany);
+// Reconciles the intended company (a targetCompany arg, or activeCompany — which may be a registry
+// alias/displayName that differs from the exact loaded name) to the EXACT name currently loaded in
+// Tally. Writes MUST be stamped with a name Tally will match: a Tally IMPORT whose SVCURRENTCOMPANY
+// doesn't exactly match a loaded company is accepted and writes into the void ("0 error(s)", nothing
+// created) — whereas a read (Export) falls back to the open company, which is why reads work but
+// writes silently no-op. Returns the exact name, or a message to fail closed on.
+export type LoadedCompanyPick = { ok: true; name: string } | { ok: false; message: string };
+
+// Pure decision (unit-tested): given the intended name and the live loaded list, pick the EXACT
+// loaded name to stamp a write with, or fail closed. Blank intended + exactly one loaded → that one.
+export function pickLoadedCompany(intended: string | null, loaded: string[]): LoadedCompanyPick {
+  if (loaded.length === 0) {
+    return { ok: false, message: 'No company is loaded in Tally — a write would go into the void. Load a company (use-company / load-company) first.' };
   }
+  if (!intended || !intended.trim()) {
+    if (loaded.length === 1) return { ok: true, name: loaded[0]! };
+    return { ok: false, message: `No active company set and ${loaded.length} are loaded (${loaded.join(', ')}). Call set-active-company or pass targetCompany.` };
+  }
+  const match = findMatchingLoadedCompany(intended, loaded);
+  if (!match) {
+    return { ok: false, message: `"${intended}" is not currently loaded in Tally (loaded: ${loaded.join(', ')}). A master/voucher import stamped with a non-loaded name silently no-ops — load/activate it (use-company) or pass the exact loaded name.` };
+  }
+  return { ok: true, name: match };
+}
+
+async function resolveExactLoadedCompany(intended: string | null): Promise<LoadedCompanyPick> {
+  let loaded: string[] = [];
+  try { loaded = await listLoadedCompanies(); } catch {}
+  return pickLoadedCompany(intended, loaded);
+}
+
+async function push(templateName: string, inputParams: Map<string, any>) {
+  // Stamp the write with the EXACT loaded company name (not a registry alias/displayName), and fail
+  // closed if the target isn't actually loaded — otherwise Tally accepts the import and no-ops.
+  const intended = (inputParams.has('targetCompany') ? String(inputParams.get('targetCompany')) : activeCompany) ?? null;
+  const target = await resolveExactLoadedCompany(intended);
+  if (!target.ok) {
+    return { success: false, created: 0, altered: 0, lastVchId: 0, error: target.message };
+  }
+  inputParams.set('targetCompany', target.name);
   return handlePush(templateName, inputParams);
+}
+
+// Static list of external preconditions surfaced by get-context so a fresh agent
+// can learn what must be running before it loads a company — without hitting walls.
+export function getTallyRequirements(): { requirement: string; why: string }[] {
+  return [
+    { requirement: 'Tally Prime running with its XML/HTTP server enabled (default port 9000)', why: 'Every data read (ledgers, vouchers, GST, balance sheet) goes through Tally\'s XML server.' },
+    { requirement: 'GUI automation agent (tally-gui-agent-v2.ps1) running in the interactive desktop session', why: 'Required to load/switch companies and to unlock password-protected companies. Not needed for read-only queries against an already-loaded company.' },
+    { requirement: 'Credentials for password-protected companies', why: 'load-company / load-company-by-alias need userName+password for protected companies; list-available-companies flags which folders require them.' },
+    { requirement: 'Edition awareness (Silver vs Gold)', why: 'Silver keeps only one company resident at a time — loading another replaces it; Gold allows several.' },
+  ];
+}
+
+// Server-level tool-selection guidance delivered to the MCP client (like GitHub's MCP does).
+const TALLY_MCP_INSTRUCTIONS = `Tally Prime MCP server — exposes a local Tally Prime ERP as typed tools (GST returns, balance sheet, vouchers, ledgers, masters).
+
+Getting started:
+- Call \`status\` first: is Tally reachable, is the GUI agent alive, what is the active company, edition (silver/gold), and readonly mode. \`get-context\` returns the same plus the list of external requirements.
+- Find a company with \`list-available-companies\` (flags which need credentials) or \`list-companies\`; switch an already-loaded one with \`set-active-company\`.
+- Cold-load with \`load-company\` / \`load-company-by-alias\` (edition-aware; supply userName+password for protected companies). \`open-company\`'s verify-* strategies only check — they do not load.
+- Once a company is active, all query tools target it unless you pass targetCompany.
+
+Hard preconditions (discover via \`status\`/\`get-context\`, don't hit walls):
+- The Tally XML server must be running for any data read.
+- The GUI automation agent must be running to load/switch companies or unlock protected ones.
+- On Silver only one company is resident at a time; loading another replaces it.
+- Write tools are refused when readonly is true (READONLY_MODE).
+
+Driving the Tally GUI (only when ENABLE_GUI_CONTROL=true) — YOU drive it, look-verify-act, never blind:
+- Use \`gui-screenshot\` as your eyes and \`gui-send-keys\` as your hands. Screenshot → confirm which screen you're on → send ONE step → screenshot → confirm the transition. Never send a relative sequence into an unknown screen.
+- Anchor first: press Escape back to the Gateway of Tally and confirm you're there before navigating.
+- Keystrokes are for LOGIN and COMPANY SELECTION only. NEVER keystroke a data write. All vouchers/masters go through the deterministic tools (create-voucher, create-ledger, …) which use Tally's XML API — never the GUI.
+- Fail closed: if a screenshot shows an unexpected screen (especially any Create/Alter master screen), STOP, press Escape back to the anchor, and return the problem — do NOT push more keys into the void.
+- Unlocking a protected company: when the password prompt is visible (confirm via screenshot first), call \`unlock-stored-credentials\` — the SERVER decrypts and types the vaulted password locally; the plaintext never comes to you and is never logged. If it returns noStoredCredentials or failed, ask the user for the password, then type it and verify by screenshot.`;
+
+// Shared liveness probe used by both `status` and `get-context`. Retries each
+// probe so a single transient blip doesn't flip the reported state.
+async function probeLiveness(): Promise<{ tallyReachable: boolean; agentAlive: boolean }> {
+  const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+  const tallyReachable = await probeWithRetry(() => pingTally());
+  const agentAlive = await probeWithRetry(async () => (await pingGuiAgent(tallyDataPath, 2)).alive, 2);
+  return { tallyReachable, agentAlive };
+}
+
+// Server version, read from package.json (single source of truth). Falls back to
+// 0.0.0 if the file can't be read.
+export function getServerVersion(): string {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, '..', 'package.json'), 'utf-8'));
+    return typeof pkg.version === 'string' && pkg.version.length > 0 ? pkg.version : '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+}
+
+// The HTTP /status endpoint (#25) is opt-in: disabled unless STATUS_ENDPOINT_PUBLIC
+// is "1" or "true". Pure so the gating can be unit-tested.
+export function isStatusEndpointEnabled(raw: string | undefined = process.env.STATUS_ENDPOINT_PUBLIC): boolean {
+  const v = String(raw ?? '').trim().toLowerCase();
+  return v === '1' || v === 'true';
+}
+
+// Builds the health report served by the HTTP GET /status endpoint. Richer than the
+// MCP `status` tool's stable contract: includes version, agent version handshake,
+// loaded companies, and optional build info. Reuses the retried Tally probe.
+export async function getHttpStatusReport(): Promise<{
+  ok: boolean;
+  version: string;
+  edition: 'silver' | 'gold';
+  readonly: boolean;
+  activeCompany: string | null;
+  agent: { responding: boolean; version: string | null; versionOk: boolean };
+  tally: { reachable: boolean; loadedCompanies: string[] };
+  build: { commit: string | null; builtAt: string | null };
+}> {
+  const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+  const tallyReachable = await probeWithRetry(() => pingTally());
+  const agentPing = await pingGuiAgent(tallyDataPath, 2);
+  let loadedCompanies: string[] = [];
+  if (tallyReachable) {
+    try { loadedCompanies = await listLoadedCompanies(); } catch { /* leave empty */ }
+  }
+  return {
+    ok: tallyReachable,
+    version: getServerVersion(),
+    edition: getTallyEdition(),
+    readonly: process.env.READONLY_MODE === 'true',
+    activeCompany: activeCompany || null,
+    agent: { responding: agentPing.alive, version: agentPing.agentVersion ?? null, versionOk: agentPing.versionOk },
+    tally: { reachable: tallyReachable, loadedCompanies },
+    build: { commit: process.env.GIT_COMMIT ?? null, builtAt: process.env.BUILD_TIME ?? null },
+  };
+}
+
+// ── Typed, machine-readable tool errors (#61) ──────────────────────────────
+// Tool failures used to be free-text log dumps the model had to read "like prose"
+// to decide what to do next. A ToolError gives a machine-readable `code` plus
+// `retryable` and a concrete `remedy`, so callers can branch deterministically;
+// the raw transcript is demoted to a `logs` field instead of being the payload.
+// The spec's fixed code enum (H-14): 10 codes the session can branch on deterministically.
+// The first block is the 10 spec codes; the second is documented HOST EXTENSIONS that predate the
+// spec and stay for backward-compat (they are NOT part of the spec-10):
+//   - AGENT_TOO_OLD    — version-handshake failure (a specific AGENT_UNREACHABLE sub-case)
+//   - COMPANY_NOT_FOUND— company-scoped not-found (distinct from master-scoped MASTER_NOT_FOUND)
+//   - AMBIGUOUS        — company-match ambiguity (distinct from the general, host-deterministic AMBIGUOUS_INPUT)
+//   - UNKNOWN          — unclassified fallback; every use is a candidate to reclassify onto a typed code
+export type ToolErrorCode =
+  // ── spec-10 (H-14) ──
+  | 'AGENT_UNREACHABLE'
+  | 'TALLY_DOWN'
+  | 'PASSWORD_REQUIRED'
+  | 'OUT_OF_PERIOD'
+  | 'MASTER_NOT_FOUND'
+  | 'AMBIGUOUS_INPUT'
+  | 'UNBALANCED'
+  | 'DUPLICATE'
+  | 'READONLY'
+  | 'PRECONDITION_FAILED'
+  // ── host extensions (not in the spec-10) ──
+  | 'AGENT_TOO_OLD'
+  | 'COMPANY_NOT_FOUND'
+  | 'AMBIGUOUS'
+  | 'UNKNOWN';
+
+export type ToolErrorEnvelope = {
+  code: ToolErrorCode;
+  message: string;
+  retryable: boolean;
+  remedy?: string;
+  logs?: string;
+};
+
+// Sensible default message / retryable / remedy per code so call sites stay terse.
+const TOOL_ERROR_DEFAULTS: Record<ToolErrorCode, { retryable: boolean; message: string; remedy?: string }> = {
+  PASSWORD_REQUIRED: { retryable: true, message: 'The company appears to be password-protected.', remedy: 'Retry with userName and password arguments.' },
+  AGENT_UNREACHABLE: { retryable: true, message: 'The Tally GUI automation agent is not responding.', remedy: 'Start tally-gui-agent-v2.ps1 in the interactive desktop session (Task Scheduler "At logon"), then retry.' },
+  TALLY_DOWN: { retryable: true, message: 'Tally Prime is not reachable on its XML port.', remedy: 'Ensure Tally Prime is running with the XML/HTTP server enabled, then retry.' },
+  AGENT_TOO_OLD: { retryable: true, message: 'The GUI agent is older than the required version.', remedy: 'Restart the agent to pick up the on-disk update (schtasks /End /TN TallyMCPAgent; schtasks /Run /TN TallyMCPAgent).' },
+  COMPANY_NOT_FOUND: { retryable: false, message: 'No company matched the given identifier.', remedy: 'Use resolve-company or list-available-companies to find the exact id, name, or alias.' },
+  AMBIGUOUS: { retryable: false, message: 'The identifier matched more than one company.', remedy: 'Re-call with the exact folder id or a configured alias.' },
+  PRECONDITION_FAILED: { retryable: true, message: 'A required precondition is not met.' },
+  READONLY: { retryable: false, message: 'Write operations are disabled (READONLY_MODE=true).', remedy: 'Unset READONLY_MODE on the server to allow writes.' },
+  // spec-10 deterministic-invariant codes (H-14 / H-9)
+  OUT_OF_PERIOD: { retryable: false, message: 'The voucher date is outside the company\'s open period.', remedy: 'Use get-period and date the voucher within booksFrom..fyTo.' },
+  MASTER_NOT_FOUND: { retryable: false, message: 'A referenced ledger or stock item does not exist.', remedy: 'Create the master first (create-ledger / create-stock-item) or correct the exact name via search-master.' },
+  AMBIGUOUS_INPUT: { retryable: false, message: 'The input matched more than one master on an exact key.', remedy: 'Disambiguate with the exact, fully-qualified name.' },
+  UNBALANCED: { retryable: false, message: 'Voucher entries do not balance (total debits != total credits).', remedy: 'Adjust the entries so debits equal credits before retrying.' },
+  DUPLICATE: { retryable: false, message: 'A voucher or master with the same deterministic key already exists.', remedy: 'Use a different voucher number / master name, or reverse-voucher to cancel the existing one.' },
+  UNKNOWN: { retryable: false, message: 'An unexpected error occurred.' },
+};
+
+// Pure builder — returns the envelope object (tested directly).
+export function buildToolError(
+  code: ToolErrorCode,
+  opts?: { message?: string; retryable?: boolean; remedy?: string; logs?: string }
+): ToolErrorEnvelope {
+  const d = TOOL_ERROR_DEFAULTS[code];
+  const remedy = opts?.remedy ?? d.remedy;
+  const env: ToolErrorEnvelope = {
+    code,
+    message: opts?.message ?? d.message,
+    retryable: opts?.retryable ?? d.retryable,
+  };
+  if (remedy) env.remedy = remedy;
+  if (opts?.logs) env.logs = opts.logs;
+  return env;
+}
+
+// The single helper all classified failures route through: emits the envelope as
+// JSON text (machine-parseable) and as structuredContent, with isError set.
+export function errorResult(
+  code: ToolErrorCode,
+  opts?: { message?: string; retryable?: boolean; remedy?: string; logs?: string }
+) {
+  const env = buildToolError(code, opts);
+  return {
+    isError: true as const,
+    content: [{ type: 'text' as const, text: JSON.stringify(env, null, 2) }],
+    structuredContent: env,
+  };
+}
+
+// ── voucher schemas + shared executor (#94 H-8, #97 H-11) ──────────────────
+const voucherEntrySchema = z.object({
+  ledger: z.string().describe('exact ledger name (already resolved — no fuzzy matching host-side)'),
+  drCr: z.enum(['dr', 'cr']).describe('dr = debit, cr = credit'),
+  amount: z.number().positive().describe('positive amount; the sign is derived from drCr'),
+  billwise: z.array(z.object({
+    name: z.string(),
+    billType: z.enum(['New Ref', 'Agst Ref', 'Advance', 'On Account']).optional(),
+    amount: z.number()
+  })).optional().describe('bill-wise allocations for a receivable/payable line'),
+  costCentres: z.array(z.object({ category: z.string(), centre: z.string(), amount: z.number() })).optional()
+});
+const inventoryLineSchema = z.object({
+  stockItem: z.string(),
+  quantity: z.number(),
+  rate: z.number().optional(),
+  amount: z.number().optional(),
+  unit: z.string().optional(),
+  godown: z.string().optional(),
+  batch: z.string().optional(),
+  accountingLedger: z.string().optional().describe('sales/purchase ledger this stock value posts to')
+});
+const gstBlockSchema = z.object({
+  placeOfSupply: z.string().optional(),
+  isReverseCharge: z.boolean().optional(),
+  registrationType: z.string().optional()
+});
+// The full voucher shape, shared by create-voucher and create-vouchers.
+const voucherInputShape = {
+  voucherType: z.enum(['Sales', 'Purchase', 'Payment', 'Receipt', 'Contra', 'Journal', 'Debit Note', 'Credit Note']),
+  date: z.string().describe('voucher date in YYYY-MM-DD format'),
+  entries: z.array(voucherEntrySchema).optional().describe('fully-resolved ledger lines; MUST balance (sum of dr amounts == sum of cr amounts). Preferred over the deprecated debitLedger/creditLedger/amount form.'),
+  debitLedger: z.string().optional().describe('DEPRECATED shim — use entries[]. Kept for back-compat: forms a 2-line voucher with creditLedger + amount.'),
+  creditLedger: z.string().optional().describe('DEPRECATED shim — use entries[].'),
+  amount: z.number().optional().describe('DEPRECATED shim — use entries[]. Amount for the debit/credit shim.'),
+  narration: z.string().optional(),
+  voucherNumber: z.string().optional().describe('optional; blank for auto-numbering'),
+  reference: z.string().optional(),
+  partyLedger: z.string().optional().describe('party ledger for GST/invoice vouchers (PARTYLEDGERNAME)'),
+  inventory: z.array(inventoryLineSchema).optional(),
+  gst: gstBlockSchema.optional()
+};
+type VoucherArgs = {
+  voucherType: string; date: string;
+  entries?: VoucherEntry[];
+  debitLedger?: string; creditLedger?: string; amount?: number;
+  narration?: string; voucherNumber?: string; reference?: string; partyLedger?: string;
+  inventory?: VoucherInput['inventory']; gst?: VoucherInput['gst'];
+};
+
+// Normalizes a voucher's ledger lines: prefer entries[]; else fold the deprecated
+// debitLedger/creditLedger/amount shim into a 2-line balanced entry set. Returns a typed error
+// string when neither form is usable. Pure — no I/O.
+export function normalizeVoucherEntries(args: VoucherArgs): { entries: VoucherEntry[] } | { error: string } {
+  if (args.entries && args.entries.length > 0) return { entries: args.entries };
+  if (args.debitLedger && args.creditLedger && typeof args.amount === 'number') {
+    return { entries: [
+      { ledger: args.debitLedger, drCr: 'dr', amount: args.amount },
+      { ledger: args.creditLedger, drCr: 'cr', amount: args.amount },
+    ] };
+  }
+  return { error: 'Provide entries[] (preferred) or the debitLedger + creditLedger + amount shim.' };
+}
+
+type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean; structuredContent?: any };
+
+// Assembles + posts a single voucher, applying the deterministic host invariants (#94/#95). Shared by
+// create-voucher, create-vouchers (#97), and the dryRun path (#96). With opts.dryRun it echoes the
+// exact posting (voucher + rendered XML) and does NOT call Tally. #95 extends the invariant set
+// (date-in-period, master-existence, idempotency) via optional opts.
+export type VoucherExecOpts = {
+  dryRun?: boolean;
+  // Active company's open period for the OUT_OF_PERIOD check (fetched by the handler via get-period).
+  period?: { fyFrom: string | null; fyTo: string | null; booksFrom?: string | null } | null;
+  // Exact known master names for the MASTER_NOT_FOUND check. Empty/omitted → skip (don't block on an
+  // unavailable list). Fetched by the handler via list-master.
+  knownLedgers?: string[];
+  knownStockItems?: string[];
+  // Idempotency: replay the stored result for a repeated key instead of re-posting (#95/#97).
+  idempotency?: { store: IdempotencyStore; now: string };
+  // The EXACT loaded company name to stamp the import with (resolved by the handler). When provided,
+  // executeVoucher skips its own reconciliation. When resolution failed, companyError holds why.
+  exactCompany?: string;
+  companyError?: string;
+};
+
+export async function executeVoucher(
+  args: VoucherArgs & { targetCompany?: string; idempotencyKey?: string },
+  opts: VoucherExecOpts = {}
+): Promise<ToolResult> {
+  // Idempotent replay: a repeated key returns the prior result, posts nothing.
+  if (args.idempotencyKey && opts.idempotency) {
+    const prior = opts.idempotency.store.get(args.idempotencyKey);
+    if (prior) {
+      return { content: [{ type: 'text', text: JSON.stringify({ idempotentReplay: true, result: prior.result }) }] };
+    }
+  }
+  const norm = normalizeVoucherEntries(args);
+  if ('error' in norm) return errorResult('PRECONDITION_FAILED', { message: norm.error, retryable: false });
+  const entries = norm.entries;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(args.date)) {
+    return errorResult('PRECONDITION_FAILED', { message: 'Date must be in YYYY-MM-DD format.', retryable: false });
+  }
+  if (entries.some(e => !(e.amount > 0))) {
+    return errorResult('PRECONDITION_FAILED', { message: 'Every entry amount must be greater than 0.', retryable: false });
+  }
+  // (a) balance invariant (#94 H-8): total debits must equal total credits.
+  const bal = voucherBalance(entries);
+  if (!bal.balanced) {
+    return errorResult('UNBALANCED', { message: `Voucher does not balance: debits ${bal.debit} != credits ${bal.credit}.` });
+  }
+  // Stamp the import with the EXACT loaded company name (not a registry alias/displayName) and fail
+  // closed if it isn't loaded — otherwise Tally accepts the voucher and writes into the void. The
+  // reconciliation happens at the handler boundary (buildVoucherExecOpts / the batch handler) and is
+  // passed in via opts.exactCompany / opts.companyError; a direct caller without it uses the raw name.
+  if (opts.companyError) {
+    return errorResult('COMPANY_NOT_FOUND', { message: opts.companyError, retryable: false });
+  }
+  const company: string | undefined = opts.exactCompany ?? args.targetCompany ?? activeCompany ?? undefined;
+  const voucher: VoucherInput = {
+    voucherType: args.voucherType, date: args.date, entries,
+    narration: args.narration, voucherNumber: args.voucherNumber, reference: args.reference,
+    partyLedger: args.partyLedger, inventory: args.inventory, gst: args.gst,
+  };
+  // (b) date within the open period (#95 H-9 → OUT_OF_PERIOD).
+  if (opts.period && !isDateInOpenPeriod(args.date, opts.period)) {
+    const lo = opts.period.booksFrom || opts.period.fyFrom;
+    return errorResult('OUT_OF_PERIOD', { message: `Voucher date ${args.date} is outside the open period (${lo}..${opts.period.fyTo}).` });
+  }
+  // (c) referenced masters exist (#95 H-9 → MASTER_NOT_FOUND). Exact-name only; skipped when the
+  // known list is unavailable so a fetch failure never blocks a legitimate write.
+  if (opts.knownLedgers?.length) {
+    const missing = findMissingMasters(referencedLedgers(voucher), opts.knownLedgers);
+    if (missing.length) return errorResult('MASTER_NOT_FOUND', { message: `Unknown ledger(s): ${missing.join(', ')}.` });
+  }
+  if (opts.knownStockItems?.length && voucher.inventory?.length) {
+    const missing = findMissingMasters(voucher.inventory.map(i => i.stockItem), opts.knownStockItems);
+    if (missing.length) return errorResult('MASTER_NOT_FOUND', { message: `Unknown stock item(s): ${missing.join(', ')}.` });
+  }
+  const xml = buildVoucherXml(voucher, company);
+  if (opts.dryRun) {
+    // Echo exactly what would be posted; mutate nothing (#96 H-10).
+    return { content: [{ type: 'text', text: JSON.stringify({ dryRun: true, wouldPost: true, balance: bal, voucher, xml }, null, 2) }] };
+  }
+  const resp = await pushXml(xml);
+  if (!resp.success) {
+    // Re-map Tally's duplicate-voucher signal to the typed DUPLICATE code (#95/#99).
+    if (/duplicat/i.test(resp.error || '')) return errorResult('DUPLICATE', { message: resp.error });
+    return errorResult('UNKNOWN', { message: resp.error || 'Failed to create voucher.' });
+  }
+  const result = { success: true, created: resp.created, lastVchId: resp.lastVchId };
+  // (d) record the idempotency key so a replay short-circuits (#95/#97).
+  if (args.idempotencyKey && opts.idempotency) {
+    try { opts.idempotency.store.put(args.idempotencyKey, result, opts.idempotency.now); } catch {}
+  }
+  return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+}
+
+// File-backed idempotency store singleton (lives in TALLY_DATA_PATH when set, else next to dist/).
+let _idempotencyStore: IdempotencyStore | null = null;
+function getIdempotencyStore(): IdempotencyStore {
+  if (!_idempotencyStore) {
+    const dir = process.env.TALLY_DATA_PATH || path.join(import.meta.dirname, '..');
+    _idempotencyStore = makeIdempotencyStore(path.join(dir, '.tally-mcp-idempotency.json'));
+  }
+  return _idempotencyStore;
+}
+
+// Fetches exact master names for the MASTER_NOT_FOUND check. Tolerant: any failure → [] (skip).
+async function fetchMasterNames(collection: string, company?: string): Promise<string[]> {
+  try {
+    const p = new Map<string, any>([['collection', collection]]);
+    if (company) p.set('targetCompany', company);
+    const resp = await pull('list-master', p);
+    if (resp.error || !Array.isArray(resp.data)) return [];
+    return resp.data.map((r: any) => String(r?.name ?? '')).filter((s: string) => s.length > 0);
+  } catch { return []; }
+}
+
+// Fetches the active/target company's open period for the OUT_OF_PERIOD check. Tolerant: null on error.
+async function fetchPeriodForWrite(company?: string): Promise<{ fyFrom: string | null; fyTo: string | null; booksFrom: string | null } | null> {
+  try {
+    const p = await fetchCompanyPeriod(company ?? activeCompany ?? null);
+    return { fyFrom: p.fyFrom, fyTo: p.fyTo, booksFrom: p.booksFrom };
+  } catch { return null; }
+}
+
+// Assembles the deterministic write-invariant context (#95 H-9) for a voucher write: open period +
+// known ledger names (+ stock item names only when inventory is present). All fetches are tolerant.
+async function buildVoucherExecOpts(args: { targetCompany?: string; inventory?: unknown[]; idempotencyKey?: string }): Promise<VoucherExecOpts> {
+  // Resolve the EXACT loaded company FIRST so the invariant fetches (period, masters) run against the
+  // same company the import will be stamped with — and so a not-loaded target fails closed.
+  const target = await resolveExactLoadedCompany(args.targetCompany || activeCompany || null);
+  if (!target.ok) {
+    return { companyError: target.message, idempotency: { store: getIdempotencyStore(), now: new Date().toISOString() } };
+  }
+  const company = target.name;
+  const [period, knownLedgers, knownStockItems] = await Promise.all([
+    fetchPeriodForWrite(company),
+    fetchMasterNames('ledger', company),
+    (args.inventory && (args.inventory as unknown[]).length) ? fetchMasterNames('stockitem', company) : Promise.resolve<string[]>([]),
+  ]);
+  return { exactCompany: company, period, knownLedgers, knownStockItems, idempotency: { store: getIdempotencyStore(), now: new Date().toISOString() } };
+}
+
+// Echoes the exact posting a write WOULD make, without calling Tally (#96 H-10). Used by
+// create-ledger / create-stock-item / create-gst-voucher after their invariants pass.
+function dryRunEcho(template: string, inputParams: Map<string, any>, extra?: object): ToolResult {
+  return { content: [{ type: 'text', text: JSON.stringify({ dryRun: true, wouldPost: true, template, posting: Object.fromEntries(inputParams), ...(extra || {}) }, null, 2) }] };
+}
+
+// ── batch voucher execution (#97 H-11) ─────────────────────────────────────
+type BatchRow = { index: number; status: 'success' | 'error'; code?: string; message?: string; retryable?: boolean; created?: number; lastVchId?: number };
+
+// Flattens a single executeVoucher result into a per-row batch entry.
+function rowResult(index: number, r: ToolResult): BatchRow {
+  if (r.isError) {
+    const e: any = r.structuredContent || {};
+    return { index, status: 'error', code: e.code ?? 'UNKNOWN', message: e.message, retryable: e.retryable };
+  }
+  const body = JSON.parse(r.content[0]!.text) as { created?: number; lastVchId?: number };
+  return { index, status: 'success', created: body.created, lastVchId: body.lastVchId };
+}
+
+export type BatchResult = { atomic: boolean; aborted: boolean; posted: number; results: BatchRow[] };
+
+// Executes a batch of vouchers. atomic=true: validate ALL rows first (via the deterministic dryRun
+// path); if any fails, abort and post NOTHING. Otherwise post each and report per row (best-effort).
+// Reuses the shared per-voucher invariants (executeVoucher). Note: Tally has no cross-voucher
+// rollback, so an atomic batch guarantees "don't start posting unless all rows pass deterministic
+// validation" — a mid-batch WRITE failure (Tally-side) can still leave earlier rows posted; that is
+// surfaced in the per-row results.
+export async function executeVoucherBatch(
+  vouchers: Array<VoucherArgs & { targetCompany?: string }>,
+  opts: { atomic?: boolean } & VoucherExecOpts
+): Promise<BatchResult> {
+  const { atomic, dryRun, ...baseOpts } = opts;
+  if (atomic) {
+    const checks: BatchRow[] = [];
+    for (let i = 0; i < vouchers.length; i++) {
+      checks.push(rowResult(i, await executeVoucher(vouchers[i]!, { ...baseOpts, dryRun: true })));
+    }
+    if (checks.some(c => c.status === 'error')) {
+      return { atomic: true, aborted: true, posted: 0, results: checks };
+    }
+    if (dryRun) return { atomic: true, aborted: false, posted: 0, results: checks };
+    const results: BatchRow[] = [];
+    for (let i = 0; i < vouchers.length; i++) {
+      results.push(rowResult(i, await executeVoucher(vouchers[i]!, baseOpts)));
+    }
+    return { atomic: true, aborted: false, posted: results.filter(r => r.status === 'success').length, results };
+  }
+  const results: BatchRow[] = [];
+  for (let i = 0; i < vouchers.length; i++) {
+    results.push(rowResult(i, await executeVoucher(vouchers[i]!, { ...baseOpts, dryRun })));
+  }
+  return { atomic: false, aborted: false, posted: results.filter(r => r.status === 'success').length, results };
 }
 
 export async function registerMcpServer(): Promise<McpServer> {
@@ -693,6 +1522,8 @@ export async function registerMcpServer(): Promise<McpServer> {
     name: 'Tally Prime MCP Server',
     title: 'Tally Prime',
     version: '1.0.0'
+  }, {
+    instructions: TALLY_MCP_INSTRUCTIONS
   });
 
   mcpServer.registerTool(
@@ -714,16 +1545,17 @@ export async function registerMcpServer(): Promise<McpServer> {
       const sqlError = validateSQL(args.sql);
       if (sqlError) {
         auditLog('query-database', args, 'denied');
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `SQL rejected: ${sqlError}` }]
-        };
+        return errorResult('PRECONDITION_FAILED', { message: `SQL rejected: ${sqlError}`, retryable: false });
       }
       try {
         const resp = await executeSQL(args.sql);
+        // resp is header-line + one line per row (header-only on empty). count = data rows so a
+        // zero-row query is distinguishable from a failure (#92).
+        const trimmed = resp.replace(/\n+$/, '');
+        const count = trimmed.includes('\n') ? trimmed.split('\n').length - 1 : 0;
         auditLog('query-database', args, 'success', Date.now() - start);
         return {
-          content: [{ type: 'text', text: resp }]
+          content: [{ type: 'text', text: JSON.stringify({ count, rows: resp }) }]
         };
       } catch (err) {
         auditLog('query-database', args, 'error', Date.now() - start);
@@ -749,37 +1581,17 @@ export async function registerMcpServer(): Promise<McpServer> {
         const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
         if (!tallyDataPath) {
           auditLog('list-companies', args, 'error', Date.now() - start);
-          return {
-            isError: true,
-            content: [{ type: 'text', text: 'TALLY_DATA_PATH environment variable is not configured. Set it to the Tally Prime data directory (e.g. C:\\Users\\Public\\TallyPrimeEditLog\\data).' }]
-          };
+          return errorResult('PRECONDITION_FAILED', { message: 'TALLY_DATA_PATH environment variable is not configured.', remedy: 'Set it to the Tally Prime data directory (e.g. C:\\Users\\Public\\TallyPrimeEditLog\\data).', retryable: false });
         }
         if (!fs.existsSync(tallyDataPath)) {
           auditLog('list-companies', args, 'error', Date.now() - start);
-          return {
-            isError: true,
-            content: [{ type: 'text', text: `Data directory not found: ${tallyDataPath}` }]
-          };
+          return errorResult('PRECONDITION_FAILED', { message: `Data directory not found: ${tallyDataPath}`, retryable: false });
         }
-        const entries = fs.readdirSync(tallyDataPath, { withFileTypes: true });
-        const folders = entries
-          .filter(e => e.isDirectory() && /^\d+$/.test(e.name))
-          .map(e => {
-            const folderPath = path.join(tallyDataPath, e.name);
-            let companyName = '';
-            try {
-              // Try to read company name from Company.900 file
-              const companyFile = path.join(folderPath, 'Company.900');
-              if (fs.existsSync(companyFile)) {
-                const buf = fs.readFileSync(companyFile);
-                // Extract readable ASCII/Unicode text for the company name
-                const text = buf.toString('utf16le').replace(/[^\x20-\x7E\u0900-\u097F]/g, ' ').trim();
-                const match = text.match(/[A-Za-z\u0900-\u097F][\w\s\u0900-\u097F.&(),-]{2,}/);
-                if (match) companyName = match[0].trim();
-              }
-            } catch {}
-            return { folder: e.name, name: companyName, path: folderPath };
-          });
+        // Delegate to scanCompanyFolders so names are recovered the same robust way
+        // as list-available-companies (BFS finds nested Edit Log Company.1800 too),
+        // instead of the old flat-only Company.900 read that left names blank.
+        const folders = scanCompanyFolders(tallyDataPath)
+          .map(f => ({ folder: f.folder, name: f.name, path: path.join(tallyDataPath, f.folder) }));
         if (folders.length === 0) {
           auditLog('list-companies', args, 'success', Date.now() - start);
           return { content: [{ type: 'text', text: 'No company folders found in the data directory.' }] };
@@ -811,14 +1623,33 @@ export async function registerMcpServer(): Promise<McpServer> {
     async (args) => {
       const start = Date.now();
       try {
-        const tallyDataPath = args.dataPath || process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const defaultRoot = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        // Confine caller-supplied dataPath/configPath to an allowlist so a
+        // prompt-injected caller can't scan arbitrary directories or JSON-parse an
+        // arbitrary file. Default allowed root is the configured Tally data path;
+        // operators who need to scan a backup drive add roots via
+        // TALLY_ALLOWED_DATA_ROOTS (comma/semicolon-separated).
+        const allowedRoots = [
+          defaultRoot,
+          ...(process.env.TALLY_ALLOWED_DATA_ROOTS || '').split(/[;,]/).map(s => s.trim()).filter(Boolean)
+        ];
+        const tallyDataPath = args.dataPath || defaultRoot;
+        if (args.dataPath && !isPathWithinRoots(tallyDataPath, allowedRoots).ok) {
+          auditLog('list-available-companies', args, 'denied', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `dataPath "${tallyDataPath}" is outside the allowed Tally data root(s).`, remedy: 'Set TALLY_ALLOWED_DATA_ROOTS to permit additional locations.', retryable: false });
+        }
         if (!fs.existsSync(tallyDataPath)) {
           auditLog('list-available-companies', args, 'error', Date.now() - start);
-          return { isError: true, content: [{ type: 'text', text: `Data directory not found: ${tallyDataPath}` }] };
+          return errorResult('PRECONDITION_FAILED', { message: `Data directory not found: ${tallyDataPath}`, retryable: false });
         }
         const configPath = args.configPath
           || process.env.TALLY_COMPANIES_CONFIG
           || path.join(tallyDataPath, '.tally-mcp-companies.json');
+        // Confine an explicit configPath the same way (default/env-derived paths are trusted).
+        if (args.configPath && !isPathWithinRoots(configPath, allowedRoots).ok) {
+          auditLog('list-available-companies', args, 'denied', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `configPath "${configPath}" is outside the allowed Tally data root(s).`, remedy: 'Set TALLY_ALLOWED_DATA_ROOTS to permit additional locations.', retryable: false });
+        }
         const companies = scanAvailableCompanies(tallyDataPath, configPath);
 
         if (companies.length === 0) {
@@ -835,10 +1666,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         return { content: [{ type: 'text', text: JSON.stringify(summary, null, 2) }] };
       } catch (err) {
         auditLog('list-available-companies', args, 'error', Date.now() - start);
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `list-available-companies failed: ${err}` }]
-        };
+        return errorResult('UNKNOWN', { message: 'list-available-companies failed.', logs: String(err) });
       }
     }
   );
@@ -847,10 +1675,10 @@ export async function registerMcpServer(): Promise<McpServer> {
     'open-company',
     {
       title: 'Open Company',
-      description: `loads a company into Tally Prime and sets it as the active company for all subsequent queries. Tries strategies in order: (1) SVCURRENTCOMPANY probe — verifies company is directly accessible (works in Tally server/multi-company mode), (2) open company list check — detects if company is already loaded in Tally UI, (3) GUI automation agent that controls Tally UI via Alt+F3 → Select Company → type name → Enter (requires tally-gui-agent-v2.ps1 to be running in the interactive desktop session). Once open-company succeeds, all other tools automatically target this company unless targetCompany is specified explicitly. Use list-companies first to find available company names.`,
+      description: `Verifies a company is active, or GUI-loads it, and sets it as the active company for subsequent queries. Tries strategies in order: (1) SVCURRENTCOMPANY probe — verifies the company is directly accessible (works in Tally server/multi-company mode; does NOT load), (2) loaded-list check — detects if the company is already loaded in the Tally UI (does NOT load), (3) GUI automation agent that controls the Tally UI via Alt+F3 → Select Company → type name → Enter (requires tally-gui-agent-v2.ps1 running in the interactive desktop session; this is the only strategy that actually loads). For a cold load prefer load-company / load-company-by-alias — open-company's non-gui strategies only verify. Once it succeeds, all other tools automatically target this company unless targetCompany is specified explicitly. Use list-companies first to find available company names.`,
       inputSchema: {
         companyName: z.string().describe('exact company name as shown in Tally (e.g. "My Company Pvt Ltd"). Use list-companies or list-master with collection=company to find names.'),
-        strategy: z.enum(['auto', 'tdl-load', 'tdl-connect', 'gui-agent']).optional().describe('which strategy to use. "auto" tries all in order (default). "tdl-load" uses $$CmpLoadCompany. "tdl-connect" uses $$CmpConnect. "gui-agent" uses GUI automation via companion agent running in the interactive desktop session.')
+        strategy: z.enum(['auto', 'verify-svcurrentcompany', 'verify-in-loaded-list', 'gui-agent', 'tdl-load', 'tdl-connect']).optional().describe('which strategy to use. "auto" tries all in order (default). "verify-svcurrentcompany" reads SVCURRENTCOMPANY — succeeds only if the company is already resident (does NOT load). "verify-in-loaded-list" checks the loaded-company list (does NOT load). "gui-agent" performs the actual load via GUI automation (companion agent must be running). Deprecated aliases (still accepted this release): "tdl-load"→verify-svcurrentcompany, "tdl-connect"→verify-in-loaded-list.')
       },
       annotations: {
         readOnlyHint: false,
@@ -859,9 +1687,12 @@ export async function registerMcpServer(): Promise<McpServer> {
     },
     async (args) => {
       const start = Date.now();
-      const strategy = args.strategy || 'auto';
+      const { strategy, deprecatedAlias } = normalizeOpenCompanyStrategy(args.strategy || 'auto');
       let companyName = args.companyName;
       const logs: string[] = [];
+      if (deprecatedAlias) {
+        logs.push(`[deprecation] strategy "${deprecatedAlias}" was renamed to "${strategy}"; the old name still works this release but will be removed. See issue #24.`);
+      }
 
       // --- Resolve folder number to company name if needed ---
       // If input looks like a folder number, try to get the real company name from Tally's own company list
@@ -1000,7 +1831,7 @@ export async function registerMcpServer(): Promise<McpServer> {
           // --- First, ping the agent to check if it's alive ---
           const pingCommandId = createGuiAgentCommandId('ping');
           try { fs.unlinkSync(resultFile); } catch {}
-          fs.writeFileSync(commandFile, JSON.stringify({ action: 'ping', commandId: pingCommandId, timestamp: new Date().toISOString() }), 'utf-8');
+          atomicWriteFile(commandFile, JSON.stringify({ action: 'ping', commandId: pingCommandId, timestamp: new Date().toISOString() }));
           let agentAlive = false;
           for (let i = 0; i < 5; i++) {
             await new Promise(resolve => setTimeout(resolve, 1000));
@@ -1036,7 +1867,7 @@ export async function registerMcpServer(): Promise<McpServer> {
             maxSteps: guiMaxSteps,
             timestamp: new Date().toISOString()
           });
-          fs.writeFileSync(commandFile, command, 'utf-8');
+          atomicWriteFile(commandFile, command);
           logs.push(`  Command sent (commandId=${commandId}, maxSteps=${guiMaxSteps}), waiting for GUI agent (up to ${guiTimeoutSeconds} seconds for LLM-guided actions)...`);
 
           // Poll for result — timeout is configurable because LLM-guided actions can take longer.
@@ -1082,9 +1913,9 @@ export async function registerMcpServer(): Promise<McpServer> {
       try {
         let success = false;
 
-        if (strategy === 'auto' || strategy === 'tdl-load') {
+        if (strategy === 'auto' || strategy === 'verify-svcurrentcompany') {
           success = await tryTdlLoad();
-          if (success || strategy === 'tdl-load') {
+          if (success || strategy === 'verify-svcurrentcompany') {
             if (success) activeCompany = companyName;
             auditLog('open-company', args, success ? 'success' : 'error', Date.now() - start);
             return {
@@ -1094,9 +1925,9 @@ export async function registerMcpServer(): Promise<McpServer> {
           }
         }
 
-        if (strategy === 'auto' || strategy === 'tdl-connect') {
+        if (strategy === 'auto' || strategy === 'verify-in-loaded-list') {
           success = await tryTdlConnect();
-          if (success || strategy === 'tdl-connect') {
+          if (success || strategy === 'verify-in-loaded-list') {
             if (success) activeCompany = companyName;
             auditLog('open-company', args, success ? 'success' : 'error', Date.now() - start);
             return {
@@ -1108,19 +1939,22 @@ export async function registerMcpServer(): Promise<McpServer> {
 
         if (strategy === 'auto' || strategy === 'gui-agent') {
           success = await tryGuiAgent();
-          if (success) activeCompany = companyName;
-          auditLog('open-company', args, success ? 'success' : 'error', Date.now() - start);
-          return {
-            isError: !success,
-            content: [{ type: 'text', text: logs.join('\n') + (success ? `\n\nCompany "${companyName}" is now active. Subsequent tools will automatically target this company.` : '\n\nAll strategies failed. Ensure tally-gui-agent-v2.ps1 is running in the interactive desktop session, then retry.') }]
-          };
+          if (success) {
+            activeCompany = companyName;
+            auditLog('open-company', args, 'success', Date.now() - start);
+            return {
+              content: [{ type: 'text', text: logs.join('\n') + `\n\nCompany "${companyName}" is now active. Subsequent tools will automatically target this company.` }]
+            };
+          }
+          auditLog('open-company', args, 'error', Date.now() - start);
+          return errorResult('AGENT_UNREACHABLE', { message: 'All strategies failed to open the company.', logs: logs.join('\n') });
         }
 
         auditLog('open-company', args, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: logs.join('\n') + '\n\nAll strategies exhausted.' }] };
+        return errorResult('UNKNOWN', { message: 'All open-company strategies exhausted.', logs: logs.join('\n') });
       } catch (err) {
         auditLog('open-company', args, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: `Failed to open company: ${err}\n\n${logs.join('\n')}` }] };
+        return errorResult('UNKNOWN', { message: `Failed to open company: ${err}`, logs: logs.join('\n') });
       }
     }
   );
@@ -1214,10 +2048,110 @@ export async function registerMcpServer(): Promise<McpServer> {
         };
       } catch (err) {
         auditLog('open-company-debug', args, 'error', Date.now() - start);
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `open-company-debug failed: ${err}` }]
+        return errorResult('UNKNOWN', { message: 'open-company-debug failed.', logs: String(err) });
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'status',
+    {
+      title: 'Status',
+      description: `Authoritative one-shot health/usability check for this Tally MCP server. Returns a stable five-field contract: { tallyReachable, agentAlive, activeCompany, edition, readonly }. Both liveness probes are retried briefly so a single transient blip doesn't flip the reported state. Call this to answer "is this usable right now, and in what mode?" instead of stitching list-loaded-companies + open-company-debug. Use open-company-debug for the verbose troubleshooting dump (paths, files, agent version, XML sample).`,
+      inputSchema: {},
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      try {
+        const { tallyReachable, agentAlive } = await probeLiveness();
+        const status = {
+          tallyReachable,
+          agentAlive,
+          activeCompany: activeCompany || null,
+          edition: getTallyEdition(),
+          readonly: process.env.READONLY_MODE === 'true'
         };
+        auditLog('status', args, 'success', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] };
+      } catch (err) {
+        auditLog('status', args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: 'status failed.', logs: String(err) });
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'get-context',
+    {
+      title: 'Get Context',
+      description: `One-shot environment + requirements snapshot: { edition, readonly, activeCompany, agentAlive, tallyReachable, requirements }. Wraps status (live liveness, retried) and adds the static list of external requirements so a fresh agent can learn what must be running before it can load a company — without triggering a failure first.`,
+      inputSchema: {},
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      try {
+        const { tallyReachable, agentAlive } = await probeLiveness();
+        const context = {
+          edition: getTallyEdition(),
+          readonly: process.env.READONLY_MODE === 'true',
+          activeCompany: activeCompany || null,
+          agentAlive,
+          tallyReachable,
+          requirements: getTallyRequirements()
+        };
+        auditLog('get-context', args, 'success', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify(context, null, 2) }] };
+      } catch (err) {
+        auditLog('get-context', args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: 'get-context failed.', logs: String(err) });
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'get-period',
+    {
+      title: 'Get Period',
+      description: `Returns the active company's period so you never have to infer valid dates: { company, fyFrom, fyTo, booksFrom, currentDate, lastEntryDate, fyToInferred }. fyFrom/fyTo are the financial year (ISO YYYY-MM-DD); booksFrom is the books-beginning date (the earliest valid voucher date — may be later than fyFrom if the company started mid-year); currentDate is Tally's working date; lastEntryDate is the most recent voucher's date. fyToInferred=true means Tally left the FY-end blank (ongoing year) and it was computed as fyFrom + 1 year − 1 day. Call this before posting a voucher (date it inside booksFrom..fyTo) or running a report, instead of guessing dates or reading them off a screenshot. Pass targetCompany to query a specific loaded company; defaults to the active company.`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('Exact loaded-company name to query. Defaults to the active company.')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      try {
+        if (!(await pingTally(4000))) {
+          auditLog('get-period', args, 'error', Date.now() - start);
+          return errorResult('TALLY_DOWN', { logs: 'pingTally failed before get-period.' });
+        }
+        const company = (args.targetCompany && args.targetCompany.trim()) || activeCompany || null;
+        const period = await fetchCompanyPeriod(company);
+        if (!period.company && !period.fyFrom) {
+          auditLog('get-period', args, 'error', Date.now() - start);
+          return errorResult('COMPANY_NOT_FOUND', {
+            message: company
+              ? `No period returned for company "${company}" — is it loaded?`
+              : 'No active company, and no targetCompany was given.',
+            remedy: 'Load a company (load-company / load-company-by-alias) or pass targetCompany, then retry.'
+          });
+        }
+        auditLog('get-period', args, 'success', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify(period, null, 2) }], structuredContent: period };
+      } catch (err) {
+        auditLog('get-period', args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: 'get-period failed.', logs: String(err) });
       }
     }
   );
@@ -1226,10 +2160,11 @@ export async function registerMcpServer(): Promise<McpServer> {
     'tally-raw-xml-probe',
     {
       title: 'Tally Raw XML Probe (debug only)',
-      description: `Posts a raw XML envelope to the Tally XML server and returns the raw response — bypasses all wrapper logic. Used for protocol reverse-engineering and undocumented verb discovery. NOT for normal use; the wrapped tools (list-master, trial-balance, etc.) construct XML safely. Disabled unless TALLY_DEBUG_XML=1 is set in the server env.`,
+      description: `Posts a raw XML envelope to the Tally XML server and returns the raw response — bypasses all wrapper logic. Used for protocol reverse-engineering and undocumented verb discovery. NOT for normal use; the wrapped tools (list-master, trial-balance, etc.) construct XML safely. Disabled unless TALLY_DEBUG_XML=1 is set in the server env. Read-only by default: any non-Export TALLYREQUEST verb (Import/Alter/Delete) is refused unless allowWrite=true is passed explicitly.`,
       inputSchema: {
         xml: z.string().describe('raw XML envelope to POST to the Tally XML server. Standard structure: <ENVELOPE><HEADER>...</HEADER><BODY>...</BODY></ENVELOPE>.'),
-        label: z.string().optional().describe('optional label included in the audit log so probes can be correlated to experiment notes (e.g. "H1-import-variant").')
+        label: z.string().optional().describe('optional label included in the audit log so probes can be correlated to experiment notes (e.g. "H1-import-variant").'),
+        allowWrite: z.boolean().optional().describe('explicit opt-in required to POST a mutating envelope (TALLYREQUEST other than Export, i.e. Import/Alter/Delete). Defaults to false — without it, non-Export verbs are refused so a prompt-injected caller cannot silently mutate Tally data.')
       },
       annotations: {
         readOnlyHint: false,
@@ -1238,13 +2173,18 @@ export async function registerMcpServer(): Promise<McpServer> {
     },
     async (args) => {
       const start = Date.now();
-      const auditArgs = { xmlLength: args.xml.length, label: args.label };
+      const verb = parseTallyRequestVerb(args.xml);
+      // Log the full XML for this debug/write primitive so any mutation is auditable.
+      const auditArgs = { xmlLength: args.xml.length, label: args.label, verb, xml: args.xml };
       if (process.env.TALLY_DEBUG_XML !== '1') {
         auditLog('tally-raw-xml-probe', auditArgs, 'denied', Date.now() - start);
-        return {
-          isError: true,
-          content: [{ type: 'text', text: 'Disabled. Set TALLY_DEBUG_XML=1 in the server env to enable raw XML probes.' }]
-        };
+        return errorResult('PRECONDITION_FAILED', { message: 'Raw XML probe is disabled.', remedy: 'Set TALLY_DEBUG_XML=1 in the server env to enable raw XML probes.', retryable: false });
+      }
+      // Read-only by default. Export is the only read verb; Import/Alter/Delete mutate
+      // Tally data, so refuse them unless the caller explicitly opts in via allowWrite.
+      if (verb && verb !== 'export' && args.allowWrite !== true) {
+        auditLog('tally-raw-xml-probe', auditArgs, 'denied', Date.now() - start);
+        return errorResult('PRECONDITION_FAILED', { message: `Refusing TALLYREQUEST verb "${verb}" — this probe is read-only by default and only "Export" is allowed.`, remedy: 'If you genuinely intend a write (Import/Alter/Delete), re-call with allowWrite: true.', retryable: false });
       }
       try {
         const resp = await postTallyXML(args.xml);
@@ -1256,10 +2196,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         };
       } catch (err) {
         auditLog('tally-raw-xml-probe', auditArgs, 'error', Date.now() - start);
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `tally-raw-xml-probe failed: ${err}` }]
-        };
+        return errorResult('UNKNOWN', { message: 'tally-raw-xml-probe failed.', logs: String(err) });
       }
     }
   );
@@ -1288,10 +2225,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         return { content: [{ type: 'text', text: tsv }] };
       } catch (err) {
         auditLog('list-loaded-companies', args, 'error', Date.now() - start);
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `list-loaded-companies failed: ${err}` }]
-        };
+        return errorResult('UNKNOWN', { message: 'list-loaded-companies failed.', logs: String(err) });
       }
     }
   );
@@ -1302,7 +2236,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       title: 'Set Active Company',
       description: `sets the active company for subsequent tool calls without invoking the Tally UI. Cheap pointer flip — use this to switch between companies that are already loaded in Tally (e.g. for cross-referencing subsidiaries). Verifies the company is actually loaded via SVCURRENTCOMPANY probe; returns an error suggesting open-company if not. After this succeeds, every subsequent tool call automatically targets this company unless targetCompany is specified explicitly.`,
       inputSchema: {
-        companyName: z.string().describe('exact company name as shown in Tally. Use list-loaded-companies to see what is currently loaded.')
+        companyName: z.string().max(256).describe('exact company name as shown in Tally. Use list-loaded-companies to see what is currently loaded.')
       },
       annotations: {
         readOnlyHint: false,
@@ -1350,55 +2284,27 @@ export async function registerMcpServer(): Promise<McpServer> {
         auditLog('set-active-company', args, 'denied', Date.now() - start);
 
         if (closest) {
-          // Fuzzy match found — show user/LLM what they searched, what we
-          // found, and ask them to confirm by re-calling with the exact name.
-          return {
-            isError: true,
-            content: [{
-              type: 'text',
-              text:
-`Company "${args.companyName}" was not found as an exact match.
-
-Did you mean "${closest}"?
-  - Searched: "${args.companyName}"
-  - Closest match in Tally: "${closest}"
-
-To confirm and use this company, call set-active-company again with the EXACT name:
-  set-active-company(companyName: "${closest}")
-
-Other companies currently loaded in Tally:
-${loaded.map(n => `  - "${n}"`).join('\n')}`
-            }]
-          };
+          // Fuzzy match found — surface the closest name as a suggested remedy.
+          return errorResult('COMPANY_NOT_FOUND', {
+            message: `Company "${args.companyName}" was not found as an exact match. Did you mean "${closest}"?`,
+            remedy: `Re-call set-active-company with the EXACT name: set-active-company(companyName: "${closest}").`,
+            logs: `Other companies currently loaded:\n${loaded.map(n => `  - "${n}"`).join('\n')}`,
+          });
         }
 
         if (loaded.length === 0) {
-          return {
-            isError: true,
-            content: [{ type: 'text', text: `Company "${args.companyName}" not found and no companies are currently loaded in Tally. Use open-company or load-company-by-alias to load one first.` }]
-          };
+          return errorResult('COMPANY_NOT_FOUND', { message: `Company "${args.companyName}" not found and no companies are currently loaded in Tally.`, remedy: 'Use open-company or load-company-by-alias to load one first.' });
         }
 
-        // No fuzzy match either — show what IS loaded.
-        return {
-          isError: true,
-          content: [{
-            type: 'text',
-            text:
-`Company "${args.companyName}" not found in Tally — and no fuzzy match was close enough to suggest.
-
-Companies currently loaded in Tally:
-${loaded.map(n => `  - "${n}"`).join('\n')}
-
-Call set-active-company again with one of these EXACT names, or use open-company to load a different one.`
-          }]
-        };
+        // No fuzzy match either — surface the loaded list as context.
+        return errorResult('COMPANY_NOT_FOUND', {
+          message: `Company "${args.companyName}" not found in Tally — and no fuzzy match was close enough to suggest.`,
+          remedy: 'Re-call set-active-company with one of the loaded names (exact), or use open-company to load a different one.',
+          logs: `Companies currently loaded:\n${loaded.map(n => `  - "${n}"`).join('\n')}`,
+        });
       } catch (err) {
         auditLog('set-active-company', args, 'error', Date.now() - start);
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `set-active-company failed: ${err}` }]
-        };
+        return errorResult('UNKNOWN', { message: 'set-active-company failed.', logs: String(err) });
       }
     }
   );
@@ -1434,11 +2340,11 @@ Call set-active-company again with one of these EXACT names, or use open-company
       try {
         if (!fs.existsSync(tallyIniPath)) {
           auditLog('load-company', args, 'error', Date.now() - start);
-          return { isError: true, content: [{ type: 'text', text: `tally.ini not found at ${tallyIniPath}. Set TALLY_INI_PATH env var if it lives elsewhere.` }] };
+          return errorResult('PRECONDITION_FAILED', { message: `tally.ini not found at ${tallyIniPath}.`, remedy: 'Set the TALLY_INI_PATH env var if it lives elsewhere.', retryable: false });
         }
         if (!fs.existsSync(tallyExePath)) {
           auditLog('load-company', args, 'error', Date.now() - start);
-          return { isError: true, content: [{ type: 'text', text: `tally.exe not found at ${tallyExePath}. Set TALLY_EXE_PATH env var if it lives elsewhere.` }] };
+          return errorResult('PRECONDITION_FAILED', { message: `tally.exe not found at ${tallyExePath}.`, remedy: 'Set the TALLY_EXE_PATH env var if it lives elsewhere.', retryable: false });
         }
 
         // Resolve data path: explicit override > tally.ini Data= > env var > built-in default.
@@ -1462,12 +2368,20 @@ Call set-active-company again with one of these EXACT names, or use open-company
           const list = resolved.available.length === 0
             ? '(no folders found in data path)'
             : resolved.available.map(f => `  ${f.folder}\t${f.name || '(no name)'}`).join('\n');
-          return { isError: true, content: [{ type: 'text', text: `Company "${company}" not found.\nData path: ${tallyDataPath} (from ${dataPathSource})\nAvailable folders:\n${list}\n\nProvide either an exact folder id (digits) or a name that matches Company.900 exactly. If the data lives elsewhere, pass dataPath="<absolute path>".` }] };
+          return errorResult('COMPANY_NOT_FOUND', {
+            message: `Company "${company}" not found. Data path: ${tallyDataPath} (from ${dataPathSource}).`,
+            remedy: 'Provide an exact folder id (digits) or a name matching Company.900 exactly; pass dataPath="<absolute path>" if the data lives elsewhere.',
+            logs: `Available folders:\n${list}`,
+          });
         }
         if (resolved.kind === 'ambiguous') {
           auditLog('load-company', args, 'error', Date.now() - start);
           const list = resolved.matches.map(f => `  ${f.folder}\t${f.name}`).join('\n');
-          return { isError: true, content: [{ type: 'text', text: `Multiple companies match the name "${company}":\n${list}\n\nRe-call load-company with the specific folder id (e.g. company: "${resolved.matches[0].folder}") to disambiguate.` }] };
+          return errorResult('AMBIGUOUS', {
+            message: `Multiple companies match the name "${company}".`,
+            remedy: `Re-call load-company with the specific folder id (e.g. company: "${resolved.matches[0].folder}") to disambiguate.`,
+            logs: list,
+          });
         }
         const companyId = resolved.folderId;
         logs.push(`[load-company] input="${company}" matchedBy=${resolved.matchedBy} folderId=${companyId} companyName="${resolved.companyName}" edition=${edition} replace=${replace}${edition === 'silver' && args.replace === false ? ' (Silver: replace forced true)' : ''}`);
@@ -1481,10 +2395,10 @@ Call set-active-company again with one of these EXACT names, or use open-company
         const agentPing = await pingGuiAgent(agentWatchDir, 4, logs);
         if (!agentPing.alive) {
           auditLog('load-company', args, 'error', Date.now() - start);
-          return {
-            isError: true,
-            content: [{ type: 'text', text: logs.join('\n') + `\n\nGUI agent did not respond at ${agentWatchDir}. Refusing to kill Tally without confirming we can restart it.\n\nTo fix: start tally-gui-agent-v2.ps1 in the user's interactive session (e.g. via Task Scheduler "At logon"). Then retry.` }]
-          };
+          return errorResult('AGENT_UNREACHABLE', {
+            message: `GUI agent did not respond at ${agentWatchDir}. Refusing to kill Tally without confirming we can restart it.`,
+            logs: logs.join('\n'),
+          });
         }
         // Version handshake: refuse to call select-and-unlock-company / start-tally on an agent that
         // predates the IPC fields they rely on. Better to fail fast here than silently mis-key
@@ -1492,10 +2406,10 @@ Call set-active-company again with one of these EXACT names, or use open-company
         if (!agentPing.versionOk) {
           auditLog('load-company', args, 'error', Date.now() - start);
           const reportedVersion = agentPing.agentVersion ?? '(none reported)';
-          return {
-            isError: true,
-            content: [{ type: 'text', text: logs.join('\n') + `\n\nGUI agent is alive but reports version ${reportedVersion}, which is older than the required minimum ${REQUIRED_AGENT_VERSION}. The agent on disk has been updated by a deploy but the running process is stale.\n\nTo fix: stop and restart the agent (Task Scheduler: 'schtasks /End /TN TallyMCPAgent && schtasks /Run /TN TallyMCPAgent'), or just close + relaunch the PowerShell window. The agent self-restarts when its script changes; this only happens if it has been disabled with -NoSelfRestart.` }]
-          };
+          return errorResult('AGENT_TOO_OLD', {
+            message: `GUI agent is alive but reports version ${reportedVersion}, which is older than the required minimum ${REQUIRED_AGENT_VERSION}. The agent on disk has been updated by a deploy but the running process is stale.`,
+            logs: logs.join('\n'),
+          });
         }
         logs.push(`    GUI agent is alive (version ${agentPing.agentVersion ?? '(unknown)'}).`);
 
@@ -1544,10 +2458,10 @@ Call set-active-company again with one of these EXACT names, or use open-company
         const ready = await waitForTallyReady(timeoutMs, logs);
         if (!ready) {
           auditLog('load-company', args, 'error', Date.now() - start);
-          return {
-            isError: true,
-            content: [{ type: 'text', text: logs.join('\n') + '\n\nTally did not become reachable. The MCP service may be in Session 0 (no desktop) — Tally will not show a window in that case. Run the service in the user session, or have a companion process in the user session start tally.exe.' }]
-          };
+          return errorResult('TALLY_DOWN', {
+            message: 'Tally did not become reachable after restart. The MCP service may be in Session 0 (no desktop) — Tally will not show a window in that case. Run the service in the user session, or have a companion process in the user session start tally.exe.',
+            logs: logs.join('\n'),
+          });
         }
 
         // Verify load: Tally silently skips auto-load when data is missing/empty or password-protected,
@@ -1593,10 +2507,10 @@ Call set-active-company again with one of these EXACT names, or use open-company
           const hint = (args.userName || args.password)
             ? 'Even with credentials, the company did not load. Verify the username/password are correct, and that the company is reachable via Alt+F3 → type id → Enter manually.'
             : 'If the company is password-protected, retry with userName and password arguments to use the keystroke fallback.';
-          return {
-            isError: true,
-            content: [{ type: 'text', text: logs.join('\n') + `\n\nTally restarted but the requested company is not in the loaded list. ${hint}` }]
-          };
+          return errorResult('PASSWORD_REQUIRED', {
+            message: `Tally restarted but the requested company is not in the loaded list. ${hint}`,
+            logs: logs.join('\n'),
+          });
         }
 
         // Pick activeCompany: prefer the verified name match; fall back to the only loaded company on Silver/single-load setups.
@@ -1613,10 +2527,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
         };
       } catch (err) {
         auditLog('load-company', args, 'error', Date.now() - start);
-        return {
-          isError: true,
-          content: [{ type: 'text', text: logs.join('\n') + `\n\nload-company failed: ${err}` }]
-        };
+        return errorResult('UNKNOWN', { message: `load-company failed: ${err}`, logs: logs.join('\n') });
       }
     }
   );
@@ -1642,15 +2553,50 @@ Call set-active-company again with one of these EXACT names, or use open-company
       }
       const resp = await pull('list-master', inputParams);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
-          content: [{ type: 'text', text: jsonToTSV(resp.data) }]
+          content: [{ type: 'text', text: JSON.stringify({ count: rowCount(resp.data), rows: jsonToTSV(resp.data) }) }]
         };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'search-master',
+    {
+      title: 'Search Masters',
+      description: `Like list-master but filtered by a plain case-insensitive substring (or prefix) match on the master NAME — a convenience so you don't have to pull the whole collection. This is a DUMB filter: no ranking, no fuzzy scoring, no reordering; matches are returned in Tally's source order. For fuzzy/best-match selection, pull list-master and match session-side. Returns { count, rows } (TSV) — the same row shape as list-master, filtered. Blank query returns everything.`,
+      inputSchema: {
+        collection: z.enum(['group', 'ledger', 'vouchertype', 'unit', 'godown', 'stockgroup', 'stockitem', 'costcategory', 'costcentre', 'attendancetype', 'company', 'currency', 'gstin', 'gstclassification']),
+        query: z.string().describe('case-insensitive substring (or prefix) to match against the master name. Blank returns all rows (same as list-master).'),
+        mode: z.enum(['substring', 'prefix']).optional().describe('match mode; defaults to substring'),
+        targetCompany: z.string().optional().describe('optional company name; defaults to the active company')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      const inputParams = new Map<string, any>([['collection', args.collection]]);
+      if (args.targetCompany) inputParams.set('targetCompany', args.targetCompany);
+      try {
+        const resp = await pull('list-master', inputParams);
+        if (resp.error) {
+          auditLog('search-master', args, 'error', Date.now() - start);
+          return errorResult('UNKNOWN', { message: resp.error });
+        }
+        const filtered = filterMasterRows(Array.isArray(resp.data) ? resp.data : [], args.query, args.mode ?? 'substring');
+        auditLog('search-master', args, 'success', Date.now() - start);
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ count: rowCount(filtered), rows: jsonToTSV(filtered) }) }]
+        };
+      } catch (err) {
+        auditLog('search-master', args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: 'search-master failed.', logs: String(err) });
       }
     }
   );
@@ -1676,14 +2622,11 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('chart-of-accounts', inputParams);
       const tableId = await cacheTable('chart-of-accounts', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
@@ -1712,14 +2655,11 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('trial-balance', inputParams);
       const tableId = await cacheTable('trial-balance', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
@@ -1748,14 +2688,11 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('profit-loss', inputParams);
       const tableId = await cacheTable('profit-loss', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
@@ -1783,14 +2720,11 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('balance-sheet', inputParams);
       const tableId = await cacheTable('balance-sheet', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
@@ -1819,14 +2753,11 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('stock-summary', inputParams);
       const tableId = await cacheTable('stock-summary', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
@@ -1854,14 +2785,11 @@ Call set-active-company again with one of these EXACT names, or use open-company
       }
       const resp = await pull('ledger-balance', inputParams);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify(resp.data) }]
+          content: [{ type: 'text', text: JSON.stringify({ count: rowCount(resp.data), rows: resp.data }) }]
         };
       }
     }
@@ -1889,14 +2817,11 @@ Call set-active-company again with one of these EXACT names, or use open-company
       }
       const resp = await pull('stock-item-balance', inputParams);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify(resp.data) }]
+          content: [{ type: 'text', text: JSON.stringify({ count: rowCount(resp.data), rows: resp.data }) }]
         };
       }
     }
@@ -1925,14 +2850,11 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('bills-outstanding', inputParams);
       const tableId = await cacheTable('bills-outstanding', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
@@ -1963,10 +2885,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('ledger-account', inputParams);
       const tableId = await cacheTable('ledger-account', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
 
@@ -1976,7 +2895,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
           resp.data.unshift(lastItem);
         }
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
 
@@ -2008,10 +2927,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('stock-item-account', inputParams);
       const tableId = await cacheTable('stock-item-account', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
 
@@ -2021,7 +2937,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
           resp.data.unshift(lastItem);
         }
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
 
@@ -2051,14 +2967,11 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('gst-voucher-details', inputParams);
       const tableId = await cacheTable('gst-voucher-details', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
@@ -2085,14 +2998,11 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('stock-item-gst', inputParams);
       const tableId = await cacheTable('stock-item-gst', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
@@ -2121,14 +3031,11 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('gst-hsn-summary', inputParams);
       const tableId = await cacheTable('gst-hsn-summary', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
@@ -2157,14 +3064,11 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('gstr1-summary', inputParams);
       const tableId = await cacheTable('gstr1-summary', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
@@ -2193,14 +3097,11 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const resp = await pull('gstr2-summary', inputParams);
       const tableId = await cacheTable('gstr2-summary', resp.data);
       if (resp.error) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: resp.error }]
-        };
+        return errorResult('UNKNOWN', { message: resp.error });
       }
       else {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
         };
       }
     }
@@ -2212,16 +3113,12 @@ Call set-active-company again with one of these EXACT names, or use open-company
     'create-voucher',
     {
       title: 'Create Voucher',
-      description: `creates a new voucher entry in Tally Prime. Supports voucher types: Sales, Purchase, Payment, Receipt, Contra, Journal, Debit Note, Credit Note. Debit and credit ledger names must exactly match existing ledgers in Tally — validate using list-master tool with collection as ledger before calling this tool. Amount must be greater than 0. Debit and credit ledger must be different. Returns success status with created voucher ID`,
+      description: `Posts one fully-resolved voucher to Tally. Preferred form: entries[] — an array of { ledger, drCr, amount } lines that MUST balance (sum of debits == sum of credits); the host rejects an unbalanced voucher with UNBALANCED. Supports optional inventory[], per-line billwise / costCentres, partyLedger, gst (placeOfSupply / reverse-charge), narration, voucherNumber, reference — so a plain journal, a GST invoice with stock, and a bill-wise receipt all post through this one tool. Ledger/stock names must already be exact (resolve them session-side; the host does no fuzzy matching). The legacy debitLedger/creditLedger/amount form still works as a 2-line shim. Returns { success, created, lastVchId }.`,
       inputSchema: {
-        targetCompany: z.string().optional().describe('optional company name. leave it blank or skip this to choose for default company'),
-        voucherType: z.enum(['Sales', 'Purchase', 'Payment', 'Receipt', 'Contra', 'Journal', 'Debit Note', 'Credit Note']).describe('type of voucher to create'),
-        date: z.string().describe('voucher date in YYYY-MM-DD format'),
-        debitLedger: z.string().describe('exact debit ledger name — validate using list-master tool with collection as ledger'),
-        creditLedger: z.string().describe('exact credit ledger name — validate using list-master tool with collection as ledger'),
-        amount: z.number().describe('voucher amount, must be greater than 0'),
-        narration: z.string().optional().describe('optional narration / remarks for the voucher'),
-        voucherNumber: z.string().optional().describe('optional voucher number. leave blank for auto-numbering')
+        targetCompany: z.string().optional().describe('optional company name; defaults to the active company'),
+        ...voucherInputShape,
+        idempotencyKey: z.string().optional().describe('optional; replaying the same key returns the prior result without re-posting'),
+        dryRun: z.boolean().optional().describe('if true, run all invariants and echo the exact posting (voucher + XML) WITHOUT writing to Tally'),
       },
       annotations: {
         readOnlyHint: false,
@@ -2233,44 +3130,121 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const start = Date.now();
       if (process.env.READONLY_MODE === 'true') {
         auditLog('create-voucher', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Write operations are disabled (READONLY_MODE=true)' }] };
+        return errorResult('READONLY');
       }
-      // validate amount > 0
-      if (args.amount <= 0) {
-        auditLog('create-voucher', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Amount must be greater than 0' }] };
-      }
-      // validate debit != credit
-      if (args.debitLedger.trim().toLowerCase() === args.creditLedger.trim().toLowerCase()) {
-        auditLog('create-voucher', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Debit and credit ledger must be different' }] };
-      }
-      // validate date format
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(args.date)) {
-        auditLog('create-voucher', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Date must be in YYYY-MM-DD format' }] };
-      }
+      const execOpts = await buildVoucherExecOpts(args);
+      const result = await executeVoucher(args, { ...execOpts, dryRun: args.dryRun });
+      auditLog('create-voucher', args, args.dryRun ? 'dryrun' : (result.isError ? 'error' : 'success'), Date.now() - start);
+      return result;
+    }
+  );
 
-      let inputParams = new Map<string, any>([
-        ['voucherType', args.voucherType],
-        ['date', args.date],
-        ['debitLedger', args.debitLedger],
-        ['creditLedger', args.creditLedger],
-        ['amount', args.amount]
+  mcpServer.registerTool(
+    'create-vouchers',
+    {
+      title: 'Create Vouchers (batch)',
+      description: `Posts a batch of vouchers, each the same shape as create-voucher (entries[] + optional blocks). Returns per-row typed results aligned to the input. atomic=true validates EVERY row first (deterministic invariants) and posts NOTHING if any fails — but note Tally has no cross-voucher rollback, so a mid-batch Tally-side write failure can leave earlier rows posted (surfaced per-row). atomic=false (default) posts each independently; a failed row doesn't stop the rest. idempotencyKey makes a replayed batch return the prior result without re-posting. Session assembles the well-formed vouchers[]; the host executes deterministically.`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name; defaults to the active company'),
+        vouchers: z.array(z.object(voucherInputShape)).min(1).describe('array of vouchers, each the create-voucher shape (entries[] + optional blocks)'),
+        atomic: z.boolean().optional().describe('true = all-or-nothing validation (post nothing if any row fails deterministic checks). Default false = best-effort per row.'),
+        idempotencyKey: z.string().optional().describe('optional; replaying the same key returns the prior batch result without re-posting'),
+        dryRun: z.boolean().optional().describe('if true, validate all rows and echo per-row results WITHOUT writing to Tally')
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      if (process.env.READONLY_MODE === 'true') {
+        auditLog('create-vouchers', { count: args.vouchers.length }, 'denied');
+        return errorResult('READONLY');
+      }
+      const store = getIdempotencyStore();
+      const batchKey = args.idempotencyKey ? `batch:${args.idempotencyKey}` : '';
+      if (batchKey) {
+        const prior = store.get(batchKey);
+        if (prior) {
+          auditLog('create-vouchers', { count: args.vouchers.length, idempotentReplay: true }, 'success', Date.now() - start);
+          return { content: [{ type: 'text', text: JSON.stringify({ idempotentReplay: true, result: prior.result }) }] };
+        }
+      }
+      // Resolve the EXACT loaded company once for the whole batch, and fail closed if not loaded.
+      const target = await resolveExactLoadedCompany(args.targetCompany || activeCompany || null);
+      if (!target.ok) {
+        auditLog('create-vouchers', { count: args.vouchers.length }, 'error', Date.now() - start);
+        return errorResult('COMPANY_NOT_FOUND', { message: target.message, retryable: false });
+      }
+      const company = target.name;
+      // One invariant context for the whole batch (fetch period + masters once).
+      const anyInventory = args.vouchers.some(v => (v.inventory as unknown[] | undefined)?.length);
+      const [period, knownLedgers, knownStockItems] = await Promise.all([
+        fetchPeriodForWrite(company),
+        fetchMasterNames('ledger', company),
+        anyInventory ? fetchMasterNames('stockitem', company) : Promise.resolve<string[]>([]),
       ]);
-      if (args.targetCompany) inputParams.set('targetCompany', args.targetCompany);
-      if (args.narration) inputParams.set('narration', args.narration);
-      if (args.voucherNumber) inputParams.set('voucherNumber', args.voucherNumber);
-
-      const resp = await push('voucher', inputParams);
-      if (!resp.success) {
-        auditLog('create-voucher', args, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: resp.error || 'Failed to create voucher' }] };
+      const rows = args.vouchers.map(v => ({ ...(v as VoucherArgs), targetCompany: company }));
+      const batch = await executeVoucherBatch(rows, { atomic: args.atomic ?? false, dryRun: args.dryRun, period, knownLedgers, knownStockItems, exactCompany: company });
+      if (batchKey && !args.dryRun && !batch.aborted) {
+        try { store.put(batchKey, batch, new Date().toISOString()); } catch {}
       }
-      auditLog('create-voucher', args, 'success', Date.now() - start);
-      return {
-        content: [{ type: 'text', text: JSON.stringify({ success: true, created: resp.created, lastVchId: resp.lastVchId }) }]
-      };
+      const status = args.dryRun ? 'dryrun' : (batch.aborted || batch.posted < args.vouchers.length ? 'error' : 'success');
+      auditLog('create-vouchers', { count: args.vouchers.length, atomic: args.atomic, dryRun: args.dryRun }, status, Date.now() - start);
+      return { content: [{ type: 'text', text: JSON.stringify(batch, null, 2) }], isError: batch.aborted };
+    }
+  );
+
+  mcpServer.registerTool(
+    'reverse-voucher',
+    {
+      title: 'Reverse / Cancel Voucher',
+      description: `Cancels a posted voucher (mark-cancelled: ACTION="Cancel" + ISCANCELLED — Edit-Log-safe, keeps the row with a cancellation trail). Locate the target deterministically by voucherType + voucherNumber + its original date; no fuzzy matching (resolve the exact voucher session-side). mode defaults to 'cancel'. For a reversing contra entry instead, post a normal create-voucher with the dr/cr swapped. Refused when READONLY_MODE=true. Returns { success, altered }.`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name; defaults to the active company'),
+        voucherType: z.enum(['Sales', 'Purchase', 'Payment', 'Receipt', 'Contra', 'Journal', 'Debit Note', 'Credit Note']).describe('voucher type of the target voucher'),
+        voucherNumber: z.string().describe('exact voucher number to cancel'),
+        date: z.string().describe('the target voucher\'s original date (YYYY-MM-DD), used to locate it'),
+        mode: z.enum(['cancel', 'reversing-entry']).optional().describe("defaults to 'cancel' (mark-cancelled). 'reversing-entry' is not posted here — use create-voucher with the dr/cr swapped.")
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      if (process.env.READONLY_MODE === 'true') {
+        auditLog('reverse-voucher', args, 'denied');
+        return errorResult('READONLY');
+      }
+      if (args.mode === 'reversing-entry') {
+        auditLog('reverse-voucher', args, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: 'reversing-entry mode is not posted here — create a contra voucher via create-voucher with the dr/cr swapped.', retryable: false });
+      }
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(args.date)) {
+        auditLog('reverse-voucher', args, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: 'Date must be in YYYY-MM-DD format.', retryable: false });
+      }
+      if (!args.voucherNumber.trim()) {
+        auditLog('reverse-voucher', args, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: 'voucherNumber is required to locate the voucher.', retryable: false });
+      }
+      const company = args.targetCompany || activeCompany || undefined;
+      const xml = buildCancelVoucherXml({ voucherType: args.voucherType, voucherNumber: args.voucherNumber, date: args.date }, company);
+      const resp = await pushXml(xml);
+      if (!resp.success || (resp.altered === 0 && resp.created === 0)) {
+        auditLog('reverse-voucher', args, 'error', Date.now() - start);
+        return errorResult('PRECONDITION_FAILED', {
+          message: resp.error || `Could not locate voucher ${args.voucherType} #${args.voucherNumber} dated ${args.date} to cancel.`,
+          retryable: false
+        });
+      }
+      auditLog('reverse-voucher', args, 'success', Date.now() - start);
+      return { content: [{ type: 'text', text: JSON.stringify({ success: true, altered: resp.altered, cancelled: args.voucherNumber }) }] };
     }
   );
 
@@ -2286,7 +3260,8 @@ Call set-active-company again with one of these EXACT names, or use open-company
         openingBalance: z.number().optional().describe('optional opening balance. negative = debit, positive = credit'),
         mailingName: z.string().optional().describe('optional mailing name / display name'),
         gstRegistrationType: z.enum(['Regular', 'Composition', 'Unregistered', 'Consumer', 'Unknown']).optional().describe('optional GST registration type for party ledgers'),
-        gstin: z.string().optional().describe('optional GSTIN number for party ledgers')
+        gstin: z.string().optional().describe('optional GSTIN number for party ledgers'),
+        dryRun: z.boolean().optional().describe('if true, validate and echo the posting WITHOUT writing to Tally')
       },
       annotations: {
         readOnlyHint: false,
@@ -2298,11 +3273,11 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const start = Date.now();
       if (process.env.READONLY_MODE === 'true') {
         auditLog('create-ledger', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Write operations are disabled (READONLY_MODE=true)' }] };
+        return errorResult('READONLY');
       }
       if (!args.name || args.name.trim() === '') {
         auditLog('create-ledger', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Ledger name cannot be empty' }] };
+        return errorResult('PRECONDITION_FAILED', { message: 'Ledger name cannot be empty.', retryable: false });
       }
 
       let inputParams = new Map<string, any>([
@@ -2315,10 +3290,14 @@ Call set-active-company again with one of these EXACT names, or use open-company
       if (args.gstRegistrationType) inputParams.set('gstRegistrationType', args.gstRegistrationType);
       if (args.gstin) inputParams.set('gstin', args.gstin);
 
+      if (args.dryRun) {
+        auditLog('create-ledger', args, 'dryrun', Date.now() - start);
+        return dryRunEcho('ledger', inputParams);
+      }
       const resp = await push('ledger', inputParams);
       if (!resp.success) {
         auditLog('create-ledger', args, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: resp.error || 'Failed to create ledger' }] };
+        return errorResult('UNKNOWN', { message: resp.error || 'Failed to create ledger.' });
       }
       auditLog('create-ledger', args, 'success', Date.now() - start);
       return {
@@ -2340,7 +3319,8 @@ Call set-active-company again with one of these EXACT names, or use open-company
         openingQuantity: z.number().optional().describe('optional opening quantity'),
         openingRate: z.number().optional().describe('optional opening rate per unit'),
         hsnCode: z.string().optional().describe('optional HSN/SAC code for GST'),
-        gstRate: z.number().optional().describe('optional GST rate percentage')
+        gstRate: z.number().optional().describe('optional GST rate percentage'),
+        dryRun: z.boolean().optional().describe('if true, validate and echo the posting WITHOUT writing to Tally')
       },
       annotations: {
         readOnlyHint: false,
@@ -2352,11 +3332,11 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const start = Date.now();
       if (process.env.READONLY_MODE === 'true') {
         auditLog('create-stock-item', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Write operations are disabled (READONLY_MODE=true)' }] };
+        return errorResult('READONLY');
       }
       if (!args.name || args.name.trim() === '') {
         auditLog('create-stock-item', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Stock item name cannot be empty' }] };
+        return errorResult('PRECONDITION_FAILED', { message: 'Stock item name cannot be empty.', retryable: false });
       }
 
       let inputParams = new Map<string, any>([
@@ -2373,10 +3353,14 @@ Call set-active-company again with one of these EXACT names, or use open-company
       if (args.hsnCode) inputParams.set('hsnCode', args.hsnCode);
       if (args.gstRate !== undefined) inputParams.set('gstRate', args.gstRate);
 
+      if (args.dryRun) {
+        auditLog('create-stock-item', args, 'dryrun', Date.now() - start);
+        return dryRunEcho('stock-item', inputParams);
+      }
       const resp = await push('stock-item', inputParams);
       if (!resp.success) {
         auditLog('create-stock-item', args, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: resp.error || 'Failed to create stock item' }] };
+        return errorResult('UNKNOWN', { message: resp.error || 'Failed to create stock item.' });
       }
       auditLog('create-stock-item', args, 'success', Date.now() - start);
       return {
@@ -2405,6 +3389,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
         voucherNumber: z.string().optional().describe('optional voucher number. leave blank for auto-numbering'),
         originalInvoiceNumber: z.string().optional().describe('original invoice number — required for Debit Note / Credit Note to link back to the original invoice'),
         originalInvoiceDate: z.string().optional().describe('original invoice date in YYYY-MM-DD format — optional for Debit Note / Credit Note'),
+        dryRun: z.boolean().optional().describe('if true, run all invariants + tax computation and echo the posting (incl. taxBreakup) WITHOUT writing to Tally'),
         cgstLedger: z.string().optional().describe('optional exact CGST ledger name. if not provided, auto-resolved from Tally'),
         sgstLedger: z.string().optional().describe('optional exact SGST ledger name. if not provided, auto-resolved from Tally'),
         igstLedger: z.string().optional().describe('optional exact IGST ledger name. if not provided, auto-resolved from Tally')
@@ -2419,27 +3404,36 @@ Call set-active-company again with one of these EXACT names, or use open-company
       const start = Date.now();
       if (process.env.READONLY_MODE === 'true') {
         auditLog('create-gst-voucher', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Write operations are disabled (READONLY_MODE=true)' }] };
+        return errorResult('READONLY');
       }
       // validate taxable value
       if (args.taxableValue <= 0) {
         auditLog('create-gst-voucher', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Taxable value must be greater than 0' }] };
+        return errorResult('PRECONDITION_FAILED', { message: 'Taxable value must be greater than 0.', retryable: false });
       }
       // validate GST rate
       if (args.gstRate < 0 || args.gstRate > 100) {
         auditLog('create-gst-voucher', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'GST rate must be between 0 and 100' }] };
+        return errorResult('PRECONDITION_FAILED', { message: 'GST rate must be between 0 and 100.', retryable: false });
       }
       // validate date format
       if (!/^\d{4}-\d{2}-\d{2}$/.test(args.date)) {
         auditLog('create-gst-voucher', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Date must be in YYYY-MM-DD format' }] };
+        return errorResult('PRECONDITION_FAILED', { message: 'Date must be in YYYY-MM-DD format.', retryable: false });
+      }
+      // date within the open period (#95 H-9 → OUT_OF_PERIOD). Tolerant: skipped if period unknown.
+      {
+        const period = await fetchPeriodForWrite(args.targetCompany || activeCompany || undefined);
+        if (period && !isDateInOpenPeriod(args.date, period)) {
+          auditLog('create-gst-voucher', args, 'denied');
+          const lo = period.booksFrom || period.fyFrom;
+          return errorResult('OUT_OF_PERIOD', { message: `Voucher date ${args.date} is outside the open period (${lo}..${period.fyTo}).` });
+        }
       }
       // validate party != sale/purchase ledger
       if (args.partyLedger.trim().toLowerCase() === args.salePurchaseLedger.trim().toLowerCase()) {
         auditLog('create-gst-voucher', args, 'denied');
-        return { isError: true, content: [{ type: 'text', text: 'Party ledger and sale/purchase ledger must be different' }] };
+        return errorResult('PRECONDITION_FAILED', { message: 'Party ledger and sale/purchase ledger must be different.', retryable: false });
       }
 
       // auto-resolve tax ledgers if not provided
@@ -2457,12 +3451,12 @@ Call set-active-company again with one of these EXACT names, or use open-company
           if (!cgstLedger) cgstLedger = gstLedgers.cgst;
           if (!sgstLedger) sgstLedger = gstLedgers.sgst;
           if (!cgstLedger || !sgstLedger) {
-            return { isError: true, content: [{ type: 'text', text: 'Could not auto-resolve CGST/SGST ledger names from Tally. Please provide cgstLedger and sgstLedger explicitly' }] };
+            return errorResult('PRECONDITION_FAILED', { message: 'Could not auto-resolve CGST/SGST ledger names from Tally.', remedy: 'Provide cgstLedger and sgstLedger explicitly.', retryable: false });
           }
         } else {
           if (!igstLedger) igstLedger = gstLedgers.igst;
           if (!igstLedger) {
-            return { isError: true, content: [{ type: 'text', text: 'Could not auto-resolve IGST ledger name from Tally. Please provide igstLedger explicitly' }] };
+            return errorResult('PRECONDITION_FAILED', { message: 'Could not auto-resolve IGST ledger name from Tally.', remedy: 'Provide igstLedger explicitly.', retryable: false });
           }
         }
       }
@@ -2513,10 +3507,14 @@ Call set-active-company again with one of these EXACT names, or use open-company
         inputParams.set('igstAmount', igstAmount);
       }
 
+      if (args.dryRun) {
+        auditLog('create-gst-voucher', args, 'dryrun', Date.now() - start);
+        return dryRunEcho('gst-voucher', inputParams, { taxBreakup: { taxableValue, cgstAmount, sgstAmount, igstAmount, totalInvoiceValue } });
+      }
       const resp = await push('gst-voucher', inputParams);
       if (!resp.success) {
         auditLog('create-gst-voucher', args, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: resp.error || 'Failed to create GST voucher' }] };
+        return errorResult('UNKNOWN', { message: resp.error || 'Failed to create GST voucher.' });
       }
       auditLog('create-gst-voucher', args, 'success', Date.now() - start);
       return {
@@ -2560,7 +3558,183 @@ Call set-active-company again with one of these EXACT names, or use open-company
         return { content: [{ type: 'text', text: JSON.stringify({ count: out.length, companies: out }, null, 2) }] };
       } catch (err) {
         auditLog('list-configured-companies', args, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: `list-configured-companies failed: ${err}` }] };
+        return errorResult('UNKNOWN', { message: 'list-configured-companies failed.', logs: String(err) });
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'resolve-company',
+    {
+      title: 'Resolve Company',
+      description: `Resolves ONE human string — a folder id (digits), an exact company name, or a configured alias — to a single canonical record: { name, folderId, alias, isLoaded, isProtected, matchedBy }. Prefer this over guessing among the five list-* tools: it returns a typed ok / ambiguous / not-found so you know whether you can act. isLoaded tells you whether set-active-company will work right now; isProtected tells you whether a load will need credentials. On ambiguous/not-found it lists the candidates (with aliases) so you can disambiguate.`,
+      inputSchema: {
+        query: z.string().max(256).describe('folder id (digits), exact company name, or a configured alias to resolve to one company.')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      try {
+        const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const folders = scanCompanyFolders(tallyDataPath);
+        const registry = loadCompanyRegistry(resolveRegistryPath());
+        let loaded: string[] = [];
+        try {
+          loaded = await listLoadedCompanies();
+        } catch {
+          // Tally may be unreachable; isLoaded=false is the safe default.
+        }
+        const result = resolveCompanyEnriched(args.query, folders, registry, loaded);
+        auditLog('resolve-company', args, result.kind === 'not-found' ? 'denied' : 'success', Date.now() - start);
+        return {
+          isError: result.kind === 'not-found',
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }]
+        };
+      } catch (err) {
+        auditLog('resolve-company', args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: 'resolve-company failed.', logs: String(err) });
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'use-company',
+    {
+      title: 'Use Company',
+      description: `One call to bring a known company to ACTIVE from an EXACT folder id / name / configured alias (no fuzzy matching — resolve fuzzily session-side first). Deterministically: resolves the query → if already loaded, just sets it active (fast path, no restart/keystrokes) → else routes to the right load path. Returns the final typed status: success, or a single typed error naming the one remaining blocker (AMBIGUOUS / COMPANY_NOT_FOUND / TALLY_DOWN / and, for a not-resident company, the exact load tool to call). Prefer this over hand-orchestrating resolve-company + set-active-company + load-*.`,
+      inputSchema: {
+        query: z.string().max(256).describe('EXACT folder id (digits), company name, or configured alias. Not fuzzy.')
+      },
+      annotations: {
+        readOnlyHint: false,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      try {
+        const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const folders = scanCompanyFolders(tallyDataPath);
+        const registry = loadCompanyRegistry(resolveRegistryPath());
+        let loaded: string[] = [];
+        try { loaded = await listLoadedCompanies(); } catch { /* Tally maybe down; isLoaded=false */ }
+        const resolved = resolveCompanyEnriched(args.query, folders, registry, loaded);
+        const plan = planUseCompany(resolved);
+
+        if (plan.action === 'error') {
+          auditLog('use-company', args, 'denied', Date.now() - start);
+          return errorResult(plan.code, { logs: JSON.stringify(resolved) });
+        }
+
+        // Fast path: already loaded → verify + set active (bounded transient retry on the verify).
+        if (plan.action === 'set-active') {
+          const { result: ok } = await retryForResult(
+            () => verifyCompanyLoaded(plan.company.name).then(v => (v ? true : null)),
+            (v) => v === true, 3
+          );
+          if (ok) {
+            activeCompany = plan.company.name;
+            auditLog('use-company', args, 'success', Date.now() - start);
+            return { content: [{ type: 'text', text: JSON.stringify({ success: true, activeCompany, folderId: plan.company.folderId, path: 'already-loaded' }) }] };
+          }
+          // isLoaded was stale — fall through to the appropriate load path below.
+          plan.company.isLoaded = false;
+        }
+
+        // Not resident: name the single remaining action deterministically. The actual destructive
+        // load (tally.ini restart) / DPAPI vault-unlock stay in their dedicated, Windows-validated
+        // tools; use-company routes to exactly one of them so the caller isn't guessing.
+        const c = plan.company;
+        if (c.alias) {
+          auditLog('use-company', args, 'denied', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', {
+            message: `"${c.name}" (folder ${c.folderId}) is configured but not resident. Bring it active with load-company-by-alias.`,
+            remedy: `Call load-company-by-alias with alias "${c.alias}" (uses the stored vault credentials).`,
+            retryable: false
+          });
+        }
+        auditLog('use-company', args, 'denied', Date.now() - start);
+        return errorResult('PRECONDITION_FAILED', {
+          message: `"${c.name}" (folder ${c.folderId}) is not resident and has no vault entry.`,
+          remedy: `Call load-company (folderId "${c.folderId}"${c.isProtected ? ', with userName + password — it is protected' : ''}) — note it restarts Tally. Or configure it in the tray so it can vault-unlock.`,
+          retryable: false
+        });
+      } catch (err) {
+        auditLog('use-company', args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: 'use-company failed.', logs: String(err) });
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'open-tally',
+    {
+      title: 'Open Tally',
+      description: `Launches Tally Prime if it is not already running, and waits until its XML server is reachable. Idempotent: if Tally is already up it returns immediately without relaunching. Because the MCP service runs in Windows Session 0 (no desktop), it can't spawn a GUI app itself — it dispatches the launch to the GUI agent running in the interactive session, so that agent must be alive (AGENT_UNREACHABLE otherwise). Call this before load-company / use-company / any read when Tally may be closed.`,
+      inputSchema: {
+        waitTimeoutSec: z.number().optional().describe('how long to wait for Tally to become reachable after launch (default 60)')
+      },
+      annotations: {
+        readOnlyHint: false,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      const logs: string[] = [];
+      try {
+        // Fast path: already reachable → nothing to do (no agent needed).
+        if (await pingTally()) {
+          auditLog('open-tally', args, 'success', Date.now() - start);
+          return { content: [{ type: 'text', text: JSON.stringify({ success: true, alreadyRunning: true }) }] };
+        }
+        const tallyExePath = process.env.TALLY_EXE_PATH || 'C:\\Program Files\\TallyPrimeEditLog\\tally.exe';
+        if (!fs.existsSync(tallyExePath)) {
+          auditLog('open-tally', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `tally.exe not found at ${tallyExePath}.`, remedy: 'Set TALLY_EXE_PATH in .env (via Reconfigure) if Tally lives elsewhere.', retryable: false });
+        }
+        // The service is in Session 0, so the launch must go through the interactive-session agent.
+        const agentWatchDir = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        logs.push('  Pinging GUI agent (needed to launch Tally in the interactive session)...');
+        const agentPing = await pingGuiAgent(agentWatchDir, 4, logs);
+        if (!agentPing.alive) {
+          auditLog('open-tally', args, 'error', Date.now() - start);
+          return errorResult('AGENT_UNREACHABLE', {
+            message: `GUI agent did not respond at ${agentWatchDir}, so Tally can't be launched into the desktop session.`,
+            logs: logs.join('\n'),
+          });
+        }
+        if (!agentPing.versionOk) {
+          auditLog('open-tally', args, 'error', Date.now() - start);
+          return errorResult('AGENT_TOO_OLD', {
+            message: `GUI agent is alive but reports version ${agentPing.agentVersion ?? '(none)'}, older than the required ${REQUIRED_AGENT_VERSION}.`,
+            logs: logs.join('\n'),
+          });
+        }
+        logs.push(`  Starting Tally via GUI agent (${tallyExePath})...`);
+        const agentResp = await callGuiAgent('start-tally', { exePath: tallyExePath, waitSec: 30 }, 35, agentWatchDir, logs);
+        if (!agentResp || agentResp.status !== 'success') {
+          logs.push(`    GUI agent: ${agentResp ? agentResp.message : 'no response'}`);
+        }
+        const timeoutMs = (args.waitTimeoutSec ?? 60) * 1000;
+        logs.push(`  Polling Tally XML server (timeout ${args.waitTimeoutSec ?? 60}s)...`);
+        const ready = await waitForTallyReady(timeoutMs, logs);
+        if (!ready) {
+          auditLog('open-tally', args, 'error', Date.now() - start);
+          return errorResult('TALLY_DOWN', {
+            message: 'Tally was launched but did not become reachable in time. If the service runs in Session 0, Tally won\'t show a window there — the GUI agent must launch it in the user session.',
+            logs: logs.join('\n'),
+          });
+        }
+        auditLog('open-tally', args, 'success', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify({ success: true, alreadyRunning: false, launched: true, agentMessage: agentResp?.message ?? '' }) }] };
+      } catch (err) {
+        auditLog('open-tally', args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: 'open-tally failed.', logs: logs.join('\n') + '\n' + String(err) });
       }
     }
   );
@@ -2590,7 +3764,7 @@ Call set-active-company again with one of these EXACT names, or use open-company
             ? `Valid aliases: ${valid.join(', ')}. Configure new aliases via the tray icon > Manage Companies.`
             : `No companies configured yet. Open the tray icon > Manage Companies to add one.`;
           auditLog('load-company-by-alias', args, 'denied', Date.now() - start);
-          return { isError: true, content: [{ type: 'text', text: `Unknown alias "${args.alias}". ${hint}` }] };
+          return errorResult('COMPANY_NOT_FOUND', { message: `Unknown alias "${args.alias}".`, remedy: hint });
         }
 
         // Decrypt the stored password just before dispatch. The plaintext lives in this
@@ -2602,30 +3776,38 @@ Call set-active-company again with one of these EXACT names, or use open-company
             plaintextPassword = await decryptPasswordViaDpapi(entry.passwordEnc);
           } catch (err) {
             auditLog('load-company-by-alias', args, 'error', Date.now() - start);
-            return {
-              isError: true,
-              content: [{ type: 'text', text: `Decryption failed for alias "${entry.alias}": ${err}. Fix via tray icon > Manage Companies > Edit > tick "Change password".` }]
-            };
+            return errorResult('UNKNOWN', {
+              message: `Decryption failed for alias "${entry.alias}": ${err}.`,
+              remedy: 'Fix via tray icon > Manage Companies > Edit > tick "Change password".',
+              logs: String(err),
+            });
           }
         }
 
         const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
         const timeoutSec = 30;
-        const resp = await callGuiAgent(
-          'select-and-unlock-company',
-          { companyId: entry.folderId, userName: entry.username ?? '', password: plaintextPassword },
-          timeoutSec,
-          dataPath,
-          logs
+        // Self-healing unlock (#89 H-3): a keystroke miss is transient, so re-dispatch the whole
+        // select-and-unlock up to N times (the agent re-keys + re-verifies each attempt) before
+        // surrendering PASSWORD_REQUIRED — so a transient miss isn't reported like a wrong password.
+        const maxRetries = Math.max(1, parseInt(process.env.UNLOCK_MAX_RETRIES || '3', 10) || 3);
+        const { result: resp, attempts } = await retryForResult(
+          () => callGuiAgent('select-and-unlock-company', { companyId: entry.folderId, userName: entry.username ?? '', password: plaintextPassword }, timeoutSec, dataPath, logs),
+          (r) => !!r && r.status === 'success',
+          maxRetries
         );
+        logs.push(`  [unlock] select-and-unlock-company: ${attempts} attempt(s)`);
 
         if (!resp) {
           auditLog('load-company-by-alias', args, 'error', Date.now() - start);
-          return { isError: true, content: [{ type: 'text', text: `GUI agent did not respond within ${timeoutSec}s. Is the agent running? Logs:\n${logs.join('\n')}` }] };
+          return errorResult('AGENT_UNREACHABLE', { logs: logs.join('\n') });
         }
         if (resp.status !== 'success') {
           auditLog('load-company-by-alias', args, 'error', Date.now() - start);
-          return { isError: true, content: [{ type: 'text', text: `Load failed for "${entry.alias}": ${resp.message}. If the password is wrong, fix via tray icon > Manage Companies > Edit > tick "Change password".` }] };
+          return errorResult('PASSWORD_REQUIRED', {
+            message: `Load failed for "${entry.alias}" after ${attempts} attempt(s): ${resp.message}.`,
+            remedy: 'If the password is wrong, fix via tray icon > Manage Companies > Edit > tick "Change password".',
+            logs: logs.join('\n'),
+          });
         }
 
         activeCompany = entry.displayName || entry.folderId;
@@ -2635,7 +3817,161 @@ Call set-active-company again with one of these EXACT names, or use open-company
         };
       } catch (err) {
         auditLog('load-company-by-alias', args, 'error', Date.now() - start);
-        return { isError: true, content: [{ type: 'text', text: `load-company-by-alias failed: ${err}` }] };
+        return errorResult('UNKNOWN', { message: 'load-company-by-alias failed.', logs: String(err) });
+      }
+    }
+  );
+
+  // ==================== INTERACTIVE GUI CONTROL TOOLS ====================
+  // Let an MCP client (Claude) drive the Tally window directly: gui-screenshot to SEE the current
+  // screen, gui-send-keys to act on it. This is the adaptive, human-supervised alternative to the
+  // blind select-and-unlock keystroke sequence - Claude reacts to whatever dialog is actually shown
+  // (Select Company, credential prompt, "load anyway?", Gateway of Tally). Both are gated behind
+  // ENABLE_GUI_CONTROL because they expose arbitrary keystroke injection and screenshots that can
+  // include financial data or a credential field.
+  mcpServer.registerTool(
+    'gui-screenshot',
+    {
+      title: 'GUI Screenshot (Tally window)',
+      description: `captures the current Tally Prime window as a PNG so you can SEE its on-screen state — Select Company list, credential prompt, "load anyway?" dialog, Gateway of Tally — and decide the next keystrokes. Pair with gui-send-keys to interactively drive Tally login / company selection instead of a blind fixed sequence. Requires ENABLE_GUI_CONTROL=true and the GUI agent running with Tally open. The image is returned to you and the on-disk copy is deleted immediately (it may show financial data or a credential field).`,
+      inputSchema: {},
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+    },
+    async () => {
+      const start = Date.now();
+      if (process.env.ENABLE_GUI_CONTROL !== 'true') {
+        auditLog('gui-screenshot', {}, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: 'GUI control is disabled.', remedy: 'Set ENABLE_GUI_CONTROL=true (and restart the service) to enable gui-screenshot / gui-send-keys.', retryable: false });
+      }
+      const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+      const logs: string[] = [];
+      const resp = await callGuiAgent('screenshot', {}, 20, dataPath, logs);
+      // The agent writes the PNG BEFORE writing its result, so a credential/financial frame can be on
+      // disk even on the timeout path. Always clean it up, whatever the outcome - never leave it behind.
+      const shot = path.join(dataPath, '_mcp_screenshot.png');
+      const cleanupShot = () => { try { fs.unlinkSync(shot); } catch {} };
+      if (!resp) {
+        cleanupShot();
+        auditLog('gui-screenshot', {}, 'error', Date.now() - start);
+        return errorResult('AGENT_UNREACHABLE', { message: 'GUI agent did not respond. Is it running (tray > Restart GUI agent) and is Tally open?', logs: logs.join('\n') });
+      }
+      if (resp.status !== 'success') {
+        cleanupShot();
+        auditLog('gui-screenshot', {}, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: resp.message || 'Screenshot failed.' });
+      }
+      if (!fs.existsSync(shot)) {
+        auditLog('gui-screenshot', {}, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: 'Agent reported success but the screenshot file was not found on disk.' });
+      }
+      const b64 = fs.readFileSync(shot).toString('base64');
+      cleanupShot();  // don't leave a Tally-screen image (possibly a credential frame) on disk
+      auditLog('gui-screenshot', {}, 'success', Date.now() - start);
+      return { content: [{ type: 'image', data: b64, mimeType: 'image/png' }] };
+    }
+  );
+
+  mcpServer.registerTool(
+    'gui-send-keys',
+    {
+      title: 'GUI Send Keys (Tally window)',
+      description: `sends an ordered sequence of keystrokes / typed text to the Tally Prime window to log in, select a company, or navigate menus. Pair with gui-screenshot to see the result and iterate step by step. Requires ENABLE_GUI_CONTROL=true and the GUI agent running with Tally open. Each step is {action, value}: "type" types the literal string (folder id, username, password); "key" presses ONE of these supported keys — enter, escape, tab, backspace, up, down, left, right, f1, f2, f3, f4, f5, f10, f12; "combo" presses a supported modifier chord — alt/ctrl/shift + one of f1, f2, f3, f4, f5, f10, a, c, v, x (e.g. "alt+f3", "ctrl+a"); "wait" pauses for value milliseconds (useful after an action that triggers a screen change). Keys/combos outside these sets are ignored (logged as unmapped). Focus is re-asserted before each step. Typed values are filtered from audit logs.`,
+      inputSchema: {
+        keys: z.array(z.object({
+          action: z.enum(['type', 'key', 'combo', 'wait']).describe('type = literal text; key = single key; combo = modifier chord (e.g. alt+f3); wait = pause milliseconds'),
+          value: z.string().describe('for type: the text to type; for key: the key name; for combo: e.g. "alt+f3"; for wait: milliseconds as a string')
+        })).describe('ordered keystroke steps to run in the Tally window, e.g. [{action:"type",value:"100000"},{action:"key",value:"enter"}]')
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false }
+    },
+    async (args) => {
+      const start = Date.now();
+      // Redact literal typed text (may be a password) before it reaches the audit log.
+      const redacted = { keys: (args.keys || []).map(k => k.action === 'type' ? { action: 'type', value: '***' } : k) };
+      if (process.env.ENABLE_GUI_CONTROL !== 'true') {
+        auditLog('gui-send-keys', redacted, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: 'GUI control is disabled.', remedy: 'Set ENABLE_GUI_CONTROL=true (and restart the service) to enable gui-screenshot / gui-send-keys.', retryable: false });
+      }
+      if (!args.keys || args.keys.length === 0) {
+        auditLog('gui-send-keys', redacted, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: 'No keys provided.', retryable: false });
+      }
+      const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+      const logs: string[] = [];
+      const resp = await callGuiAgent('sendkeys', { keys: args.keys }, 30, dataPath, logs);
+      if (!resp) {
+        auditLog('gui-send-keys', redacted, 'error', Date.now() - start);
+        return errorResult('AGENT_UNREACHABLE', { message: 'GUI agent did not respond. Is it running and is Tally open?', logs: logs.join('\n') });
+      }
+      if (resp.status !== 'success') {
+        auditLog('gui-send-keys', redacted, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: resp.message || 'sendkeys failed.' });
+      }
+      auditLog('gui-send-keys', redacted, 'success', Date.now() - start);
+      return { content: [{ type: 'text', text: JSON.stringify({ success: true, message: resp.message }) }] };
+    }
+  );
+
+  mcpServer.registerTool(
+    'unlock-stored-credentials',
+    {
+      title: 'Unlock with Stored Credentials',
+      description: `When a company's password prompt is on screen — CONFIRM that via gui-screenshot FIRST — this types the stored vault password locally so you never see the plaintext. The server looks up the company's saved credentials, decrypts them, and types them into the focused Tally window; it returns ONLY { unlocked } / { noStoredCredentials } / { failed } — the password never comes back to you and is never logged. On noStoredCredentials or failed, ask the user for the password and type it via gui-send-keys, then verify by screenshot. Requires ENABLE_GUI_CONTROL=true. This does NOT navigate — it types into whatever is focused, so only call it once you've visually confirmed the password prompt. Part of the look-verify-act GUI loop; never call it blind.`,
+      inputSchema: {
+        company: z.string().describe('the company to unlock — a configured alias, folder id, or display name')
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      const auditArgs = { company: args.company }; // never the password
+      if (process.env.ENABLE_GUI_CONTROL !== 'true') {
+        auditLog('unlock-stored-credentials', auditArgs, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: 'Claude-driven GUI control is disabled.', remedy: 'Set ENABLE_GUI_CONTROL=true (and restart the service) to enable it.', retryable: false });
+      }
+      try {
+        const registry = loadCompanyRegistry(resolveRegistryPath());
+        const entry = resolveVaultEntry(registry, args.company);
+        if (!entry) {
+          auditLog('unlock-stored-credentials', auditArgs, 'denied', Date.now() - start);
+          return { content: [{ type: 'text', text: JSON.stringify({ noStoredCredentials: true, reason: 'no configured company matched — ask the user for the password', company: args.company }) }] };
+        }
+        if (!entry.passwordEnc) {
+          auditLog('unlock-stored-credentials', auditArgs, 'success', Date.now() - start);
+          return { content: [{ type: 'text', text: JSON.stringify({ noStoredCredentials: true, reason: 'company configured but has no stored password — ask the user', alias: entry.alias }) }] };
+        }
+        let plaintextPassword = '';
+        try {
+          plaintextPassword = await decryptPasswordViaDpapi(entry.passwordEnc);
+        } catch {
+          auditLog('unlock-stored-credentials', auditArgs, 'error', Date.now() - start);
+          return { content: [{ type: 'text', text: JSON.stringify({ failed: true, reason: 'stored password could not be decrypted — ask the user, or fix via tray > Manage Companies' }) }], isError: true };
+        }
+        // Type the creds locally via the agent's sendkeys action. The secret is injected server-side
+        // into the IPC and is never returned to the caller nor logged. This does NOT navigate — it
+        // assumes the caller already confirmed (via gui-screenshot) the password prompt is focused.
+        const keys = (entry.username ? `${entry.username}{ENTER}` : '') + plaintextPassword + '{ENTER}';
+        const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const logs: string[] = [];
+        const resp = await callGuiAgent('sendkeys', { keys }, 15, dataPath, logs);
+        plaintextPassword = ''; // drop the secret from locals ASAP
+        if (!resp) {
+          auditLog('unlock-stored-credentials', auditArgs, 'error', Date.now() - start);
+          return errorResult('AGENT_UNREACHABLE', { message: 'GUI agent did not respond.' });
+        }
+        if (resp.status !== 'success') {
+          auditLog('unlock-stored-credentials', auditArgs, 'error', Date.now() - start);
+          return { content: [{ type: 'text', text: JSON.stringify({ failed: true, reason: resp.message }) }], isError: true };
+        }
+        auditLog('unlock-stored-credentials', auditArgs, 'success', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify({ unlocked: true, hint: 'Confirm with gui-screenshot that the company loaded.' }) }] };
+      } catch {
+        auditLog('unlock-stored-credentials', auditArgs, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: 'unlock-stored-credentials failed.' });
       }
     }
   );

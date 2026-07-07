@@ -7,10 +7,20 @@ import helmet from 'helmet';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { registerMcpServer } from './mcp.mjs';
+import dotenv from 'dotenv';
+import { registerMcpServer, getHttpStatusReport, isStatusEndpointEnabled } from './mcp.mjs';
+import { parseIntEnv } from './utility.mjs';
 
+// Load .env from the install directory by ABSOLUTE path (next to dist/), independent of the process
+// working directory. mcp.mts already runs dotenv.config() but resolves it against process.cwd();
+// under NSSM the service cwd normally equals AppDirectory, but if NSSM's cwd or AppEnvironmentExtra
+// handoff is ever wrong (issue #23), a cwd-relative load silently misses PASSWORD and the server
+// exits(1) into an NSSM respawn loop with no port bound. Anchoring to __dirname/../.env makes the
+// service read exactly the same file the "works when run manually" invocation does. override:true
+// mirrors mcp.mts so a mangled NSSM-provided value never wins over the on-disk .env.
+dotenv.config({ path: path.join(import.meta.dirname, '../.env'), override: true, quiet: true });
 
-const mcpPort = parseInt(process.env.PORT || '3000');
+const mcpPort = parseIntEnv(process.env.PORT, 3000);
 const mcpDomain = process.env.MCP_DOMAIN || 'http://localhost:3000';
 const __dirname = import.meta.dirname;
 
@@ -22,7 +32,7 @@ try {
       .filter(f => /^service-\d{8}T\d{6}\.\d+\.log$/.test(f))
       .sort()
       .reverse();
-    const maxKeep = parseInt(process.env.LOG_RETAIN_COUNT || '10');
+    const maxKeep = parseIntEnv(process.env.LOG_RETAIN_COUNT, 10);
     for (const f of logFiles.slice(maxKeep)) {
       fs.unlinkSync(path.join(logsDir, f));
     }
@@ -64,16 +74,20 @@ app.use(cors({
 
 // Rate limiting on auth endpoints
 const authRateLimiter = rateLimit({
-  windowMs: parseInt(process.env.AUTH_RATE_LIMIT_WINDOW_MS || '60000'),
-  max: parseInt(process.env.AUTH_RATE_LIMIT_MAX || '10'),
+  windowMs: parseIntEnv(process.env.AUTH_RATE_LIMIT_WINDOW_MS, 60000),
+  max: parseIntEnv(process.env.AUTH_RATE_LIMIT_MAX, 10),
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests, try again later' }
 });
 
-// Require PASSWORD env var — fail startup if missing
+// Require PASSWORD env var — fail startup if missing. Name the .env path we loaded so a service
+// that respawns here (issue #23) leaves an actionable line in logs/service.log instead of a silent
+// exit that reads as "Running but no port bound".
 if (!process.env.PASSWORD) {
-  console.error('[security] FATAL: PASSWORD environment variable is required. Set it in .env or system environment.');
+  const envPath = path.join(import.meta.dirname, '../.env');
+  console.error(`[security] FATAL: PASSWORD is not set. Expected it in ${envPath} (or the service environment). ` +
+    `The server cannot start without it. If running as the TallyMCP service, re-run the setup wizard to rewrite .env.`);
   process.exit(1);
 }
 const authPassword = process.env.PASSWORD;
@@ -111,7 +125,17 @@ interface AccessToken {
   expires_at: number;
 }
 
+interface RefreshToken {
+  token: string;
+  client_id: string;
+  expires_at: number;
+}
+
 const clientsFilePath = path.join(__dirname, '../.oauth-clients.json');
+// Bearer + refresh secrets are persisted so a server restart / redeploy doesn't drop live sessions
+// (which would force every connected client to re-authenticate). Same directory + trust level as
+// .oauth-clients.json, which already persists client secrets.
+const tokensFilePath = path.join(__dirname, '../.oauth-tokens.json');
 
 // Load persisted clients from file
 function loadClients(): { [client_id: string]: RegisteredClient } {
@@ -137,7 +161,30 @@ function saveClients(): void {
 const registeredClients: { [client_id: string]: RegisteredClient } = loadClients();
 console.log(`[oauth] Loaded ${Object.keys(registeredClients).length} persisted client(s)`);
 const authorizationCodes: { [code: string]: AuthorizationCode } = {};
-const accessTokens: { [token: string]: AccessToken } = {};
+
+// Persisted token store: access + refresh tokens survive a restart so existing sessions stay valid.
+function loadTokens(): { accessTokens: { [t: string]: AccessToken }; refreshTokens: { [t: string]: RefreshToken } } {
+  try {
+    if (fs.existsSync(tokensFilePath)) {
+      const parsed = JSON.parse(fs.readFileSync(tokensFilePath, 'utf-8'));
+      return { accessTokens: parsed.accessTokens || {}, refreshTokens: parsed.refreshTokens || {} };
+    }
+  } catch (e) {
+    console.error('[oauth] Failed to load tokens file:', e);
+  }
+  return { accessTokens: {}, refreshTokens: {} };
+}
+function saveTokens(): void {
+  try {
+    fs.writeFileSync(tokensFilePath, JSON.stringify({ accessTokens, refreshTokens }, null, 2), 'utf-8');
+  } catch (e) {
+    console.error('[oauth] Failed to save tokens file:', e);
+  }
+}
+const _persistedTokens = loadTokens();
+const accessTokens: { [token: string]: AccessToken } = _persistedTokens.accessTokens;
+const refreshTokens: { [token: string]: RefreshToken } = _persistedTokens.refreshTokens;
+console.log(`[oauth] Loaded ${Object.keys(accessTokens).length} access + ${Object.keys(refreshTokens).length} refresh token(s)`);
 
 const transports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
 
@@ -165,14 +212,17 @@ setInterval(() => {
     }
   }
 
-  // Clean expired access tokens
+  // Clean expired access + refresh tokens, persisting the store if anything changed.
+  let tokensChanged = false;
   for (const [token, data] of Object.entries(accessTokens)) {
-    if (data.expires_at < now) {
-      delete accessTokens[token];
-    }
+    if (data.expires_at < now) { delete accessTokens[token]; tokensChanged = true; }
   }
+  for (const [token, data] of Object.entries(refreshTokens)) {
+    if (data.expires_at < now) { delete refreshTokens[token]; tokensChanged = true; }
+  }
+  if (tokensChanged) saveTokens();
 
-}, parseInt(process.env.TOKEN_CLEANUP_INTERVAL_MS || '60000')); // default every minute
+}, parseIntEnv(process.env.TOKEN_CLEANUP_INTERVAL_MS, 60000)); // default every minute
 
 
 // Handle POST requests for client-to-server communication
@@ -310,7 +360,7 @@ const handleOAuthAuthorizationServer = (req: express.Request, res: express.Respo
       registration_endpoint: `${mcpDomain}/register`,
       response_types_supported: ['code'],
       response_modes_supported: ['query'],
-      grant_types_supported: ['authorization_code'],
+      grant_types_supported: ['authorization_code', 'refresh_token'],
       token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post'],
       code_challenge_methods_supported: ['S256']
     }
@@ -319,6 +369,23 @@ const handleOAuthAuthorizationServer = (req: express.Request, res: express.Respo
 
 // Handle OAuth Authorization Server
 app.get('/.well-known/oauth-authorization-server', handleOAuthAuthorizationServer);
+
+// Opt-in, unauthenticated health endpoint for uptime monitors / support tooling
+// (#25). Disabled by default; set STATUS_ENDPOINT_PUBLIC=1 to expose it. Returns
+// the server's self-report (agent ping, Tally reachability, edition, build).
+// 200 when healthy, 503 when Tally is unreachable so monitors read green/red.
+app.get('/status', async (_req: express.Request, res: express.Response) => {
+  if (!isStatusEndpointEnabled()) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  try {
+    const report = await getHttpStatusReport();
+    res.status(report.ok ? 200 : 503).json(report);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
 
 
 app.post('/register', authRateLimiter, (req, res) => {
@@ -384,7 +451,7 @@ app.post('/authorize', authRateLimiter, (req, res) => {
       redirect_uri: redirectUri,
       code_challenge: codeChallenge,
       code_challenge_method: codeChallengeMethod,
-      expires_at: Date.now() + parseInt(process.env.AUTH_CODE_EXPIRY_MS || '600000') // default 10 minutes
+      expires_at: Date.now() + parseIntEnv(process.env.AUTH_CODE_EXPIRY_MS, 600000) // default 10 minutes
     };
     res.status(200).json({ status: isValidated, code });
     
@@ -486,11 +553,38 @@ app.post('/token', authRateLimiter, (req, res) => {
     });
   }
 
+  // Refresh-token grant: mint a fresh access token from a valid, unexpired refresh token so the
+  // client renews silently without re-auth. Rotates the refresh token (one-time use) for security.
+  if (grantType === 'refresh_token') {
+    const providedRefresh = req.body['refresh_token'];
+    const stored = providedRefresh ? refreshTokens[providedRefresh] : undefined;
+    if (!stored || stored.expires_at < Date.now() || stored.client_id !== clientId) {
+      return res.status(400).json({
+        error: 'invalid_grant',
+        error_description: 'Invalid or expired refresh token'
+      });
+    }
+    delete refreshTokens[providedRefresh]; // rotate
+    const newAccess = generateSecureToken(32);
+    const newRefresh = generateSecureToken(32);
+    const expiresIn = parseIntEnv(process.env.ACCESS_TOKEN_EXPIRY_SEC, 3600);
+    const refreshExpiresIn = parseIntEnv(process.env.REFRESH_TOKEN_EXPIRY_SEC, 2592000); // default 30 days
+    accessTokens[newAccess] = { token: newAccess, client_id: clientId, expires_at: Date.now() + expiresIn * 1000 };
+    refreshTokens[newRefresh] = { token: newRefresh, client_id: clientId, expires_at: Date.now() + refreshExpiresIn * 1000 };
+    saveTokens();
+    return res.json({
+      access_token: newAccess,
+      token_type: 'Bearer',
+      expires_in: expiresIn,
+      refresh_token: newRefresh
+    });
+  }
+
   // Validate grant type
   if (grantType !== 'authorization_code') {
     return res.status(400).json({
       error: 'unsupported_grant_type',
-      error_description: 'Only authorization_code grant type is supported'
+      error_description: 'Supported grant types: authorization_code, refresh_token'
     });
   }
 
@@ -539,20 +633,30 @@ app.post('/token', authRateLimiter, (req, res) => {
   // Delete the used authorization code
   delete authorizationCodes[code];
 
-  // Generate access token and separate refresh token
+  // Generate an access token + a long-lived refresh token so the client can renew silently, and
+  // persist both so a server restart / redeploy doesn't drop the session.
   const accessToken = generateSecureToken(32);
-  const expiresIn = parseInt(process.env.ACCESS_TOKEN_EXPIRY_SEC || '3600'); // default 1 hour
+  const refreshToken = generateSecureToken(32);
+  const expiresIn = parseIntEnv(process.env.ACCESS_TOKEN_EXPIRY_SEC, 3600); // default 1 hour
+  const refreshExpiresIn = parseIntEnv(process.env.REFRESH_TOKEN_EXPIRY_SEC, 2592000); // default 30 days
 
   accessTokens[accessToken] = {
     token: accessToken,
     client_id: clientId,
     expires_at: Date.now() + (expiresIn * 1000)
   };
+  refreshTokens[refreshToken] = {
+    token: refreshToken,
+    client_id: clientId,
+    expires_at: Date.now() + (refreshExpiresIn * 1000)
+  };
+  saveTokens();
 
   res.json({
     access_token: accessToken,
     token_type: 'Bearer',
-    expires_in: expiresIn
+    expires_in: expiresIn,
+    refresh_token: refreshToken
   });
 });
 
@@ -566,11 +670,35 @@ const httpServer = app.listen(mcpPort, bindHost, () => {
   console.log(`MCP Server started on ${bindHost}:${mcpPort}`);
 });
 
-// Graceful shutdown — without this, NSSM/systemd hang in StopPending until force-killed
+// Make a bind failure loud in logs/service.log instead of an unhandled exception. Under NSSM the
+// classic symptom (issue #23) is "service Running, port empty" — often a stale node.exe still
+// holding the port after a hung stop. Name the cause so the log is actionable.
+httpServer.on('error', (err: NodeJS.ErrnoException) => {
+  const detail = err.code === 'EADDRINUSE'
+    ? `${bindHost}:${mcpPort} is already in use — a stale node.exe is likely still holding the port. Stop it (taskkill /F /IM node.exe) and restart the service.`
+    : `${err.code || ''} ${err.message}`.trim();
+  console.error(`[startup] FATAL: could not bind ${bindHost}:${mcpPort} — ${detail}`);
+  process.exit(1);
+});
+
+// Graceful shutdown — without this, NSSM/systemd hang in StopPending until force-killed.
+// On Windows, NSSM stops the service by sending a console Ctrl-C (delivered to Node as SIGINT) and
+// can escalate to Ctrl-Break (SIGBREAK); SIGTERM is not a real Windows signal but is handled for
+// systemd parity. MCP streamable-HTTP connections are long-lived, so httpServer.close() alone can
+// wait indefinitely for them to drain — closeAllConnections() drops them immediately so close()
+// resolves in well under a second, and a bounded force-exit guarantees Stop-Service returns even if
+// something wedges. Re-entrancy guard: NSSM may deliver more than one stop signal.
+let shuttingDown = false;
 const shutdown = (signal: string) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
   console.log(`[shutdown] received ${signal}, closing server`);
-  const force = setTimeout(() => { console.error('[shutdown] forced exit after 10s'); process.exit(1); }, 10000).unref();
+  const force = setTimeout(() => { console.error('[shutdown] forced exit after 5s'); process.exit(0); }, 5000);
+  force.unref();
   httpServer.close(() => { clearTimeout(force); process.exit(0); });
+  // Drop keep-alive / long-lived MCP connections so the close() callback can fire promptly.
+  httpServer.closeAllConnections?.();
 };
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGBREAK', () => shutdown('SIGBREAK'));

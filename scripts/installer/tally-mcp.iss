@@ -49,7 +49,9 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
-UninstallDisplayIcon={app}\dist\server.mjs
+UninstallDisplayIcon={app}\assets\tally-mcp.ico
+; Jina Code Systems brand icon for the installer .exe itself (generated from scripts/tray/assets/jina-logo.png).
+SetupIconFile=assets\tally-mcp.ico
 ChangesEnvironment=yes
 ; Jinacode Systems branding. Comma-separated lists let Inno pick the closest size
 ; to the user's display scaling — the standard BMP renders on 100% DPI, the @2x
@@ -92,6 +94,10 @@ Source: "{#RepoRoot}\scripts\installer\uninstall-cleanup.ps1";  DestDir: "{app}\
 Source: "{#RepoRoot}\scripts\tray\tally-mcp-tray.ps1"; DestDir: "{app}\scripts\tray"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\tray\assets\*";           DestDir: "{app}\scripts\tray\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+; --- Brand icon (Jina Code logo) for the Start Menu / desktop shortcuts and the uninstall entry.
+; Shipped to {app}\assets so the shortcut IconFilename points at a file present on the target. ---
+Source: "{#RepoRoot}\scripts\installer\assets\tally-mcp.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
+
 ; --- LICENSE at the install root so the tray dashboard can read it post-install.
 ; (LicenseFile= above only feeds the wizard's accept-license page; that copy is not
 ; placed on disk.) ---
@@ -122,7 +128,15 @@ Source: "{#StagingRoot}\nssm.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Name: "{app}\logs"; Permissions: users-modify
 Name: "{app}\data"; Permissions: users-modify
 
+[Tasks]
+Name: "desktopicon"; Description: "Create a &desktop shortcut to open the Tally MCP dashboard"; GroupDescription: "Additional shortcuts:"
+
 [Icons]
+; Primary entry point: opens the status dashboard. The tray script's single-instance guard means this
+; surfaces the already-running tray's dashboard (or starts the tray if it isn't running) rather than
+; launching a duplicate. -WindowStyle Hidden keeps the launcher windowless (brief console flash only).
+Name: "{group}\Open {#MyAppName} Dashboard"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File ""{app}\scripts\tray\tally-mcp-tray.ps1"" -InstallDir ""{app}"" -ShowDashboard"; WorkingDir: "{app}"; IconFilename: "{app}\assets\tally-mcp.ico"; Comment: "Open the Tally MCP status dashboard"
+Name: "{autodesktop}\{#MyAppName}";          Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File ""{app}\scripts\tray\tally-mcp-tray.ps1"" -InstallDir ""{app}"" -ShowDashboard"; WorkingDir: "{app}"; Tasks: desktopicon; IconFilename: "{app}\assets\tally-mcp.ico"; Comment: "Open the Tally MCP status dashboard"
 Name: "{group}\{#MyAppName} Logs";       Filename: "{app}\logs"
 Name: "{group}\Reconfigure {#MyAppName}"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"""; WorkingDir: "{app}"
 Name: "{group}\Uninstall {#MyAppName}";  Filename: "{uninstallexe}"
@@ -130,7 +144,7 @@ Name: "{group}\Uninstall {#MyAppName}";  Filename: "{uninstallexe}"
 [Run]
 ; --- 1. First-run wizard: writes .env from collected wizard inputs and registers the NSSM service ---
 Filename: "powershell.exe"; \
-  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"" -CredentialsFile ""{code:GetCredentialsFilePath}"" -TallyEdition ""{code:GetWizardEdition}"" -TallyExePath ""{code:GetWizardExePath}"" -TallyDataPath ""{code:GetWizardDataPath}"" -TallyIniPath ""{code:GetWizardIniPath}"" -McpDomain ""{code:GetWizardDomain}"" -AgentTaskUser ""{code:GetWizardAgentUser}"""; \
+  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"" -CredentialsFile ""{code:GetCredentialsFilePath}"" -TallyEdition ""{code:GetWizardEdition}"" -TallyExePath ""{code:GetWizardExePath}"" -TallyDataPath ""{code:GetWizardDataPath}"" -TallyIniPath ""{code:GetWizardIniPath}"" -McpDomain ""{code:GetWizardDomain}"" -AgentTaskUser ""{code:GetWizardAgentUser}"" -EnableGuiControl ""{code:GetWizardGuiControl}"""; \
   WorkingDir: "{app}"; \
   StatusMsg: "Configuring service and writing .env..."; \
   Flags: runhidden waituntilterminated
@@ -143,8 +157,10 @@ Filename: "powershell.exe"; \
   Flags: runhidden waituntilterminated
 
 [UninstallDelete]
-; .env is intentionally left behind on uninstall — it contains the OAuth password and other secrets
-; the operator may have rotated. Delete manually if a clean wipe is desired.
+; .env holds the OAuth password and other secrets. uninstall-cleanup.ps1 overwrites and
+; deletes it before this step; this entry is a fallback for the case where that script did
+; not run (e.g. it was removed), so a password-bearing file is never left behind.
+Type: files; Name: "{app}\.env"
 Type: filesandordirs; Name: "{app}\logs"
 Type: filesandordirs; Name: "{app}\node_modules"
 Type: filesandordirs; Name: "{app}\dist"
@@ -162,6 +178,19 @@ Type: filesandordirs; Name: "{app}\bin"
 var
   ConfigPage: TInputQueryWizardPage;
   EditionPage: TInputOptionWizardPage;
+  AgentUserOverride: TNewCheckBox;
+  GuiControlOptIn: TNewCheckBox;
+
+// Toggle the agent-user field's editability from the "advanced" checkbox. Locked (disabled) by
+// default so the Tab-selects-all-then-overwrite trap can't silently replace the correct logon; when
+// the operator opts back out we restore the current-user default so a half-typed override can't leak
+// into .env. See issue #79.
+procedure AgentUserOverrideClick(Sender: TObject);
+begin
+  ConfigPage.Edits[5].Enabled := AgentUserOverride.Checked;
+  if not AgentUserOverride.Checked then
+    ConfigPage.Values[5] := GetUserNameString();
+end;
 
 procedure InitializeWizard;
 var
@@ -176,7 +205,7 @@ begin
   ConfigPage.Add('Tally executable path:', False);
   ConfigPage.Add('Tally data folder:', False);
   ConfigPage.Add('tally.ini path:', False);
-  ConfigPage.Add('Public domain (leave blank for localhost-only):', False);
+  ConfigPage.Add('Public domain (blank = localhost-only; e.g. https://tally-mcp.example.com):', False);
   ConfigPage.Add('Windows user the GUI agent runs as (default: current user):', False);
 
   // Auto-detect defaults from the box. These are the conventional Tally Prime Edit Log paths;
@@ -206,6 +235,20 @@ begin
   ConfigPage.Values[4] := DefaultDomain;
   ConfigPage.Values[5] := DefaultUser;
 
+  // Harden the agent-user field (issue #79): it is pre-filled with the current user and LOCKED by
+  // default. Windows edit controls select-all on Tab-in, so a stray keystroke would otherwise
+  // overwrite the correct logon (observed: "taal" replacing "tapanjain") and break GUI-agent task
+  // registration. Only the explicit checkbox below unlocks it.
+  ConfigPage.Edits[5].Enabled := False;
+  AgentUserOverride := TNewCheckBox.Create(ConfigPage);
+  AgentUserOverride.Parent := ConfigPage.Surface;
+  AgentUserOverride.Left := ConfigPage.Edits[5].Left;
+  AgentUserOverride.Top := ConfigPage.Edits[5].Top + ConfigPage.Edits[5].Height + ScaleY(4);
+  AgentUserOverride.Width := ConfigPage.SurfaceWidth;
+  AgentUserOverride.Caption := 'Run the GUI agent as a different Windows user (advanced)';
+  AgentUserOverride.Checked := False;
+  AgentUserOverride.OnClick := @AgentUserOverrideClick;
+
   EditionPage := CreateInputOptionPage(ConfigPage.ID,
     'Tally Edition',
     'Which Tally Prime edition is installed?',
@@ -214,6 +257,21 @@ begin
   EditionPage.Add('Silver (single company resident; load-company always swaps)');
   EditionPage.Add('Gold (multiple companies; load-company is additive unless replace=true)');
   EditionPage.SelectedValueIndex := 0;
+
+  // Opt-in for Claude-driven GUI control (issue #81). OFF by default: it exposes arbitrary keystroke
+  // injection + screenshots of the desktop. Writes ENABLE_GUI_CONTROL=true/false to .env via
+  // firstrun-config.ps1. Placed on the roomy Edition page rather than the crowded config page.
+  // Reserve the bottom strip of the surface for the checkbox and shrink the option list to fit above
+  // it, so placement is robust regardless of how tall Inno sized the CheckListBox.
+  EditionPage.CheckListBox.Height := EditionPage.Surface.Height - ScaleY(52);
+  GuiControlOptIn := TNewCheckBox.Create(EditionPage);
+  GuiControlOptIn.Parent := EditionPage.Surface;
+  GuiControlOptIn.Left := EditionPage.CheckListBox.Left;
+  GuiControlOptIn.Top := EditionPage.Surface.Height - ScaleY(38);
+  GuiControlOptIn.Width := EditionPage.SurfaceWidth;
+  GuiControlOptIn.Height := ScaleY(32);
+  GuiControlOptIn.Caption := 'Allow Claude to control Tally directly (screenshots + keystrokes) — advanced, off by default';
+  GuiControlOptIn.Checked := False;
 end;
 
 // Runs after the wizard and before any file copying. Stops the running TallyMCP service
@@ -240,11 +298,13 @@ begin
   Exec(ExpandConstant('{cmd}'), '/C schtasks /End /TN TallyMCPAgent /F', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
   Exec(ExpandConstant('{cmd}'), '/C schtasks /End /TN TallyMCPTray /F',  '', SW_HIDE, ewWaitUntilTerminated, resultCode);
 
-  // 3. Kill any orphan node.exe (the MCP service child) and any powershell.exe whose
-  //    command line references tally-mcp / TallyMCP (orphan agent / tray instances from a
-  //    crashed earlier run). taskkill /T includes child processes; wmic filters by
-  //    commandline without nested-quote hell.
-  Exec(ExpandConstant('{cmd}'), '/C taskkill /F /IM node.exe /T', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+  // 3. Kill any orphan node.exe belonging to THIS install (the MCP service child) and any
+  //    powershell.exe whose command line references tally-mcp / TallyMCP (orphan agent / tray
+  //    instances from a crashed earlier run). wmic filters by commandline without nested-quote
+  //    hell. The node.exe filter matches this server's own entrypoint (dist\server.mjs) rather
+  //    than the bare image name, so unrelated node processes on the box (dev servers, Electron
+  //    apps, other services) are NOT terminated — the old `taskkill /IM node.exe /T` killed them all.
+  Exec(ExpandConstant('{cmd}'), '/C wmic process where "name=''node.exe'' and commandline like ''%%server.mjs%%''" delete', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
   Exec(ExpandConstant('{cmd}'), '/C wmic process where "name=''powershell.exe'' and commandline like ''%%tally-mcp%%''" delete', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
   Exec(ExpandConstant('{cmd}'), '/C wmic process where "name=''powershell.exe'' and commandline like ''%%TallyMCP%%''" delete', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
 
@@ -295,9 +355,11 @@ begin
     agentUserValue := Trim(ConfigPage.Values[5]);
     if Length(agentUserValue) = 0 then
     begin
-      MsgBox('Windows user (last field) cannot be empty.', mbError, MB_OK);
-      Result := False;
-      exit;
+      // Blank (e.g. cleared while overriding) — restore the current-user default rather than block.
+      // The field is locked to the current user unless the "advanced" checkbox is ticked (issue #79),
+      // so an empty value here is a mistake we can safely auto-correct.
+      ConfigPage.Values[5] := GetUserNameString();
+      agentUserValue := Trim(ConfigPage.Values[5]);
     end;
     // ShellExec runs `net user "<name>"` quietly; exit code 0 = user exists.
     if not ShellExec('open', 'cmd.exe', '/c net user "' + agentUserValue + '" >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, errCode) then
@@ -377,6 +439,14 @@ end;
 function GetWizardAgentUser(Param: string): string;
 begin
   Result := ConfigPage.Values[5];
+end;
+
+function GetWizardGuiControl(Param: string): string;
+begin
+  if GuiControlOptIn.Checked then
+    Result := 'true'
+  else
+    Result := 'false';
 end;
 
 function GetWizardEdition(Param: string): string;
