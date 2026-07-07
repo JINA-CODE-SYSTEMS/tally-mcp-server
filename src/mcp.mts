@@ -152,9 +152,17 @@ export function parseCompanyPeriod(xml: string, preferCompany?: string | null): 
     const match = rows.find(r => (field(r, 'F01') || '').toLowerCase() === want);
     if (match) chosen = match;
   }
-  const fyFrom = normalizeTallyDate(field(chosen, 'F02'));
-  let fyTo = normalizeTallyDate(field(chosen, 'F03'));
-  let fyToInferred = false;
+  const startingFrom = normalizeTallyDate(field(chosen, 'F02')); // $StartingFrom (may be the ORIGINAL FY)
+  const currentDate = normalizeTallyDate(field(chosen, 'F04'));   // ##SVCurrentDate (Tally working date)
+  const rawEndingAt = normalizeTallyDate(field(chosen, 'F03'));   // $EndingAt (often the working date, not FY end)
+  // Derive the CURRENT financial year from the working date + the FY-start month/day (#4). Tally's
+  // $EndingAt commonly returns the working date, and $StartingFrom can be the company's original FY —
+  // so compute the active FY window around currentDate instead of trusting those raw fields.
+  const fy = computeFinancialYear(startingFrom, currentDate);
+  let fyFrom = fy ? fy.fyFrom : startingFrom;
+  let fyTo = fy ? fy.fyTo : rawEndingAt;
+  let fyToInferred = !!fy;
+  // Last-resort inference if we couldn't compute (no currentDate) and Tally gave no end.
   if (!fyTo && fyFrom) {
     const m = fyFrom.match(/^(\d{4})-(\d{2})-(\d{2})$/);
     if (m) {
@@ -169,10 +177,29 @@ export function parseCompanyPeriod(xml: string, preferCompany?: string | null): 
     fyFrom,
     fyTo,
     booksFrom: normalizeTallyDate(field(chosen, 'F06')),
-    currentDate: normalizeTallyDate(field(chosen, 'F04')),
+    currentDate,
     lastEntryDate: normalizeTallyDate(field(chosen, 'F05')),
     fyToInferred
   };
+}
+
+// Computes the CURRENT financial-year window from the FY-start anchor (month/day come from
+// $StartingFrom) and Tally's working date. Returns null if either date is missing/unparseable.
+export function computeFinancialYear(fyStartAnchor: string | null, currentDate: string | null): { fyFrom: string; fyTo: string } | null {
+  const a = /^(\d{4})-(\d{2})-(\d{2})$/.exec(fyStartAnchor ?? '');
+  const c = /^(\d{4})-(\d{2})-(\d{2})$/.exec(currentDate ?? '');
+  if (!a || !c) return null;
+  const startMonth = Number(a[2]);
+  const startDay = Number(a[3]);
+  const curYear = Number(c[1]);
+  const cur = new Date(Date.UTC(Number(c[1]), Number(c[2]) - 1, Number(c[3])));
+  const iso = (d: Date) => `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+  let fyStart = new Date(Date.UTC(curYear, startMonth - 1, startDay));
+  if (cur < fyStart) fyStart = new Date(Date.UTC(curYear - 1, startMonth - 1, startDay)); // before this year's FY start → previous FY
+  const fyEnd = new Date(fyStart);
+  fyEnd.setUTCFullYear(fyEnd.getUTCFullYear() + 1);
+  fyEnd.setUTCDate(fyEnd.getUTCDate() - 1);
+  return { fyFrom: iso(fyStart), fyTo: iso(fyEnd) };
 }
 
 // Builds the period report envelope, posts it, and parses. Injects SVCURRENTCOMPANY only when a
@@ -819,12 +846,17 @@ export function resolveCompanyEnriched(
   //   2. else the registry-configured displayName for this folderId (deterministic, user-set),
   //   3. else fall back to the scraped folder name.
   const canonicalName = (folderId: string, scrapedName: string): string => {
-    const n = scrapedName.trim().toLowerCase();
-    if (n) {
-      const live = loadedNames.find(l => l.trim().toLowerCase() === n);
-      if (live) return live;
-    }
     const disp = registry.companies.find(c => c.folderId === folderId)?.displayName;
+    // Prefer the exact live loaded name. Match BOTH the scrape and the registry displayName against
+    // the loaded list with normalization/fuzzy (findMatchingLoadedCompany), so a configured name like
+    // "Ross Computer Pvt Ltd" resolves to the loaded "ROSS COMPUTERS PVT. LTD." — which makes isLoaded
+    // true and use-company's residency check pass instead of falsely reporting "not resident" (#2).
+    for (const cand of [scrapedName, disp]) {
+      if (cand && cand.trim()) {
+        const live = findMatchingLoadedCompany(cand, loadedNames);
+        if (live) return live;
+      }
+    }
     if (disp && disp.trim()) return disp;
     return scrapedName;
   };

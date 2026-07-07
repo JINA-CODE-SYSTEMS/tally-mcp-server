@@ -408,6 +408,23 @@ function extractReport(reportConfig: m.ModelPullReportInfo, reportInputParams: M
     });
 }
 
+// Builds a faithful failure message from Tally's raw import RESPONSE instead of collapsing to
+// "Tally returned 0 error(s)" (report #1). Surfaces LINEERROR + the full counts, and calls out the
+// EXCEPTIONS case (created 0, errors 0, exceptions >0) — usually a non-existent parent group/ledger,
+// a duplicate, or a field Tally rejected — which the old message hid entirely.
+export function summarizeImportFailure(resp: any, retval: m.ModelPushResponse): string {
+    const errors = parseInt(resp?.['ERRORS'] || '0');
+    const exceptions = parseInt(resp?.['EXCEPTIONS'] || '0');
+    const ignored = parseInt(resp?.['IGNORED'] || '0');
+    const lineError = typeof resp?.['LINEERROR'] === 'string' ? resp['LINEERROR'].trim() : '';
+    const counts = `created=${retval.created}, altered=${retval.altered}, errors=${errors}, exceptions=${exceptions}, ignored=${ignored}`;
+    if (lineError) return `${lineError} [${counts}]`;
+    if (exceptions > 0) {
+        return `Tally raised ${exceptions} exception(s) with no line error — the master/voucher was NOT saved. Most commonly a referenced parent group/ledger/stock-item name is not exact, a duplicate, or a field Tally rejected. [${counts}]`;
+    }
+    return `Tally import failed. [${counts}]`;
+}
+
 export function handlePush(templateName: string, inputParams: Map<string, any>): Promise<m.ModelPushResponse> {
     return new Promise<m.ModelPushResponse>(async (resolve, reject) => {
         let retval: m.ModelPushResponse = {
@@ -510,7 +527,7 @@ export function handlePush(templateName: string, inputParams: Map<string, any>):
 
                 if (errors > 0 || (retval.created === 0 && retval.altered === 0)) {
                     retval.success = false;
-                    retval.error = resp['LINEERROR'] || `Tally returned ${errors} error(s). Check if ledger/item names are valid`;
+                    retval.error = summarizeImportFailure(resp, retval);
                 } else {
                     retval.success = true;
                 }
@@ -562,7 +579,7 @@ export function pushXml(xml: string): Promise<m.ModelPushResponse> {
                 const errors = parseInt(resp['ERRORS'] || '0');
                 if (errors > 0 || (retval.created === 0 && retval.altered === 0)) {
                     retval.success = false;
-                    retval.error = resp['LINEERROR'] || `Tally returned ${errors} error(s). Check if ledger/item names are valid`;
+                    retval.error = summarizeImportFailure(resp, retval);
                 } else {
                     retval.success = true;
                 }

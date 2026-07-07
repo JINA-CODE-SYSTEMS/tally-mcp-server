@@ -1,6 +1,27 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { normalizeTallyDate, parseCompanyPeriod } from './mcp.mjs';
+import { normalizeTallyDate, parseCompanyPeriod, computeFinancialYear } from './mcp.mjs';
+
+// #4: derive the CURRENT financial year from the working date + FY-start month/day.
+test('computeFinancialYear: current FY from working date (April-start)', () => {
+  // $StartingFrom is an OLD year (2023); working date 2026-10-10 → current FY 2026-04-01..2027-03-31
+  assert.deepEqual(computeFinancialYear('2023-04-01', '2026-10-10'), { fyFrom: '2026-04-01', fyTo: '2027-03-31' });
+  // before this year's FY start → previous FY
+  assert.deepEqual(computeFinancialYear('2020-04-01', '2026-02-15'), { fyFrom: '2025-04-01', fyTo: '2026-03-31' });
+  // non-April FY start (July)
+  assert.deepEqual(computeFinancialYear('2019-07-01', '2026-10-10'), { fyFrom: '2026-07-01', fyTo: '2027-06-30' });
+  assert.equal(computeFinancialYear(null, '2026-10-10'), null);
+});
+
+test('parseCompanyPeriod fixes the wrong FY end (report #4): $EndingAt = working date', () => {
+  // Exactly the reported payload: StartingFrom old, EndingAt == currentDate == lastEntry
+  const xml = '<DATA><ROW><F01>ROSS COMPUTERS PVT. LTD.</F01><F02>1-Apr-2023</F02><F03>10-Oct-2026</F03><F04>10-Oct-2026</F04><F05>10-Oct-2026</F05><F06>1-Apr-2023</F06></ROW></DATA>';
+  const p = parseCompanyPeriod(xml);
+  assert.equal(p.fyFrom, '2026-04-01'); // current FY start, not 2023
+  assert.equal(p.fyTo, '2027-03-31');   // real FY end, NOT the working date
+  assert.equal(p.currentDate, '2026-10-10');
+  assert.equal(p.booksFrom, '2023-04-01');
+});
 
 // ── normalizeTallyDate ─────────────────────────────────────────────────────
 test('normalizeTallyDate converts d-MMM-yyyy to ISO', () => {
@@ -38,7 +59,7 @@ test('parses a single company period row', () => {
   assert.equal(p.booksFrom, '2026-04-01');
   assert.equal(p.currentDate, '2026-10-10');
   assert.equal(p.lastEntryDate, '2026-10-10');
-  assert.equal(p.fyToInferred, false);
+  assert.equal(p.fyToInferred, true); // FY is now derived from working date + FY-start month (#4)
 });
 
 test('parses booksFrom when it differs from fyFrom (company started mid-year)', () => {
