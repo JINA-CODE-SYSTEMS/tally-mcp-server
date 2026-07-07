@@ -19,7 +19,7 @@ param(
 # against an agent older than its required minimum (issue #15 - version handshake).
 # Format: MAJOR.MINOR.PATCH. Bump MINOR on any new IPC action or response field;
 # bump PATCH on internal fixes that callers can ignore.
-$Script:AgentVersion = "1.4.0"
+$Script:AgentVersion = "1.5.0"
 
 if (-not $WatchDir) {
     $WatchDir = if ($env:TALLY_DATA_PATH) { $env:TALLY_DATA_PATH } else { "C:\Users\Public\TallyPrimeEditLog\data" }
@@ -67,6 +67,9 @@ function Find-TallyWindow {
 function Get-Screenshot {
     param([IntPtr]$Hwnd)
     $screenshotPath = Join-Path $WatchDir "_mcp_screenshot.png"
+    # Hide the Claude-control frame so it never appears in what Claude sees, then give it a beat to
+    # actually vanish before capturing.
+    if (Get-Command Hide-ClaudeOverlay -ErrorAction SilentlyContinue) { Hide-ClaudeOverlay; Start-Sleep -Milliseconds 180 }
     try {
         $bmp = [TallyUI2]::CaptureWindow($Hwnd)
         if ($null -eq $bmp) { return $null }
@@ -240,6 +243,9 @@ function Invoke-OpenAI {
 
 function Execute-Action {
     param($Action)
+
+    # Signal "Claude is driving" while we act on the window (best-effort; no-op if overlay unavailable).
+    if (Get-Command Show-ClaudeOverlay -ErrorAction SilentlyContinue) { Show-ClaudeOverlay }
 
     switch ($Action.action) {
         "key" {
@@ -574,6 +580,84 @@ Write-Host "Max steps per command: $MaxSteps"
 Write-Host "Self-restart on script change: $(-not $NoSelfRestart)"
 Write-Host "Agent started. Polling every 500ms for commands..."
 
+# --- Claude-control visual overlay -------------------------------------------------------------
+# A topmost, CLICK-THROUGH orange frame around the Tally window while the agent is driving it, so the
+# user can see "Claude has the wheel - hands off". Runs on its own STA WinForms thread (a runspace)
+# because the agent's polling loop has no message pump. ENTIRELY best-effort: every touchpoint is
+# wrapped in try/catch, so if anything here fails the overlay simply won't appear and GUI control is
+# unaffected. It auto-hides ~6s after the last action, and is hidden during screenshot capture so it
+# never appears in what Claude sees.
+$Script:OverlayState = [hashtable]::Synchronized(@{ Show = $false; Until = [datetime]::MinValue; Rect = $null; Stop = $false })
+try {
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.ApartmentState = 'STA'; $rs.ThreadOptions = 'ReuseThread'; $rs.Open()
+    $rs.SessionStateProxy.SetVariable('State', $Script:OverlayState)
+    $overlayPs = [powershell]::Create(); $overlayPs.Runspace = $rs
+    [void]$overlayPs.AddScript({
+        try {
+            Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing
+            Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+public class ClaudeOverlayNative {
+  [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int i);
+  [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr h, int i, int v);
+}
+'@
+            $orange = [System.Drawing.Color]::FromArgb(255, 140, 0)
+            $barH = 26; $th = 6
+            $form = New-Object System.Windows.Forms.Form
+            $form.FormBorderStyle = 'None'; $form.ShowInTaskbar = $false; $form.TopMost = $true
+            $form.StartPosition = 'Manual'; $form.BackColor = $orange; $form.Visible = $false
+            $label = New-Object System.Windows.Forms.Label
+            $label.Text = "  Claude is controlling Tally - please don't use the keyboard or mouse  "
+            $label.Dock = 'Top'; $label.Height = $barH; $label.TextAlign = 'MiddleCenter'
+            $label.BackColor = $orange; $label.ForeColor = [System.Drawing.Color]::White
+            $label.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
+            $form.Controls.Add($label)
+            $form.Add_HandleCreated({
+                # Make the window click-through + non-activating: WS_EX_LAYERED|TRANSPARENT|TOOLWINDOW|NOACTIVATE
+                $ex = [ClaudeOverlayNative]::GetWindowLong($form.Handle, -20)
+                [void][ClaudeOverlayNative]::SetWindowLong($form.Handle, -20, ($ex -bor 0x80000 -bor 0x20 -bor 0x80 -bor 0x8000000))
+            })
+            $timer = New-Object System.Windows.Forms.Timer; $timer.Interval = 150
+            $timer.Add_Tick({
+                try {
+                    if ($State.Stop) { $timer.Stop(); $form.Close(); return }
+                    if ($State.Show -and ((Get-Date) -lt $State.Until) -and $State.Rect) {
+                        $r = $State.Rect
+                        $w = [int]$r.Width + 2 * $th; $h = [int]$r.Height + $barH + $th
+                        $form.Bounds = New-Object System.Drawing.Rectangle ([int]$r.Left - $th), ([int]$r.Top - $barH), $w, $h
+                        $rgn = New-Object System.Drawing.Region (New-Object System.Drawing.Rectangle 0, 0, $w, $h)
+                        $rgn.Exclude((New-Object System.Drawing.Rectangle $th, $barH, ($w - 2 * $th), ($h - $barH - $th)))
+                        $form.Region = $rgn
+                        if (-not $form.Visible) { $form.Show() }
+                        $form.TopMost = $true
+                    } elseif ($form.Visible) { $form.Hide() }
+                } catch {}
+            })
+            $timer.Start()
+            [System.Windows.Forms.Application]::Run($form)
+        } catch {}
+    })
+    [void]$overlayPs.BeginInvoke()
+    Write-Host "[overlay] Claude-control indicator ready"
+} catch { $Script:OverlayState = $null; Write-Host "[overlay] unavailable (non-fatal): $_" }
+
+function Show-ClaudeOverlay {
+    if (-not $Script:OverlayState) { return }
+    try {
+        $hwnd = Find-TallyWindow
+        if ($hwnd -ne [IntPtr]::Zero) {
+            $rect = New-Object TallyUI2+RECT
+            [void][TallyUI2]::GetWindowRect($hwnd, [ref]$rect)
+            $Script:OverlayState.Rect = @{ Left = $rect.Left; Top = $rect.Top; Width = ($rect.Right - $rect.Left); Height = ($rect.Bottom - $rect.Top) }
+            $Script:OverlayState.Show = $true
+            $Script:OverlayState.Until = (Get-Date).AddSeconds(6)
+        }
+    } catch {}
+}
+function Hide-ClaudeOverlay { if ($Script:OverlayState) { try { $Script:OverlayState.Show = $false } catch {} } }
+
 while ($true) {
     # Check if our own script file changed on disk between iterations. If so, the user/deploy
     # has shipped a new agent version; re-launch into the new version and exit this process.
@@ -595,6 +679,12 @@ while ($true) {
             $cmdId = if ($cmd.commandId) { [string]$cmd.commandId } else { "" }
             $cmdMaxSteps = if ($cmd.maxSteps) { [int]$cmd.maxSteps } else { 0 }
             Write-Host "`n=== Received command: $($cmd.action) ==="
+
+            # Show the "Claude is controlling Tally" frame for GUI-driving commands (screenshot/ping
+            # excluded — screenshot must be clean, ping is passive). Auto-hides ~6s after the last action.
+            if (@('select-company','load-on-startup','sendkeys','select-and-unlock-company','start-tally') -contains ([string]$cmd.action)) {
+                if (Get-Command Show-ClaudeOverlay -ErrorAction SilentlyContinue) { Show-ClaudeOverlay }
+            }
 
             switch ($cmd.action) {
                 "select-company" {
