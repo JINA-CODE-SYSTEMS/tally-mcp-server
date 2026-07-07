@@ -13,6 +13,7 @@ public class TallyUI2 {
     [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, uint extra);
     [DllImport("user32.dll")] public static extern short VkKeyScan(char ch);
+    [DllImport("user32.dll")] public static extern uint MapVirtualKey(uint uCode, uint uMapType);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
 
     [StructLayout(LayoutKind.Sequential)]
@@ -71,17 +72,22 @@ public class TallyUI2 {
         Thread.Sleep(100);
     }
 
+    // Char-by-char typing (fallback path; the agent prefers clipboard paste for known strings). Passes
+    // the hardware SCAN CODE alongside the vk — keybd_event with scan=0 is the classic cause of Tally's
+    // custom UI double-registering or dropping keys ("JJINAA..."). Longer debounce reduces overlap.
     public static void TypeString(string text) {
+        byte shiftScan = (byte)MapVirtualKey(VK_SHIFT, 0);
         foreach (char c in text) {
             short vk = VkKeyScan(c);
             byte lo = (byte)(vk & 0xFF);
+            byte scan = (byte)MapVirtualKey(lo, 0);
             bool needShift = ((vk >> 8) & 1) != 0;
-            if (needShift) keybd_event(VK_SHIFT, 0, 0, 0);
-            keybd_event(lo, 0, 0, 0);
-            Thread.Sleep(20);
-            keybd_event(lo, 0, KEYEVENTF_KEYUP, 0);
-            if (needShift) keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0);
-            Thread.Sleep(40);
+            if (needShift) keybd_event(VK_SHIFT, shiftScan, 0, 0);
+            keybd_event(lo, scan, 0, 0);
+            Thread.Sleep(30);
+            keybd_event(lo, scan, KEYEVENTF_KEYUP, 0);
+            if (needShift) keybd_event(VK_SHIFT, shiftScan, KEYEVENTF_KEYUP, 0);
+            Thread.Sleep(55);
         }
     }
 
