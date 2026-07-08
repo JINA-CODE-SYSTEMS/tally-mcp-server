@@ -19,7 +19,7 @@ param(
 # against an agent older than its required minimum (issue #15 - version handshake).
 # Format: MAJOR.MINOR.PATCH. Bump MINOR on any new IPC action or response field;
 # bump PATCH on internal fixes that callers can ignore.
-$Script:AgentVersion = "1.6.0"
+$Script:AgentVersion = "1.6.1"
 
 # --- Single-instance guard ---------------------------------------------------------------------
 # Only ONE agent may run. Multiple instances race on the command/result files and each spawns its own
@@ -602,7 +602,7 @@ Write-Host "Agent started. Polling every 500ms for commands..."
 # wrapped in try/catch, so if anything here fails the overlay simply won't appear and GUI control is
 # unaffected. It auto-hides ~6s after the last action, and is hidden during screenshot capture so it
 # never appears in what Claude sees.
-$Script:OverlayState = [hashtable]::Synchronized(@{ Show = $false; Until = [datetime]::MinValue; Rect = $null; Stop = $false })
+$Script:OverlayState = [hashtable]::Synchronized(@{ Show = $false; Until = [datetime]::MinValue; Rect = $null; Hwnd = [IntPtr]::Zero; Stop = $false })
 try {
     $rs = [runspacefactory]::CreateRunspace()
     $rs.ApartmentState = 'STA'; $rs.ThreadOptions = 'ReuseThread'; $rs.Open()
@@ -616,10 +616,13 @@ using System; using System.Runtime.InteropServices;
 public class ClaudeOverlayNative {
   [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int i);
   [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr h, int i, int v);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool GetWindowRect(IntPtr h, out RECT r);
 }
 '@
             $orange = [System.Drawing.Color]::FromArgb(255, 140, 0)
-            $barH = 26; $th = 6
+            # Thicker border reads as a softer "glow"; the pulse (below) breathes its opacity + amber shimmer.
+            $barH = 26; $th = 8
             $form = New-Object System.Windows.Forms.Form
             $form.FormBorderStyle = 'None'; $form.ShowInTaskbar = $false; $form.TopMost = $true
             $form.StartPosition = 'Manual'; $form.BackColor = $orange; $form.Visible = $false
@@ -639,20 +642,69 @@ public class ClaudeOverlayNative {
                 $ex = [ClaudeOverlayNative]::GetWindowLong($form.Handle, -20)
                 [void][ClaudeOverlayNative]::SetWindowLong($form.Handle, -20, ($ex -bor 0x80000 -bor 0x20 -bor 0x80 -bor 0x8000000))
             })
-            $timer = New-Object System.Windows.Forms.Timer; $timer.Interval = 150
+            # Glow pulse counter (mutable-by-ref hashtable so the timer closure can bump it).
+            $glow = @{ n = 0 }
+            $timer = New-Object System.Windows.Forms.Timer; $timer.Interval = 100
             $timer.Add_Tick({
                 try {
                     if ($State.Stop) { $timer.Stop(); $form.Close(); return }
-                    if ($State.Show -and ((Get-Date) -lt $State.Until) -and $State.Rect) {
-                        $r = $State.Rect
-                        $w = [int]$r.Width + 2 * $th; $h = [int]$r.Height + $barH + $th
-                        $form.Bounds = New-Object System.Drawing.Rectangle ([int]$r.Left - $th), ([int]$r.Top - $barH), $w, $h
-                        $rgn = New-Object System.Drawing.Region (New-Object System.Drawing.Rectangle 0, 0, $w, $h)
-                        $rgn.Exclude((New-Object System.Drawing.Rectangle $th, $barH, ($w - 2 * $th), ($h - $barH - $th)))
-                        $form.Region = $rgn
-                        if (-not $form.Visible) { $form.Show() }
-                        $form.TopMost = $true
-                    } elseif ($form.Visible) { $form.Hide() }
+                    $active = $State.Show -and ((Get-Date) -lt $State.Until)
+                    if (-not $active) { if ($form.Visible) { $form.Hide() }; return }
+
+                    # LIVE window rect: re-read every tick so the frame FOLLOWS a window that is moved,
+                    # resized or (un)maximized while Claude is driving. Fall back to the rect captured
+                    # when the overlay was last shown if the live read fails.
+                    $r = $null
+                    try {
+                        $hwnd = [IntPtr]$State.Hwnd
+                        if ($hwnd -ne [IntPtr]::Zero) {
+                            $wr = New-Object ClaudeOverlayNative+RECT
+                            if ([ClaudeOverlayNative]::GetWindowRect($hwnd, [ref]$wr)) {
+                                $r = @{ Left = $wr.Left; Top = $wr.Top; Width = ($wr.Right - $wr.Left); Height = ($wr.Bottom - $wr.Top) }
+                            }
+                        }
+                    } catch {}
+                    if (-not $r) { $r = $State.Rect }
+                    if (-not $r) { if ($form.Visible) { $form.Hide() }; return }
+
+                    # Clamp to the target monitor's visible work area so the frame is ALWAYS on-screen. A
+                    # maximized Tally overhangs the monitor by a few px, which used to push the top banner
+                    # (and the outside borders) off-screen — the reason it wasn't visible in full screen.
+                    $rect = New-Object System.Drawing.Rectangle ([int]$r.Left), ([int]$r.Top), ([int]$r.Width), ([int]$r.Height)
+                    $wa = ([System.Windows.Forms.Screen]::FromRectangle($rect)).WorkingArea
+                    $left   = [Math]::Max([int]$r.Left, $wa.Left)
+                    $top    = [Math]::Max([int]$r.Top,  $wa.Top)
+                    $right  = [Math]::Min([int]$r.Left + [int]$r.Width,  $wa.Right)
+                    $bottom = [Math]::Min([int]$r.Top  + [int]$r.Height, $wa.Bottom)
+                    $vw = $right - $left; $vh = $bottom - $top
+                    if ($vw -le (2 * $th) -or $vh -le ($barH + $th)) { if ($form.Visible) { $form.Hide() }; return }
+
+                    # Mode A (windowed, with room): float the banner ABOVE the window and hug the OUTSIDE
+                    # edges so no Tally content is covered. Mode B (maximized / hard against a screen edge):
+                    # INSET the frame inside the visible area with the banner along the top, so both the
+                    # banner text and the glowing border stay on-screen.
+                    $fitsAbove = ($top - $barH) -ge $wa.Top
+                    $fitsSides = (($left - $th) -ge $wa.Left) -and (($right + $th) -le $wa.Right) -and (($bottom + $th) -le $wa.Bottom)
+                    if ($fitsAbove -and $fitsSides) {
+                        $fLeft = $left - $th; $fTop = $top - $barH; $fW = $vw + 2 * $th; $fH = $vh + $barH + $th
+                    } else {
+                        $fLeft = $left; $fTop = $top; $fW = $vw; $fH = $vh
+                    }
+                    $form.Bounds = New-Object System.Drawing.Rectangle $fLeft, $fTop, $fW, $fH
+                    $rgn = New-Object System.Drawing.Region (New-Object System.Drawing.Rectangle 0, 0, $fW, $fH)
+                    $rgn.Exclude((New-Object System.Drawing.Rectangle $th, $barH, ($fW - 2 * $th), ($fH - $barH - $th)))
+                    $form.Region = $rgn
+
+                    # Glow: breathe the opacity and shimmer the frame from deep orange toward hot amber.
+                    $glow.n = ($glow.n + 1) % 100000
+                    $phase = ([Math]::Sin($glow.n * 0.22) + 1) / 2       # 0..1, ~2.9s cycle at 100ms
+                    $form.Opacity = 0.70 + 0.25 * $phase                  # 0.70 .. 0.95
+                    $gc = [int](120 + 70 * $phase)                        # green channel 120..190 (orange→amber)
+                    $col = [System.Drawing.Color]::FromArgb(255, $gc, 0)
+                    $form.BackColor = $col; $label.BackColor = $col
+
+                    if (-not $form.Visible) { $form.Show() }
+                    $form.TopMost = $true
                 } catch {}
             })
             $timer.Start()
@@ -671,6 +723,9 @@ function Show-ClaudeOverlay {
             $rect = New-Object TallyUI2+RECT
             [void][TallyUI2]::GetWindowRect($hwnd, [ref]$rect)
             $Script:OverlayState.Rect = @{ Left = $rect.Left; Top = $rect.Top; Width = ($rect.Right - $rect.Left); Height = ($rect.Bottom - $rect.Top) }
+            # Publish the hwnd so the overlay's own timer can re-read the LIVE rect each tick and follow
+            # the window (moved / resized / maximized) instead of freezing at this captured snapshot.
+            $Script:OverlayState.Hwnd = $hwnd
             $Script:OverlayState.Show = $true
             $Script:OverlayState.Until = (Get-Date).AddSeconds(6)
         }
