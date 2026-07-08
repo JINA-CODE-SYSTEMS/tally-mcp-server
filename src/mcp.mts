@@ -928,6 +928,71 @@ export function getTallyEdition(rawValue: string | undefined = process.env.TALLY
 // fields. (issue #15 - version handshake, option D).
 export const REQUIRED_AGENT_VERSION = '1.1.0';
 
+// The agent version that introduced the `switch-company` action. switch-company refuses to dispatch
+// to an older agent (which would return "Unknown action" and leave Tally untouched) — but we also
+// detect that message defensively in interpretSwitchResult, so the two guards agree.
+export const SWITCH_COMPANY_MIN_AGENT_VERSION = '1.6.0';
+
+// Pure decision (unit-tested): translate the GUI agent's switch-company response into a typed outcome.
+// The agent's macro is open-loop but self-verifies against Tally's XML server (Write-VerifiedLoadResult),
+// so its status is already ground-truthed: 'success' = target confirmed resident, 'error' = keystrokes
+// took but nothing/‑wrong is loaded (usually credentials), 'unverified' = couldn't confirm either way.
+export type SwitchOutcome =
+  | { ok: true; message: string }
+  | { ok: false; code: ToolErrorCode; message: string; remedy?: string };
+
+export function interpretSwitchResult(
+  resp: { status: string; message: string } | null,
+  opts: { target: string; isProtected: boolean; hadCreds: boolean }
+): SwitchOutcome {
+  const target = opts.target;
+  if (!resp) {
+    return { ok: false, code: 'AGENT_UNREACHABLE', message: `The GUI agent did not respond while switching to "${target}".` };
+  }
+  const msg = (resp.message || '').trim();
+  const status = (resp.status || '').toLowerCase();
+
+  if (status === 'success') {
+    return { ok: true, message: msg || `Switched the resident company to "${target}" (no Tally restart).` };
+  }
+  // An agent predating switch-company answers its default arm with "Unknown action: switch-company".
+  if (/unknown action/i.test(msg)) {
+    return {
+      ok: false, code: 'AGENT_TOO_OLD',
+      message: `The GUI agent does not support switch-company yet (needs v${SWITCH_COMPANY_MIN_AGENT_VERSION}+).`,
+      remedy: 'Restart the agent to pick up the on-disk update (schtasks /End /TN TallyMCPAgent; schtasks /Run /TN TallyMCPAgent).',
+    };
+  }
+  // The agent's entry-state fail-safe: a data-entry/modal screen was open, so it refused to switch.
+  if (/unsaved|data.?entry|modal|quit\?/i.test(msg)) {
+    return { ok: false, code: 'UNSAVED_ENTRY_OPEN', message: msg };
+  }
+  // 'unverified' = keystrokes sent but Tally's XML server couldn't confirm the target loaded.
+  if (status === 'unverified') {
+    return {
+      ok: false, code: 'PRECONDITION_FAILED',
+      message: `Could not verify the switch to "${target}": ${msg}`,
+      remedy: 'Look with gui-screenshot (a dialog may be open), Escape back to the Gateway, then retry. If it persists, load-company will force it (but restarts Tally).',
+    };
+  }
+  // status === 'error': keystrokes took but the target is not resident. For a protected company this is
+  // almost always a credential problem (missing or wrong); otherwise the keystrokes missed the list.
+  if (opts.isProtected) {
+    return {
+      ok: false, code: 'PASSWORD_REQUIRED',
+      message: opts.hadCreds
+        ? `"${target}" did not load — the stored credentials may be wrong: ${msg}`
+        : `"${target}" is password-protected and no stored credentials were available: ${msg}`,
+      remedy: 'Fix/add the password via tray > Manage Companies, or pass userName + password.',
+    };
+  }
+  return {
+    ok: false, code: 'PRECONDITION_FAILED',
+    message: `Switch to "${target}" failed: ${msg}`,
+    remedy: 'Confirm the folder id/name and that Tally was at the Gateway (not mid data-entry), then retry.',
+  };
+}
+
 // Compares two MAJOR.MINOR.PATCH version strings. Returns true if `actual` is at least `required`.
 // Missing/unparseable segments are treated as 0 — so "1" >= "1.0.0", "1.2" >= "1.1.99", etc.
 // Non-numeric suffixes like "1.1.0-rc1" compare by their numeric prefix only ("1.1.0").
@@ -1141,6 +1206,7 @@ const TALLY_MCP_INSTRUCTIONS = `Tally Prime MCP server — exposes a local Tally
 Getting started:
 - Call \`status\` first: is Tally reachable, is the GUI agent alive, what is the active company, edition (silver/gold), and readonly mode. \`get-context\` returns the same plus the list of external requirements.
 - Find a company with \`list-available-companies\` (flags which need credentials) or \`list-companies\`; switch an already-loaded one with \`set-active-company\`.
+- To change which company is RESIDENT during a session, prefer \`switch-company\` — it uses Tally's Select Company screen and does NOT restart Tally (keeps the XML port and this session up). Use \`load-company\` / \`load-company-by-alias\` only for a first-time cold load of a never-loaded company: they relaunch tally.exe, which drops the connection.
 - Cold-load with \`load-company\` / \`load-company-by-alias\` (edition-aware; supply userName+password for protected companies). \`open-company\`'s verify-* strategies only check — they do not load.
 - Once a company is active, all query tools target it unless you pass targetCompany.
 
@@ -1244,6 +1310,7 @@ export type ToolErrorCode =
   | 'AGENT_TOO_OLD'
   | 'COMPANY_NOT_FOUND'
   | 'AMBIGUOUS'
+  | 'UNSAVED_ENTRY_OPEN'
   | 'UNKNOWN';
 
 export type ToolErrorEnvelope = {
@@ -1262,6 +1329,7 @@ const TOOL_ERROR_DEFAULTS: Record<ToolErrorCode, { retryable: boolean; message: 
   AGENT_TOO_OLD: { retryable: true, message: 'The GUI agent is older than the required version.', remedy: 'Restart the agent to pick up the on-disk update (schtasks /End /TN TallyMCPAgent; schtasks /Run /TN TallyMCPAgent).' },
   COMPANY_NOT_FOUND: { retryable: false, message: 'No company matched the given identifier.', remedy: 'Use resolve-company or list-available-companies to find the exact id, name, or alias.' },
   AMBIGUOUS: { retryable: false, message: 'The identifier matched more than one company.', remedy: 'Re-call with the exact folder id or a configured alias.' },
+  UNSAVED_ENTRY_OPEN: { retryable: true, message: 'Tally has an unsaved data-entry screen or modal open, so switching companies was refused to avoid discarding it.', remedy: 'Save or close the open voucher/master (or gui-screenshot then Escape back to the Gateway), then retry.' },
   PRECONDITION_FAILED: { retryable: true, message: 'A required precondition is not met.' },
   READONLY: { retryable: false, message: 'Write operations are disabled (READONLY_MODE=true).', remedy: 'Unset READONLY_MODE on the server to allow writes.' },
   // spec-10 deterministic-invariant codes (H-14 / H-9)
@@ -3871,6 +3939,129 @@ export async function registerMcpServer(): Promise<McpServer> {
       } catch (err) {
         auditLog('load-company-by-alias', args, 'error', Date.now() - start);
         return errorResult('UNKNOWN', { message: 'load-company-by-alias failed.', logs: String(err) });
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'switch-company',
+    {
+      title: 'Switch Company (no Tally restart)',
+      description: `Change which company is resident in Tally WITHOUT restarting Tally — unlike load-company / load-company-by-alias, which kill and relaunch tally.exe (dropping the XML port and the hosted session, forcing a reconnect). Use this to move between already-installed companies during a session. It drives Tally's own "Select Company" screen (Alt+F3 → F1 → pick → login) via the GUI agent, using vaulted credentials for protected companies (you never see the password). PRECONDITION: Tally should be at a read-only screen (Gateway or a report) — anchor there first; it fails closed (UNSAVED_ENTRY_OPEN / PRECONDITION_FAILED) rather than risk discarding an open entry. If the target is already resident it returns immediately with no keystrokes. On success the switch is verified against Tally's XML server. For a first-time cold load of a never-loaded company, or if this can't reach the target, fall back to load-company.`,
+      inputSchema: {
+        company: z.string().max(256).describe('the company to make resident — a configured alias, folder id (digits), or exact display name.'),
+        userName: z.string().optional().describe('override the stored username (rarely needed; vault credentials are used automatically).'),
+        password: z.string().optional().describe('override/supply the password for a protected company not in the vault. Prefer configuring it in the vault so it is never passed here.')
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      const auditArgs = { company: args.company, userName: args.userName }; // never the password
+      const logs: string[] = [];
+      try {
+        // Resolve the human string to a single canonical record (folder id, exact name, isLoaded, isProtected).
+        const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const folders = scanCompanyFolders(tallyDataPath);
+        const registry = loadCompanyRegistry(resolveRegistryPath());
+        let loaded: string[] = [];
+        try { loaded = await listLoadedCompanies(); } catch { /* Tally maybe down; isLoaded=false */ }
+        const resolved = resolveCompanyEnriched(args.company, folders, registry, loaded);
+        if (resolved.kind === 'ambiguous') {
+          auditLog('switch-company', auditArgs, 'denied', Date.now() - start);
+          return errorResult('AMBIGUOUS', { logs: JSON.stringify(resolved.matches) });
+        }
+        if (resolved.kind === 'not-found') {
+          auditLog('switch-company', auditArgs, 'denied', Date.now() - start);
+          return errorResult('COMPANY_NOT_FOUND', { message: `No company matched "${args.company}".`, logs: JSON.stringify(resolved.available) });
+        }
+        const company = resolved.company;
+
+        // Fast path: already resident → no keystrokes, no risk. Just adopt it as active.
+        if (company.isLoaded) {
+          activeCompany = company.name;
+          auditLog('switch-company', auditArgs, 'success', Date.now() - start);
+          return { content: [{ type: 'text', text: JSON.stringify({ success: true, alreadyResident: true, company: company.name, folderId: company.folderId, switched: false }) }] };
+        }
+
+        // Assemble credentials: explicit args win, else the vault entry for this folder id.
+        const vaultEntry = resolveVaultEntry(registry, args.company);
+        let userName = (args.userName ?? vaultEntry?.username ?? '').trim();
+        let password = args.password ?? '';
+        if (!password && vaultEntry?.passwordEnc) {
+          try {
+            password = await decryptPasswordViaDpapi(vaultEntry.passwordEnc);
+          } catch (err) {
+            auditLog('switch-company', auditArgs, 'error', Date.now() - start);
+            return errorResult('UNKNOWN', {
+              message: `Stored password for "${company.name}" could not be decrypted.`,
+              remedy: 'Fix via tray icon > Manage Companies > Edit > tick "Change password", or pass the password argument.',
+              logs: String(err),
+            });
+          }
+        }
+        const hadCreds = !!(userName || password);
+
+        // Fail BEFORE touching the GUI if the company needs a password we don't have — otherwise the
+        // keystrokes would stall on an open credential prompt and leave Tally in a modal state.
+        if (company.isProtected && !password) {
+          auditLog('switch-company', auditArgs, 'denied', Date.now() - start);
+          return errorResult('PASSWORD_REQUIRED', {
+            message: `"${company.name}" is password-protected and no stored credentials were found.`,
+            remedy: 'Configure it via tray icon > Manage Companies, or call switch-company with userName + password.',
+          });
+        }
+
+        // Confirm the GUI agent is alive AND new enough to know the switch-company action.
+        const agentPing = await pingGuiAgent(tallyDataPath, 4, logs);
+        if (!agentPing.alive) {
+          auditLog('switch-company', auditArgs, 'error', Date.now() - start);
+          return errorResult('AGENT_UNREACHABLE', { logs: logs.join('\n') });
+        }
+        if (!isAgentVersionAtLeast(agentPing.agentVersion, SWITCH_COMPANY_MIN_AGENT_VERSION)) {
+          auditLog('switch-company', auditArgs, 'error', Date.now() - start);
+          return errorResult('AGENT_TOO_OLD', {
+            message: `The GUI agent reports version ${agentPing.agentVersion ?? '(none)'}, older than the ${SWITCH_COMPANY_MIN_AGENT_VERSION} required for switch-company.`,
+            remedy: 'Restart the agent to pick up the on-disk update (schtasks /End /TN TallyMCPAgent; schtasks /Run /TN TallyMCPAgent).',
+            logs: logs.join('\n'),
+          });
+        }
+
+        // Dispatch the keystroke macro. Bounded retry (each attempt re-opens Select Company via Alt+F3
+        // and re-verifies against Tally's XML server), so a single transient keystroke miss isn't fatal.
+        const maxRetries = Math.max(1, parseInt(process.env.SWITCH_MAX_RETRIES || '2', 10) || 2);
+        const { result: resp, attempts } = await retryForResult(
+          () => callGuiAgent('switch-company', { companyId: company.folderId, companyName: company.name, userName, password }, 30, tallyDataPath, logs),
+          (r) => !!r && r.status === 'success',
+          maxRetries
+        );
+        password = ''; userName = ''; // drop secrets from locals ASAP
+        logs.push(`  [switch-company] ${attempts} attempt(s)`);
+
+        const outcome = interpretSwitchResult(resp, { target: company.name, isProtected: company.isProtected, hadCreds });
+        if (!outcome.ok) {
+          auditLog('switch-company', auditArgs, 'error', Date.now() - start);
+          return errorResult(outcome.code, { message: outcome.message, remedy: outcome.remedy, logs: logs.join('\n') });
+        }
+
+        // Second checkpoint (server-side): confirm the target now appears in Tally's loaded list.
+        activeCompany = company.name;
+        let nowLoaded: string[] = [];
+        try { nowLoaded = await listLoadedCompanies(); } catch { /* best-effort */ }
+        auditLog('switch-company', auditArgs, 'success', Date.now() - start);
+        return {
+          content: [{ type: 'text', text: JSON.stringify({
+            success: true, switched: true, company: company.name, folderId: company.folderId,
+            attempts, loadedCompanies: nowLoaded, agentMessage: outcome.message
+          }) }]
+        };
+      } catch (err) {
+        auditLog('switch-company', auditArgs, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: 'switch-company failed.', logs: logs.join('\n') + '\n' + String(err) });
       }
     }
   );
