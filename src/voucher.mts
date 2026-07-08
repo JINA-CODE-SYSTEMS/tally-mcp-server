@@ -44,6 +44,35 @@ export function escapeXml(s: string): string {
     .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
 
+// Inverse of escapeXml: decode the predefined + numeric XML entities back to literal characters.
+// We CANONICALIZE every master name (ledger / stock item / party / voucher type / company) to this
+// literal form so that (a) escaping is applied exactly once at XML-build time — a name arriving as
+// "LEGAL &amp; PROFESSIONAL FEES" is not double-escaped into "&amp;amp;" (which Tally stores/looks up
+// literally, so the ledger becomes unreferenceable), and (b) the master-exists check matches on one
+// normalized form regardless of whether the caller passed "A & B" or "A &amp; B". `&amp;` is decoded
+// LAST so "&amp;lt;" round-trips to the literal "&lt;" rather than collapsing to "<".
+export function decodeXmlEntities(s: string): string {
+  return String(s)
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+// XML-encode a MASTER NAME safely: decode any entities the caller already applied, then escape exactly
+// once. Idempotent w.r.t. caller escaping — xmlName("A & B") === xmlName("A &amp; B") === "A &amp; B".
+export function xmlName(s: string): string {
+  return escapeXml(decodeXmlEntities(s));
+}
+
+// Canonical comparison key for a master name: entity-decoded, trimmed, case-folded. So the
+// master-exists check is insensitive to XML-escaping and to how Tally happened to encode the name it
+// reported back.
+export function masterKey(s: string): string {
+  return decodeXmlEntities(String(s ?? '')).trim().toLowerCase();
+}
+
 // YYYY-MM-DD → YYYYMMDD (Tally's date format). Returns '' if not a valid ISO date.
 export function toTallyDate(iso: string): string {
   const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || '');
@@ -83,10 +112,12 @@ export function isDateInOpenPeriod(
 // An empty `known` list means "unknown" → returns [] (don't block on an unavailable master list).
 export function findMissingMasters(referenced: string[], known: string[]): string[] {
   if (!known.length) return [];
-  const set = new Set(known.map(k => k.trim().toLowerCase()));
+  // Compare on the entity-decoded, case-folded key so "LEGAL & PROFESSIONAL FEES" and
+  // "LEGAL &amp; PROFESSIONAL FEES" (either side) are treated as the same master (P0-1).
+  const set = new Set(known.map(masterKey));
   const missing: string[] = [];
   for (const r of referenced) {
-    const n = (r ?? '').trim().toLowerCase();
+    const n = masterKey(r);
     if (n && !set.has(n) && !missing.includes(r)) missing.push(r);
   }
   return missing;
@@ -128,9 +159,9 @@ function costCentreXml(entry: VoucherEntry): string {
   }
   let xml = '';
   for (const [category, allocs] of byCat) {
-    xml += `<CATEGORYALLOCATIONS.LIST><CATEGORY>${escapeXml(category)}</CATEGORY>`;
+    xml += `<CATEGORYALLOCATIONS.LIST><CATEGORY>${xmlName(category)}</CATEGORY>`;
     for (const a of allocs) {
-      xml += `<COSTCENTREALLOCATIONS.LIST><NAME>${escapeXml(a.centre)}</NAME>` +
+      xml += `<COSTCENTREALLOCATIONS.LIST><NAME>${xmlName(a.centre)}</NAME>` +
              `<AMOUNT>${sign < 0 ? '-' : ''}${a.amount}</AMOUNT></COSTCENTREALLOCATIONS.LIST>`;
     }
     xml += `</CATEGORYALLOCATIONS.LIST>`;
@@ -140,7 +171,7 @@ function costCentreXml(entry: VoucherEntry): string {
 
 function ledgerEntryXml(entry: VoucherEntry): string {
   return `<ALLLEDGERENTRIES.LIST>` +
-    `<LEDGERNAME>${escapeXml(entry.ledger)}</LEDGERNAME>` +
+    `<LEDGERNAME>${xmlName(entry.ledger)}</LEDGERNAME>` +
     `<ISDEEMEDPOSITIVE>${entry.drCr === 'dr' ? 'Yes' : 'No'}</ISDEEMEDPOSITIVE>` +
     `<AMOUNT>${signedAmount(entry)}</AMOUNT>` +
     billwiseXml(entry) +
@@ -153,7 +184,7 @@ function inventoryXml(line: InventoryLine): string {
   const qtyUnit = line.unit ? `${line.quantity} ${line.unit}` : `${line.quantity}`;
   const rateUnit = (line.rate != null && line.unit) ? `${line.rate}/${line.unit}` : (line.rate != null ? `${line.rate}` : '');
   let xml = `<ALLINVENTORYENTRIES.LIST>` +
-    `<STOCKITEMNAME>${escapeXml(line.stockItem)}</STOCKITEMNAME>` +
+    `<STOCKITEMNAME>${xmlName(line.stockItem)}</STOCKITEMNAME>` +
     `<ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>` +
     (rateUnit ? `<RATE>${escapeXml(rateUnit)}</RATE>` : '') +
     `<AMOUNT>${amount}</AMOUNT>` +
@@ -161,14 +192,14 @@ function inventoryXml(line: InventoryLine): string {
     `<BILLEDQTY>${escapeXml(qtyUnit)}</BILLEDQTY>`;
   if (line.godown || line.batch) {
     xml += `<BATCHALLOCATIONS.LIST>` +
-      (line.godown ? `<GODOWNNAME>${escapeXml(line.godown)}</GODOWNNAME>` : '') +
-      (line.batch ? `<BATCHNAME>${escapeXml(line.batch)}</BATCHNAME>` : '') +
+      (line.godown ? `<GODOWNNAME>${xmlName(line.godown)}</GODOWNNAME>` : '') +
+      (line.batch ? `<BATCHNAME>${xmlName(line.batch)}</BATCHNAME>` : '') +
       `<AMOUNT>${amount}</AMOUNT><ACTUALQTY>${escapeXml(qtyUnit)}</ACTUALQTY><BILLEDQTY>${escapeXml(qtyUnit)}</BILLEDQTY>` +
       `</BATCHALLOCATIONS.LIST>`;
   }
   if (line.accountingLedger) {
     xml += `<ACCOUNTINGALLOCATIONS.LIST>` +
-      `<LEDGERNAME>${escapeXml(line.accountingLedger)}</LEDGERNAME>` +
+      `<LEDGERNAME>${xmlName(line.accountingLedger)}</LEDGERNAME>` +
       `<ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>` +
       `<AMOUNT>${amount}</AMOUNT>` +
       `</ACCOUNTINGALLOCATIONS.LIST>`;
@@ -180,14 +211,14 @@ function inventoryXml(line: InventoryLine): string {
 // Builds the full Import envelope. `targetCompany` is injected into STATICVARIABLES when supplied.
 export function buildVoucherXml(v: VoucherInput, targetCompany?: string): string {
   const tallyDate = toTallyDate(v.date);
-  const svCompany = targetCompany ? `<SVCURRENTCOMPANY>${escapeXml(targetCompany)}</SVCURRENTCOMPANY>` : '';
+  const svCompany = targetCompany ? `<SVCURRENTCOMPANY>${xmlName(targetCompany)}</SVCURRENTCOMPANY>` : '';
   const body =
-    `<VOUCHER VCHTYPE="${escapeXml(v.voucherType)}" ACTION="Create">` +
+    `<VOUCHER VCHTYPE="${xmlName(v.voucherType)}" ACTION="Create">` +
     `<DATE>${tallyDate}</DATE>` +
     `<EFFECTIVEDATE>${tallyDate}</EFFECTIVEDATE>` +
-    `<VOUCHERTYPENAME>${escapeXml(v.voucherType)}</VOUCHERTYPENAME>` +
+    `<VOUCHERTYPENAME>${xmlName(v.voucherType)}</VOUCHERTYPENAME>` +
     (v.voucherNumber ? `<VOUCHERNUMBER>${escapeXml(v.voucherNumber)}</VOUCHERNUMBER>` : '') +
-    (v.partyLedger ? `<PARTYLEDGERNAME>${escapeXml(v.partyLedger)}</PARTYLEDGERNAME>` : '') +
+    (v.partyLedger ? `<PARTYLEDGERNAME>${xmlName(v.partyLedger)}</PARTYLEDGERNAME>` : '') +
     (v.reference ? `<REFERENCE>${escapeXml(v.reference)}</REFERENCE>` : '') +
     (v.narration ? `<NARRATION>${escapeXml(v.narration)}</NARRATION>` : '') +
     (v.gst?.placeOfSupply ? `<PLACEOFSUPPLY>${escapeXml(v.gst.placeOfSupply)}</PLACEOFSUPPLY>` : '') +
@@ -209,11 +240,11 @@ export function buildVoucherXml(v: VoucherInput, targetCompany?: string): string
 // not duplicated here.
 export function buildCancelVoucherXml(v: { voucherType: string; voucherNumber: string; date: string }, targetCompany?: string): string {
   const tallyDate = toTallyDate(v.date);
-  const svCompany = targetCompany ? `<SVCURRENTCOMPANY>${escapeXml(targetCompany)}</SVCURRENTCOMPANY>` : '';
+  const svCompany = targetCompany ? `<SVCURRENTCOMPANY>${xmlName(targetCompany)}</SVCURRENTCOMPANY>` : '';
   const body =
-    `<VOUCHER ACTION="Cancel" VCHTYPE="${escapeXml(v.voucherType)}">` +
+    `<VOUCHER ACTION="Cancel" VCHTYPE="${xmlName(v.voucherType)}">` +
     `<DATE>${tallyDate}</DATE>` +
-    `<VOUCHERTYPENAME>${escapeXml(v.voucherType)}</VOUCHERTYPENAME>` +
+    `<VOUCHERTYPENAME>${xmlName(v.voucherType)}</VOUCHERTYPENAME>` +
     `<VOUCHERNUMBER>${escapeXml(v.voucherNumber)}</VOUCHERNUMBER>` +
     `<ISCANCELLED>Yes</ISCANCELLED>` +
     `</VOUCHER>`;
