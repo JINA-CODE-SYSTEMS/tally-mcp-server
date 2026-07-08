@@ -11,15 +11,36 @@ param(
     [string]$WatchDir = $null,
     [string]$LLMProvider = $null,   # "anthropic" or "openai" (auto-detected from available API key)
     [int]$MaxSteps = 15,            # Safety limit per command
-    [switch]$NoSelfRestart          # Disable self-watching auto-restart (for debugging)
+    [switch]$NoSelfRestart,         # Disable self-watching auto-restart (for debugging)
+    [switch]$ShowConsole            # Keep the console window visible (debugging); hidden by default
 )
+
+# --- Hide our own console window --------------------------------------------------------------
+# The agent MUST run in the interactive desktop session (it drives the Tally GUI and takes
+# screenshots — a Session-0 service can't). But its console window is just noise a user can
+# accidentally close, which kills GUI control until the crash-respawn heartbeat brings it back.
+# Hide the window so it isn't visible or closeable; the tray dashboard shows the agent's real
+# status (Running + PID). Runs first so the window is gone almost immediately. Pass -ShowConsole
+# (or run the script by hand with it) to keep the console visible for debugging.
+if (-not $ShowConsole) {
+    try {
+        Add-Type -Name _AgentConsole -Namespace _Tally -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
+'@ -ErrorAction Stop
+        $__consoleWnd = [_Tally._AgentConsole]::GetConsoleWindow()
+        if ($__consoleWnd -ne [System.IntPtr]::Zero) {
+            [void][_Tally._AgentConsole]::ShowWindow($__consoleWnd, 0)  # 0 = SW_HIDE
+        }
+    } catch { }
+}
 
 # --- Agent version (bumped whenever the IPC contract or script behavior changes) ---
 # The MCP server reads this from the ping response and refuses load-company calls
 # against an agent older than its required minimum (issue #15 - version handshake).
 # Format: MAJOR.MINOR.PATCH. Bump MINOR on any new IPC action or response field;
 # bump PATCH on internal fixes that callers can ignore.
-$Script:AgentVersion = "1.6.1"
+$Script:AgentVersion = "1.6.2"
 
 # --- Single-instance guard ---------------------------------------------------------------------
 # Only ONE agent may run. Multiple instances race on the command/result files and each spawns its own
