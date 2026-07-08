@@ -190,20 +190,8 @@ var
   ConfigPage: TInputQueryWizardPage;
   RemotePage: TInputQueryWizardPage;
   EditionPage: TInputOptionWizardPage;
-  AgentUserOverride: TNewCheckBox;
   GuiControlOptIn: TNewCheckBox;
   BrandLabel: TNewStaticText;
-
-// Toggle the agent-user field's editability from the "advanced" checkbox. Locked (disabled) by
-// default so the Tab-selects-all-then-overwrite trap can't silently replace the correct logon; when
-// the operator opts back out we restore the current-user default so a half-typed override can't leak
-// into .env. See issue #79.
-procedure AgentUserOverrideClick(Sender: TObject);
-begin
-  ConfigPage.Edits[4].Enabled := AgentUserOverride.Checked;
-  if not AgentUserOverride.Checked then
-    ConfigPage.Values[4] := GetUserNameString();
-end;
 
 procedure InitializeWizard;
 var
@@ -244,21 +232,13 @@ begin
   ConfigPage.Values[1] := DefaultExePath;
   ConfigPage.Values[2] := DefaultDataPath;
   ConfigPage.Values[3] := DefaultIniPath;
-  ConfigPage.Values[4] := DefaultUser;  // Windows user the GUI agent runs as
+  ConfigPage.Values[4] := DefaultUser;  // Windows user the GUI agent runs as (current logon, editable)
 
-  // Harden the agent-user field (issue #79): it is pre-filled with the current user and LOCKED by
-  // default. Windows edit controls select-all on Tab-in, so a stray keystroke would otherwise
-  // overwrite the correct logon (observed: "taal" replacing "tapanjain") and break GUI-agent task
-  // registration. Only the explicit checkbox below unlocks it.
-  ConfigPage.Edits[4].Enabled := False;
-  AgentUserOverride := TNewCheckBox.Create(ConfigPage);
-  AgentUserOverride.Parent := ConfigPage.Surface;
-  AgentUserOverride.Left := ConfigPage.Edits[4].Left;
-  AgentUserOverride.Top := ConfigPage.Edits[4].Top + ConfigPage.Edits[4].Height + ScaleY(4);
-  AgentUserOverride.Width := ConfigPage.SurfaceWidth;
-  AgentUserOverride.Caption := 'Run the GUI agent as a different Windows user (advanced)';
-  AgentUserOverride.Checked := False;
-  AgentUserOverride.OnClick := @AgentUserOverrideClick;
+  // The agent-user field is pre-filled with the current Windows user and left EDITABLE. (We dropped the
+  // earlier lock + "advanced" unlock checkbox from issue #79: the checkbox sat below the last field and
+  // clipped off the bottom of the wizard page, which doesn't scroll. NextButtonClick still validates the
+  // entered user actually exists via `net user`, so a stray keystroke can't silently register a bad
+  // account — it's caught with a clear error instead of failing silently.)
 
   // --- Page 2: Remote access (optional). Both fields are optional and only needed for the browser
   // claude.ai connector; kept on their own page so the main page never overflows. ---
