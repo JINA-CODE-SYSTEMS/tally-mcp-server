@@ -19,7 +19,22 @@ param(
 # against an agent older than its required minimum (issue #15 - version handshake).
 # Format: MAJOR.MINOR.PATCH. Bump MINOR on any new IPC action or response field;
 # bump PATCH on internal fixes that callers can ignore.
-$Script:AgentVersion = "1.5.0"
+$Script:AgentVersion = "1.5.1"
+
+# --- Single-instance guard ---------------------------------------------------------------------
+# Only ONE agent may run. Multiple instances race on the command/result files and each spawns its own
+# overlay window. A named session mutex enforces this across EVERY launch path (at-logon trigger, the
+# 1-min crash-respawn heartbeat, Restart-Self on script change, manual starts, reinstalls). We wait a
+# few seconds so a Restart-Self predecessor can exit and release the mutex before we give up; an
+# abandoned mutex (predecessor exited without releasing) still counts as acquired.
+$Script:SingleInstanceMutex = New-Object System.Threading.Mutex($false, 'TallyMCPAgentSingleInstance')
+$haveMutex = $false
+try { $haveMutex = $Script:SingleInstanceMutex.WaitOne(4000) }
+catch [System.Threading.AbandonedMutexException] { $haveMutex = $true }
+if (-not $haveMutex) {
+    Write-Host "Another Tally GUI agent is already running - exiting this duplicate instance."
+    exit 0
+}
 
 if (-not $WatchDir) {
     $WatchDir = if ($env:TALLY_DATA_PATH) { $env:TALLY_DATA_PATH } else { "C:\Users\Public\TallyPrimeEditLog\data" }
@@ -608,6 +623,11 @@ public class ClaudeOverlayNative {
             $form = New-Object System.Windows.Forms.Form
             $form.FormBorderStyle = 'None'; $form.ShowInTaskbar = $false; $form.TopMost = $true
             $form.StartPosition = 'Manual'; $form.BackColor = $orange; $form.Visible = $false
+            # Opacity < 1 makes WinForms apply the LAYERED alpha — WITHOUT this the manual WS_EX_LAYERED
+            # composites the window fully transparent (invisible), which is why the frame never showed.
+            $form.Opacity = 0.9
+            # Suppress the brief startup flash from Application.Run showing the form before the timer.
+            $form.Add_Shown({ try { $form.Hide() } catch {} })
             $label = New-Object System.Windows.Forms.Label
             $label.Text = "  Claude is controlling Tally - please don't use the keyboard or mouse  "
             $label.Dock = 'Top'; $label.Height = $barH; $label.TextAlign = 'MiddleCenter'
