@@ -188,6 +188,7 @@ Type: filesandordirs; Name: "{app}\bin"
 [Code]
 var
   ConfigPage: TInputQueryWizardPage;
+  RemotePage: TInputQueryWizardPage;
   EditionPage: TInputOptionWizardPage;
   AgentUserOverride: TNewCheckBox;
   GuiControlOptIn: TNewCheckBox;
@@ -199,9 +200,9 @@ var
 // into .env. See issue #79.
 procedure AgentUserOverrideClick(Sender: TObject);
 begin
-  ConfigPage.Edits[6].Enabled := AgentUserOverride.Checked;
+  ConfigPage.Edits[4].Enabled := AgentUserOverride.Checked;
   if not AgentUserOverride.Checked then
-    ConfigPage.Values[6] := GetUserNameString();
+    ConfigPage.Values[4] := GetUserNameString();
 end;
 
 procedure InitializeWizard;
@@ -217,8 +218,6 @@ begin
   ConfigPage.Add('Tally executable path:', False);
   ConfigPage.Add('Tally data folder:', False);
   ConfigPage.Add('tally.ini path:', False);
-  ConfigPage.Add('Public domain / Cloudflare Tunnel hostname (blank = localhost-only; e.g. https://tally-mcp.example.com):', False);
-  ConfigPage.Add('Cloudflare Tunnel token (optional; leave blank if you do not use Cloudflare Tunnel):', False);
   ConfigPage.Add('Windows user the GUI agent runs as (default: current user):', False);
 
   // Auto-detect defaults from the box. These are the conventional Tally Prime Edit Log paths;
@@ -245,25 +244,34 @@ begin
   ConfigPage.Values[1] := DefaultExePath;
   ConfigPage.Values[2] := DefaultDataPath;
   ConfigPage.Values[3] := DefaultIniPath;
-  ConfigPage.Values[4] := DefaultDomain;
-  ConfigPage.Values[5] := '';           // Cloudflare Tunnel token (optional)
-  ConfigPage.Values[6] := DefaultUser;  // Windows user the GUI agent runs as
+  ConfigPage.Values[4] := DefaultUser;  // Windows user the GUI agent runs as
 
   // Harden the agent-user field (issue #79): it is pre-filled with the current user and LOCKED by
   // default. Windows edit controls select-all on Tab-in, so a stray keystroke would otherwise
   // overwrite the correct logon (observed: "taal" replacing "tapanjain") and break GUI-agent task
   // registration. Only the explicit checkbox below unlocks it.
-  ConfigPage.Edits[6].Enabled := False;
+  ConfigPage.Edits[4].Enabled := False;
   AgentUserOverride := TNewCheckBox.Create(ConfigPage);
   AgentUserOverride.Parent := ConfigPage.Surface;
-  AgentUserOverride.Left := ConfigPage.Edits[6].Left;
-  AgentUserOverride.Top := ConfigPage.Edits[6].Top + ConfigPage.Edits[6].Height + ScaleY(4);
+  AgentUserOverride.Left := ConfigPage.Edits[4].Left;
+  AgentUserOverride.Top := ConfigPage.Edits[4].Top + ConfigPage.Edits[4].Height + ScaleY(4);
   AgentUserOverride.Width := ConfigPage.SurfaceWidth;
   AgentUserOverride.Caption := 'Run the GUI agent as a different Windows user (advanced)';
   AgentUserOverride.Checked := False;
   AgentUserOverride.OnClick := @AgentUserOverrideClick;
 
-  EditionPage := CreateInputOptionPage(ConfigPage.ID,
+  // --- Page 2: Remote access (optional). Both fields are optional and only needed for the browser
+  // claude.ai connector; kept on their own page so the main page never overflows. ---
+  RemotePage := CreateInputQueryPage(ConfigPage.ID,
+    'Remote Access (optional)',
+    'Only needed for the browser-based claude.ai connector. Leave both blank for localhost-only (Claude Desktop needs nothing here).',
+    'No public domain or static IP? Use Cloudflare Tunnel: a Jina admin provisions a token + hostname per client. Paste the hostname and token below and the installer runs cloudflared so this box gets a stable public HTTPS URL with no router config.');
+  RemotePage.Add('Public domain / Cloudflare Tunnel hostname (e.g. https://client.tally.jinacode.systems):', False);
+  RemotePage.Add('Cloudflare Tunnel token (optional; leave blank if you do not use Cloudflare Tunnel):', False);
+  RemotePage.Values[0] := DefaultDomain;
+  RemotePage.Values[1] := '';
+
+  EditionPage := CreateInputOptionPage(RemotePage.ID,
     'Tally Edition',
     'Which Tally Prime edition is installed?',
     'Silver allows only one company resident at a time; Gold allows multiple. The MCP server adapts load-company behavior based on this. Choose Silver if unsure — it is the safer default.',
@@ -376,29 +384,17 @@ begin
       exit;
     end;
 
-    // A Cloudflare Tunnel token needs the public hostname (the reused "Public domain" field) so the
-    // MCP server advertises the correct OAuth URL. Block rather than silently produce a connector that
-    // points at localhost.
-    if (Length(Trim(ConfigPage.Values[5])) > 0) and (Length(Trim(ConfigPage.Values[4])) = 0) then
-    begin
-      MsgBox('You entered a Cloudflare Tunnel token but left the "Public domain / Cloudflare Tunnel hostname" field blank.' + #13#10 +
-             'Enter the tunnel hostname (e.g. https://client123.tally.jinacode.systems) so the connector URL is correct.', mbError, MB_OK);
-      Result := False;
-      exit;
-    end;
-
     // Validate the GUI agent user actually exists on this box. Catches typos / paste accidents
-    // (e.g. accidentally fragmenting the public-domain string into the user field) BEFORE the
-    // installer tries to register the scheduled task with a bogus account, which fails with
-    // "No mapping between account names and security IDs was done."
-    agentUserValue := Trim(ConfigPage.Values[6]);
+    // BEFORE the installer tries to register the scheduled task with a bogus account, which fails
+    // with "No mapping between account names and security IDs was done."
+    agentUserValue := Trim(ConfigPage.Values[4]);
     if Length(agentUserValue) = 0 then
     begin
       // Blank (e.g. cleared while overriding) — restore the current-user default rather than block.
       // The field is locked to the current user unless the "advanced" checkbox is ticked (issue #79),
       // so an empty value here is a mistake we can safely auto-correct.
-      ConfigPage.Values[6] := GetUserNameString();
-      agentUserValue := Trim(ConfigPage.Values[6]);
+      ConfigPage.Values[4] := GetUserNameString();
+      agentUserValue := Trim(ConfigPage.Values[4]);
     end;
     // ShellExec runs `net user "<name>"` quietly; exit code 0 = user exists.
     if not ShellExec('open', 'cmd.exe', '/c net user "' + agentUserValue + '" >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, errCode) then
@@ -413,6 +409,19 @@ begin
              'Use the actual logon name (e.g. ' + GetUserNameString() + ').' + #13#10#13#10 +
              'If you continue with this value, the GUI agent task will not register and load-company will not work.',
              mbError, MB_OK);
+      Result := False;
+      exit;
+    end;
+  end
+  else if CurPageID = RemotePage.ID then
+  begin
+    // A Cloudflare Tunnel token needs the public hostname (field above it) so the MCP server
+    // advertises the correct OAuth URL. Block rather than silently produce a connector that
+    // points at localhost.
+    if (Length(Trim(RemotePage.Values[1])) > 0) and (Length(Trim(RemotePage.Values[0])) = 0) then
+    begin
+      MsgBox('You entered a Cloudflare Tunnel token but left the "Public domain / Cloudflare Tunnel hostname" field blank.' + #13#10 +
+             'Enter the tunnel hostname (e.g. https://client123.tally.jinacode.systems) so the connector URL is correct.', mbError, MB_OK);
       Result := False;
       exit;
     end;
@@ -472,17 +481,17 @@ end;
 
 function GetWizardDomain(Param: string): string;
 begin
-  Result := ConfigPage.Values[4];
+  Result := RemotePage.Values[0];
 end;
 
 function GetWizardTunnelToken(Param: string): string;
 begin
-  Result := ConfigPage.Values[5];
+  Result := RemotePage.Values[1];
 end;
 
 function GetWizardAgentUser(Param: string): string;
 begin
-  Result := ConfigPage.Values[6];
+  Result := ConfigPage.Values[4];
 end;
 
 function GetWizardGuiControl(Param: string): string;
