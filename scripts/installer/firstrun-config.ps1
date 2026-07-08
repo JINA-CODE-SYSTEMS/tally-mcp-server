@@ -67,6 +67,11 @@ param(
     # Opt-in for Claude-driven GUI control (gui-screenshot / gui-send-keys). Wizard passes
     # 'true'/'false'; a bare Reconfigure omits it, so we preserve the existing .env value below.
     [string]$EnableGuiControl,
+    # Cloudflare Tunnel. When -TunnelToken is non-empty, a second NSSM service ($TunnelServiceName)
+    # runs cloudflared so a NAT'd box gets a stable public HTTPS URL with no router config. Blank on a
+    # bare Reconfigure -> preserved from .env below (like McpDomain), so a reconfigure doesn't drop it.
+    [string]$TunnelServiceName = 'TallyMCPTunnel',
+    [string]$TunnelToken,
     [switch]$SkipTrayTask
 )
 
@@ -113,6 +118,9 @@ $AgentTaskUser  = _Coalesce $AgentTaskUser  $_existingEnv['AGENT_TASK_USER']  $e
 # existing value on a bare Reconfigure; normalize anything that isn't the literal 'true' to 'false'.
 $EnableGuiControl = _Coalesce $EnableGuiControl $_existingEnv['ENABLE_GUI_CONTROL'] 'false'
 if ($EnableGuiControl -ne 'true') { $EnableGuiControl = 'false' }
+# Cloudflare Tunnel token: preserve across a bare Reconfigure (like MCP_DOMAIN). Blank = no tunnel,
+# and a previously-configured tunnel is torn down below. Trim so a stray-space value counts as blank.
+$TunnelToken = ("$(_Coalesce $TunnelToken $_existingEnv['TUNNEL_TOKEN'] '')").Trim()
 
 # --- Resolve OAuth password ---
 # Two entry paths:
@@ -305,8 +313,20 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     # so the OAuth-gated server is NOT reachable from the LAN. Older versions always wrote
     # BIND_HOST=0.0.0.0 even in the localhost-only path, silently exposing the server network-wide
     # (and the adjacent "binds to localhost only" comment was false).
-    if ($McpDomain) {
-        # A reverse proxy (Caddy/IIS/Cloudflare Tunnel) sits in front and restricts access.
+    if ($TunnelToken -and -not $McpDomain) {
+        Write-Host "[WARN] A Cloudflare Tunnel token was supplied but MCP_DOMAIN (the public hostname) is blank." -ForegroundColor Yellow
+        Write-Host "       The tunnel will run, but the OAuth metadata URL will be wrong until you set the hostname (Reconfigure)." -ForegroundColor Yellow
+    }
+    if ($TunnelToken) {
+        # Cloudflare Tunnel: cloudflared makes an OUTBOUND connection to Cloudflare's edge and reaches
+        # the MCP server on loopback, so the server never needs to listen beyond 127.0.0.1 — strictly
+        # more secure than the bring-your-own reverse-proxy path below (which must bind 0.0.0.0).
+        # MCP_DOMAIN stays the public hostname so OAuth discovery advertises the right URL.
+        $envLines += "BIND_HOST=127.0.0.1"
+        if ($McpDomain) { $envLines += "MCP_DOMAIN=$McpDomain" }
+        $envLines += "TUNNEL_TOKEN=$(_envQuote $TunnelToken)"
+    } elseif ($McpDomain) {
+        # A reverse proxy (Caddy/IIS) the operator runs themselves sits in front and restricts access.
         # Node listens only on 127.0.0.1 by default; a proxy that resolves `localhost` to ::1
         # first on Windows then gets 502, so bind all interfaces for the proxy to reach it.
         $envLines += "BIND_HOST=0.0.0.0"
@@ -481,6 +501,63 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
 
     Write-Host "[OK] Service '$ServiceName' registered with bundled node + nssm"
 
+    # --- 3b. Cloudflare Tunnel service (optional) --------------------------
+    # When a tunnel token is configured, register cloudflared as a second NSSM service so a NAT'd box
+    # gets a stable public HTTPS URL with no router/domain config. Idempotent: ALWAYS stop/remove any
+    # prior instance first (mirrors the main-service teardown above), then re-register ONLY if a token
+    # is present — so blanking the token on a Reconfigure tears the tunnel down cleanly. The token is
+    # passed via the service ENV (TUNNEL_TOKEN), never on the command line where a local user could read it.
+    $cloudflaredExe = Join-Path $InstallDir 'bin\cloudflared.exe'
+    $existingTunnel = Get-Service -Name $TunnelServiceName -ErrorAction SilentlyContinue
+    if ($existingTunnel) {
+        Write-Host "[*] Existing tunnel service detected; stopping and removing..."
+        $savedPrefT = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            if ($existingTunnel.Status -eq 'Running') {
+                & $bundledNssm stop $TunnelServiceName 2>$null | Out-Null
+                Start-Sleep -Seconds 2
+            }
+            & $bundledNssm remove $TunnelServiceName confirm 2>$null | Out-Null
+        } finally {
+            $ErrorActionPreference = $savedPrefT
+        }
+        $deadlineT = (Get-Date).AddSeconds(15)
+        while ((Get-Service -Name $TunnelServiceName -ErrorAction SilentlyContinue) -and ((Get-Date) -lt $deadlineT)) {
+            Start-Sleep -Milliseconds 500
+        }
+    }
+    if ($TunnelToken) {
+        if (-not (Test-Path -LiteralPath $cloudflaredExe)) {
+            Write-Host "[WARN] Tunnel token set but cloudflared.exe not found at $cloudflaredExe - skipping tunnel service. Re-run the installer to bundle it." -ForegroundColor Yellow
+        } else {
+            & $bundledNssm install $TunnelServiceName $cloudflaredExe                               | Out-Null
+            & $bundledNssm set $TunnelServiceName AppParameters 'tunnel run'                        | Out-Null
+            & $bundledNssm set $TunnelServiceName AppDirectory $InstallDir                          | Out-Null
+            & $bundledNssm set $TunnelServiceName Description  'Claudally Cloudflare Tunnel (cloudflared)' | Out-Null
+            & $bundledNssm set $TunnelServiceName Start        SERVICE_AUTO_START                   | Out-Null
+            & $bundledNssm set $TunnelServiceName AppStdout    (Join-Path $InstallDir 'logs\tunnel.log') | Out-Null
+            & $bundledNssm set $TunnelServiceName AppStderr    (Join-Path $InstallDir 'logs\tunnel.log') | Out-Null
+            & $bundledNssm set $TunnelServiceName AppRotateFiles 1                                  | Out-Null
+            & $bundledNssm set $TunnelServiceName AppRotateOnline 1                                 | Out-Null
+            & $bundledNssm set $TunnelServiceName AppRotateSeconds 86400                            | Out-Null
+            & $bundledNssm set $TunnelServiceName AppRotateBytes 5242880                            | Out-Null
+            & $bundledNssm set $TunnelServiceName AppStdoutCreationDisposition 4                    | Out-Null
+            & $bundledNssm set $TunnelServiceName AppStderrCreationDisposition 4                    | Out-Null
+            & $bundledNssm set $TunnelServiceName AppExit Default Restart                           | Out-Null
+            & $bundledNssm set $TunnelServiceName AppRestartDelay 2000                              | Out-Null
+            & $bundledNssm set $TunnelServiceName AppThrottle 5000                                  | Out-Null
+            # cloudflared reads TUNNEL_TOKEN from its environment (so no --token on the command line).
+            & $bundledNssm set $TunnelServiceName AppEnvironmentExtra "TUNNEL_TOKEN=$TunnelToken"   | Out-Null
+            $savedPrefT2 = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try { & $bundledNssm start $TunnelServiceName 2>$null | Out-Null } finally { $ErrorActionPreference = $savedPrefT2 }
+            Write-Host "[OK] Cloudflare Tunnel service '$TunnelServiceName' registered and started (cloudflared)"
+        }
+    } else {
+        Write-Host "[*] No Cloudflare Tunnel token configured - tunnel service not registered"
+    }
+
     # --- 4. Register the GUI agent at-logon Scheduled Task -----------------
     # Use the ScheduledTasks PowerShell module rather than schtasks.exe. schtasks.exe via the
     # `&` operator with /TR mangles the inner quotes around paths with spaces (e.g.
@@ -603,6 +680,7 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     Write-Host ""
     Write-Host "Configuration complete."
     Write-Host "  Service:        $ServiceName  ($($svc.Status))"
+    Write-Host "  Tunnel:         $(if ($TunnelToken) { "$TunnelServiceName (cloudflared -> $McpDomain)" } else { 'not configured' })"
     Write-Host "  Agent task:     $AgentTaskName"
     Write-Host "  Tray task:      $TrayTaskName"
     Write-Host "  .env:           $envFile"
