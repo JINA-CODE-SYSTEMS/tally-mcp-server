@@ -696,7 +696,7 @@ function Show-Dashboard {
     }
 
     $lblProduct = New-Object System.Windows.Forms.Label
-    $lblProduct.Text     = 'Tally MCP Server'
+    $lblProduct.Text     = 'Claudally'
     $lblProduct.Font     = New-Object System.Drawing.Font 'Segoe UI Semibold', 16
     $lblProduct.AutoSize = $true
     $lblProduct.Location = New-Object System.Drawing.Point 128, 24
