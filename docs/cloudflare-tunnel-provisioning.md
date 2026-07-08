@@ -89,6 +89,68 @@ it on a Reconfigure tears the tunnel service down** and reverts `BIND_HOST`.
 5. Run **Reconfigure** with the token blanked → `TallyMCPTunnel` stops and is removed,
    `BIND_HOST` reverts. Uninstall → both services removed, no orphaned `cloudflared.exe`.
 
+## Security & hardening
+
+The tunnel exposes a server that can **read *and write* live books**, so treat the following as
+part of every deployment — not optional.
+
+### The OAuth password is the primary gate — get it right
+
+Every MCP call requires an authenticated OAuth 2.1 + PKCE session using the `PASSWORD` set in the
+wizard; unauthenticated requests to `/mcp` get nothing, and auth attempts are rate-limited
+server-side. That password is effectively the single key to the books:
+
+- **Use a strong, unique 16+ character random password.** Never reuse it.
+- **Rotate it** if it was ever shared over an insecure channel, or on staff changes — Start Menu →
+  **Reconfigure** → re-enter → it rewrites `.env` and restarts the service.
+- The installer already **ACL-locks `.env`** (SYSTEM + Administrators + the agent user) so the
+  password isn't readable by other local users. Don't loosen that.
+
+### What the tunnel already gives you
+
+- **No inbound ports, no LAN exposure** — the server binds `127.0.0.1` only and `cloudflared`
+  connects *outbound*. The only path in is Cloudflare's tunnel + the OAuth gate.
+- **TLS + DDoS protection** at Cloudflare's edge, free.
+
+### Edge hardening that is compatible with the MCP connector
+
+Add these on the tunnel's zone in the Cloudflare dashboard — they raise the bar without breaking the
+connector:
+
+- **Rate-limiting rule** on `/oauth/token` and `/mcp` (e.g. N req/min/IP) — a second brake on
+  credential-guessing on top of the app's own limiter.
+- **Geo restriction** — a WAF rule allowing only the country/countries the client operates from;
+  most attack traffic is foreign and this cuts it cheaply.
+- **Bot Fight Mode / Managed WAF** — Cloudflare's baseline bot + exploit filtering.
+- **IP allowlist** — *only if* the Claude client runs from a fixed IP (e.g. Claude Desktop on the
+  office PC, or a known office/home line): a WAF rule allowing just that IP makes the endpoint
+  invisible to everyone else. This does **not** work for the claude.ai **browser** connector, whose
+  calls originate from Anthropic's cloud (no stable client IP to allowlist).
+
+### Cloudflare Access (Zero Trust) — powerful but caveated
+
+Access can gate the hostname behind an identity check (email OTP / SSO) *before* any request reaches
+the server. It works cleanly for **browser-only** apps, but a remote MCP connector makes
+**server-to-server** calls (claude.ai's backend exchanges the OAuth token and calls `/mcp` directly),
+which cannot complete an interactive Access login. Using Access here needs Access **service tokens**
+(`CF-Access-Client-Id` / `-Secret` headers) **and** a client that can send custom headers — which the
+claude.ai / Claude Desktop connectors generally do not expose. So treat Access as
+**advanced/conditional**, not a drop-in; for most deployments the strong password + the WAF rules
+above are the practical layers.
+
+### Read-only clients
+
+For a client who only needs **reporting** (no voucher/ledger writes), set `READONLY_MODE=true` in
+`.env` (Reconfigure preserves it). Every write tool is then refused server-side (`READONLY`),
+removing the write-attack surface entirely — a strong risk reducer when writes aren't needed.
+
+### Operational
+
+- Traffic transits **Cloudflare** (TLS terminated at their edge) and the client is **Anthropic**
+  (claude.ai / Desktop) — the same trust model as any SaaS; name it to the client.
+- Review the server **audit log** periodically (every tool call is logged).
+- Keep `cloudflared` + the server updated by re-running the installer (refreshes the bundled binaries).
+
 ## Out of scope (v2 candidates)
 
 - Self-serve/automated provisioning (a hosted API that calls Cloudflare's API at install
