@@ -176,9 +176,14 @@ For browser-based clients (ChatGPT, Claude web, Copilot) that can't reach a loca
 }
 ```
 
-The server uses OAuth 2.1 with PKCE for authentication. Detailed setup guides:
+The server uses OAuth 2.1 with PKCE for authentication.
+
+**No public domain or static IP?** The Windows installer can bundle **Cloudflare Tunnel** — fill in the optional "Cloudflare Tunnel token" field in the wizard and it registers `cloudflared` as a second service that gives the box a stable public HTTPS URL (e.g. `https://<client>.tally.jinacode.systems`) with **zero router/port-forward config**. The MCP server then binds loopback-only (cloudflared reaches it on `127.0.0.1`), which is strictly safer than running your own `0.0.0.0` reverse proxy — the recommended path for a Tally box behind NAT.
+
+Detailed setup guides:
 - [Linux-based Server](docs/server-setup-linux.md) (recommended — Tally connects via SSH tunnel)
 - [Windows Server](docs/server-setup-windows.md)
+- [Cloudflare Tunnel provisioning](docs/cloudflare-tunnel-provisioning.md) (per-client tunnel setup for NAT'd boxes)
 
 ## Available Tools
 
