@@ -1,0 +1,32 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Claudally">
+  <!--
+    Claudally brand mark (Claude + Tally).
+    Concept: a warm-orange app tile (brand colour, matching the "Claude is controlling Tally" overlay)
+    carrying a white Claude-style spark sitting on a Tally ledger — the spark = Claude's intelligence,
+    the three tapering lines = ledger entries / a tally sheet. Reads cleanly from 16px to full size.
+    Master art; regenerate the .ico / wizard .bmp files from this — see REGENERATE-BRANDING.md.
+  -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FF9A2E"/>
+      <stop offset="1" stop-color="#F5620A"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.18"/>
+      <stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded-square tile -->
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#tile)"/>
+  <rect x="16" y="16" width="480" height="240" rx="112" fill="url(#sheen)"/>
+
+  <!-- Claude spark (four-point sparkle with concave sides) -->
+  <path d="M 256 106 Q 280 200 374 224 Q 280 248 256 342 Q 232 248 138 224 Q 232 200 256 106 Z"
+        fill="#FFFFFF"/>
+
+  <!-- Ledger / tally lines -->
+  <rect x="172" y="372" width="168" height="20" rx="10" fill="#FFFFFF" fill-opacity="0.95"/>
+  <rect x="190" y="404" width="132" height="20" rx="10" fill="#FFFFFF" fill-opacity="0.78"/>
+  <rect x="208" y="436" width="96"  height="20" rx="10" fill="#FFFFFF" fill-opacity="0.60"/>
+</svg>

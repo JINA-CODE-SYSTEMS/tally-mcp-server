@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Builds TallyMCP-Setup-<version>.exe from a clean source tree (issue #18).
+    Builds Claudally-Setup-<version>.exe from a clean source tree (issue #18).
 
 .DESCRIPTION
     Orchestrates the installer build:
@@ -9,7 +9,7 @@
         3. Stage portable Node.js + nssm.exe under ./installer-staging/ (downloaded
            if -DownloadDeps is passed; otherwise expects them to already be there)
         4. Invoke ISCC.exe on scripts/installer/tally-mcp.iss
-        5. Output is ./dist-installer/TallyMCP-Setup-<version>.exe
+        5. Output is ./dist-installer/Claudally-Setup-<version>.exe
 
     Run from the repo root in an admin PowerShell (admin needed only if you
     download deps to Program Files; default uses CWD).
@@ -232,7 +232,7 @@ Write-Host "==> Compiling $iss" -ForegroundColor Cyan
 & $InnoSetupPath $iss
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit $LASTEXITCODE" }
 
-$out = Get-ChildItem -Path (Join-Path $repoRoot 'dist-installer') -Filter 'TallyMCP-Setup-*.exe' |
+$out = Get-ChildItem -Path (Join-Path $repoRoot 'dist-installer') -Filter 'Claudally-Setup-*.exe' |
     Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
 if ($out) {
