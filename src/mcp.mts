@@ -6,7 +6,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import { cacheTable, executeSQL, validateSQL } from './database.mjs';
 import { handlePull, handlePush, jsonToTSV, pingTally, postTallyXML, pushXml, resolveGSTLedgers } from './tally.mjs';
-import { buildVoucherXml, buildCancelVoucherXml, voucherBalance, isDateInOpenPeriod, findMissingMasters, referencedLedgers, type VoucherEntry, type VoucherInput } from './voucher.mjs';
+import { buildVoucherXml, buildCancelVoucherXml, voucherBalance, isDateInOpenPeriod, findMissingMasters, referencedLedgers, decodeXmlEntities, type VoucherEntry, type VoucherInput } from './voucher.mjs';
 import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
 
 dotenv.config({ override: true, quiet: true });
@@ -1098,7 +1098,21 @@ async function resolveExactLoadedCompany(intended: string | null): Promise<Loade
   return pickLoadedCompany(intended, loaded);
 }
 
+// Master-name template variables that must ROUND-TRIP to match a Tally master. We entity-decode them
+// to their literal form so the template's `| escape` applies exactly once — a caller passing an already
+// escaped name ("LEGAL &amp; PROFESSIONAL FEES") isn't double-escaped into "&amp;amp;" (which Tally
+// would store/look up literally, making the ledger unreferenceable). Free text (narration, gstin, hsn)
+// is intentionally excluded. (P0-1)
+const PUSH_NAME_KEYS = [
+  'name', 'parentGroup', 'debitLedger', 'creditLedger', 'partyLedger',
+  'salePurchaseLedger', 'cgstLedger', 'sgstLedger', 'igstLedger', 'unit', 'voucherType', 'mailingName',
+];
+
 async function push(templateName: string, inputParams: Map<string, any>) {
+  for (const k of PUSH_NAME_KEYS) {
+    const v = inputParams.get(k);
+    if (typeof v === 'string' && v.length) inputParams.set(k, decodeXmlEntities(v));
+  }
   // Stamp the write with the EXACT loaded company name (not a registry alias/displayName), and fail
   // closed if the target isn't actually loaded — otherwise Tally accepts the import and no-ops.
   const intended = (inputParams.has('targetCompany') ? String(inputParams.get('targetCompany')) : activeCompany) ?? null;
@@ -1465,7 +1479,9 @@ async function fetchMasterNames(collection: string, company?: string): Promise<s
     if (company) p.set('targetCompany', company);
     const resp = await pull('list-master', p);
     if (resp.error || !Array.isArray(resp.data)) return [];
-    return resp.data.map((r: any) => String(r?.name ?? '')).filter((s: string) => s.length > 0);
+    // Decode XML entities so the known-master list holds LITERAL names ("A & B", not "A &amp; B"),
+    // matching what a caller types and keeping MASTER_NOT_FOUND messages readable. (P0-1)
+    return resp.data.map((r: any) => decodeXmlEntities(String(r?.name ?? ''))).filter((s: string) => s.length > 0);
   } catch { return []; }
 }
 
