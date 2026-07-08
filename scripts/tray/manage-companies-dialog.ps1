@@ -319,7 +319,7 @@ function Show-CsvImportPreviewDialog {
     $btnImport.Location = New-Object System.Drawing.Point(595, 442)
     $btnImport.Size = New-Object System.Drawing.Size(95, 32)
     $btnImport.Anchor = 'Bottom,Right'
-    $btnImport.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
+    $btnImport.BackColor = [System.Drawing.Color]::FromArgb(255, 140, 0)
     $btnImport.ForeColor = [System.Drawing.Color]::White
     $btnImport.UseVisualStyleBackColor = $false
     $form.Controls.Add($btnImport)
@@ -609,20 +609,33 @@ function Show-ManageCompaniesDialog {
     $fnPreviewCsv   = ${function:Show-CsvImportPreviewDialog}
 
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = 'Manage Companies - TallyMCP'
+    $form.Text = 'Manage Companies - Claudally'
     $form.Size = New-Object System.Drawing.Size(920, 650)
     $form.StartPosition = 'CenterScreen'
     $form.MinimumSize = New-Object System.Drawing.Size(760, 480)
     $form.BackColor = [System.Drawing.Color]::White
     $form.Font = New-Object System.Drawing.Font 'Segoe UI', 9
+    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
+    # Claudally title-bar icon (shipped to {app}\assets by the installer). Best-effort.
+    try {
+        $icoPath = Join-Path $PSScriptRoot '..\..\assets\tally-mcp.ico'
+        if (Test-Path -LiteralPath $icoPath) { $form.Icon = New-Object System.Drawing.Icon $icoPath }
+    } catch {}
 
     # Header band: subtle tinted strip behind the title for visual anchor
     $headerPanel = New-Object System.Windows.Forms.Panel
     $headerPanel.Location = New-Object System.Drawing.Point(0, 0)
     $headerPanel.Size = New-Object System.Drawing.Size(920, 78)
-    $headerPanel.BackColor = [System.Drawing.Color]::FromArgb(245, 247, 250)
+    $headerPanel.BackColor = [System.Drawing.Color]::White
     $headerPanel.Anchor = 'Top,Left,Right'
     $form.Controls.Add($headerPanel)
+
+    # Orange brand rule along the header's bottom edge (matches the tray dashboard + installer).
+    $headerAccent = New-Object System.Windows.Forms.Panel
+    $headerAccent.Dock = [System.Windows.Forms.DockStyle]::Bottom
+    $headerAccent.Height = 3
+    $headerAccent.BackColor = [System.Drawing.Color]::FromArgb(255, 140, 0)
+    $headerPanel.Controls.Add($headerAccent)
 
     $lblTitle = New-Object System.Windows.Forms.Label
     $lblTitle.Text = 'Manage Companies'
@@ -780,29 +793,53 @@ function Show-ManageCompaniesDialog {
     # Buttons. Row ops grouped left (Add/Edit/Delete/Test), bulk ops in the
     # middle (Import/Sample), Close right-anchored.
     $btnY = 535
+    # Flat buttons with a brand-orange accent + hover — Kind = 'primary' (orange) | 'danger' (red) |
+    # 'secondary'. Matches the tray dashboard reskin.
     function _MakeButton {
-        param([string]$Text, [int]$X, [int]$W = 95, [string]$Anchor = 'Bottom,Left', [System.Drawing.Color]$Back = ([System.Drawing.Color]::Empty), [System.Drawing.Color]$Fore = ([System.Drawing.Color]::Empty))
+        param([string]$Text, [int]$X, [int]$W = 95, [string]$Anchor = 'Bottom,Left', [string]$Kind = 'secondary')
         $b = New-Object System.Windows.Forms.Button
         $b.Text = $Text
         $b.Location = New-Object System.Drawing.Point($X, $btnY)
         $b.Size = New-Object System.Drawing.Size($W, 34)
         $b.Anchor = $Anchor
         $b.Font = New-Object System.Drawing.Font 'Segoe UI', 9
-        $b.FlatStyle = 'System'
-        if (-not $Back.IsEmpty) { $b.BackColor = $Back; $b.UseVisualStyleBackColor = $false }
-        if (-not $Fore.IsEmpty) { $b.ForeColor = $Fore }
+        $b.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+        $b.Cursor = [System.Windows.Forms.Cursors]::Hand
+        $b.UseVisualStyleBackColor = $false
+        switch ($Kind) {
+            'primary' {
+                $b.BackColor = [System.Drawing.Color]::FromArgb(255, 140, 0)
+                $b.ForeColor = [System.Drawing.Color]::White
+                $b.FlatAppearance.BorderSize = 0
+                $b.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(255, 158, 46)
+                $b.FlatAppearance.MouseDownBackColor = [System.Drawing.Color]::FromArgb(230, 126, 0)
+            }
+            'danger' {
+                $b.BackColor = [System.Drawing.Color]::White
+                $b.ForeColor = [System.Drawing.Color]::FromArgb(185, 28, 28)
+                $b.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(252, 205, 205)
+                $b.FlatAppearance.BorderSize = 1
+                $b.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(254, 242, 242)
+            }
+            default {
+                $b.BackColor = [System.Drawing.Color]::White
+                $b.ForeColor = [System.Drawing.Color]::FromArgb(55, 65, 81)
+                $b.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(209, 213, 219)
+                $b.FlatAppearance.BorderSize = 1
+                $b.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(243, 244, 246)
+            }
+        }
         $form.Controls.Add($b)
         return $b
     }
-    $btnAdd       = _MakeButton -Text 'Add'        -X  20 -W 90
+    $btnAdd       = _MakeButton -Text 'Add'        -X  20 -W 90  -Kind 'primary'
     $btnEdit      = _MakeButton -Text 'Edit'       -X 115 -W 90
-    $btnDelete    = _MakeButton -Text 'Delete'     -X 210 -W 90
+    $btnDelete    = _MakeButton -Text 'Delete'     -X 210 -W 90  -Kind 'danger'
     $btnTest      = _MakeButton -Text 'Test'       -X 305 -W 90
     $btnImportCsv = _MakeButton -Text 'Import CSV' -X 425 -W 100
     $btnExportCsv = _MakeButton -Text 'Export CSV' -X 530 -W 100
     $btnSampleCsv = _MakeButton -Text 'Sample CSV' -X 635 -W 100
-    $btnClose     = _MakeButton -Text 'Close'      -X 805 -W 95 -Anchor 'Bottom,Right' `
-                      -Back ([System.Drawing.Color]::FromArgb(0, 120, 215)) -Fore ([System.Drawing.Color]::White)
+    $btnClose     = _MakeButton -Text 'Close'      -X 805 -W 95 -Anchor 'Bottom,Right'
 
     # Translate an edit-dialog entry's transient password fields (_passwordChanged /
     # _plaintextPassword) into a clean entry suitable for persistence, encrypting on the fly.
