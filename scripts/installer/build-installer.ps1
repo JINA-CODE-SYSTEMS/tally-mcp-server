@@ -213,6 +213,33 @@ if (-not (Test-Path $nssmTarget)) {
     throw "nssm.exe not found at $nssmTarget. Re-run with -DownloadDeps, or place nssm.exe (x64) there manually (e.g. via 'choco install nssm' then copy)."
 }
 
+# --- 3b. Stage cloudflared (Cloudflare Tunnel client) ---------------------
+# A single self-contained .exe. Only used at runtime when the operator supplies a Cloudflare Tunnel
+# token in the wizard; harmless to bundle otherwise (the installer ships it unconditionally, like
+# nssm). Downloaded from Cloudflare's official GitHub release. Reused across builds unless removed.
+$cloudflaredTarget = Join-Path $staging 'cloudflared.exe'
+if ($DownloadDeps -and -not (Test-Path $cloudflaredTarget)) {
+    $cfUrl = 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe'
+    $downloaded = $false
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        Write-Host "==> Downloading cloudflared (attempt $attempt) from $cfUrl" -ForegroundColor Cyan
+        try {
+            Invoke-WebRequest -Uri $cfUrl -OutFile $cloudflaredTarget -ErrorAction Stop
+            $downloaded = $true
+            break
+        } catch {
+            Write-Warning "  download failed: $($_.Exception.Message)"
+            if ($attempt -lt 3) { Start-Sleep -Seconds (3 * $attempt) }
+        }
+    }
+    if (-not $downloaded) {
+        throw "Could not download cloudflared. Manual workaround: download cloudflared-windows-amd64.exe from https://github.com/cloudflare/cloudflared/releases/latest, save it as '$cloudflaredTarget', then re-run this script WITHOUT -DownloadDeps."
+    }
+}
+if (-not (Test-Path $cloudflaredTarget)) {
+    throw "cloudflared.exe not found at $cloudflaredTarget. Re-run with -DownloadDeps, or place cloudflared-windows-amd64.exe there manually (renamed to cloudflared.exe)."
+}
+
 # --- 4. Locate ISCC.exe ---------------------------------------------------
 if (-not $InnoSetupPath) {
     $candidate = Get-Command ISCC.exe -ErrorAction SilentlyContinue

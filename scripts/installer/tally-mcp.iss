@@ -27,6 +27,10 @@
 #define MyServiceName    "TallyMCP"
 #define MyAgentTaskName  "TallyMCPAgent"
 #define MyTrayTaskName   "TallyMCPTray"
+; Second NSSM-managed service, registered only when the wizard's optional Cloudflare Tunnel token
+; is supplied. Runs cloudflared so a NAT'd box gets a stable public HTTPS URL with no router config.
+; See docs/cloudflare-tunnel-provisioning.md.
+#define MyTunnelServiceName "TallyMCPTunnel"
 
 ; Source root: the installer is built from <repo>/scripts/installer/, so SourceDir
 ; climbs two levels to reach the repo root. SourcePath itself is provided by Inno.
@@ -125,6 +129,10 @@ Source: "{#StagingRoot}\node-portable\*"; DestDir: "{app}\node-portable"; Flags:
 ; --- NSSM (service manager). Wrapped here so we don't need network access at install time. ---
 Source: "{#StagingRoot}\nssm.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 
+; --- cloudflared (Cloudflare Tunnel client). Only run when the wizard's Cloudflare Tunnel token
+; field is filled in; harmless to ship unconditionally otherwise. Staged by build-installer.ps1. ---
+Source: "{#StagingRoot}\cloudflared.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
+
 ; --- Logs / data directories created at install time (empty on disk; AfterInstall ensures perms). ---
 
 [Dirs]
@@ -147,7 +155,7 @@ Name: "{group}\Uninstall {#MyAppName}";  Filename: "{uninstallexe}"
 [Run]
 ; --- 1. First-run wizard: writes .env from collected wizard inputs and registers the NSSM service ---
 Filename: "powershell.exe"; \
-  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"" -CredentialsFile ""{code:GetCredentialsFilePath}"" -TallyEdition ""{code:GetWizardEdition}"" -TallyExePath ""{code:GetWizardExePath}"" -TallyDataPath ""{code:GetWizardDataPath}"" -TallyIniPath ""{code:GetWizardIniPath}"" -McpDomain ""{code:GetWizardDomain}"" -AgentTaskUser ""{code:GetWizardAgentUser}"" -EnableGuiControl ""{code:GetWizardGuiControl}"""; \
+  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"" -TunnelServiceName ""{#MyTunnelServiceName}"" -CredentialsFile ""{code:GetCredentialsFilePath}"" -TallyEdition ""{code:GetWizardEdition}"" -TallyExePath ""{code:GetWizardExePath}"" -TallyDataPath ""{code:GetWizardDataPath}"" -TallyIniPath ""{code:GetWizardIniPath}"" -McpDomain ""{code:GetWizardDomain}"" -TunnelToken ""{code:GetWizardTunnelToken}"" -AgentTaskUser ""{code:GetWizardAgentUser}"" -EnableGuiControl ""{code:GetWizardGuiControl}"""; \
   WorkingDir: "{app}"; \
   StatusMsg: "Configuring service and writing .env..."; \
   Flags: runhidden waituntilterminated
@@ -155,7 +163,7 @@ Filename: "powershell.exe"; \
 [UninstallRun]
 ; --- Cleanup BEFORE Inno deletes files: stop service, remove NSSM entry, remove scheduled task ---
 Filename: "powershell.exe"; \
-  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\uninstall-cleanup.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"""; \
+  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\uninstall-cleanup.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"" -TunnelServiceName ""{#MyTunnelServiceName}"""; \
   RunOnceId: "TallyMcpUninstallCleanup"; \
   Flags: runhidden waituntilterminated
 
@@ -191,9 +199,9 @@ var
 // into .env. See issue #79.
 procedure AgentUserOverrideClick(Sender: TObject);
 begin
-  ConfigPage.Edits[5].Enabled := AgentUserOverride.Checked;
+  ConfigPage.Edits[6].Enabled := AgentUserOverride.Checked;
   if not AgentUserOverride.Checked then
-    ConfigPage.Values[5] := GetUserNameString();
+    ConfigPage.Values[6] := GetUserNameString();
 end;
 
 procedure InitializeWizard;
@@ -209,7 +217,8 @@ begin
   ConfigPage.Add('Tally executable path:', False);
   ConfigPage.Add('Tally data folder:', False);
   ConfigPage.Add('tally.ini path:', False);
-  ConfigPage.Add('Public domain (blank = localhost-only; e.g. https://tally-mcp.example.com):', False);
+  ConfigPage.Add('Public domain / Cloudflare Tunnel hostname (blank = localhost-only; e.g. https://tally-mcp.example.com):', False);
+  ConfigPage.Add('Cloudflare Tunnel token (optional; leave blank if you do not use Cloudflare Tunnel):', False);
   ConfigPage.Add('Windows user the GUI agent runs as (default: current user):', False);
 
   // Auto-detect defaults from the box. These are the conventional Tally Prime Edit Log paths;
@@ -237,17 +246,18 @@ begin
   ConfigPage.Values[2] := DefaultDataPath;
   ConfigPage.Values[3] := DefaultIniPath;
   ConfigPage.Values[4] := DefaultDomain;
-  ConfigPage.Values[5] := DefaultUser;
+  ConfigPage.Values[5] := '';           // Cloudflare Tunnel token (optional)
+  ConfigPage.Values[6] := DefaultUser;  // Windows user the GUI agent runs as
 
   // Harden the agent-user field (issue #79): it is pre-filled with the current user and LOCKED by
   // default. Windows edit controls select-all on Tab-in, so a stray keystroke would otherwise
   // overwrite the correct logon (observed: "taal" replacing "tapanjain") and break GUI-agent task
   // registration. Only the explicit checkbox below unlocks it.
-  ConfigPage.Edits[5].Enabled := False;
+  ConfigPage.Edits[6].Enabled := False;
   AgentUserOverride := TNewCheckBox.Create(ConfigPage);
   AgentUserOverride.Parent := ConfigPage.Surface;
-  AgentUserOverride.Left := ConfigPage.Edits[5].Left;
-  AgentUserOverride.Top := ConfigPage.Edits[5].Top + ConfigPage.Edits[5].Height + ScaleY(4);
+  AgentUserOverride.Left := ConfigPage.Edits[6].Left;
+  AgentUserOverride.Top := ConfigPage.Edits[6].Top + ConfigPage.Edits[6].Height + ScaleY(4);
   AgentUserOverride.Width := ConfigPage.SurfaceWidth;
   AgentUserOverride.Caption := 'Run the GUI agent as a different Windows user (advanced)';
   AgentUserOverride.Checked := False;
@@ -306,6 +316,10 @@ begin
   //    `nssm set ... Start SERVICE_AUTO_START` later in the install.
   Exec(ExpandConstant('{cmd}'), '/C sc stop TallyMCP', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
   Exec(ExpandConstant('{cmd}'), '/C sc config TallyMCP start= disabled', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+  // Also stop the optional Cloudflare Tunnel service + cloudflared.exe so bin\cloudflared.exe isn't
+  // locked when the file-copy phase overwrites it on an upgrade. No-ops when no tunnel was configured.
+  Exec(ExpandConstant('{cmd}'), '/C sc stop TallyMCPTunnel', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+  Exec(ExpandConstant('{cmd}'), '/C taskkill /F /IM cloudflared.exe', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
 
   // 2. End the at-logon scheduled tasks. /F = force, even if currently running. schtasks
   //    tolerates missing tasks on fresh installs (non-zero exit, ignored).
@@ -362,18 +376,29 @@ begin
       exit;
     end;
 
+    // A Cloudflare Tunnel token needs the public hostname (the reused "Public domain" field) so the
+    // MCP server advertises the correct OAuth URL. Block rather than silently produce a connector that
+    // points at localhost.
+    if (Length(Trim(ConfigPage.Values[5])) > 0) and (Length(Trim(ConfigPage.Values[4])) = 0) then
+    begin
+      MsgBox('You entered a Cloudflare Tunnel token but left the "Public domain / Cloudflare Tunnel hostname" field blank.' + #13#10 +
+             'Enter the tunnel hostname (e.g. https://client123.tally.jinacode.systems) so the connector URL is correct.', mbError, MB_OK);
+      Result := False;
+      exit;
+    end;
+
     // Validate the GUI agent user actually exists on this box. Catches typos / paste accidents
     // (e.g. accidentally fragmenting the public-domain string into the user field) BEFORE the
     // installer tries to register the scheduled task with a bogus account, which fails with
     // "No mapping between account names and security IDs was done."
-    agentUserValue := Trim(ConfigPage.Values[5]);
+    agentUserValue := Trim(ConfigPage.Values[6]);
     if Length(agentUserValue) = 0 then
     begin
       // Blank (e.g. cleared while overriding) — restore the current-user default rather than block.
       // The field is locked to the current user unless the "advanced" checkbox is ticked (issue #79),
       // so an empty value here is a mistake we can safely auto-correct.
-      ConfigPage.Values[5] := GetUserNameString();
-      agentUserValue := Trim(ConfigPage.Values[5]);
+      ConfigPage.Values[6] := GetUserNameString();
+      agentUserValue := Trim(ConfigPage.Values[6]);
     end;
     // ShellExec runs `net user "<name>"` quietly; exit code 0 = user exists.
     if not ShellExec('open', 'cmd.exe', '/c net user "' + agentUserValue + '" >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, errCode) then
@@ -450,9 +475,14 @@ begin
   Result := ConfigPage.Values[4];
 end;
 
-function GetWizardAgentUser(Param: string): string;
+function GetWizardTunnelToken(Param: string): string;
 begin
   Result := ConfigPage.Values[5];
+end;
+
+function GetWizardAgentUser(Param: string): string;
+begin
+  Result := ConfigPage.Values[6];
 end;
 
 function GetWizardGuiControl(Param: string): string;

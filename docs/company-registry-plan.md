@@ -240,7 +240,7 @@ Three deployment options, in order of complexity:
 |---|---|---|
 | **Same local network** | Both machines on the same office Wi-Fi or LAN | Open TCP port 3000 in Machine A's firewall. Point the LLM client at `http://<Machine-A-IP>:3000`. |
 | **Public domain with reverse proxy** | You want to use Claude from home, on the road, anywhere | Point a subdomain (e.g. `tally.yourdomain.com`) at Machine A. Run Caddy or IIS as a reverse proxy on Machine A to handle HTTPS. Set `MCP_DOMAIN` in the installer wizard. |
-| **Cloudflare Tunnel or similar** | Same as above but Machine A is behind a NAT you can't open | Install `cloudflared` on Machine A. It gives you a public HTTPS URL with no router config. |
+| **Cloudflare Tunnel or similar** | Same as above but Machine A is behind a NAT you can't open | Install `cloudflared` on Machine A. It gives you a public HTTPS URL with no router config. **Now implemented in the Windows installer** — supply a tunnel token in the wizard; see [cloudflare-tunnel-provisioning.md](cloudflare-tunnel-provisioning.md). |
 
 **Important constraints when running across two machines:**
 

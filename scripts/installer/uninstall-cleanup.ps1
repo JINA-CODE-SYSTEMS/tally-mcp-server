@@ -15,7 +15,8 @@ param(
     [Parameter(Mandatory=$true)] [string]$InstallDir,
     [string]$ServiceName   = 'TallyMCP',
     [string]$AgentTaskName = 'TallyMCPAgent',
-    [string]$TrayTaskName  = 'TallyMCPTray'
+    [string]$TrayTaskName  = 'TallyMCPTray',
+    [string]$TunnelServiceName = 'TallyMCPTunnel'
 )
 
 # ErrorActionPreference deliberately Continue: uninstall must finish even if a step throws.
@@ -44,6 +45,33 @@ try {
     }
 } catch {
     Write-Host "[WARN] Service removal raised: $_"
+}
+
+# 1b. Stop and remove the Cloudflare Tunnel NSSM service (same shape as step 1), then kill any
+#     leftover cloudflared.exe so file deletion succeeds. No-op when no tunnel was configured.
+try {
+    if (Get-Service -Name $TunnelServiceName -ErrorAction SilentlyContinue) {
+        if (Test-Path -LiteralPath $bundledNssm) {
+            Write-Host "[*] Stopping tunnel service via bundled nssm..."
+            & $bundledNssm stop $TunnelServiceName 2>$null | Out-Null
+            & $bundledNssm remove $TunnelServiceName confirm | Out-Null
+        } else {
+            Write-Host "[*] Bundled nssm not found; falling back to sc.exe for tunnel"
+            & sc.exe stop $TunnelServiceName | Out-Null
+            Start-Sleep -Seconds 2
+            & sc.exe delete $TunnelServiceName | Out-Null
+        }
+        Write-Host "[OK] Service '$TunnelServiceName' removed"
+    } else {
+        Write-Host "[*] Service '$TunnelServiceName' not found - already removed / never configured"
+    }
+} catch {
+    Write-Host "[WARN] Tunnel service removal raised: $_"
+}
+try {
+    Get-Process -Name cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+} catch {
+    Write-Host "[WARN] cloudflared.exe kill raised: $_"
 }
 
 # 2. Kill any leftover node.exe instances spawned by the service so file deletion succeeds.
