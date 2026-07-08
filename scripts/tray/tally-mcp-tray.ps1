@@ -656,7 +656,119 @@ $tray.ContextMenuStrip = $menu
 # and the right-click menu share one implementation per action.
 # ---------------------------------------------------------------------------
 $Dashboard       = $null     # the Form instance, or $null if never opened / disposed
-$DashboardLabels = $null     # hashtable of the live-updating status labels
+$DashboardLabels = $null     # per-row hashtable { Pill; Dot; Word; Detail } of the live status widgets
+
+# ---------------------------------------------------------------------------
+# Dashboard skin helpers (flat/modern reskin). All best-effort: any failure degrades
+# gracefully (e.g. a square pill instead of a rounded one) rather than breaking the form.
+# ---------------------------------------------------------------------------
+
+# Rounded-rectangle region for pills/dots. R is the corner radius; R = height/2 gives a full pill.
+function New-RoundedRegion {
+    param([int]$W, [int]$H, [int]$R)
+    try {
+        if ($R * 2 -gt $W) { $R = [int]($W / 2) }
+        if ($R * 2 -gt $H) { $R = [int]($H / 2) }
+        $d = 2 * $R
+        $gp = New-Object System.Drawing.Drawing2D.GraphicsPath
+        $gp.AddArc(0, 0, $d, $d, 180, 90)
+        $gp.AddArc($W - $d, 0, $d, $d, 270, 90)
+        $gp.AddArc($W - $d, $H - $d, $d, $d, 0, 90)
+        $gp.AddArc(0, $H - $d, $d, $d, 90, 90)
+        $gp.CloseFigure()
+        return New-Object System.Drawing.Region $gp
+    } catch { return $null }
+}
+
+# Colours for a health state: dot fill, pill background tint, pill text.
+function Get-HealthPalette {
+    param([string]$Health)
+    switch ($Health) {
+        'green' { @{ Dot = [System.Drawing.Color]::FromArgb(22,163,74);  Bg = [System.Drawing.Color]::FromArgb(220,247,233); Text = [System.Drawing.Color]::FromArgb(21,128,61) } }
+        'amber' { @{ Dot = [System.Drawing.Color]::FromArgb(217,119,6);  Bg = [System.Drawing.Color]::FromArgb(254,243,199); Text = [System.Drawing.Color]::FromArgb(146,64,14) } }
+        'red'   { @{ Dot = [System.Drawing.Color]::FromArgb(220,69,69);  Bg = [System.Drawing.Color]::FromArgb(254,226,226); Text = [System.Drawing.Color]::FromArgb(153,27,27) } }
+        default { @{ Dot = [System.Drawing.Color]::FromArgb(156,163,175); Bg = [System.Drawing.Color]::FromArgb(243,244,246); Text = [System.Drawing.Color]::FromArgb(75,85,99) } }
+    }
+}
+
+# A borderless "card": white panel with a 1px light border drawn in Paint + an optional bold header.
+function New-DashCard {
+    param([int]$X, [int]$Y, [int]$W, [int]$H, [System.Windows.Forms.AnchorStyles]$Anchor, [string]$Title)
+    $card = New-Object System.Windows.Forms.Panel
+    $card.Location  = New-Object System.Drawing.Point $X, $Y
+    $card.Size      = New-Object System.Drawing.Size $W, $H
+    $card.BackColor = [System.Drawing.Color]::White
+    $card.Anchor    = $Anchor
+    $card.Add_Paint({
+        param($s, $e)
+        $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(229,231,235))
+        $e.Graphics.DrawRectangle($pen, 0, 0, $s.ClientSize.Width - 1, $s.ClientSize.Height - 1)
+        $pen.Dispose()
+    })
+    # Redraw the whole border when the card is resized (anchored cards grow with the window),
+    # otherwise the right/bottom edge can smear.
+    $card.Add_Resize({ param($s, $e) $s.Invalidate() })
+    if ($Title) {
+        $hl = New-Object System.Windows.Forms.Label
+        $hl.Text      = $Title
+        $hl.Font      = New-Object System.Drawing.Font 'Segoe UI Semibold', 10
+        $hl.ForeColor = [System.Drawing.Color]::FromArgb(55,65,81)
+        $hl.BackColor = [System.Drawing.Color]::Transparent
+        $hl.AutoSize  = $true
+        $hl.Location  = New-Object System.Drawing.Point 14, 10
+        $card.Controls.Add($hl)
+    }
+    return $card
+}
+
+# Flat button styling with brand-accent hover. Kind = 'primary' (orange) | 'danger' (red) | 'secondary'.
+function Set-FlatButton {
+    param($Btn, [string]$Kind = 'secondary')
+    $Btn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $Btn.Font      = New-Object System.Drawing.Font 'Segoe UI', 9
+    $Btn.Cursor    = [System.Windows.Forms.Cursors]::Hand
+    $Btn.UseVisualStyleBackColor = $false
+    switch ($Kind) {
+        'primary' {
+            $Btn.BackColor = [System.Drawing.Color]::FromArgb(255,140,0)
+            $Btn.ForeColor = [System.Drawing.Color]::White
+            $Btn.FlatAppearance.BorderSize = 0
+            $Btn.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(255,158,46)
+            $Btn.FlatAppearance.MouseDownBackColor = [System.Drawing.Color]::FromArgb(230,126,0)
+        }
+        'danger' {
+            $Btn.BackColor = [System.Drawing.Color]::White
+            $Btn.ForeColor = [System.Drawing.Color]::FromArgb(185,28,28)
+            $Btn.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(252,205,205)
+            $Btn.FlatAppearance.BorderSize = 1
+            $Btn.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(254,242,242)
+        }
+        default {
+            $Btn.BackColor = [System.Drawing.Color]::White
+            $Btn.ForeColor = [System.Drawing.Color]::FromArgb(55,65,81)
+            $Btn.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(209,213,219)
+            $Btn.FlatAppearance.BorderSize = 1
+            $Btn.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(243,244,246)
+        }
+    }
+}
+
+# Update one status row: colour the pill/dot/text, size the pill to its word, slide the detail after it.
+function Set-StatusRow {
+    param($Row, [string]$Word, [string]$Detail, [string]$Health)
+    if (-not $Row) { return }
+    $pal = Get-HealthPalette $Health
+    $Row.Word.Text      = $Word
+    $Row.Word.ForeColor  = $pal.Text
+    $Row.Pill.BackColor = $pal.Bg
+    $Row.Dot.BackColor  = $pal.Dot
+    $Row.Detail.Text    = $Detail
+    $pillW = 26 + $Row.Word.PreferredWidth + 12
+    $Row.Pill.Width = $pillW
+    $rgn = New-RoundedRegion $pillW $Row.Pill.Height ([int]($Row.Pill.Height / 2))
+    if ($rgn) { $Row.Pill.Region = $rgn }
+    $Row.Detail.Left = $Row.Pill.Right + 10
+}
 
 function Show-Dashboard {
     if ($Dashboard -and -not $Dashboard.IsDisposed) {
@@ -671,130 +783,164 @@ function Show-Dashboard {
     }
 
     $form = New-Object System.Windows.Forms.Form
-    $form.Text          = 'TallyMCP - Dashboard'
-    $form.Size          = New-Object System.Drawing.Size 640, 660
+    $form.Text          = 'Claudally - Dashboard'
+    $form.Size          = New-Object System.Drawing.Size 660, 720
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-    $form.MinimumSize   = New-Object System.Drawing.Size 560, 580
-    $form.BackColor     = [System.Drawing.Color]::White
+    $form.MinimumSize   = New-Object System.Drawing.Size 580, 640
+    # Light-grey canvas so the white cards read as raised surfaces (modern flat look).
+    $form.BackColor     = [System.Drawing.Color]::FromArgb(244, 245, 247)
     $form.Font          = New-Object System.Drawing.Font 'Segoe UI', 9
+    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
 
-    # --- Header band: logo + product name + version. Anchored top, fixed-height. ---
+    # --- Header band: Claudally logo + product name + publisher + version, with a thin orange
+    #     brand rule along its bottom edge. White, anchored top, fixed height. ---
     $header = New-Object System.Windows.Forms.Panel
     $header.Dock      = [System.Windows.Forms.DockStyle]::Top
-    $header.Height    = 120
+    $header.Height    = 96
     $header.BackColor = [System.Drawing.Color]::White
     $form.Controls.Add($header)
 
-    $logoPath = Join-Path $PSScriptRoot 'assets\jina-logo.png'
+    $accent = New-Object System.Windows.Forms.Panel
+    $accent.Dock      = [System.Windows.Forms.DockStyle]::Bottom
+    $accent.Height    = 3
+    $accent.BackColor = [System.Drawing.Color]::FromArgb(255, 140, 0)
+    $header.Controls.Add($accent)
+
+    # Prefer the Claudally brand mark; fall back to the legacy JINA logo if it isn't present.
+    $logoPath = Join-Path $PSScriptRoot 'assets\claudally-logo.png'
+    if (-not (Test-Path -LiteralPath $logoPath)) { $logoPath = Join-Path $PSScriptRoot 'assets\jina-logo.png' }
     if (Test-Path -LiteralPath $logoPath) {
         $pic = New-Object System.Windows.Forms.PictureBox
         $pic.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
-        $pic.Location = New-Object System.Drawing.Point 16, 12
-        $pic.Size     = New-Object System.Drawing.Size 96, 96
+        $pic.Location = New-Object System.Drawing.Point 20, 16
+        $pic.Size     = New-Object System.Drawing.Size 64, 64
         try { $pic.Image = [System.Drawing.Image]::FromFile($logoPath) } catch {}
         $header.Controls.Add($pic)
     }
 
     $lblProduct = New-Object System.Windows.Forms.Label
-    $lblProduct.Text     = 'Claudally'
-    $lblProduct.Font     = New-Object System.Drawing.Font 'Segoe UI Semibold', 16
-    $lblProduct.AutoSize = $true
-    $lblProduct.Location = New-Object System.Drawing.Point 128, 24
+    $lblProduct.Text      = 'Claudally'
+    $lblProduct.Font      = New-Object System.Drawing.Font 'Segoe UI Semibold', 18
+    $lblProduct.ForeColor = [System.Drawing.Color]::FromArgb(31, 41, 55)
+    $lblProduct.BackColor = [System.Drawing.Color]::Transparent
+    $lblProduct.AutoSize  = $true
+    $lblProduct.Location  = New-Object System.Drawing.Point 100, 18
     $header.Controls.Add($lblProduct)
 
     $lblPublisher = New-Object System.Windows.Forms.Label
-    $lblPublisher.Text     = 'by JINA CODE SYSTEMS LLP'
-    $lblPublisher.Font     = New-Object System.Drawing.Font 'Segoe UI', 9
-    $lblPublisher.ForeColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
-    $lblPublisher.AutoSize = $true
-    $lblPublisher.Location = New-Object System.Drawing.Point 128, 56
+    $lblPublisher.Text      = 'by JINA CODE SYSTEMS LLP'
+    $lblPublisher.Font      = New-Object System.Drawing.Font 'Segoe UI', 9
+    $lblPublisher.ForeColor = [System.Drawing.Color]::FromArgb(107, 114, 128)
+    $lblPublisher.BackColor = [System.Drawing.Color]::Transparent
+    $lblPublisher.AutoSize  = $true
+    $lblPublisher.Location  = New-Object System.Drawing.Point 102, 52
     $header.Controls.Add($lblPublisher)
 
     $lblVersion = New-Object System.Windows.Forms.Label
-    $lblVersion.Text     = 'v1.1.0'
-    $lblVersion.Font     = New-Object System.Drawing.Font 'Segoe UI', 9
-    $lblVersion.ForeColor = [System.Drawing.Color]::FromArgb(120, 120, 120)
-    $lblVersion.AutoSize = $true
-    $lblVersion.Location = New-Object System.Drawing.Point 128, 80
+    $lblVersion.Text      = 'v1.1.0'
+    $lblVersion.Font      = New-Object System.Drawing.Font 'Segoe UI', 9
+    $lblVersion.ForeColor = [System.Drawing.Color]::FromArgb(156, 163, 175)
+    $lblVersion.BackColor = [System.Drawing.Color]::Transparent
+    $lblVersion.AutoSize  = $true
+    $lblVersion.Location  = New-Object System.Drawing.Point 102, 70
     $header.Controls.Add($lblVersion)
 
-    # --- Status panel: 4 live-updating lines, refreshed by Update-DashboardUi. ---
-    $status = New-Object System.Windows.Forms.GroupBox
-    $status.Text     = ' Status '
-    $status.Location = New-Object System.Drawing.Point 16, 130
-    $status.Size     = New-Object System.Drawing.Size 600, 110
-    $status.Anchor   = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    # --- Status card: 4 live rows (Service / Agent / Tally / Public URL), each a health "pill"
+    #     (coloured dot + word) plus a plain detail string. Refreshed by Update-DashboardUi. ---
+    $status = New-DashCard 16 104 600 150 ([System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right) 'Status'
     $form.Controls.Add($status)
 
     $labels = @{}
-    $rowY = 22
+    $rowY = 42
     foreach ($name in @('Service','Agent','Tally','PublicUrl')) {
         $caption = New-Object System.Windows.Forms.Label
-        $caption.Text     = switch ($name) {
-            'Service'   { 'Service:' }
-            'Agent'     { 'Agent:' }
-            'Tally'     { 'Tally:' }
-            'PublicUrl' { 'Public URL:' }
+        $caption.Text      = switch ($name) {
+            'Service'   { 'Service' }
+            'Agent'     { 'GUI agent' }
+            'Tally'     { 'Tally' }
+            'PublicUrl' { 'Public URL' }
         }
-        $caption.Location = New-Object System.Drawing.Point 16, $rowY
-        $caption.Size     = New-Object System.Drawing.Size 100, 18
-        $caption.Font     = New-Object System.Drawing.Font 'Segoe UI Semibold', 9
+        $caption.Location  = New-Object System.Drawing.Point 16, ($rowY + 2)
+        $caption.Size      = New-Object System.Drawing.Size 84, 18
+        $caption.Font      = New-Object System.Drawing.Font 'Segoe UI Semibold', 9
+        $caption.ForeColor = [System.Drawing.Color]::FromArgb(55, 65, 81)
+        $caption.BackColor = [System.Drawing.Color]::Transparent
         $status.Controls.Add($caption)
 
-        $value = New-Object System.Windows.Forms.Label
-        $value.Text     = '-'
-        $value.Location = New-Object System.Drawing.Point 120, $rowY
-        $value.Size     = New-Object System.Drawing.Size 460, 18
-        $status.Controls.Add($value)
+        # Pill: rounded tinted badge holding the dot + status word.
+        $pill = New-Object System.Windows.Forms.Panel
+        $pill.Location  = New-Object System.Drawing.Point 104, ($rowY - 1)
+        $pill.Size      = New-Object System.Drawing.Size 96, 22
+        $pill.BackColor = [System.Drawing.Color]::FromArgb(243, 244, 246)
+        $rgn0 = New-RoundedRegion 96 22 11
+        if ($rgn0) { $pill.Region = $rgn0 }
+        $status.Controls.Add($pill)
 
-        $labels[$name] = $value
-        $rowY += 20
+        $dot = New-Object System.Windows.Forms.Panel
+        $dot.Location  = New-Object System.Drawing.Point 11, 7
+        $dot.Size      = New-Object System.Drawing.Size 8, 8
+        $dot.BackColor = [System.Drawing.Color]::FromArgb(156, 163, 175)
+        $dotRgn = New-RoundedRegion 8 8 4
+        if ($dotRgn) { $dot.Region = $dotRgn }
+        $pill.Controls.Add($dot)
+
+        $word = New-Object System.Windows.Forms.Label
+        $word.Text      = '-'
+        $word.Font      = New-Object System.Drawing.Font 'Segoe UI Semibold', 9
+        $word.ForeColor = [System.Drawing.Color]::FromArgb(75, 85, 99)
+        $word.BackColor = [System.Drawing.Color]::Transparent
+        $word.AutoSize  = $true
+        $word.Location  = New-Object System.Drawing.Point 24, 3
+        $pill.Controls.Add($word)
+
+        $detail = New-Object System.Windows.Forms.Label
+        $detail.Text      = ''
+        $detail.Font      = New-Object System.Drawing.Font 'Segoe UI', 9
+        $detail.ForeColor = [System.Drawing.Color]::FromArgb(107, 114, 128)
+        $detail.BackColor = [System.Drawing.Color]::Transparent
+        $detail.AutoEllipsis = $true
+        $detail.Location  = New-Object System.Drawing.Point 210, ($rowY + 2)
+        $detail.Size      = New-Object System.Drawing.Size 372, 18
+        $detail.Anchor    = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+        $status.Controls.Add($detail)
+
+        $labels[$name] = @{ Pill = $pill; Dot = $dot; Word = $word; Detail = $detail }
+        $rowY += 27
     }
 
-    # --- Action buttons: 2x3 grid of the same actions exposed by the right-click menu.
-    # Each button .PerformClick()s the corresponding ToolStripMenuItem so the
-    # implementations stay in one place (no duplicated restart/reconfigure logic). ---
-    $actions = New-Object System.Windows.Forms.GroupBox
-    $actions.Text     = ' Actions '
-    $actions.Location = New-Object System.Drawing.Point 16, 250
-    $actions.Size     = New-Object System.Drawing.Size 600, 150
-    $actions.Anchor   = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    # --- Actions card: 3x3 grid of flat buttons. Each .PerformClick()s the corresponding
+    # right-click ToolStripMenuItem so the implementation stays in one place. ---
+    $actions = New-DashCard 16 266 600 174 ([System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right) 'Actions'
     $form.Controls.Add($actions)
 
-    # Grid: 3 columns x 3 rows. Each button .PerformClick()s the corresponding ToolStripMenuItem
-    # so the implementation stays in one place (no duplicated restart/reconfigure logic).
     $btnSpecs = @(
-        @{ Text = 'Restart service';     X =  16; Y =  24; Click = { $miRestartService.PerformClick() } },
-        @{ Text = 'Restart GUI agent';   X = 210; Y =  24; Click = { $miRestartAgent.PerformClick() } },
-        @{ Text = 'Reconfigure...';      X = 404; Y =  24; Click = { $miReconfigure.PerformClick() } },
-        @{ Text = 'Launch Tally';        X =  16; Y =  64; Click = { $miLaunchTally.PerformClick() } },
-        @{ Text = 'Open logs';           X = 210; Y =  64; Click = { $miOpenLogs.PerformClick() } },
-        @{ Text = 'Copy public URL';     X = 404; Y =  64; Click = {
+        @{ Text = 'Restart service';      X =  14; Y = 42;  Kind = 'primary';   Click = { $miRestartService.PerformClick() } },
+        @{ Text = 'Restart GUI agent';    X = 202; Y = 42;  Kind = 'secondary'; Click = { $miRestartAgent.PerformClick() } },
+        @{ Text = 'Reconfigure...';       X = 390; Y = 42;  Kind = 'secondary'; Click = { $miReconfigure.PerformClick() } },
+        @{ Text = 'Launch Tally';         X =  14; Y = 84;  Kind = 'secondary'; Click = { $miLaunchTally.PerformClick() } },
+        @{ Text = 'Open logs';            X = 202; Y = 84;  Kind = 'secondary'; Click = { $miOpenLogs.PerformClick() } },
+        @{ Text = 'Copy public URL';      X = 390; Y = 84;  Kind = 'secondary'; Click = {
             if ($State.PublicUrl) {
                 try { [System.Windows.Forms.Clipboard]::SetText($State.PublicUrl) } catch {}
             }
         } },
-        @{ Text = 'Manage Companies...'; X =  16; Y = 104; Click = { $miManageCompanies.PerformClick() } },
-        @{ Text = 'Stop service';        X = 210; Y = 104; Click = { $miStopService.PerformClick() } },
-        @{ Text = 'Claude GUI control...'; X = 404; Y = 104; Click = { $miGuiControl.PerformClick() } }
+        @{ Text = 'Manage Companies...';  X =  14; Y = 126; Kind = 'secondary'; Click = { $miManageCompanies.PerformClick() } },
+        @{ Text = 'Stop service';         X = 202; Y = 126; Kind = 'danger';    Click = { $miStopService.PerformClick() } },
+        @{ Text = 'Claude GUI control...';X = 390; Y = 126; Kind = 'secondary'; Click = { $miGuiControl.PerformClick() } }
     )
     foreach ($spec in $btnSpecs) {
         $btn = New-Object System.Windows.Forms.Button
         $btn.Text     = $spec.Text
         $btn.Location = New-Object System.Drawing.Point $spec.X, $spec.Y
-        $btn.Size     = New-Object System.Drawing.Size 180, 32
+        $btn.Size     = New-Object System.Drawing.Size 182, 34
+        Set-FlatButton $btn $spec.Kind
         $btn.Add_Click($spec.Click)
         $actions.Controls.Add($btn)
     }
 
-    # --- License panel: read-only multi-line viewer of the bundled LICENSE file.
-    # Anchored to all four sides so the user can resize the window to read more
-    # without horizontal scroll. ---
-    $licenseGroup = New-Object System.Windows.Forms.GroupBox
-    $licenseGroup.Text     = ' License '
-    $licenseGroup.Location = New-Object System.Drawing.Point 16, 410
-    $licenseGroup.Size     = New-Object System.Drawing.Size 600, 200
-    $licenseGroup.Anchor   = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    # --- License card: read-only viewer of the bundled LICENSE file. Anchored to all four sides
+    # so the user can resize the window to read more without horizontal scroll. ---
+    $licenseGroup = New-DashCard 16 452 600 210 ([System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right) 'License'
     $form.Controls.Add($licenseGroup)
 
     $licenseBox = New-Object System.Windows.Forms.TextBox
@@ -803,8 +949,13 @@ function Show-Dashboard {
     $licenseBox.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
     $licenseBox.WordWrap   = $true
     $licenseBox.Font       = New-Object System.Drawing.Font 'Consolas', 9
-    $licenseBox.BackColor  = [System.Drawing.Color]::FromArgb(248, 248, 248)
-    $licenseBox.Dock       = [System.Windows.Forms.DockStyle]::Fill
+    $licenseBox.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+    $licenseBox.BackColor  = [System.Drawing.Color]::FromArgb(250, 250, 250)
+    $licenseBox.ForeColor  = [System.Drawing.Color]::FromArgb(75, 85, 99)
+    # Sit inside the card, clear of its header label; anchored all four so it grows with the card.
+    $licenseBox.Location   = New-Object System.Drawing.Point 12, 36
+    $licenseBox.Size       = New-Object System.Drawing.Size 576, 160
+    $licenseBox.Anchor     = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
     # The shipped LICENSE (AGPL v3) is ~34KB; default TextBox.MaxLength = 32767 chars
     # would silently truncate the closing sections of the license, which is exactly the
     # opposite of what an operator opening this dialog wants to see. 0 disables the cap.
@@ -841,32 +992,42 @@ function Show-Dashboard {
 function Update-DashboardUi {
     if (-not $script:Dashboard -or $script:Dashboard.IsDisposed -or -not $script:DashboardLabels) { return }
 
+    # Service
     if ($State.Service) {
-        $script:DashboardLabels['Service'].Text = "$($State.Service.Status)"
+        $s = "$($State.Service.Status)"
+        $sh = switch ($s) { 'Running' { 'green' } 'Stopped' { 'red' } default { 'amber' } }
+        Set-StatusRow $script:DashboardLabels['Service'] $s '' $sh
     } else {
-        $script:DashboardLabels['Service'].Text = 'not installed'
+        Set-StatusRow $script:DashboardLabels['Service'] 'Not installed' '' 'gray'
     }
 
+    # GUI agent
     if ($State.AgentTask) {
-        $procPart = if ($State.AgentProcess) { "PID $($State.AgentProcess.ProcessId)" } else { 'no process' }
-        $script:DashboardLabels['Agent'].Text = "$($State.AgentTask.State) ($procPart)"
+        if ($State.AgentProcess) {
+            $ah = if ($State.AgentTask.State -eq 'Running') { 'green' } else { 'amber' }
+            Set-StatusRow $script:DashboardLabels['Agent'] "$($State.AgentTask.State)" "PID $($State.AgentProcess.ProcessId)" $ah
+        } else {
+            Set-StatusRow $script:DashboardLabels['Agent'] "$($State.AgentTask.State)" 'no process running' 'amber'
+        }
     } else {
-        $script:DashboardLabels['Agent'].Text = 'task not registered'
+        Set-StatusRow $script:DashboardLabels['Agent'] 'Not registered' '' 'red'
     }
 
+    # Tally
     if ($State.TallyProcess) {
-        $cmp = if ($State.LoadedCompany) { " - $($State.LoadedCompany)" } else { '' }
-        $script:DashboardLabels['Tally'].Text = "Running$cmp"
+        $cmp = if ($State.LoadedCompany) { "$($State.LoadedCompany)" } else { '' }
+        Set-StatusRow $script:DashboardLabels['Tally'] 'Running' $cmp 'green'
     } else {
-        $script:DashboardLabels['Tally'].Text = 'not running'
+        Set-StatusRow $script:DashboardLabels['Tally'] 'Not running' '' 'gray'
     }
 
+    # Public URL
     if ($null -eq $State.PublicUrlOk) {
-        $script:DashboardLabels['PublicUrl'].Text = 'not configured'
+        Set-StatusRow $script:DashboardLabels['PublicUrl'] 'Not configured' '' 'gray'
     } elseif ($State.PublicUrlOk) {
-        $script:DashboardLabels['PublicUrl'].Text = "OK ($($State.PublicUrl))"
+        Set-StatusRow $script:DashboardLabels['PublicUrl'] 'OK' "$($State.PublicUrl)" 'green'
     } else {
-        $script:DashboardLabels['PublicUrl'].Text = "unreachable ($($State.PublicUrl))"
+        Set-StatusRow $script:DashboardLabels['PublicUrl'] 'Unreachable' "$($State.PublicUrl)" 'red'
     }
 }
 
