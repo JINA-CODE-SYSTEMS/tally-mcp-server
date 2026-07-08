@@ -1,7 +1,7 @@
 ; ===========================================================================
-; Tally MCP Server - Inno Setup installer (issue #18)
+; Claudally (Tally MCP Server) - Inno Setup installer (issue #18)
 ;
-; Builds a single TallyMCP-Setup.exe that takes a Windows box from "nothing
+; Builds a single Claudally-Setup.exe that takes a Windows box from "nothing
 ; installed" to "service running" with a short wizard. Bundles:
 ;   - the prebuilt dist/ output (no client-side TS compile)
 ;   - scripts/ (deploy.ps1, tally-gui-agent-v2.ps1, TallyUI.dll, this installer's helpers)
@@ -17,9 +17,12 @@
 ; for direct download. SCCM/GPO support can be added later if a client needs it.
 ; ===========================================================================
 
-#define MyAppName        "Tally MCP Server"
+; Product name is "Claudally" (Claude + Tally). The internal service/task names (MyServiceName,
+; MyAgentTaskName, MyTrayTaskName) and the install directory stay "TallyMCP" on purpose so existing
+; installs upgrade in place — only the user-facing brand changes. AppId is unchanged for the same reason.
+#define MyAppName        "Claudally"
 #define MyAppVersion     "1.1.0"
-#define MyAppPublisher   "Jinacode Systems"
+#define MyAppPublisher   "JINA CODE SYSTEMS LLP"
 #define MyAppURL         "https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server"
 #define MyServiceName    "TallyMCP"
 #define MyAgentTaskName  "TallyMCPAgent"
@@ -43,7 +46,7 @@ DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 LicenseFile={#RepoRoot}\LICENSE
 OutputDir={#RepoRoot}\dist-installer
-OutputBaseFilename=TallyMCP-Setup-{#MyAppVersion}
+OutputBaseFilename=Claudally-Setup-{#MyAppVersion}
 Compression=lzma2/ultra
 SolidCompression=yes
 WizardStyle=modern
@@ -53,7 +56,7 @@ UninstallDisplayIcon={app}\assets\tally-mcp.ico
 ; Jina Code Systems brand icon for the installer .exe itself (generated from scripts/tray/assets/jina-logo.png).
 SetupIconFile=assets\tally-mcp.ico
 ChangesEnvironment=yes
-; Jinacode Systems branding. Comma-separated lists let Inno pick the closest size
+; JINA CODE SYSTEMS LLP branding. Comma-separated lists let Inno pick the closest size
 ; to the user's display scaling — the standard BMP renders on 100% DPI, the @2x
 ; variant covers 150-200% scaling without upscale blur.
 WizardImageFile=assets\wizard-sidebar.bmp,assets\wizard-sidebar@2x.bmp
@@ -180,6 +183,7 @@ var
   EditionPage: TInputOptionWizardPage;
   AgentUserOverride: TNewCheckBox;
   GuiControlOptIn: TNewCheckBox;
+  BrandLabel: TNewStaticText;
 
 // Toggle the agent-user field's editability from the "advanced" checkbox. Locked (disabled) by
 // default so the Tab-selects-all-then-overwrite trap can't silently replace the correct logon; when
@@ -258,11 +262,11 @@ begin
   EditionPage.Add('Gold (multiple companies; load-company is additive unless replace=true)');
   EditionPage.SelectedValueIndex := 0;
 
-  // Opt-in for Claude-driven GUI control (issue #81). OFF by default: it exposes arbitrary keystroke
-  // injection + screenshots of the desktop. Writes ENABLE_GUI_CONTROL=true/false to .env via
-  // firstrun-config.ps1. Placed on the roomy Edition page rather than the crowded config page.
-  // Reserve the bottom strip of the surface for the checkbox and shrink the option list to fit above
-  // it, so placement is robust regardless of how tall Inno sized the CheckListBox.
+  // Claude-driven GUI control (issue #81). ON by default (opt-OUT): it is Claudally's core capability —
+  // it lets Claude log in, select/switch companies and unlock protected companies by driving the Tally
+  // window (screenshots + keystrokes). Unchecking disables it (ENABLE_GUI_CONTROL=false in .env, written
+  // by firstrun-config.ps1) for locked-down boxes that only want the read/write XML tools. Placed on the
+  // roomy Edition page; reserve the bottom strip for the checkbox and shrink the option list to fit above.
   EditionPage.CheckListBox.Height := EditionPage.Surface.Height - ScaleY(52);
   GuiControlOptIn := TNewCheckBox.Create(EditionPage);
   GuiControlOptIn.Parent := EditionPage.Surface;
@@ -270,8 +274,18 @@ begin
   GuiControlOptIn.Top := EditionPage.Surface.Height - ScaleY(38);
   GuiControlOptIn.Width := EditionPage.SurfaceWidth;
   GuiControlOptIn.Height := ScaleY(32);
-  GuiControlOptIn.Caption := 'Allow Claude to control Tally directly (screenshots + keystrokes) — advanced, off by default';
-  GuiControlOptIn.Checked := False;
+  GuiControlOptIn.Caption := 'Let Claude control Tally directly (screenshots + keystrokes) — recommended. Uncheck to disable.';
+  GuiControlOptIn.Checked := True;
+
+  // Persistent publisher credit, bottom-left of the wizard chrome (shows on every page, alongside the
+  // JINA logo carried by the sidebar image). Keeps "by JINA CODE SYSTEMS LLP" visible after the rebrand
+  // to Claudally. Vertically centred against the Cancel button so it sits in the empty bottom-left strip.
+  BrandLabel := TNewStaticText.Create(WizardForm);
+  BrandLabel.Parent := WizardForm;
+  BrandLabel.Caption := 'Claudally — by JINA CODE SYSTEMS LLP';
+  BrandLabel.Font.Color := clGray;
+  BrandLabel.Left := ScaleX(16);
+  BrandLabel.Top := WizardForm.CancelButton.Top + (WizardForm.CancelButton.Height - BrandLabel.Height) div 2;
 end;
 
 // Runs after the wizard and before any file copying. Stops the running TallyMCP service
