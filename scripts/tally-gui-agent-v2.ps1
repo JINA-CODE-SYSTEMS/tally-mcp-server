@@ -19,7 +19,7 @@ param(
 # against an agent older than its required minimum (issue #15 - version handshake).
 # Format: MAJOR.MINOR.PATCH. Bump MINOR on any new IPC action or response field;
 # bump PATCH on internal fixes that callers can ignore.
-$Script:AgentVersion = "1.5.1"
+$Script:AgentVersion = "1.6.0"
 
 # --- Single-instance guard ---------------------------------------------------------------------
 # Only ONE agent may run. Multiple instances race on the command/result files and each spawns its own
@@ -702,7 +702,7 @@ while ($true) {
 
             # Show the "Claude is controlling Tally" frame for GUI-driving commands (screenshot/ping
             # excluded — screenshot must be clean, ping is passive). Auto-hides ~6s after the last action.
-            if (@('select-company','load-on-startup','sendkeys','select-and-unlock-company','start-tally') -contains ([string]$cmd.action)) {
+            if (@('select-company','load-on-startup','sendkeys','select-and-unlock-company','switch-company','start-tally') -contains ([string]$cmd.action)) {
                 if (Get-Command Show-ClaudeOverlay -ErrorAction SilentlyContinue) { Show-ClaudeOverlay }
             }
 
@@ -868,6 +868,95 @@ while ($true) {
                             }
                         } catch {
                             Write-Result -Status "error" -Message "Exception: $_" -Strategy "select-and-unlock" -CommandId $cmdId
+                        }
+                    }
+                }
+                "switch-company" {
+                    # Switch the RESIDENT company on a LIVE Tally WITHOUT restarting it. This is the whole point:
+                    # load-company kills + relaunches tally.exe, which drops the XML port 9000 and the hosted OAuth
+                    # session -> forces a manual reconnect. Switching via Tally's own "Select Company" screen keeps
+                    # Tally (and the connection) up.
+                    #
+                    # Composition of two ALREADY-PROVEN sequences:
+                    #   1. PREFIX (open Select Company on a running Tally): Alt+F3 -> F1. This mirrors the LLM
+                    #      select-company fallback above (search "typed company name search"), which empirically
+                    #      opens the Select Company list on this Tally build. Alt+F3 = Company menu, F1 = Select Company.
+                    #   2. TAIL (pick + unlock): identical to select-and-unlock-company - type the folder id, Enter to
+                    #      drill the folder, Enter to select the company, then type credentials if supplied.
+                    #
+                    # SAFETY: we deliberately do NOT send a blind Escape first. From the Gateway a stray Escape pops
+                    # the "Quit?" prompt (which has bitten us before). The caller is expected to anchor at a READ-ONLY
+                    # screen (Gateway / a report) first - the MCP tool documents this and short-circuits when the target
+                    # is already resident. Everything here is open-loop, so we VERIFY the outcome against Tally's XML
+                    # server (Write-VerifiedLoadResult) and fail closed: a wrong/failed switch is never reported as success.
+                    $companyId   = if ($cmd.companyId)   { [string]$cmd.companyId }   else { "" }
+                    $companyName = if ($cmd.companyName) { [string]$cmd.companyName } else { "" }
+                    $userName    = if ($cmd.userName)    { [string]$cmd.userName }    else { "" }
+                    $password    = if ($cmd.password)    { [string]$cmd.password }    else { "" }
+                    $waitMsAfterEnter = if ($cmd.waitMsAfterEnter) { [int]$cmd.waitMsAfterEnter } else { 3000 }
+                    $waitMsAfterCreds = if ($cmd.waitMsAfterCreds) { [int]$cmd.waitMsAfterCreds } else { 3000 }
+                    if (-not $companyId) {
+                        Write-Result -Status "error" -Message "Missing companyId" -Strategy "switch-company" -CommandId $cmdId
+                    } else {
+                        try {
+                            $hwnd = Find-TallyWindow
+                            if ($hwnd -eq [IntPtr]::Zero) {
+                                Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "switch-company" -CommandId $cmdId
+                            } else {
+                                [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                                Start-Sleep -Milliseconds 500
+
+                                # PREFIX: open the Select Company list on the running Tally (Alt+F3 -> F1).
+                                [TallyUI2]::PressCombo([TallyUI2]::VK_MENU, [TallyUI2]::VK_F3)
+                                Start-Sleep -Milliseconds 800
+                                [TallyUI2]::PressKey([TallyUI2]::VK_F1)
+                                Start-Sleep -Milliseconds 900
+
+                                # TAIL: type the folder id; Tally auto-jumps the highlight to the matching folder.
+                                [TallyUI2]::TypeString($companyId)
+                                Start-Sleep -Milliseconds 800
+
+                                # folder -> company drill (default 2 Enters), same as select-and-unlock-company.
+                                $enterPresses = if ($cmd.enterPresses) { [int]$cmd.enterPresses } else { 2 }
+                                if ($enterPresses -lt 1) { $enterPresses = 1 }
+                                if ($enterPresses -gt 4) { $enterPresses = 4 }
+                                for ($_ep = 0; $_ep -lt $enterPresses; $_ep++) {
+                                    [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
+                                    if ($_ep -lt ($enterPresses - 1)) {
+                                        Start-Sleep -Milliseconds 1500
+                                    }
+                                }
+                                Start-Sleep -Milliseconds $waitMsAfterEnter
+
+                                # Credentials, if the company is protected. TypeString (scan-code) not clipboard paste:
+                                # masked/TallyVault fields can silently reject a paste, so char typing is safer here.
+                                if ($userName) {
+                                    [TallyUI2]::TypeString($userName)
+                                    Start-Sleep -Milliseconds 300
+                                    [TallyUI2]::PressKey([TallyUI2]::VK_TAB)
+                                    Start-Sleep -Milliseconds 300
+                                }
+                                if ($password) {
+                                    if ([TallyUI2]::GetForegroundWindow() -ne $hwnd) {
+                                        [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                                        Start-Sleep -Milliseconds 300
+                                    }
+                                    [TallyUI2]::TypeString($password)
+                                    Start-Sleep -Milliseconds 300
+                                }
+                                if ($userName -or $password) {
+                                    [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
+                                    Start-Sleep -Milliseconds $waitMsAfterCreds
+                                }
+
+                                # CHECKPOINT: ground-truth verify (get-period / loaded-list agrees). Prefer the real
+                                # display name for the match; fall back to the folder id.
+                                $requested = if ($companyName) { $companyName } else { $companyId }
+                                $ctx = if ($userName -or $password) { " with credentials" } else { "" }
+                                Write-VerifiedLoadResult -Requested $requested -Strategy "switch-company" -CommandId $cmdId -Context $ctx
+                            }
+                        } catch {
+                            Write-Result -Status "error" -Message "Exception: $_" -Strategy "switch-company" -CommandId $cmdId
                         }
                     }
                 }
