@@ -287,6 +287,16 @@ The config never stores passwords — only the hint that one is needed, so calle
 | `gstr1-summary` | GSTR-1 outward supplies summary (B2B/B2C) |
 | `gstr2-summary` | GSTR-2 inward supplies summary for ITC reconciliation |
 
+> **⚠️ Known limitation — GST returns need GST-configured ledgers.** `create-ledger` does not yet set a
+> ledger's GST configuration (the tax type on CGST/SGST/IGST ledgers, nor GST applicability / nature-of-supply /
+> HSN / rate on sales-purchase ledgers). So for a GST company, vouchers **book the CGST/SGST/IGST amounts
+> correctly** — the accounts reconcile and `gst-voucher-details` / `ledger-account` show the tax — but Tally's
+> **statutory `gstr1-summary` / GSTR-3B will not auto-populate**, because Tally classifies returns by those
+> ledger GST settings, which aren't applied on server-created ledgers.
+> **Workaround:** create the GST/tax ledgers in Tally first (or set their GST details once via *Alter → Set/alter
+> GST details*), then post against them — returns then populate normally. Having `create-ledger` set GST nature is
+> a planned **server** fix (not a skill/plugin fix).
+
 ### Master Data
 
 | Tool | Description |
