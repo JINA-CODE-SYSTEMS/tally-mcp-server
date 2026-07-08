@@ -3473,22 +3473,27 @@ export async function registerMcpServer(): Promise<McpServer> {
       let sgstLedger = args.sgstLedger;
       let igstLedger = args.igstLedger;
 
+      // A sale (Sales / Credit Note) books OUTPUT tax; a purchase (Purchase / Debit Note) books INPUT
+      // tax. Pass the direction so auto-resolve never picks an input-tax ledger for a sales voucher.
+      const gstNature: 'output' | 'input' = (args.voucherType === 'Sales' || args.voucherType === 'Credit Note') ? 'output' : 'input';
+
       if ((!args.isInterState && (!cgstLedger || !sgstLedger)) || (args.isInterState && !igstLedger)) {
         const resolveParams = new Map<string, any>();
         const _gtc = args.targetCompany || activeCompany;
         if (_gtc) resolveParams.set('targetCompany', _gtc);
-        const gstLedgers = await resolveGSTLedgers(resolveParams);
+        const gstLedgers = await resolveGSTLedgers(resolveParams, gstNature);
+        const remedyHint = `No matching ${gstNature}-tax ledger was found (a ${gstNature === 'output' ? 'sales' : 'purchase'} voucher must post to an ${gstNature} GST ledger). Create one, or pass the exact ledger name explicitly.`;
 
         if (!args.isInterState) {
           if (!cgstLedger) cgstLedger = gstLedgers.cgst;
           if (!sgstLedger) sgstLedger = gstLedgers.sgst;
           if (!cgstLedger || !sgstLedger) {
-            return errorResult('PRECONDITION_FAILED', { message: 'Could not auto-resolve CGST/SGST ledger names from Tally.', remedy: 'Provide cgstLedger and sgstLedger explicitly.', retryable: false });
+            return errorResult('MASTER_NOT_FOUND', { message: `Could not auto-resolve the ${gstNature} CGST/SGST ledger(s) from Tally.`, remedy: remedyHint, retryable: false });
           }
         } else {
           if (!igstLedger) igstLedger = gstLedgers.igst;
           if (!igstLedger) {
-            return errorResult('PRECONDITION_FAILED', { message: 'Could not auto-resolve IGST ledger name from Tally.', remedy: 'Provide igstLedger explicitly.', retryable: false });
+            return errorResult('MASTER_NOT_FOUND', { message: `Could not auto-resolve the ${gstNature} IGST ledger from Tally.`, remedy: remedyHint, retryable: false });
           }
         }
       }
