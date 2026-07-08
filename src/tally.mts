@@ -634,36 +634,61 @@ export async function resolveGroupHierarchy(inputParams: Map<string, any>): Prom
     return primaryMap;
 }
 
-/**
- * Resolves GST tax ledger names from Tally by searching the ledger list
- * for ledgers under "Duties & Taxes" group that match CGST/SGST/IGST naming
- */
-export async function resolveGSTLedgers(inputParams: Map<string, any>): Promise<{ cgst?: string; sgst?: string; igst?: string }> {
-    const result: { cgst?: string; sgst?: string; igst?: string } = {};
+// GST tax direction: a sale (Sales / Credit Note) posts to OUTPUT tax (liability); a purchase
+// (Purchase / Debit Note) posts to INPUT tax (ITC). Picking the wrong one corrupts the GST return.
+export type GstNature = 'output' | 'input';
 
+const GST_TOKENS: Record<'cgst' | 'sgst' | 'igst', string[]> = {
+    cgst: ['cgst', 'central tax', 'central gst'],
+    sgst: ['sgst', 'state tax', 'state gst', 'utgst'],
+    igst: ['igst', 'integrated tax', 'integrated gst'],
+};
+
+// Classify a tax-ledger name as output / input / neutral by its wording. A ledger that names BOTH
+// (or NEITHER) is neutral — usable for either direction. Word-boundary matches on input/output/itc
+// avoid false hits inside unrelated words.
+export function classifyGstNature(name: string): GstNature | 'neutral' {
+    const l = name.toLowerCase();
+    const isOutput = /\b(output|outward)\b/.test(l) || l.includes('on sales') || l.includes('sales') || l.includes('payable');
+    const isInput  = /\b(input|inward|itc)\b/.test(l) || l.includes('on purchase') || l.includes('purchase') || l.includes('receivable');
+    if (isOutput && !isInput) return 'output';
+    if (isInput && !isOutput) return 'input';
+    return 'neutral';
+}
+
+// Pure, unit-tested selection. For each tax type, among the ledgers whose name matches the tax token,
+// prefer one matching the desired nature; else a nature-neutral one; NEVER an opposite-nature one
+// (returning undefined instead, so the caller fails closed / asks for an explicit ledger rather than
+// silently booking output tax to an input ledger). With no nature given, keeps the legacy first-match.
+export function pickGstLedgers(ledgerNames: string[], nature?: GstNature): { cgst?: string; sgst?: string; igst?: string } {
+    const out: { cgst?: string; sgst?: string; igst?: string } = {};
+    for (const key of ['cgst', 'sgst', 'igst'] as const) {
+        const tokens = GST_TOKENS[key];
+        const candidates = ledgerNames.filter(n => { const l = n.toLowerCase(); return tokens.some(t => l.includes(t)); });
+        if (!candidates.length) continue;
+        if (!nature) { out[key] = candidates[0]; continue; }
+        const byNature = candidates.find(n => classifyGstNature(n) === nature);
+        const neutral  = candidates.find(n => classifyGstNature(n) === 'neutral');
+        const chosen = byNature ?? neutral;
+        if (chosen) out[key] = chosen;
+    }
+    return out;
+}
+
+/**
+ * Resolves GST tax ledger names from Tally by searching the ledger list for CGST/SGST/IGST ledgers,
+ * preferring the ledger whose OUTPUT/INPUT nature matches the voucher direction (`nature`) so a sales
+ * voucher never books to an input-tax ledger (or vice-versa).
+ */
+export async function resolveGSTLedgers(inputParams: Map<string, any>, nature?: GstNature): Promise<{ cgst?: string; sgst?: string; igst?: string }> {
     const listParams = new Map<string, any>([['collection', 'ledger']]);
     if (inputParams.has('targetCompany')) {
         listParams.set('targetCompany', inputParams.get('targetCompany'));
     }
 
     const resp = await handlePull('list-master', listParams);
-    if (!resp.data || !Array.isArray(resp.data)) return result;
+    if (!resp.data || !Array.isArray(resp.data)) return {};
 
     const ledgerNames: string[] = resp.data.map((r: any) => r.name as string).filter(Boolean);
-
-    // match common GST ledger naming patterns (case-insensitive)
-    for (const name of ledgerNames) {
-        const lower = name.toLowerCase();
-        if (!result.cgst && (lower.includes('cgst') || lower.includes('central tax') || lower.includes('central gst'))) {
-            result.cgst = name;
-        }
-        if (!result.sgst && (lower.includes('sgst') || lower.includes('state tax') || lower.includes('state gst') || lower.includes('utgst'))) {
-            result.sgst = name;
-        }
-        if (!result.igst && (lower.includes('igst') || lower.includes('integrated tax') || lower.includes('integrated gst'))) {
-            result.igst = name;
-        }
-    }
-
-    return result;
+    return pickGstLedgers(ledgerNames, nature);
 }
