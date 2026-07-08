@@ -21,13 +21,13 @@ Step 5: Installer hint                     → Inno Setup (scripts/installer/)
 ## Step 1 — Extend config + add DPAPI encryption (Day 1–2)
 
 ### Where
-- [src/mcp.mts:174-200](../src/mcp.mts#L174-L200) — existing `CompaniesConfig` type + `loadCompaniesConfig()`
+- [src/mcp.mts:174-200](../../src/mcp.mts#L174-L200) — existing `CompaniesConfig` type + `loadCompaniesConfig()`
 - new file: `scripts/dpapi-helper.ps1`
-- [scripts/installer/firstrun-config.ps1](../scripts/installer/firstrun-config.ps1) — NTFS ACL lockdown
+- [scripts/installer/firstrun-config.ps1](../../scripts/installer/firstrun-config.ps1) — NTFS ACL lockdown
 
 ### What changes
 
-**1a. Extend `CompaniesConfig` type in [src/mcp.mts](../src/mcp.mts)**
+**1a. Extend `CompaniesConfig` type in [src/mcp.mts](../../src/mcp.mts)**
 
 Today the type is a flat `{ [folderId]: { requiresCredentials?, knownUsername?, notes? } }` keyed by folder ID. Replace with the richer shape from the plan doc:
 
@@ -78,7 +78,7 @@ The MCP service is Node/TypeScript, DPAPI is Windows-only and easiest from Power
 
 **1d. Lock down NTFS permissions**
 
-In [scripts/installer/firstrun-config.ps1](../scripts/installer/firstrun-config.ps1), after the JSON file is created, set ACL:
+In [scripts/installer/firstrun-config.ps1](../../scripts/installer/firstrun-config.ps1), after the JSON file is created, set ACL:
 
 ```powershell
 icacls "<path>" /inheritance:r /grant:r "SYSTEM:F" "Administrators:F"
@@ -96,8 +96,8 @@ This is the real access control. DPAPI is just defense-in-depth.
 ## Step 2 — Add `load-company-by-alias` MCP tool (Day 3)
 
 ### Where
-- [src/mcp.mts](../src/mcp.mts) near line ~1250 (end of tool registrations)
-- Follow the pattern of existing `open-company` at [src/mcp.mts:614-893](../src/mcp.mts#L614-L893)
+- [src/mcp.mts](../../src/mcp.mts) near line ~1250 (end of tool registrations)
+- Follow the pattern of existing `open-company` at [src/mcp.mts:614-893](../../src/mcp.mts#L614-L893)
 
 ### What it does (the flow from §7 of the plan doc)
 
@@ -112,7 +112,7 @@ This is the real access control. DPAPI is just defense-in-depth.
 ```
 
 ### Reuse what's there
-- IPC mechanism: same `_mcp_gui_command.json` / `_mcp_gui_result.json` files as [src/mcp.mts:743-806](../src/mcp.mts#L743-L806).
+- IPC mechanism: same `_mcp_gui_command.json` / `_mcp_gui_result.json` files as [src/mcp.mts:743-806](../../src/mcp.mts#L743-L806).
 - `createGuiAgentCommandId()`, `pingGuiAgent()`, `isMatchingGuiAgentCommand()` — call as-is.
 - `auditLog()` — call with `{ alias, success, durationMs }` only. Never the password, never the folder ID alone (low value).
 
@@ -129,8 +129,8 @@ Write the description so the LLM picks the right tool:
 ## Step 3 — GUI agent: add password-typing action (Day 4)
 
 ### Where
-- [scripts/tally-gui-agent-v2.ps1](../scripts/tally-gui-agent-v2.ps1)
-- Existing keystroke primitives are in [scripts/TallyUI.cs](../scripts/TallyUI.cs) (`TallyUI2.TypeString`, `PressKey`, `PressCombo`)
+- [scripts/tally-gui-agent-v2.ps1](../../scripts/tally-gui-agent-v2.ps1)
+- Existing keystroke primitives are in [scripts/TallyUI.cs](../../scripts/TallyUI.cs) (`TallyUI2.TypeString`, `PressKey`, `PressCombo`)
 
 ### What changes
 
@@ -156,7 +156,7 @@ The existing `select-company` uses the LLM-vision loop. The new one is pure-keys
 ## Step 4 — "Manage Companies" dashboard UI (Day 5–7)
 
 ### Where
-- [scripts/tray/tally-mcp-tray.ps1](../scripts/tray/tally-mcp-tray.ps1)
+- [scripts/tray/tally-mcp-tray.ps1](../../scripts/tray/tally-mcp-tray.ps1)
 
 This is the biggest single piece of new code. WinForms in PowerShell — same framework as the rest of the tray app.
 
@@ -216,13 +216,13 @@ Turns a frustrating dead-end into a 30-second fix.
 ## Step 5 — Installer hint (Day 7, 10 minutes of work)
 
 ### Where
-- [scripts/installer/tally-mcp.iss](../scripts/installer/tally-mcp.iss) — final page
+- [scripts/installer/tally-mcp.iss](../../scripts/installer/tally-mcp.iss) — final page
 
 Add one line to the FinishedLabel or a custom info page:
 
 > *"To configure your Tally companies, right-click the tray icon and click 'Manage Companies'."*
 
-Bump version to `1.2.0`. Rebuild installer via [scripts/installer/build-installer.ps1](../scripts/installer/build-installer.ps1). Done.
+Bump version to `1.2.0`. Rebuild installer via [scripts/installer/build-installer.ps1](../../scripts/installer/build-installer.ps1). Done.
 
 ---
 
@@ -259,15 +259,15 @@ For anyone picking this up cold, here's the lay of the land:
 
 | Piece | File | Notes |
 |---|---|---|
-| MCP tool registrations | [src/mcp.mts](../src/mcp.mts) | ~2227 lines. New tools go at the end of the registrations. |
-| Existing `open-company` tool | [src/mcp.mts:614-893](../src/mcp.mts#L614-L893) | Three-strategy fallback. We're adding a fourth tool, not replacing this. |
-| Companies config loader | [src/mcp.mts:174-200](../src/mcp.mts#L174-L200) | Old flat shape. Extend here. |
-| GUI agent (PowerShell) | [scripts/tally-gui-agent-v2.ps1](../scripts/tally-gui-agent-v2.ps1) | File-IPC loop. Add new action in the switch. |
-| Keystroke primitives | [scripts/TallyUI.cs](../scripts/TallyUI.cs) / `TallyUI.dll` | `TypeString`, `PressKey`, `PressCombo`. Reuse as-is. |
-| Tray + dashboard | [scripts/tray/tally-mcp-tray.ps1](../scripts/tray/tally-mcp-tray.ps1) | WinForms in PowerShell. New menu item + dialog goes here. |
-| Installer | [scripts/installer/tally-mcp.iss](../scripts/installer/tally-mcp.iss) | Inno Setup. |
-| Installer post-install | [scripts/installer/firstrun-config.ps1](../scripts/installer/firstrun-config.ps1) | Adds NTFS ACL lockdown for the JSON file here. |
-| DuckDB cache layer | [src/database.mts](../src/database.mts) | Used for report data only, **not** for config. Don't confuse the two. |
+| MCP tool registrations | [src/mcp.mts](../../src/mcp.mts) | ~2227 lines. New tools go at the end of the registrations. |
+| Existing `open-company` tool | [src/mcp.mts:614-893](../../src/mcp.mts#L614-L893) | Three-strategy fallback. We're adding a fourth tool, not replacing this. |
+| Companies config loader | [src/mcp.mts:174-200](../../src/mcp.mts#L174-L200) | Old flat shape. Extend here. |
+| GUI agent (PowerShell) | [scripts/tally-gui-agent-v2.ps1](../../scripts/tally-gui-agent-v2.ps1) | File-IPC loop. Add new action in the switch. |
+| Keystroke primitives | [scripts/TallyUI.cs](../../scripts/TallyUI.cs) / `TallyUI.dll` | `TypeString`, `PressKey`, `PressCombo`. Reuse as-is. |
+| Tray + dashboard | [scripts/tray/tally-mcp-tray.ps1](../../scripts/tray/tally-mcp-tray.ps1) | WinForms in PowerShell. New menu item + dialog goes here. |
+| Installer | [scripts/installer/tally-mcp.iss](../../scripts/installer/tally-mcp.iss) | Inno Setup. |
+| Installer post-install | [scripts/installer/firstrun-config.ps1](../../scripts/installer/firstrun-config.ps1) | Adds NTFS ACL lockdown for the JSON file here. |
+| DuckDB cache layer | [src/database.mts](../../src/database.mts) | Used for report data only, **not** for config. Don't confuse the two. |
 | DPAPI usage | _none yet_ | New requirement — added as `scripts/dpapi-helper.ps1` in Step 1b. |
 
 **Stack summary:** Node.js 20+ (TypeScript) for the MCP service, DuckDB for report caching, Express 5 for HTTP/OAuth, PowerShell for desktop automation, Inno Setup for the Windows installer.

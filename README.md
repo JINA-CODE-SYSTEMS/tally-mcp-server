@@ -1,6 +1,18 @@
-# Tally Prime MCP Server
+<div align="center">
+
+<img src="scripts/tray/assets/claudally-logo.png" width="96" alt="Claudally logo">
+
+# Claudally
+
+**Drive Tally Prime with Claude.** A Tally Prime ERP ↔ [MCP](https://modelcontextprotocol.io/) server for Claude, ChatGPT, Copilot, and any MCP client.
+
+by **JINA CODE SYSTEMS LLP** &nbsp;<img src="scripts/tray/assets/jina-logo.png" height="26" alt="JINA CODE SYSTEMS LLP logo">
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
+
+</div>
+
+*(“Claudally” = Claude + Tally. Formerly “Tally Prime MCP Server”.)*
 
 **A [Jina Code Systems LLP](https://github.com/JINA-CODE-SYSTEMS) project.**
 Copyright © 2026 Jina Code Systems LLP. Licensed under [AGPL-3.0-or-later](LICENSE).
@@ -9,7 +21,7 @@ all copies, forks, and derivative works — see [NOTICE](NOTICE) for the full cl
 
 > **Note:** Git history was rewritten on 16 Apr 2026 to remove accidentally committed auth tokens. All leaked credentials have been rotated. Thanks to [@Journeyman1987](https://github.com/Journeyman1987) for flagging this.
 
-An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that bridges **Tally Prime ERP** with AI assistants like Claude, ChatGPT, GitHub Copilot, and any MCP-compatible client. Query financial reports, manage masters, create vouchers, and analyse GST data — all through natural language.
+**Claudally** is an [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that bridges **Tally Prime ERP** with AI assistants like Claude, ChatGPT, GitHub Copilot, and any MCP-compatible client. Query financial reports, manage masters, create vouchers, and analyse GST data — all through natural language.
 
 ## Features
 
@@ -40,11 +52,19 @@ Port = 9000
 
 ### Option A — Windows installer (recommended for client deployments)
 
-A double-click `TallyMCP-Setup-<version>.exe` takes a Windows box from
+A double-click **`Claudally-Setup-<version>.exe`** takes a Windows box from
 "nothing installed" to "service running" in under 5 minutes. Bundles portable
-Node.js + NSSM, prompts for the few values it can't auto-detect, registers
-the Windows service and the GUI agent at-logon task. See
-[docs/installer.md](docs/installer.md) for build instructions.
+Node.js, NSSM, and `cloudflared`; registers the Windows service and the GUI
+agent at-logon task. See [docs/installer.md](docs/installer.md) for build
+instructions.
+
+**The setup wizard collects (most values auto-detect — usually just click Next):**
+
+- **Page 1 — Tally MCP Configuration:** OAuth password (min 12 chars — this gates every tool), Tally exe / data / `tally.ini` paths, and the Windows user the GUI agent runs as.
+- **Page 2 — Remote Access (optional):** a public domain / Cloudflare Tunnel hostname and a Cloudflare Tunnel token. **Leave both blank for localhost-only** (Claude Desktop on the same PC needs nothing here) — see [Connecting — which URL?](#connecting--which-url) below.
+- **Page 3 — Tally Edition:** Silver / Gold, plus a checkbox to let **Claude control Tally directly** (screenshots + keystrokes for login / company switching) — on by default.
+
+Change any of these later via the **Reconfigure** Start-Menu shortcut, or manage saved companies from the tray icon → **Manage Companies**.
 
 ### Option B — From source (development / custom deployments)
 
@@ -130,6 +150,23 @@ Because the MCP server typically runs as a Windows service in **Session 0** (no 
 
 ## Setup
 
+### Connecting — which URL?
+
+Where your Claude client runs decides what URL to point it at. **Rule of thumb: you only need a public URL when the client is *not* on the Tally PC.**
+
+| Your Claude client | URL to use | Wizard "Remote Access" page |
+| --- | --- | --- |
+| **Claude Desktop on the Tally PC** | local (stdio, or `http://127.0.0.1:3000/mcp`) | leave both fields blank |
+| **Claude Desktop on another PC** | the public HTTPS URL | fill it in (tunnel or own domain) |
+| **claude.ai / ChatGPT in a browser** | the public HTTPS URL | fill it in (tunnel or own domain) |
+
+Two ways to get that public HTTPS URL:
+
+- **Cloudflare Tunnel** *(in progress)* — no domain, no static IP, no router config. A Jina admin provisions a token + hostname; you paste both into the wizard's Remote Access page and the bundled `cloudflared` gives the box a stable HTTPS URL. The server binds **loopback-only** (safest). See [docs/cloudflare-tunnel-provisioning.md](docs/cloudflare-tunnel-provisioning.md).
+- **Your own domain** — you have a domain, a routable/static IP, and can run a reverse proxy. Put your `https://…` URL in the hostname field, leave the token blank; the server binds `0.0.0.0` and **you** terminate TLS with a reverse proxy (e.g. Caddy) in front of `127.0.0.1:3000`.
+
+Either way, add the URL (with `/mcp`) as a custom connector in your client and sign in with the OAuth password from the wizard. Before exposing writes to the internet, read [Security & hardening](docs/cloudflare-tunnel-provisioning.md#security--hardening).
+
 ### Local (Claude Desktop)
 
 Add to your `claude_desktop_config.json` (File → Settings → Developer):
@@ -176,9 +213,17 @@ For browser-based clients (ChatGPT, Claude web, Copilot) that can't reach a loca
 }
 ```
 
-The server uses OAuth 2.1 with PKCE for authentication.
+The server uses OAuth 2.1 with PKCE for authentication. See [Connecting — which URL?](#connecting--which-url) above for which path fits your client.
 
-**No public domain or static IP?** The Windows installer can bundle **Cloudflare Tunnel** — fill in the optional "Cloudflare Tunnel token" field in the wizard and it registers `cloudflared` as a second service that gives the box a stable public HTTPS URL (e.g. `https://<client>.tally.jinacode.systems`) with **zero router/port-forward config**. The MCP server then binds loopback-only (cloudflared reaches it on `127.0.0.1`), which is strictly safer than running your own `0.0.0.0` reverse proxy — the recommended path for a Tally box behind NAT.
+**No public domain or static IP?** *(in progress)* — the Windows installer can bundle **Cloudflare Tunnel**: fill in the token + hostname on the wizard's Remote Access page and `cloudflared` gives the box a stable public HTTPS URL (e.g. `https://<client>.tally.jinacode.systems`) with **zero router/port-forward config**, binding the server loopback-only. See [docs/cloudflare-tunnel-provisioning.md](docs/cloudflare-tunnel-provisioning.md).
+
+**Own domain instead?** Put your `https://…` URL in the hostname field, leave the token blank (server binds `0.0.0.0`), and terminate TLS with a reverse proxy in front of `127.0.0.1:3000`. Caddy is the quickest — auto HTTPS:
+
+```caddy
+tally.myfirm.com {
+    reverse_proxy 127.0.0.1:3000
+}
+```
 
 Detailed setup guides:
 - [Linux-based Server](docs/server-setup-linux.md) (recommended — Tally connects via SSH tunnel)
