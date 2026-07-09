@@ -3377,6 +3377,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         mailingName: z.string().optional().describe('optional mailing name / display name'),
         gstRegistrationType: z.enum(['Regular', 'Composition', 'Unregistered', 'Consumer', 'Unknown']).optional().describe('optional GST registration type for party ledgers'),
         gstin: z.string().optional().describe('optional GSTIN number for party ledgers'),
+        gstDutyHead: z.enum(['CGST', 'SGST', 'UTGST', 'IGST', 'Cess']).optional().describe('for a GST TAX ledger under "Duties & Taxes" (e.g. Output CGST): sets Type of duty = GST + the GST duty head, so gstr1-summary / gstr2-summary classify CGST/SGST/IGST correctly. Without it, tax ledgers post amounts but statutory GST returns stay empty (#135). NOTE: sales/purchase-ledger GST details (HSN/rate/nature) are not set here yet.'),
         dryRun: z.boolean().optional().describe('if true, validate and echo the posting WITHOUT writing to Tally')
       },
       annotations: {
@@ -3405,6 +3406,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (args.mailingName) inputParams.set('mailingName', args.mailingName);
       if (args.gstRegistrationType) inputParams.set('gstRegistrationType', args.gstRegistrationType);
       if (args.gstin) inputParams.set('gstin', args.gstin);
+      if (args.gstDutyHead) inputParams.set('gstDutyHead', args.gstDutyHead);
 
       if (args.dryRun) {
         auditLog('create-ledger', args, 'dryrun', Date.now() - start);
