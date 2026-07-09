@@ -1635,9 +1635,17 @@ export async function executeVoucherBatch(
 
 export async function registerMcpServer(): Promise<McpServer> {
   const mcpServer = new McpServer({
-    name: 'Tally Prime MCP Server',
-    title: 'Tally Prime',
-    version: '1.0.0'
+    name: 'Claudally',
+    title: 'Claudally',
+    version: '1.0.0',
+    description: 'Drive Tally Prime with Claude — query reports, manage masters, post vouchers, and analyse GST.',
+    websiteUrl: 'https://claudally.jinacode.systems',
+    // Tell the client which logo to show (MCP icons). Hosted on the public landing site so any
+    // MCP client can fetch it; the plain placeholder tile in some connector UIs is the fallback
+    // shown when a server advertises no icon.
+    icons: [
+      { src: 'https://claudally.jinacode.systems/claudally-logo.png', mimeType: 'image/png', sizes: ['256x256'] }
+    ]
   }, {
     instructions: TALLY_MCP_INSTRUCTIONS
   });
