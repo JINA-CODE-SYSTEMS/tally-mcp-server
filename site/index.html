@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Claudally — Drive Tally Prime with Claude</title>
+  <meta name="description" content="Claudally is an open-source Tally Prime ↔ MCP server. Query financial reports, manage masters, create vouchers, and analyse GST from Claude, ChatGPT, Copilot, or any MCP client — in plain language.">
+
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Claudally — Drive Tally Prime with Claude">
+  <meta property="og:description" content="Open-source Tally Prime ↔ MCP server. Talk to your books in plain language from any MCP client.">
+  <meta property="og:url" content="https://claudally.jinacode.systems">
+  <meta name="theme-color" content="#F5620A">
+
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='112' fill='%23F5620A'/%3E%3Cpath d='M256 106Q280 200 374 224Q280 248 256 342Q232 248 138 224Q232 200 256 106Z' fill='white'/%3E%3C/svg%3E">
+
+  <style>
+    :root {
+      --orange-1: #FF9A2E;
+      --orange-2: #F5620A;
+      --ink: #1c1917;
+      --muted: #6b6560;
+      --bg: #fbf7f2;
+      --card: #ffffff;
+      --border: #efe7dc;
+      --code-bg: #1c1613;
+      --code-ink: #f5e9dd;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --ink: #f5efe8;
+        --muted: #a49c94;
+        --bg: #14100d;
+        --card: #1e1813;
+        --border: #2c2419;
+        --code-bg: #0d0a08;
+        --code-ink: #f5e9dd;
+      }
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: inherit; }
+    .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+    .brand-grad { background: linear-gradient(135deg, var(--orange-1), var(--orange-2)); }
+
+    /* Header */
+    header {
+      position: sticky; top: 0; z-index: 20;
+      backdrop-filter: saturate(180%) blur(12px);
+      background: color-mix(in srgb, var(--bg) 82%, transparent);
+      border-bottom: 1px solid var(--border);
+    }
+    .nav { display: flex; align-items: center; justify-content: space-between; height: 64px; }
+    .nav-brand { display: flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: -.01em; text-decoration: none; }
+    .nav-brand .tile { width: 30px; height: 30px; border-radius: 8px; }
+    .nav-links { display: flex; align-items: center; gap: 22px; font-size: 15px; }
+    .nav-links a { text-decoration: none; color: var(--muted); font-weight: 500; transition: color .15s; }
+    .nav-links a:hover { color: var(--ink); }
+    .nav-links a.ghbtn { color: var(--ink); }
+    @media (max-width: 620px) { .nav-links .hide-sm { display: none; } }
+
+    /* Buttons */
+    .btn {
+      display: inline-flex; align-items: center; gap: 8px;
+      font-weight: 600; font-size: 15px; text-decoration: none;
+      padding: 12px 22px; border-radius: 12px; border: 1px solid transparent;
+      transition: transform .12s ease, box-shadow .12s ease, background .12s;
+    }
+    .btn:active { transform: translateY(1px); }
+    .btn-primary { color: #fff; box-shadow: 0 6px 20px -6px rgba(245,98,10,.6); }
+    .btn-primary:hover { box-shadow: 0 10px 28px -8px rgba(245,98,10,.75); }
+    .btn-ghost { background: var(--card); border-color: var(--border); color: var(--ink); }
+    .btn-ghost:hover { border-color: color-mix(in srgb, var(--orange-2) 45%, var(--border)); }
+
+    /* Hero */
+    .hero { text-align: center; padding: 80px 0 48px; }
+    .hero .logo { width: 96px; height: 96px; border-radius: 26px; box-shadow: 0 20px 50px -18px rgba(245,98,10,.6); }
+    .hero h1 { font-size: clamp(40px, 7vw, 68px); line-height: 1.02; letter-spacing: -.035em; margin: 26px 0 6px; }
+    .hero .tag {
+      display: inline-block; font-size: clamp(19px, 3vw, 24px); font-weight: 600;
+      background: linear-gradient(135deg, var(--orange-1), var(--orange-2));
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+      margin: 0 0 18px;
+    }
+    .hero p.lede { max-width: 640px; margin: 0 auto 32px; font-size: 18px; color: var(--muted); }
+    .cta { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+    .byline { margin-top: 34px; font-size: 14px; color: var(--muted); }
+    .byline strong { color: var(--ink); }
+    .badges { margin-top: 18px; display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+    .pill {
+      font-size: 12.5px; font-weight: 600; padding: 5px 12px; border-radius: 999px;
+      background: var(--card); border: 1px solid var(--border); color: var(--muted);
+    }
+
+    /* Terminal mock */
+    .demo { max-width: 720px; margin: 56px auto 0; }
+    .term {
+      background: var(--code-bg); border-radius: 16px; overflow: hidden;
+      box-shadow: 0 30px 70px -30px rgba(0,0,0,.5); border: 1px solid rgba(255,255,255,.06);
+    }
+    .term-bar { display: flex; align-items: center; gap: 7px; padding: 13px 16px; border-bottom: 1px solid rgba(255,255,255,.07); }
+    .dot { width: 11px; height: 11px; border-radius: 50%; }
+    .term-title { margin-left: 10px; color: #9a8f84; font-size: 12.5px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .term-body { padding: 22px 22px 26px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px; color: var(--code-ink); }
+    .term-body .you { color: #ffb765; }
+    .term-body .ai { color: #e9ddce; }
+    .term-body .muted2 { color: #8a7f74; }
+    .term-body .num { color: #7fd39a; }
+    .term-body p { margin: 0 0 14px; }
+    .term-body p:last-child { margin-bottom: 0; }
+
+    /* Section shell */
+    section.block { padding: 72px 0; }
+    .eyebrow { text-align: center; font-size: 13px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--orange-2); margin: 0 0 10px; }
+    h2.sec { text-align: center; font-size: clamp(28px, 4.5vw, 40px); letter-spacing: -.03em; margin: 0 0 14px; }
+    p.sub { text-align: center; color: var(--muted); max-width: 620px; margin: 0 auto 48px; font-size: 17px; }
+
+    /* Feature grid */
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+    @media (max-width: 860px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+    .card {
+      background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 26px;
+      transition: transform .15s ease, border-color .15s;
+    }
+    .card:hover { transform: translateY(-3px); border-color: color-mix(in srgb, var(--orange-2) 35%, var(--border)); }
+    .card .ico { width: 42px; height: 42px; border-radius: 11px; display: grid; place-items: center; margin-bottom: 16px; }
+    .card .ico svg { width: 22px; height: 22px; stroke: #fff; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+    .card h3 { margin: 0 0 7px; font-size: 18px; letter-spacing: -.01em; }
+    .card p { margin: 0; color: var(--muted); font-size: 15px; }
+
+    /* Steps */
+    .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; counter-reset: step; }
+    @media (max-width: 760px) { .steps { grid-template-columns: 1fr; } }
+    .step { position: relative; padding-left: 4px; }
+    .step .n {
+      width: 40px; height: 40px; border-radius: 11px; color: #fff; font-weight: 700; font-size: 18px;
+      display: grid; place-items: center; margin-bottom: 16px;
+    }
+    .step h3 { margin: 0 0 7px; font-size: 19px; letter-spacing: -.01em; }
+    .step p { margin: 0; color: var(--muted); font-size: 15px; }
+    .step code { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 1px 6px; font-size: 13px; }
+
+    /* Trust band */
+    .band { background: var(--card); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+    .band .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 30px; }
+    @media (max-width: 760px) { .band .grid3 { grid-template-columns: 1fr; text-align: center; } }
+    .trust h3 { margin: 0 0 6px; font-size: 17px; }
+    .trust p { margin: 0; color: var(--muted); font-size: 15px; }
+    .trust .k { color: var(--orange-2); font-weight: 700; }
+
+    /* Install */
+    .install { max-width: 720px; margin: 0 auto; }
+    pre.code {
+      background: var(--code-bg); color: var(--code-ink); border-radius: 14px; padding: 22px 24px;
+      overflow-x: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px; line-height: 1.7;
+      border: 1px solid rgba(255,255,255,.06);
+    }
+    pre.code .c { color: #8a7f74; }
+    pre.code .p { color: #ffb765; }
+    .install .note { text-align: center; margin-top: 22px; color: var(--muted); font-size: 15px; }
+
+    /* Final CTA */
+    .finalcta { text-align: center; padding: 84px 0; }
+    .finalcta h2 { font-size: clamp(30px, 5vw, 46px); letter-spacing: -.03em; margin: 0 0 14px; }
+    .finalcta p { color: var(--muted); font-size: 18px; margin: 0 0 30px; }
+
+    /* Footer */
+    footer { border-top: 1px solid var(--border); padding: 44px 0 60px; }
+    .foot { display: flex; align-items: flex-start; justify-content: space-between; gap: 30px; flex-wrap: wrap; }
+    .foot .brand { display: flex; align-items: center; gap: 11px; font-weight: 700; }
+    .foot .tile { width: 34px; height: 34px; border-radius: 9px; }
+    .foot .cols { display: flex; gap: 56px; flex-wrap: wrap; }
+    .foot .col h4 { margin: 0 0 12px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+    .foot .col a { display: block; text-decoration: none; color: var(--ink); font-size: 15px; margin-bottom: 9px; opacity: .85; }
+    .foot .col a:hover { opacity: 1; color: var(--orange-2); }
+    .legal { margin-top: 40px; padding-top: 22px; border-top: 1px solid var(--border); color: var(--muted); font-size: 13.5px; }
+    .legal a { color: var(--muted); }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="wrap nav">
+      <a class="nav-brand" href="#top">
+        <span class="tile brand-grad"></span>
+        Claudally
+      </a>
+      <nav class="nav-links">
+        <a href="#features" class="hide-sm">Features</a>
+        <a href="#how" class="hide-sm">How it works</a>
+        <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/README.md">Docs</a>
+        <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server" class="ghbtn">GitHub ↗</a>
+      </nav>
+    </div>
+  </header>
+
+  <a id="top"></a>
+  <main>
+
+    <!-- HERO -->
+    <section class="hero wrap">
+      <svg class="logo" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" aria-label="Claudally logo">
+        <defs>
+          <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#FF9A2E"/><stop offset="1" stop-color="#F5620A"/>
+          </linearGradient>
+          <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stop-color="#fff" stop-opacity=".18"/><stop offset=".5" stop-color="#fff" stop-opacity="0"/>
+          </linearGradient>
+        </defs>
+        <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#tile)"/>
+        <rect x="16" y="16" width="480" height="240" rx="112" fill="url(#sheen)"/>
+        <path d="M256 106Q280 200 374 224Q280 248 256 342Q232 248 138 224Q232 200 256 106Z" fill="#fff"/>
+        <rect x="172" y="372" width="168" height="20" rx="10" fill="#fff" fill-opacity=".95"/>
+        <rect x="190" y="404" width="132" height="20" rx="10" fill="#fff" fill-opacity=".78"/>
+        <rect x="208" y="436" width="96" height="20" rx="10" fill="#fff" fill-opacity=".60"/>
+      </svg>
+
+      <h1>Claudally</h1>
+      <span class="tag">Drive Tally Prime with Claude</span>
+      <p class="lede">
+        An open-source Tally&nbsp;Prime&nbsp;ERP&nbsp;↔&nbsp;MCP server. Query financial reports, manage
+        masters, post vouchers, and analyse GST — in plain language, from Claude, ChatGPT, Copilot,
+        or any MCP client.
+      </p>
+
+      <div class="cta">
+        <a class="btn btn-primary brand-grad" href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/installer.md">Get started</a>
+        <a class="btn btn-ghost" href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server">
+          <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+          Star on GitHub
+        </a>
+      </div>
+
+      <div class="badges">
+        <span class="pill">🔒 Local-first &amp; self-hosted</span>
+        <span class="pill">⚖️ AGPL-3.0 open source</span>
+        <span class="pill">🪟 5-minute Windows installer</span>
+      </div>
+
+      <p class="byline">by <strong>JINA CODE SYSTEMS LLP</strong></p>
+
+      <!-- Terminal demo -->
+      <div class="demo">
+        <div class="term">
+          <div class="term-bar">
+            <span class="dot" style="background:#ff5f57"></span>
+            <span class="dot" style="background:#febc2e"></span>
+            <span class="dot" style="background:#28c840"></span>
+            <span class="term-title">Claude · Claudally</span>
+          </div>
+          <div class="term-body">
+            <p><span class="you">You&nbsp;›</span> What was my GST liability last quarter?</p>
+            <p><span class="ai">Claude&nbsp;›</span> <span class="muted2">reading GSTR-3B from Tally…</span><br>
+              Output tax <span class="num">₹4,12,860</span> − Input credit <span class="num">₹2,88,140</span>
+              = net payable <span class="num">₹1,24,720</span> for Jul–Sep.</p>
+            <p><span class="you">You&nbsp;›</span> Post a sales invoice to Acme Ltd for ₹50,000 + 18% GST.</p>
+            <p><span class="ai">Claude&nbsp;›</span> <span class="muted2">created voucher #1043</span> ✓ — taxable ₹50,000,
+              CGST ₹4,500, SGST ₹4,500, total <span class="num">₹59,000</span>.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- FEATURES -->
+    <section class="block wrap" id="features">
+      <p class="eyebrow">What it does</p>
+      <h2 class="sec">Your whole ledger, one conversation away</h2>
+      <p class="sub">Every Claudally tool maps to Tally's own XML API — deterministic, auditable, and safe to run on live books.</p>
+
+      <div class="grid">
+        <div class="card">
+          <div class="ico brand-grad"><svg viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="M7 14l3-3 3 3 5-6"/></svg></div>
+          <h3>Financial reports</h3>
+          <p>Balance sheet, P&amp;L, trial balance, cash &amp; bank, outstanding bills — pulled live and explained in plain English.</p>
+        </div>
+        <div class="card">
+          <div class="ico brand-grad"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg></div>
+          <h3>GST returns</h3>
+          <p>GSTR-1 / GSTR-3B summaries, HSN breakups, and per-voucher tax detail — reconciled straight from your data.</p>
+        </div>
+        <div class="card">
+          <div class="ico brand-grad"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></div>
+          <h3>Post vouchers</h3>
+          <p>Sales, purchase, payment, receipt, journal — single or batch, with dry-run preview and reversible entries.</p>
+        </div>
+        <div class="card">
+          <div class="ico brand-grad"><svg viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg></div>
+          <h3>Manage masters</h3>
+          <p>Create and configure ledgers, groups, and stock items — including GST-ready tax ledgers that populate returns.</p>
+        </div>
+        <div class="card">
+          <div class="ico brand-grad"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-9-9"/><path d="M21 3v6h-6"/></svg></div>
+          <h3>Multi-company</h3>
+          <p>List, load, switch, and unlock protected companies — Silver or Gold edition — without restarting Tally.</p>
+        </div>
+        <div class="card">
+          <div class="ico brand-grad"><svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
+          <h3>Yours, privately</h3>
+          <p>Runs on your machine or your server. Data never leaves your control. Optional Cloudflare Tunnel for remote access.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- HOW IT WORKS -->
+    <section class="block wrap" id="how">
+      <p class="eyebrow">How it works</p>
+      <h2 class="sec">Running in three steps</h2>
+      <p class="sub">From "nothing installed" to talking to your books in under five minutes.</p>
+
+      <div class="steps">
+        <div class="step">
+          <div class="n brand-grad">1</div>
+          <h3>Install the agent</h3>
+          <p>Run the Windows installer on the PC with Tally Prime. It bundles Node.js, the service, and <code>cloudflared</code> — no dependencies to chase.</p>
+        </div>
+        <div class="step">
+          <div class="n brand-grad">2</div>
+          <h3>Connect your client</h3>
+          <p>Add the server URL to Claude, ChatGPT, or Copilot as an MCP connector. OAuth handles auth; pick a company and you're live.</p>
+        </div>
+        <div class="step">
+          <div class="n brand-grad">3</div>
+          <h3>Just ask</h3>
+          <p>"Show me overdue receivables." "File-ready GSTR-1 for June?" "Book this expense." Claudally does the rest — deterministically.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- TRUST BAND -->
+    <section class="band">
+      <div class="block wrap">
+        <div class="grid3">
+          <div class="trust">
+            <h3><span class="k">Local-first</span> by design</h3>
+            <p>The server talks to Tally over localhost XML. Your financial data stays on your infrastructure — nothing is sent to a third party.</p>
+          </div>
+          <div class="trust">
+            <h3><span class="k">Deterministic</span> writes</h3>
+            <p>Every voucher and master goes through Tally's native XML API, never GUI guessing — with read-only mode, audit logs, and dry-run.</p>
+          </div>
+          <div class="trust">
+            <h3><span class="k">Truly</span> open source</h3>
+            <p>AGPL-3.0. Read the code, self-host it, fork it. No lock-in, no per-seat pricing, no black box between you and your ledger.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- INSTALL -->
+    <section class="block wrap">
+      <p class="eyebrow">Quick start</p>
+      <h2 class="sec">Prefer the source?</h2>
+      <p class="sub">Clone and build in a few commands — or grab the one-click Windows installer for production.</p>
+      <div class="install">
+<pre class="code"><span class="c"># clone &amp; build</span>
+git clone https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server.git
+<span class="p">cd</span> tally-mcp-server
+npm install <span class="p">&amp;&amp;</span> npx tsc
+
+<span class="c"># then point your MCP client at the running server</span></pre>
+        <p class="note">
+          For production Windows boxes, use the <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/installer.md">installer</a>
+          — portable Node, NSSM service, and Cloudflare Tunnel, all bundled.
+        </p>
+      </div>
+    </section>
+
+    <!-- FINAL CTA -->
+    <section class="finalcta wrap">
+      <h2>Talk to your books.</h2>
+      <p>Free, open source, and running in minutes.</p>
+      <div class="cta">
+        <a class="btn btn-primary brand-grad" href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/installer.md">Get started</a>
+        <a class="btn btn-ghost" href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/README.md">Read the docs</a>
+      </div>
+    </section>
+
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <div class="foot">
+        <div>
+          <div class="brand"><span class="tile brand-grad"></span> Claudally</div>
+          <p style="color:var(--muted); max-width:320px; margin:14px 0 0; font-size:14.5px;">
+            Claude + Tally. An open-source bridge between Tally Prime ERP and AI assistants.
+          </p>
+        </div>
+        <div class="cols">
+          <div class="col">
+            <h4>Project</h4>
+            <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server">GitHub</a>
+            <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/README.md">Documentation</a>
+            <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/installer.md">Installer</a>
+            <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues">Issues</a>
+          </div>
+          <div class="col">
+            <h4>Reference</h4>
+            <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/security-assessment.md">Security</a>
+            <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/CHANGELOG.md">Changelog</a>
+            <a href="https://modelcontextprotocol.io/">About MCP ↗</a>
+            <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/LICENSE">License</a>
+          </div>
+        </div>
+      </div>
+      <div class="legal">
+        © 2026 <a href="https://github.com/JINA-CODE-SYSTEMS">JINA CODE SYSTEMS LLP</a>. Licensed under
+        <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/LICENSE">AGPL-3.0-or-later</a>.
+        Tally and Tally Prime are trademarks of Tally Solutions Pvt. Ltd.; Claudally is an independent
+        open-source project and is not affiliated with or endorsed by Tally Solutions.
+      </div>
+    </div>
+  </footer>
+
+</body>
+</html>
