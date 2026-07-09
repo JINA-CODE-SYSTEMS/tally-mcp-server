@@ -20,6 +20,19 @@ test('ledger master import carries a <NAME> child (not just the NAME attribute)'
   assert.match(out, /<SVCURRENTCOMPANY>ROSS COMPUTERS PVT\. LTD\.<\/SVCURRENTCOMPANY>/);
 });
 
+// #135: a GST TAX ledger (Duties & Taxes) must carry the duty head so gstr1/gstr2 can classify it.
+test('ledger with gstDutyHead emits TAXTYPE=GST + GSTDUTYHEAD', () => {
+  const out = env.renderString(tmpl('ledger'), { name: 'Output CGST', parentGroup: 'Duties & Taxes', gstDutyHead: 'CGST' });
+  assert.match(out, /<TAXTYPE>GST<\/TAXTYPE>/);
+  assert.match(out, /<GSTDUTYHEAD>CGST<\/GSTDUTYHEAD>/);
+});
+
+test('ledger without gstDutyHead emits no GST tax tags (non-GST ledgers unchanged)', () => {
+  const out = env.renderString(tmpl('ledger'), { name: 'Cash', parentGroup: 'Cash-in-Hand' });
+  assert.equal(/<GSTDUTYHEAD>/.test(out), false);
+  assert.equal(/<TAXTYPE>/.test(out), false);
+});
+
 test('stock-item master import carries a <NAME> child', () => {
   const out = env.renderString(tmpl('stock-item'), { name: 'Test Item', parentGroup: 'Primary', unit: 'Nos' });
   assert.match(out, /<STOCKITEM NAME="Test Item" ACTION="Create">/);

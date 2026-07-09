@@ -30,6 +30,10 @@
                         <nunjuck>if gstin</nunjuck>
                         <PARTYGSTIN>{{gstin | escape}}</PARTYGSTIN>
                         <nunjuck>endif</nunjuck>
+                        <nunjuck>if gstDutyHead</nunjuck>
+                        <TAXTYPE>GST</TAXTYPE>
+                        <GSTDUTYHEAD>{{gstDutyHead | escape}}</GSTDUTYHEAD>
+                        <nunjuck>endif</nunjuck>
                     </LEDGER>
                 </TALLYMESSAGE>
             </REQUESTDATA>
