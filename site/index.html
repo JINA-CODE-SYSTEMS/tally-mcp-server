@@ -94,6 +94,8 @@
     .cta { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
     .byline { margin-top: 34px; font-size: 14px; color: var(--muted); }
     .byline strong { color: var(--ink); }
+    .tested { margin: 14px 0 0; font-size: 13.5px; color: var(--muted); }
+    .tested strong { color: var(--orange-2); font-weight: 600; }
     .badges { margin-top: 18px; display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
     .pill {
       font-size: 12.5px; font-weight: 600; padding: 5px 12px; border-radius: 999px;
@@ -149,6 +151,21 @@
     .step p { margin: 0; color: var(--muted); font-size: 15px; }
     .step code { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 1px 6px; font-size: 13px; }
 
+    /* Plugin card */
+    .plugin-card {
+      display: flex; align-items: center; gap: 40px;
+      background: var(--card); border: 1px solid var(--border); border-radius: 22px;
+      padding: 44px; position: relative; overflow: hidden;
+    }
+    .plugin-card::before {
+      content: ""; position: absolute; inset: 0; pointer-events: none;
+      background: radial-gradient(120% 140% at 100% 0%, color-mix(in srgb, var(--orange-2) 12%, transparent), transparent 55%);
+    }
+    .plugin-body { position: relative; flex: 1; }
+    .plugin-badge { width: 128px; height: 128px; border-radius: 30px; flex-shrink: 0; display: grid; place-items: center; box-shadow: 0 20px 44px -18px rgba(245,98,10,.6); position: relative; }
+    .plugin-badge svg { width: 60px; height: 60px; }
+    @media (max-width: 720px) { .plugin-card { flex-direction: column-reverse; align-items: flex-start; padding: 32px; gap: 26px; } }
+
     /* Trust band */
     .band { background: var(--card); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
     .band .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 30px; }
@@ -191,12 +208,20 @@
   <header>
     <div class="wrap nav">
       <a class="nav-brand" href="#top">
-        <span class="tile brand-grad"></span>
+        <svg class="tile" viewBox="0 0 512 512" aria-hidden="true">
+          <defs><linearGradient id="tnav" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FF9A2E"/><stop offset="1" stop-color="#F5620A"/></linearGradient></defs>
+          <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#tnav)"/>
+          <path d="M256 106Q280 200 374 224Q280 248 256 342Q232 248 138 224Q232 200 256 106Z" fill="#fff"/>
+          <rect x="172" y="372" width="168" height="20" rx="10" fill="#fff" fill-opacity=".95"/>
+          <rect x="190" y="404" width="132" height="20" rx="10" fill="#fff" fill-opacity=".78"/>
+          <rect x="208" y="436" width="96" height="20" rx="10" fill="#fff" fill-opacity=".60"/>
+        </svg>
         Claudally
       </a>
       <nav class="nav-links">
         <a href="#features" class="hide-sm">Features</a>
         <a href="#how" class="hide-sm">How it works</a>
+        <a href="#plugin" class="hide-sm">Plugin</a>
         <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/README.md">Docs</a>
         <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server" class="ghbtn">GitHub ↗</a>
       </nav>
@@ -246,6 +271,7 @@
         <span class="pill">⚖️ AGPL-3.0 open source</span>
         <span class="pill">🪟 5-minute Windows installer</span>
       </div>
+      <p class="tested">✓ Tested with Claude <strong>Opus&nbsp;4+</strong> and <strong>Sonnet&nbsp;5 (beta)</strong></p>
 
       <p class="byline">by <strong>JINA CODE SYSTEMS LLP</strong></p>
 
@@ -336,6 +362,40 @@
       </div>
     </section>
 
+    <!-- CLAUDE PLUGIN -->
+    <section class="block wrap" id="plugin">
+      <div class="plugin-card">
+        <div class="plugin-body">
+          <p class="eyebrow" style="text-align:left; margin-bottom:12px;">Claude plugin</p>
+          <h2 style="text-align:left; font-size:clamp(26px,4vw,34px); letter-spacing:-.03em; margin:0 0 12px;">
+            Tally&nbsp;Feeding — books that stay in your house style
+          </h2>
+          <p style="color:var(--muted); font-size:17px; margin:0 0 22px; max-width:52ch;">
+            An optional Claude plugin that profiles how your firm <em>actually</em> posts — numbering,
+            narration style, ledger pairings — confirms it with you, then feeds ledgers, stock items,
+            and GST / non-GST vouchers that match, consistently across sessions. Skill only: it drives
+            Claudally, and your connection stays in your own settings.
+          </p>
+          <div class="cta" style="justify-content:flex-start;">
+            <a class="btn btn-primary brand-grad" href="tally-feeding.plugin" download>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>
+              Download plugin
+            </a>
+            <a class="btn btn-ghost" href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server">View source</a>
+          </div>
+          <p style="color:var(--muted); font-size:14px; margin:20px 0 0;">
+            Install it in <strong>Claude Cowork</strong> (plugin install / marketplace), then connect a
+            working folder for your client sheets. Requires the Claudally server connected as an MCP connector.
+          </p>
+        </div>
+        <div class="plugin-badge brand-grad" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 7h16M4 12h16M4 17h10"/><circle cx="17" cy="17" r="3.2"/><path d="M17 15.6v2.8M15.6 17h2.8"/>
+          </svg>
+        </div>
+      </div>
+    </section>
+
     <!-- TRUST BAND -->
     <section class="band">
       <div class="block wrap">
@@ -391,7 +451,17 @@ npm install <span class="p">&amp;&amp;</span> npx tsc
     <div class="wrap">
       <div class="foot">
         <div>
-          <div class="brand"><span class="tile brand-grad"></span> Claudally</div>
+          <div class="brand">
+            <svg class="tile" viewBox="0 0 512 512" aria-hidden="true">
+              <defs><linearGradient id="tfoot" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FF9A2E"/><stop offset="1" stop-color="#F5620A"/></linearGradient></defs>
+              <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#tfoot)"/>
+              <path d="M256 106Q280 200 374 224Q280 248 256 342Q232 248 138 224Q232 200 256 106Z" fill="#fff"/>
+              <rect x="172" y="372" width="168" height="20" rx="10" fill="#fff" fill-opacity=".95"/>
+              <rect x="190" y="404" width="132" height="20" rx="10" fill="#fff" fill-opacity=".78"/>
+              <rect x="208" y="436" width="96" height="20" rx="10" fill="#fff" fill-opacity=".60"/>
+            </svg>
+            Claudally
+          </div>
           <p style="color:var(--muted); max-width:320px; margin:14px 0 0; font-size:14.5px;">
             Claude + Tally. An open-source bridge between Tally Prime ERP and AI assistants.
           </p>
@@ -402,6 +472,7 @@ npm install <span class="p">&amp;&amp;</span> npx tsc
             <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server">GitHub</a>
             <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/README.md">Documentation</a>
             <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/installer.md">Installer</a>
+            <a href="tally-feeding.plugin" download>Claude plugin</a>
             <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues">Issues</a>
           </div>
           <div class="col">

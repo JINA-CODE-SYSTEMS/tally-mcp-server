@@ -21,3 +21,7 @@ dist-installer/
 
 # Transient PID file written by scripts/dev-run-local.ps1
 scripts/.dev-pids
+
+# Pages build copies these in from their canonical source at deploy time (see pages.yml)
+site/claudally-logo.png
+site/tally-feeding.plugin

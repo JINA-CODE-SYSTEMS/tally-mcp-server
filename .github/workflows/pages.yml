@@ -7,6 +7,8 @@ on:
     branches: [main]
     paths:
       - 'site/**'
+      - 'tally-feeding.plugin'
+      - 'scripts/tray/assets/claudally-logo.png'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -32,6 +34,13 @@ jobs:
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
+
+      # Stage assets kept at their canonical source (no committed duplicates in site/):
+      # the brand logo (regenerated from the SVG master) and the downloadable Claude plugin.
+      - name: Stage downloadable assets
+        run: |
+          cp scripts/tray/assets/claudally-logo.png site/claudally-logo.png
+          cp tally-feeding.plugin site/tally-feeding.plugin
 
       - name: Upload site artifact
         uses: actions/upload-pages-artifact@v3
