@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ENVELOPE>
+    <HEADER>
+        <TALLYREQUEST>Import Data</TALLYREQUEST>
+    </HEADER>
+    <BODY>
+        <IMPORTDATA>
+            <REQUESTDESC>
+                <REPORTNAME>All Masters</REPORTNAME>
+                <STATICVARIABLES>
+                    <nunjuck>if targetCompany</nunjuck>
+                    <SVCURRENTCOMPANY>{{targetCompany | escape}}</SVCURRENTCOMPANY>
+                    <nunjuck>endif</nunjuck>
+                </STATICVARIABLES>
+            </REQUESTDESC>
+            <REQUESTDATA>
+                <TALLYMESSAGE xmlns:UDF="TallyUDF">
+                    <LEDGER NAME="{{name | escape}}" ACTION="Alter">
+                        <NAME>{{name | escape}}</NAME>
+                        <nunjuck>if gstDutyHead</nunjuck>
+                        <TAXTYPE>GST</TAXTYPE>
+                        <GSTDUTYHEAD>{{gstDutyHead | escape}}</GSTDUTYHEAD>
+                        <nunjuck>endif</nunjuck>
+                    </LEDGER>
+                </TALLYMESSAGE>
+            </REQUESTDATA>
+        </IMPORTDATA>
+    </BODY>
+</ENVELOPE>

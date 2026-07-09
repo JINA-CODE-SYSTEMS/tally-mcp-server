@@ -3425,6 +3425,56 @@ export async function registerMcpServer(): Promise<McpServer> {
   );
 
   mcpServer.registerTool(
+    'set-ledger-gst',
+    {
+      title: 'Set Ledger GST Configuration',
+      description: `Configures GST on an EXISTING ledger by ALTERing it (does not create). Use this to fix a tax ledger that was created without its GST settings — e.g. an "OUTPUT CGST" under Duties & Taxes whose TAXTYPE is "Others", so statutory GSTR-1 / GSTR-3B stay empty. Pass gstDutyHead (CGST/SGST/UTGST/IGST/Cess) and it stamps TAXTYPE=GST + GSTDUTYHEAD on the ledger — the exact tags a live TallyPrime GST tax ledger carries. Tally ALTER merges: only these GST fields change; the balance, parent, name, and everything else are preserved. Refused when READONLY_MODE=true. Use dryRun first to see the exact posting. NOTE: sales/purchase-ledger GST details (applicability / HSN / rate) are not set by this tool yet.`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name. leave blank to use the active company'),
+        name: z.string().describe('EXACT name of the existing ledger to configure (validate with list-master / search-master first)'),
+        gstDutyHead: z.enum(['CGST', 'SGST', 'UTGST', 'IGST', 'Cess']).describe('the GST duty head for this tax ledger under "Duties & Taxes"'),
+        dryRun: z.boolean().optional().describe('if true, echo the ALTER posting WITHOUT writing to Tally')
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      if (process.env.READONLY_MODE === 'true') {
+        auditLog('set-ledger-gst', args, 'denied');
+        return errorResult('READONLY');
+      }
+      if (!args.name || args.name.trim() === '') {
+        auditLog('set-ledger-gst', args, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: 'Ledger name cannot be empty.', retryable: false });
+      }
+
+      let inputParams = new Map<string, any>([
+        ['name', args.name],
+        ['gstDutyHead', args.gstDutyHead]
+      ]);
+      if (args.targetCompany) inputParams.set('targetCompany', args.targetCompany);
+
+      if (args.dryRun) {
+        auditLog('set-ledger-gst', args, 'dryrun', Date.now() - start);
+        return dryRunEcho('ledger-gst', inputParams);
+      }
+      const resp = await push('ledger-gst', inputParams);
+      if (!resp.success) {
+        auditLog('set-ledger-gst', args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: resp.error || 'Failed to configure ledger GST.' });
+      }
+      auditLog('set-ledger-gst', args, 'success', Date.now() - start);
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ success: true, altered: resp.altered ?? resp.created, ledger: args.name, gstDutyHead: args.gstDutyHead }) }]
+      };
+    }
+  );
+
+  mcpServer.registerTool(
     'create-stock-item',
     {
       title: 'Create Stock Item',
