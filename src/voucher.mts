@@ -235,17 +235,23 @@ export function buildVoucherXml(v: VoucherInput, targetCompany?: string): string
 }
 
 // Builds a cancel envelope for reverse-voucher (#98 H-12), mark-cancelled semantics (Edit-Log-safe):
-// ACTION="Cancel" + ISCANCELLED on the target voucher, located by type + number + original date.
-// A reversing-entry (contra) reversal is just a normal create-voucher with swapped dr/cr, so it is
-// not duplicated here.
-export function buildCancelVoucherXml(v: { voucherType: string; voucherNumber: string; date: string }, targetCompany?: string): string {
-  const tallyDate = toTallyDate(v.date);
+// ACTION="Cancel" + ISCANCELLED on the target voucher. When masterId is supplied, Tally keys the
+// cancel to that exact immutable id — this is what stops the classic gotcha where a Cancel that can't
+// match by number+date instead CREATES a brand-new cancelled voucher. voucherNumber/date remain as
+// secondary identifiers. A reversing-entry (contra) reversal is just a normal create-voucher with
+// swapped dr/cr, so it is not duplicated here.
+export function buildCancelVoucherXml(
+  v: { voucherType: string; voucherNumber?: string; date?: string; masterId?: string | number },
+  targetCompany?: string
+): string {
+  const tallyDate = v.date ? toTallyDate(v.date) : '';
   const svCompany = targetCompany ? `<SVCURRENTCOMPANY>${xmlName(targetCompany)}</SVCURRENTCOMPANY>` : '';
   const body =
     `<VOUCHER ACTION="Cancel" VCHTYPE="${xmlName(v.voucherType)}">` +
-    `<DATE>${tallyDate}</DATE>` +
+    (v.masterId ? `<MASTERID>${escapeXml(String(v.masterId))}</MASTERID>` : '') +
+    (tallyDate ? `<DATE>${tallyDate}</DATE>` : '') +
     `<VOUCHERTYPENAME>${xmlName(v.voucherType)}</VOUCHERTYPENAME>` +
-    `<VOUCHERNUMBER>${escapeXml(v.voucherNumber)}</VOUCHERNUMBER>` +
+    (v.voucherNumber ? `<VOUCHERNUMBER>${escapeXml(v.voucherNumber)}</VOUCHERNUMBER>` : '') +
     `<ISCANCELLED>Yes</ISCANCELLED>` +
     `</VOUCHER>`;
   return `<?xml version="1.0" encoding="utf-8"?>` +

@@ -7,6 +7,7 @@ import { z } from 'zod';
 import { cacheTable, executeSQL, validateSQL } from './database.mjs';
 import { handlePull, handlePush, jsonToTSV, pingTally, postTallyXML, pushXml, resolveGSTLedgers } from './tally.mjs';
 import { buildVoucherXml, buildCancelVoucherXml, voucherBalance, isDateInOpenPeriod, findMissingMasters, referencedLedgers, decodeXmlEntities, type VoucherEntry, type VoucherInput } from './voucher.mjs';
+import type { ModelPushResponse } from './models.mjs';
 import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
 
 dotenv.config({ override: true, quiet: true });
@@ -1129,6 +1130,50 @@ async function pull(reportName: string, inputParams: Map<string, any>) {
     inputParams.set('targetCompany', activeCompany);
   }
   return handlePull(reportName, inputParams);
+}
+
+// ── reverse-voucher / delete-voucher shared locate + interpret helpers ───────────────────────────
+// Resolve candidate vouchers by exact type + number within a date range via the voucher-lookup report.
+async function locateVouchers(voucherType: string, voucherNumber: string, fromDate: string, toDate: string, company?: string): Promise<{ rows: any[] } | { error: string }> {
+  const p = new Map<string, any>([['voucherType', voucherType], ['voucherNumber', voucherNumber], ['fromDate', fromDate], ['toDate', toDate]]);
+  if (company) p.set('targetCompany', company);
+  const resp = await pull('voucher-lookup', p);
+  if (resp.error) return { error: resp.error };
+  return { rows: Array.isArray(resp.data) ? resp.data : [] };
+}
+
+export type VoucherLookupOutcome =
+  | { status: 'ok'; voucher: any }
+  | { status: 'not_found' }
+  | { status: 'ambiguous'; masterIds: string[] }
+  | { status: 'already_cancelled'; voucher: any };
+
+// Pure decision over the rows locateVouchers returned: not_found / ambiguous / already_cancelled / ok.
+// The network happens in locateVouchers so this stays unit-testable.
+export function interpretVoucherLookup(rows: any[]): VoucherLookupOutcome {
+  if (!rows || rows.length === 0) return { status: 'not_found' };
+  if (rows.length > 1) return { status: 'ambiguous', masterIds: rows.map(r => String(r.master_id)) };
+  const v = rows[0];
+  if (String(v.is_cancelled).toLowerCase() === 'yes') return { status: 'already_cancelled', voucher: v };
+  return { status: 'ok', voucher: v };
+}
+
+export type CancelOutcome =
+  | { status: 'cancelled'; cancelled: number }
+  | { status: 'duplicate_created'; created: number; altered: number; cancelled: number }
+  | { status: 'failed'; message: string };
+
+// Classify a cancel import's response. The load-bearing guard is duplicate_created: if Tally reports
+// CREATED>0 it made a NEW cancelled voucher instead of cancelling the target — that must NEVER read as
+// success (it is the exact junk-duplicate bug). Otherwise success iff something was cancelled/altered.
+export function interpretCancelResponse(resp: ModelPushResponse, masterId: string): CancelOutcome {
+  if (resp.created > 0) {
+    return { status: 'duplicate_created', created: resp.created, altered: resp.altered, cancelled: resp.cancelled };
+  }
+  if (!resp.success || (resp.cancelled === 0 && resp.altered === 0)) {
+    return { status: 'failed', message: resp.error || `Cancel did not take effect for master_id ${masterId} (cancelled=${resp.cancelled}, altered=${resp.altered}).` };
+  }
+  return { status: 'cancelled', cancelled: resp.cancelled || resp.altered };
 }
 
 // Wraps handlePush — injects activeCompany as targetCompany fallback when the caller did not specify one.
@@ -3368,12 +3413,13 @@ export async function registerMcpServer(): Promise<McpServer> {
     'reverse-voucher',
     {
       title: 'Reverse / Cancel Voucher',
-      description: `Cancels a posted voucher (mark-cancelled: ACTION="Cancel" + ISCANCELLED — Edit-Log-safe, keeps the row with a cancellation trail). Locate the target deterministically by voucherType + voucherNumber + its original date; no fuzzy matching (resolve the exact voucher session-side). mode defaults to 'cancel'. For a reversing contra entry instead, post a normal create-voucher with the dr/cr swapped. Refused when READONLY_MODE=true. Returns { success, altered }.`,
+      description: `Cancels a posted voucher (mark-cancelled: ACTION="Cancel" + ISCANCELLED — Edit-Log-safe, keeps the row with a cancellation trail). The target is resolved to its immutable master_id first (via locate-voucher) and the cancel is keyed to that id, so Tally can NEVER create a duplicate cancelled voucher instead of cancelling the target. Pass masterId directly to skip the lookup. If the number matches more than one voucher in the period the call fails with the candidate master_ids rather than guessing. An already-cancelled voucher is a no-op success. mode defaults to 'cancel'; for a reversing contra entry, post a normal create-voucher with the dr/cr swapped. Refused when READONLY_MODE=true. Returns { success, cancelled, masterId }.`,
       inputSchema: {
         targetCompany: z.string().optional().describe('optional company name; defaults to the active company'),
         voucherType: z.enum(['Sales', 'Purchase', 'Payment', 'Receipt', 'Contra', 'Journal', 'Debit Note', 'Credit Note']).describe('voucher type of the target voucher'),
         voucherNumber: z.string().describe('exact voucher number to cancel'),
         date: z.string().describe('the target voucher\'s original date (YYYY-MM-DD), used to locate it'),
+        masterId: z.string().optional().describe('internal Tally master_id from locate-voucher; if given, skips the lookup and cancels exactly this voucher (recommended when the number is not unique)'),
         mode: z.enum(['cancel', 'reversing-entry']).optional().describe("defaults to 'cancel' (mark-cancelled). 'reversing-entry' is not posted here — use create-voucher with the dr/cr swapped.")
       },
       annotations: {
@@ -3401,17 +3447,45 @@ export async function registerMcpServer(): Promise<McpServer> {
         return errorResult('PRECONDITION_FAILED', { message: 'voucherNumber is required to locate the voucher.', retryable: false });
       }
       const company = args.targetCompany || activeCompany || undefined;
-      const xml = buildCancelVoucherXml({ voucherType: args.voucherType, voucherNumber: args.voucherNumber, date: args.date }, company);
+
+      // Resolve the exact voucher (immutable master_id) so the cancel targets it and can't spawn a
+      // duplicate. A caller who already holds the id (e.g. from locate-voucher) may pass it directly.
+      let masterId = (args.masterId || '').trim();
+      if (!masterId) {
+        const loc = await locateVouchers(args.voucherType, args.voucherNumber, args.date, args.date, company);
+        if ('error' in loc) {
+          auditLog('reverse-voucher', args, 'error', Date.now() - start);
+          return errorResult('UNKNOWN', { message: loc.error });
+        }
+        const outcome = interpretVoucherLookup(loc.rows);
+        if (outcome.status === 'not_found') {
+          auditLog('reverse-voucher', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `Could not locate ${args.voucherType} #${args.voucherNumber} dated ${args.date}. Check the number/date, or pass masterId from locate-voucher.`, retryable: false });
+        }
+        if (outcome.status === 'ambiguous') {
+          auditLog('reverse-voucher', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `Ambiguous: ${outcome.masterIds.length} vouchers match ${args.voucherType} #${args.voucherNumber} on ${args.date} (master_ids: ${outcome.masterIds.join(', ')}). Pass masterId to pick one.`, retryable: false });
+        }
+        if (outcome.status === 'already_cancelled') {
+          auditLog('reverse-voucher', args, 'success', Date.now() - start);
+          return { content: [{ type: 'text', text: JSON.stringify({ success: true, alreadyCancelled: true, masterId: String(outcome.voucher.master_id), voucherNumber: args.voucherNumber, message: 'Voucher is already cancelled — no action taken.' }) }] };
+        }
+        masterId = String(outcome.voucher.master_id);
+      }
+
+      const xml = buildCancelVoucherXml({ voucherType: args.voucherType, voucherNumber: args.voucherNumber, date: args.date, masterId }, company);
       const resp = await pushXml(xml);
-      if (!resp.success || (resp.altered === 0 && resp.created === 0)) {
+      const result = interpretCancelResponse(resp, masterId);
+      if (result.status === 'duplicate_created') {
         auditLog('reverse-voucher', args, 'error', Date.now() - start);
-        return errorResult('PRECONDITION_FAILED', {
-          message: resp.error || `Could not locate voucher ${args.voucherType} #${args.voucherNumber} dated ${args.date} to cancel.`,
-          retryable: false
-        });
+        return errorResult('PRECONDITION_FAILED', { message: `Refusing to report success: Tally CREATED ${result.created} new voucher(s) instead of cancelling master_id ${masterId} (created=${result.created}, altered=${result.altered}, cancelled=${result.cancelled}). The target was NOT cancelled and a duplicate may now exist — check the Day Book.`, retryable: false });
+      }
+      if (result.status === 'failed') {
+        auditLog('reverse-voucher', args, 'error', Date.now() - start);
+        return errorResult('PRECONDITION_FAILED', { message: result.message, retryable: false });
       }
       auditLog('reverse-voucher', args, 'success', Date.now() - start);
-      return { content: [{ type: 'text', text: JSON.stringify({ success: true, altered: resp.altered, cancelled: args.voucherNumber }) }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ success: true, cancelled: result.cancelled, masterId, voucherNumber: args.voucherNumber }) }] };
     }
   );
 
