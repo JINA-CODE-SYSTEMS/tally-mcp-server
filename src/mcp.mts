@@ -6,7 +6,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import { cacheTable, executeSQL, validateSQL } from './database.mjs';
 import { handlePull, handlePush, jsonToTSV, pingTally, postTallyXML, pushXml, resolveGSTLedgers } from './tally.mjs';
-import { buildVoucherXml, buildCancelVoucherXml, voucherBalance, isDateInOpenPeriod, findMissingMasters, referencedLedgers, decodeXmlEntities, type VoucherEntry, type VoucherInput } from './voucher.mjs';
+import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, voucherBalance, isDateInOpenPeriod, findMissingMasters, referencedLedgers, decodeXmlEntities, type VoucherEntry, type VoucherInput } from './voucher.mjs';
 import type { ModelPushResponse } from './models.mjs';
 import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
 
@@ -1174,6 +1174,23 @@ export function interpretCancelResponse(resp: ModelPushResponse, masterId: strin
     return { status: 'failed', message: resp.error || `Cancel did not take effect for master_id ${masterId} (cancelled=${resp.cancelled}, altered=${resp.altered}).` };
   }
   return { status: 'cancelled', cancelled: resp.cancelled || resp.altered };
+}
+
+export type DeleteOutcome =
+  | { status: 'deleted'; deleted: number }
+  | { status: 'created_instead'; created: number }
+  | { status: 'failed'; message: string };
+
+// Classify a hard-delete import's response using PR #141's DELETED counter. created_instead guards the
+// same gotcha as cancel (a mis-keyed delete could spawn a voucher); success requires deleted>0.
+export function interpretDeleteResponse(resp: ModelPushResponse, masterId: string): DeleteOutcome {
+  if (resp.created > 0) {
+    return { status: 'created_instead', created: resp.created };
+  }
+  if (!resp.success || resp.deleted === 0) {
+    return { status: 'failed', message: resp.error || `Delete did not take effect for master_id ${masterId} (deleted=${resp.deleted}). The voucher may not exist, or this Tally build needs a delete reason / different flags — verify with a live probe.` };
+  }
+  return { status: 'deleted', deleted: resp.deleted };
 }
 
 // Wraps handlePush — injects activeCompany as targetCompany fallback when the caller did not specify one.
@@ -3486,6 +3503,99 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
       auditLog('reverse-voucher', args, 'success', Date.now() - start);
       return { content: [{ type: 'text', text: JSON.stringify({ success: true, cancelled: result.cancelled, masterId, voucherNumber: args.voucherNumber }) }] };
+    }
+  );
+
+  mcpServer.registerTool(
+    'delete-voucher',
+    {
+      title: 'Delete Voucher (permanent)',
+      description: `PERMANENTLY deletes a voucher (ACTION="Delete"), leaving NO row — unlike reverse-voucher which only marks it cancelled. Irreversible. The target is keyed by its immutable master_id: pass masterId directly (from locate-voucher), or pass voucherType + voucherNumber (+ date) to resolve it — a number that matches more than one voucher fails with the candidates rather than deleting the wrong one. Double-gated for safety: with dryRun:true it returns exactly what WOULD be deleted and posts nothing; otherwise it will NOT delete unless confirm:true is set — without confirm it returns a preview and waits. On a TallyPrime Edit Log company the deletion is recorded in the Edit Log. Refused when READONLY_MODE=true.`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name; defaults to the active company'),
+        voucherType: z.enum(['Sales', 'Purchase', 'Payment', 'Receipt', 'Contra', 'Journal', 'Debit Note', 'Credit Note']).describe('voucher type (also sets VCHTYPE on the delete)'),
+        voucherNumber: z.string().optional().describe('exact voucher number, used to locate the voucher when masterId is not given'),
+        date: z.string().optional().describe('the voucher\'s date (YYYY-MM-DD); narrows the lookup when resolving by number'),
+        masterId: z.string().optional().describe('internal Tally master_id from locate-voucher; if given, deletes exactly this voucher without a lookup'),
+        dryRun: z.boolean().optional().describe('if true, return what WOULD be deleted and post nothing'),
+        confirm: z.boolean().optional().describe('must be true to actually delete; without it (and without dryRun) the tool returns a preview and does NOT delete')
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      if (process.env.READONLY_MODE === 'true') {
+        auditLog('delete-voucher', args, 'denied');
+        return errorResult('READONLY');
+      }
+      if (args.date && !/^\d{4}-\d{2}-\d{2}$/.test(args.date)) {
+        auditLog('delete-voucher', args, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: 'date must be in YYYY-MM-DD format.', retryable: false });
+      }
+      const haveMasterId = !!(args.masterId || '').trim();
+      if (!haveMasterId && !(args.voucherNumber || '').trim()) {
+        auditLog('delete-voucher', args, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: 'Provide masterId (from locate-voucher), or voucherNumber (+ optional date) to resolve the voucher.', retryable: false });
+      }
+      const company = args.targetCompany || activeCompany || undefined;
+
+      // Resolve the exact voucher. Unlike cancel, an already-cancelled voucher is a valid delete
+      // target (deleting stray cancelled junk is a primary use case), so 'already_cancelled' proceeds.
+      let masterId = (args.masterId || '').trim();
+      let located: any = null;
+      if (!masterId) {
+        const from = args.date || '2000-04-01';
+        const to = args.date || new Date().toISOString().slice(0, 10);
+        const loc = await locateVouchers(args.voucherType, args.voucherNumber!, from, to, company);
+        if ('error' in loc) {
+          auditLog('delete-voucher', args, 'error', Date.now() - start);
+          return errorResult('UNKNOWN', { message: loc.error });
+        }
+        const outcome = interpretVoucherLookup(loc.rows);
+        if (outcome.status === 'not_found') {
+          auditLog('delete-voucher', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `Could not locate ${args.voucherType} #${args.voucherNumber}${args.date ? ' dated ' + args.date : ''}. Check the number/date, or pass masterId from locate-voucher.`, retryable: false });
+        }
+        if (outcome.status === 'ambiguous') {
+          auditLog('delete-voucher', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `Ambiguous: ${outcome.masterIds.length} vouchers match ${args.voucherType} #${args.voucherNumber} (master_ids: ${outcome.masterIds.join(', ')}). Pass masterId to pick exactly one — refusing to delete the wrong voucher.`, retryable: false });
+        }
+        located = outcome.voucher; // 'ok' or 'already_cancelled'
+        masterId = String(located.master_id);
+      }
+
+      const preview = located
+        ? { master_id: masterId, date: located.date, voucher_number: located.voucher_number, voucher_type: located.voucher_type, reference: located.reference, party_ledger: located.party_ledger, amount: located.amount, is_cancelled: located.is_cancelled }
+        : { master_id: masterId, voucher_type: args.voucherType };
+
+      // Gate 1 — dryRun: show the plan, post nothing.
+      if (args.dryRun) {
+        auditLog('delete-voucher', args, 'dryrun', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify({ dryRun: true, wouldDelete: preview }) }] };
+      }
+      // Gate 2 — no confirm: return a preview and refuse to delete until confirm:true.
+      if (args.confirm !== true) {
+        auditLog('delete-voucher', args, 'denied', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify({ requiresConfirmation: true, wouldDelete: preview, message: 'This will PERMANENTLY delete the voucher above (irreversible). Re-call delete-voucher with confirm:true to proceed.' }) }] };
+      }
+
+      const xml = buildDeleteVoucherXml({ masterId, voucherType: args.voucherType, date: args.date || located?.date }, company);
+      const resp = await pushXml(xml);
+      const result = interpretDeleteResponse(resp, masterId);
+      if (result.status === 'created_instead') {
+        auditLog('delete-voucher', args, 'error', Date.now() - start);
+        return errorResult('PRECONDITION_FAILED', { message: `Refusing to report success: the delete import made Tally CREATE ${result.created} voucher(s) rather than delete master_id ${masterId}. The voucher was NOT deleted — check the Day Book.`, retryable: false });
+      }
+      if (result.status === 'failed') {
+        auditLog('delete-voucher', args, 'error', Date.now() - start);
+        return errorResult('PRECONDITION_FAILED', { message: result.message, retryable: false });
+      }
+      auditLog('delete-voucher', args, 'success', Date.now() - start);
+      return { content: [{ type: 'text', text: JSON.stringify({ success: true, deleted: result.deleted, masterId, voucher: preview }) }] };
     }
   );
 
