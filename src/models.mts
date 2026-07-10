@@ -45,6 +45,8 @@ export interface ModelPushResponse {
     success: boolean;
     created: number;
     altered: number;
+    cancelled: number;
+    deleted: number;
     lastVchId: number;
     error?: string;
 }
