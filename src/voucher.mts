@@ -261,3 +261,29 @@ export function buildCancelVoucherXml(
     `<REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF">${body}</TALLYMESSAGE></REQUESTDATA>` +
     `</IMPORTDATA></BODY></ENVELOPE>`;
 }
+
+// Builds a HARD-DELETE envelope (ACTION="Delete"). Unlike buildCancelVoucherXml (mark-cancelled, keeps
+// the row), this removes the voucher outright — no row remains. The target is keyed by its immutable
+// MASTERID; NEVER guess it — resolve it via locate-voucher. VCHTYPE routes Tally to the right register
+// and DATE disambiguates. On a TallyPrime Edit Log company the deletion is auto-recorded in the Edit
+// Log. NOTE: no delete-reason tag is emitted — that tag is version-specific and unverified against a
+// live Edit Log build; if a reasonless delete is rejected there, the tag is added after a live probe.
+export function buildDeleteVoucherXml(
+  v: { masterId: string | number; voucherType: string; date?: string },
+  targetCompany?: string
+): string {
+  const tallyDate = v.date ? toTallyDate(v.date) : '';
+  const svCompany = targetCompany ? `<SVCURRENTCOMPANY>${xmlName(targetCompany)}</SVCURRENTCOMPANY>` : '';
+  const body =
+    `<VOUCHER ACTION="Delete" VCHTYPE="${xmlName(v.voucherType)}">` +
+    `<MASTERID>${escapeXml(String(v.masterId))}</MASTERID>` +
+    `<VOUCHERTYPENAME>${xmlName(v.voucherType)}</VOUCHERTYPENAME>` +
+    (tallyDate ? `<DATE>${tallyDate}</DATE>` : '') +
+    `</VOUCHER>`;
+  return `<?xml version="1.0" encoding="utf-8"?>` +
+    `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>` +
+    `<BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME>` +
+    `<STATICVARIABLES>${svCompany}</STATICVARIABLES></REQUESTDESC>` +
+    `<REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF">${body}</TALLYMESSAGE></REQUESTDATA>` +
+    `</IMPORTDATA></BODY></ENVELOPE>`;
+}
