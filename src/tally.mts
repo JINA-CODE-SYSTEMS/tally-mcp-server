@@ -417,12 +417,45 @@ export function summarizeImportFailure(resp: any, retval: m.ModelPushResponse): 
     const exceptions = parseInt(resp?.['EXCEPTIONS'] || '0');
     const ignored = parseInt(resp?.['IGNORED'] || '0');
     const lineError = typeof resp?.['LINEERROR'] === 'string' ? resp['LINEERROR'].trim() : '';
-    const counts = `created=${retval.created}, altered=${retval.altered}, errors=${errors}, exceptions=${exceptions}, ignored=${ignored}`;
+    const counts = `created=${retval.created}, altered=${retval.altered}, cancelled=${retval.cancelled}, deleted=${retval.deleted}, errors=${errors}, exceptions=${exceptions}, ignored=${ignored}, lastVchId=${retval.lastVchId}`;
     if (lineError) return `${lineError} [${counts}]`;
     if (exceptions > 0) {
         return `Tally raised ${exceptions} exception(s) with no line error — the master/voucher was NOT saved. Most commonly a referenced parent group/ledger/stock-item name is not exact, a duplicate, or a field Tally rejected. [${counts}]`;
     }
     return `Tally import failed. [${counts}]`;
+}
+
+// The single source of truth for turning Tally's <RESPONSE> import counters into a ModelPushResponse.
+// Both handlePush (template path) and pushXml (raw-envelope path) funnel through here so the
+// success/failure rule can never drift between them.
+//
+// success  ==  errors === 0  AND  (created | altered | cancelled | deleted) > 0
+//
+// The `errors > 0` clause is a HARD gate evaluated first: an import that Tally flagged with errors can
+// never be reported as success even if a counter is non-zero. Reading CANCELLED and DELETED (which the
+// old inline code ignored) is what makes a genuine voucher cancel/delete report success instead of
+// being misclassified as a no-op failure — while a true no-op (all four counters 0) still fails.
+export function parseImportResponse(resultObj: any): m.ModelPushResponse {
+    const retval: m.ModelPushResponse = { success: false, created: 0, altered: 0, cancelled: 0, deleted: 0, lastVchId: 0 };
+    const resp = resultObj?.['RESPONSE'];
+    if (!resp) {
+        retval.error = 'Unexpected response format from Tally';
+        return retval;
+    }
+    retval.created = parseInt(resp['CREATED'] || '0');
+    retval.altered = parseInt(resp['ALTERED'] || '0');
+    retval.cancelled = parseInt(resp['CANCELLED'] || '0');
+    retval.deleted = parseInt(resp['DELETED'] || '0');
+    retval.lastVchId = parseInt(resp['LASTVCHID'] || '0');
+    const errors = parseInt(resp['ERRORS'] || '0');
+    const touched = retval.created > 0 || retval.altered > 0 || retval.cancelled > 0 || retval.deleted > 0;
+    if (errors > 0 || !touched) {
+        retval.success = false;
+        retval.error = summarizeImportFailure(resp, retval);
+    } else {
+        retval.success = true;
+    }
+    return retval;
 }
 
 export function handlePush(templateName: string, inputParams: Map<string, any>): Promise<m.ModelPushResponse> {
@@ -431,6 +464,8 @@ export function handlePush(templateName: string, inputParams: Map<string, any>):
             success: false,
             created: 0,
             altered: 0,
+            cancelled: 0,
+            deleted: 0,
             lastVchId: 0
         };
         try {
@@ -518,22 +553,7 @@ export function handlePush(templateName: string, inputParams: Map<string, any>):
             let xmlParser = new XMLParser({ parseTagValue: false });
             let resultObj = xmlParser.parse(respContent);
 
-            if (resultObj['RESPONSE']) {
-                let resp = resultObj['RESPONSE'];
-                retval.created = parseInt(resp['CREATED'] || '0');
-                retval.altered = parseInt(resp['ALTERED'] || '0');
-                retval.lastVchId = parseInt(resp['LASTVCHID'] || '0');
-                let errors = parseInt(resp['ERRORS'] || '0');
-
-                if (errors > 0 || (retval.created === 0 && retval.altered === 0)) {
-                    retval.success = false;
-                    retval.error = summarizeImportFailure(resp, retval);
-                } else {
-                    retval.success = true;
-                }
-            } else {
-                retval.error = 'Unexpected response format from Tally';
-            }
+            Object.assign(retval, parseImportResponse(resultObj));
 
         } catch (err) {
             retval.error = 'Server exception';
@@ -548,7 +568,7 @@ export function handlePush(templateName: string, inputParams: Map<string, any>):
 // handlePush. Pings first (fail fast if Tally is wedged) and injects company credentials if set.
 export function pushXml(xml: string): Promise<m.ModelPushResponse> {
     return new Promise<m.ModelPushResponse>(async (resolve) => {
-        const retval: m.ModelPushResponse = { success: false, created: 0, altered: 0, lastVchId: 0 };
+        const retval: m.ModelPushResponse = { success: false, created: 0, altered: 0, cancelled: 0, deleted: 0, lastVchId: 0 };
         try {
             const alive = await pingTally();
             if (!alive) {
@@ -571,21 +591,7 @@ export function pushXml(xml: string): Promise<m.ModelPushResponse> {
             }
             const xmlParser = new XMLParser({ parseTagValue: false });
             const resultObj = xmlParser.parse(respContent);
-            if (resultObj['RESPONSE']) {
-                const resp = resultObj['RESPONSE'];
-                retval.created = parseInt(resp['CREATED'] || '0');
-                retval.altered = parseInt(resp['ALTERED'] || '0');
-                retval.lastVchId = parseInt(resp['LASTVCHID'] || '0');
-                const errors = parseInt(resp['ERRORS'] || '0');
-                if (errors > 0 || (retval.created === 0 && retval.altered === 0)) {
-                    retval.success = false;
-                    retval.error = summarizeImportFailure(resp, retval);
-                } else {
-                    retval.success = true;
-                }
-            } else {
-                retval.error = 'Unexpected response format from Tally';
-            }
+            Object.assign(retval, parseImportResponse(resultObj));
         } catch (err) {
             retval.error = 'Server exception';
         } finally {
