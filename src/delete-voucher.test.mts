@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { interpretDeleteResponse } from './mcp.mjs';
+import fs from 'node:fs';
+import path from 'node:path';
+import { interpretDeleteResponse, decideDeleteGate } from './mcp.mjs';
 import { buildDeleteVoucherXml } from './voucher.mjs';
+import { reportColumnMetadata } from './tally.mjs';
 
 const resp = (o: Partial<{ success: boolean; created: number; altered: number; cancelled: number; deleted: number; lastVchId: number; error: string }>) =>
   ({ success: false, created: 0, altered: 0, cancelled: 0, deleted: 0, lastVchId: 0, ...o });
@@ -43,4 +46,36 @@ test('delete: nothing deleted → failed with a diagnostic (names master_id + hi
   const o = interpretDeleteResponse(resp({ success: false }), '4321');
   assert.equal(o.status, 'failed');
   assert.match((o as any).message, /master_id 4321/);
+});
+
+// ── decideDeleteGate: the safety gate. 'proceed' (the only path that deletes) REQUIRES confirm:true
+//    AND a master_id, so a destructive call can never be bound to a voucher number that Tally can renumber.
+test('gate: dryRun always previews, even with confirm+masterId', () => {
+  assert.equal(decideDeleteGate({ dryRun: true, confirm: true, hasMasterId: true }), 'dryRun');
+});
+
+test('gate: confirm:true + masterId → proceed (the ONLY delete path)', () => {
+  assert.equal(decideDeleteGate({ confirm: true, hasMasterId: true }), 'proceed');
+});
+
+test('gate: confirm:true WITHOUT masterId → needs_confirm (number+confirm can never delete — the TOCTOU fix)', () => {
+  assert.equal(decideDeleteGate({ confirm: true, hasMasterId: false }), 'needs_confirm');
+});
+
+test('gate: masterId WITHOUT confirm → needs_confirm', () => {
+  assert.equal(decideDeleteGate({ confirm: false, hasMasterId: true }), 'needs_confirm');
+});
+
+test('gate: neither → needs_confirm', () => {
+  assert.equal(decideDeleteGate({ hasMasterId: false }), 'needs_confirm');
+});
+
+// ── voucher-by-masterid report: verifies a master_id against Tally before an irreversible delete.
+test('voucher-by-masterid report is declared with the identity fields and filters on $MasterID', () => {
+  const fields = reportColumnMetadata('voucher-by-masterid');
+  assert.ok(fields, 'voucher-by-masterid must be a declared pull report');
+  assert.deepEqual(fields!.map(f => f.name), ['master_id', 'date', 'voucher_number', 'voucher_type', 'reference', 'party_ledger', 'amount', 'is_cancelled']);
+  const xml = fs.readFileSync(path.join(import.meta.dirname, '..', 'pull', 'voucher-by-masterid.xml'), 'utf-8');
+  assert.match(xml, /FilterMasterId">\$MasterID = \{masterId\}/); // numeric compare, unquoted
+  assert.match(xml, /<TYPE>Voucher<\/TYPE>/);
 });

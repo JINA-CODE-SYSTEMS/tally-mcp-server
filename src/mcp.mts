@@ -1142,6 +1142,20 @@ async function locateVouchers(voucherType: string, voucherNumber: string, fromDa
   return { rows: Array.isArray(resp.data) ? resp.data : [] };
 }
 
+// Resolve a single voucher by its immutable master_id (all-time). Returns the row, or null if no such
+// voucher exists in the company — so a destructive caller can fail closed BEFORE the irreversible write
+// instead of trusting a stale/cross-company id.
+async function locateByMasterId(masterId: string, company?: string): Promise<{ voucher: any | null } | { error: string }> {
+  const idNum = Number(masterId);
+  if (!Number.isFinite(idNum)) return { error: `master_id must be numeric (got "${masterId}").` };
+  const p = new Map<string, any>([['masterId', idNum], ['fromDate', '2000-04-01'], ['toDate', new Date().toISOString().slice(0, 10)]]);
+  if (company) p.set('targetCompany', company);
+  const resp = await pull('voucher-by-masterid', p);
+  if (resp.error) return { error: resp.error };
+  const rows = Array.isArray(resp.data) ? resp.data : [];
+  return { voucher: rows[0] ?? null };
+}
+
 export type VoucherLookupOutcome =
   | { status: 'ok'; voucher: any }
   | { status: 'not_found' }
@@ -1191,6 +1205,16 @@ export function interpretDeleteResponse(resp: ModelPushResponse, masterId: strin
     return { status: 'failed', message: resp.error || `Delete did not take effect for master_id ${masterId} (deleted=${resp.deleted}). The voucher may not exist, or this Tally build needs a delete reason / different flags — verify with a live probe.` };
   }
   return { status: 'deleted', deleted: resp.deleted };
+}
+
+// The delete-voucher safety gate (pure). 'proceed' — the only path that actually deletes — REQUIRES
+// both confirm:true AND a master_id, so a destructive call can never be bound to a voucher number
+// (which Tally can renumber between the preview and the confirm). Everything else previews.
+export type DeleteGate = 'dryRun' | 'needs_confirm' | 'proceed';
+export function decideDeleteGate(a: { dryRun?: boolean; confirm?: boolean; hasMasterId: boolean }): DeleteGate {
+  if (a.dryRun) return 'dryRun';
+  if (a.confirm === true && a.hasMasterId) return 'proceed';
+  return 'needs_confirm';
 }
 
 // Wraps handlePush — injects activeCompany as targetCompany fallback when the caller did not specify one.
@@ -3463,7 +3487,14 @@ export async function registerMcpServer(): Promise<McpServer> {
         auditLog('reverse-voucher', args, 'denied');
         return errorResult('PRECONDITION_FAILED', { message: 'voucherNumber is required to locate the voucher.', retryable: false });
       }
-      const company = args.targetCompany || activeCompany || undefined;
+      // Reconcile the EXACT loaded company first (fail closed), like every other write — so the locate
+      // and the cancel run against the company the import stamps, instead of silently no-opping.
+      const target = await resolveExactLoadedCompany(args.targetCompany || activeCompany || null);
+      if (!target.ok) {
+        auditLog('reverse-voucher', args, 'error', Date.now() - start);
+        return errorResult('COMPANY_NOT_FOUND', { message: target.message, retryable: false });
+      }
+      const company = target.name;
 
       // Resolve the exact voucher (immutable master_id) so the cancel targets it and can't spawn a
       // duplicate. A caller who already holds the id (e.g. from locate-voucher) may pass it directly.
@@ -3510,15 +3541,15 @@ export async function registerMcpServer(): Promise<McpServer> {
     'delete-voucher',
     {
       title: 'Delete Voucher (permanent)',
-      description: `PERMANENTLY deletes a voucher (ACTION="Delete"), leaving NO row — unlike reverse-voucher which only marks it cancelled. Irreversible. The target is keyed by its immutable master_id: pass masterId directly (from locate-voucher), or pass voucherType + voucherNumber (+ date) to resolve it — a number that matches more than one voucher fails with the candidates rather than deleting the wrong one. Double-gated for safety: with dryRun:true it returns exactly what WOULD be deleted and posts nothing; otherwise it will NOT delete unless confirm:true is set — without confirm it returns a preview and waits. On a TallyPrime Edit Log company the deletion is recorded in the Edit Log. Refused when READONLY_MODE=true.`,
+      description: `PERMANENTLY deletes a voucher (ACTION="Delete"), leaving NO row — unlike reverse-voucher which only marks it cancelled. Irreversible. TWO-STEP, master_id-bound flow: first call with voucherType + voucherNumber (+ optional date) to PREVIEW — the tool resolves the exact voucher, verifies it against Tally, and returns its details plus its immutable master_id. Then delete by re-calling with that masterId AND confirm:true. A delete ONLY happens when both masterId and confirm:true are present, so it can never be bound to a voucher number (Tally can renumber). A number matching more than one voucher fails with the candidates. masterId is always re-verified against Tally (fails closed if it no longer exists), and the exact loaded company is reconciled first. dryRun:true previews with no write. Refused when READONLY_MODE=true.`,
       inputSchema: {
         targetCompany: z.string().optional().describe('optional company name; defaults to the active company'),
-        voucherType: z.enum(['Sales', 'Purchase', 'Payment', 'Receipt', 'Contra', 'Journal', 'Debit Note', 'Credit Note']).describe('voucher type (also sets VCHTYPE on the delete)'),
-        voucherNumber: z.string().optional().describe('exact voucher number, used to locate the voucher when masterId is not given'),
+        voucherType: z.enum(['Sales', 'Purchase', 'Payment', 'Receipt', 'Contra', 'Journal', 'Debit Note', 'Credit Note']).describe('voucher type; when resolving by number it filters the lookup, and it is checked against the voucher master_id points to'),
+        voucherNumber: z.string().optional().describe('exact voucher number, used to PREVIEW/resolve the voucher when masterId is not given'),
         date: z.string().optional().describe('the voucher\'s date (YYYY-MM-DD); narrows the lookup when resolving by number'),
-        masterId: z.string().optional().describe('internal Tally master_id from locate-voucher; if given, deletes exactly this voucher without a lookup'),
-        dryRun: z.boolean().optional().describe('if true, return what WOULD be deleted and post nothing'),
-        confirm: z.boolean().optional().describe('must be true to actually delete; without it (and without dryRun) the tool returns a preview and does NOT delete')
+        masterId: z.string().optional().describe('immutable Tally master_id (from a preview / locate-voucher). Required together with confirm:true to actually delete.'),
+        dryRun: z.boolean().optional().describe('if true, resolve + return what WOULD be deleted and post nothing'),
+        confirm: z.boolean().optional().describe('must be true AND accompanied by masterId to actually delete; otherwise the tool previews and does NOT delete')
       },
       annotations: {
         readOnlyHint: false,
@@ -3536,18 +3567,45 @@ export async function registerMcpServer(): Promise<McpServer> {
         auditLog('delete-voucher', args, 'denied');
         return errorResult('PRECONDITION_FAILED', { message: 'date must be in YYYY-MM-DD format.', retryable: false });
       }
-      const haveMasterId = !!(args.masterId || '').trim();
-      if (!haveMasterId && !(args.voucherNumber || '').trim()) {
+      const argMasterId = (args.masterId || '').trim();
+      if (!argMasterId && !(args.voucherNumber || '').trim()) {
         auditLog('delete-voucher', args, 'denied');
-        return errorResult('PRECONDITION_FAILED', { message: 'Provide masterId (from locate-voucher), or voucherNumber (+ optional date) to resolve the voucher.', retryable: false });
+        return errorResult('PRECONDITION_FAILED', { message: 'Provide masterId (from a preview / locate-voucher), or voucherNumber (+ optional date) to preview the voucher.', retryable: false });
       }
-      const company = args.targetCompany || activeCompany || undefined;
 
-      // Resolve the exact voucher. Unlike cancel, an already-cancelled voucher is a valid delete
-      // target (deleting stray cancelled junk is a primary use case), so 'already_cancelled' proceeds.
-      let masterId = (args.masterId || '').trim();
-      let located: any = null;
-      if (!masterId) {
+      // Reconcile the EXACT loaded company first (fail closed) — the same write-boundary invariant the
+      // other write tools use, so the lookup and the delete run against the company the import stamps.
+      const target = await resolveExactLoadedCompany(args.targetCompany || activeCompany || null);
+      if (!target.ok) {
+        auditLog('delete-voucher', args, 'error', Date.now() - start);
+        return errorResult('COMPANY_NOT_FOUND', { message: target.message, retryable: false });
+      }
+      const company = target.name;
+
+      // Resolve the REAL voucher against Tally in every path, so the preview is truthful and a
+      // stale/cross-company/renumbered id fails closed BEFORE the irreversible write. An
+      // already-cancelled voucher is a valid delete target (cleaning up stray cancelled junk).
+      let located: any;
+      if (argMasterId) {
+        const loc = await locateByMasterId(argMasterId, company);
+        if ('error' in loc) {
+          auditLog('delete-voucher', args, 'error', Date.now() - start);
+          return errorResult('UNKNOWN', { message: loc.error });
+        }
+        if (!loc.voucher) {
+          auditLog('delete-voucher', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `No voucher with master_id ${argMasterId} exists in ${company}. It may have been deleted already, or belongs to a different company.`, retryable: false });
+        }
+        located = loc.voucher;
+        if (String(located.voucher_type) !== args.voucherType) {
+          auditLog('delete-voucher', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `master_id ${argMasterId} is a ${located.voucher_type} voucher (#${located.voucher_number}), not a ${args.voucherType}. Refusing — re-check the target.`, retryable: false });
+        }
+        if ((args.voucherNumber || '').trim() && String(located.voucher_number) !== String(args.voucherNumber)) {
+          auditLog('delete-voucher', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `master_id ${argMasterId} is voucher #${located.voucher_number}, but you passed voucherNumber ${args.voucherNumber}. Refusing on the mismatch.`, retryable: false });
+        }
+      } else {
         const from = args.date || '2000-04-01';
         const to = args.date || new Date().toISOString().slice(0, 10);
         const loc = await locateVouchers(args.voucherType, args.voucherNumber!, from, to, company);
@@ -3558,32 +3616,33 @@ export async function registerMcpServer(): Promise<McpServer> {
         const outcome = interpretVoucherLookup(loc.rows);
         if (outcome.status === 'not_found') {
           auditLog('delete-voucher', args, 'error', Date.now() - start);
-          return errorResult('PRECONDITION_FAILED', { message: `Could not locate ${args.voucherType} #${args.voucherNumber}${args.date ? ' dated ' + args.date : ''}. Check the number/date, or pass masterId from locate-voucher.`, retryable: false });
+          return errorResult('PRECONDITION_FAILED', { message: `Could not locate ${args.voucherType} #${args.voucherNumber}${args.date ? ' dated ' + args.date : ''}. Check the number/date, or pass masterId.`, retryable: false });
         }
         if (outcome.status === 'ambiguous') {
           auditLog('delete-voucher', args, 'error', Date.now() - start);
-          return errorResult('PRECONDITION_FAILED', { message: `Ambiguous: ${outcome.masterIds.length} vouchers match ${args.voucherType} #${args.voucherNumber} (master_ids: ${outcome.masterIds.join(', ')}). Pass masterId to pick exactly one — refusing to delete the wrong voucher.`, retryable: false });
+          return errorResult('PRECONDITION_FAILED', { message: `Ambiguous: ${outcome.masterIds.length} vouchers match ${args.voucherType} #${args.voucherNumber} (master_ids: ${outcome.masterIds.join(', ')}). Re-call with masterId to pick exactly one — refusing to delete the wrong voucher.`, retryable: false });
         }
         located = outcome.voucher; // 'ok' or 'already_cancelled'
-        masterId = String(located.master_id);
       }
 
-      const preview = located
-        ? { master_id: masterId, date: located.date, voucher_number: located.voucher_number, voucher_type: located.voucher_type, reference: located.reference, party_ledger: located.party_ledger, amount: located.amount, is_cancelled: located.is_cancelled }
-        : { master_id: masterId, voucher_type: args.voucherType };
+      const masterId = String(located.master_id);
+      const preview = { master_id: masterId, date: located.date, voucher_number: located.voucher_number, voucher_type: located.voucher_type, reference: located.reference, party_ledger: located.party_ledger, amount: located.amount, is_cancelled: located.is_cancelled };
 
-      // Gate 1 — dryRun: show the plan, post nothing.
-      if (args.dryRun) {
+      const gate = decideDeleteGate({ dryRun: args.dryRun, confirm: args.confirm, hasMasterId: !!argMasterId });
+      if (gate === 'dryRun') {
         auditLog('delete-voucher', args, 'dryrun', Date.now() - start);
         return { content: [{ type: 'text', text: JSON.stringify({ dryRun: true, wouldDelete: preview }) }] };
       }
-      // Gate 2 — no confirm: return a preview and refuse to delete until confirm:true.
-      if (args.confirm !== true) {
+      if (gate === 'needs_confirm') {
+        // Not both masterId AND confirm:true — return the verified preview and require a master_id-bound
+        // confirm. This is what prevents deleting a voucher that got renumbered since the preview.
         auditLog('delete-voucher', args, 'denied', Date.now() - start);
-        return { content: [{ type: 'text', text: JSON.stringify({ requiresConfirmation: true, wouldDelete: preview, message: 'This will PERMANENTLY delete the voucher above (irreversible). Re-call delete-voucher with confirm:true to proceed.' }) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ requiresConfirmation: true, wouldDelete: preview, message: `This will PERMANENTLY delete the voucher above (irreversible). To proceed, re-call delete-voucher with masterId:"${masterId}", voucherType:"${located.voucher_type}", confirm:true.` }) }] };
       }
 
-      const xml = buildDeleteVoucherXml({ masterId, voucherType: args.voucherType, date: args.date || located?.date }, company);
+      // gate === 'proceed' — masterId + confirm:true, target verified above. Key the delete to the
+      // authoritative type/id from Tally, not the raw args.
+      const xml = buildDeleteVoucherXml({ masterId, voucherType: String(located.voucher_type) }, company);
       const resp = await pushXml(xml);
       const result = interpretDeleteResponse(resp, masterId);
       if (result.status === 'created_instead') {
