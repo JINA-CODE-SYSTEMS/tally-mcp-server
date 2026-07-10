@@ -1148,7 +1148,9 @@ async function locateVouchers(voucherType: string, voucherNumber: string, fromDa
 async function locateByMasterId(masterId: string, company?: string): Promise<{ voucher: any | null } | { error: string }> {
   const idNum = Number(masterId);
   if (!Number.isFinite(idNum)) return { error: `master_id must be numeric (got "${masterId}").` };
-  const p = new Map<string, any>([['masterId', idNum], ['fromDate', '2000-04-01'], ['toDate', new Date().toISOString().slice(0, 10)]]);
+  // $MasterID uniquely identifies the voucher, so use the widest window — a narrow "today" bound would
+  // exclude post-dated vouchers (e.g. post-dated cheques) and misreport them as non-existent.
+  const p = new Map<string, any>([['masterId', idNum], ['fromDate', '1990-04-01'], ['toDate', '2099-03-31']]);
   if (company) p.set('targetCompany', company);
   const resp = await pull('voucher-by-masterid', p);
   if (resp.error) return { error: resp.error };
@@ -3606,8 +3608,8 @@ export async function registerMcpServer(): Promise<McpServer> {
           return errorResult('PRECONDITION_FAILED', { message: `master_id ${argMasterId} is voucher #${located.voucher_number}, but you passed voucherNumber ${args.voucherNumber}. Refusing on the mismatch.`, retryable: false });
         }
       } else {
-        const from = args.date || '2000-04-01';
-        const to = args.date || new Date().toISOString().slice(0, 10);
+        const from = args.date || '1990-04-01';
+        const to = args.date || '2099-03-31';
         const loc = await locateVouchers(args.voucherType, args.voucherNumber!, from, to, company);
         if ('error' in loc) {
           auditLog('delete-voucher', args, 'error', Date.now() - start);
