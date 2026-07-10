@@ -1158,6 +1158,17 @@ async function locateByMasterId(masterId: string, company?: string): Promise<{ v
   return { voucher: rows[0] ?? null };
 }
 
+// Find LIVE (non-cancelled, non-optional) vouchers carrying an exact Reference (a NEFT UTR / cheque no)
+// within a period. This is the natural idempotency key for bank rows: the same instrument reference can
+// only belong to one real transaction, so a non-empty result means it is already booked (by anyone).
+async function findVouchersByReference(reference: string, fromDate: string, toDate: string, company?: string): Promise<{ rows: any[] } | { error: string }> {
+  const p = new Map<string, any>([['reference', reference], ['fromDate', fromDate], ['toDate', toDate]]);
+  if (company) p.set('targetCompany', company);
+  const resp = await pull('find-voucher-by-reference', p);
+  if (resp.error) return { error: resp.error };
+  return { rows: Array.isArray(resp.data) ? resp.data : [] };
+}
+
 export type VoucherLookupOutcome =
   | { status: 'ok'; voucher: any }
   | { status: 'not_found' }
@@ -3112,6 +3123,39 @@ export async function registerMcpServer(): Promise<McpServer> {
       return {
         content: [{ type: 'text', text: JSON.stringify({ count: rows.length, vouchers: rows }) }]
       };
+    }
+  );
+
+  mcpServer.registerTool(
+    'find-voucher-by-reference',
+    {
+      title: 'Find Voucher by Reference',
+      description: `Finds LIVE vouchers whose Reference field (the <REFERENCE> / $Reference — a NEFT UTR, IMPS RRN, RTGS ref or cheque number) exactly equals the given value, within a period. Returns each match's master_id, date, voucher_number, voucher_type, reference, party_ledger, amount. Cancelled and optional vouchers are excluded, so a non-empty result means the transaction is already booked. Use this to dedupe before posting bank rows: a bank instrument reference is unique to one real transaction, so if it already exists you should NOT post it again (by you or anyone). Read-only. Exact, case/space-sensitive match. Default period is all-time.`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name; leave blank for the active company'),
+        reference: z.string().describe('exact reference value to search for (e.g. the NEFT UTR / cheque number)'),
+        fromDate: z.string().optional().describe('YYYY-MM-DD; start of the search period (defaults to 1990-04-01)'),
+        toDate: z.string().optional().describe('YYYY-MM-DD; end of the search period (defaults to 2099-03-31)')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      if (!args.reference || !args.reference.trim()) {
+        auditLog('find-voucher-by-reference', args, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: 'reference cannot be empty.', retryable: false });
+      }
+      const company = args.targetCompany || activeCompany || undefined;
+      const loc = await findVouchersByReference(args.reference, args.fromDate || '1990-04-01', args.toDate || '2099-03-31', company);
+      if ('error' in loc) {
+        auditLog('find-voucher-by-reference', args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: loc.error });
+      }
+      auditLog('find-voucher-by-reference', args, 'success', Date.now() - start);
+      return { content: [{ type: 'text', text: JSON.stringify({ count: loc.rows.length, exists: loc.rows.length > 0, vouchers: loc.rows }) }] };
     }
   );
 

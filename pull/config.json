@@ -130,6 +130,63 @@
             }
         },
         {
+            "name": "find-voucher-by-reference",
+            "input": [
+                {
+                    "name": "reference",
+                    "datatype": "string"
+                },
+                {
+                    "name": "fromDate",
+                    "datatype": "date"
+                },
+                {
+                    "name": "toDate",
+                    "datatype": "date"
+                }
+            ],
+            "output": {
+                "datatype": "array",
+                "fields": [
+                    {
+                        "identifier": "F01",
+                        "name": "master_id",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F02",
+                        "name": "date",
+                        "datatype": "date"
+                    },
+                    {
+                        "identifier": "F03",
+                        "name": "voucher_number",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F04",
+                        "name": "voucher_type",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F05",
+                        "name": "reference",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F06",
+                        "name": "party_ledger",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F07",
+                        "name": "amount",
+                        "datatype": "number"
+                    }
+                ]
+            }
+        },
+        {
             "name": "list-companies",
             "input": [],
             "output": {
