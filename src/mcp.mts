@@ -2985,6 +2985,49 @@ export async function registerMcpServer(): Promise<McpServer> {
   );
 
   mcpServer.registerTool(
+    'locate-voucher',
+    {
+      title: 'Locate Voucher',
+      description: `Finds existing vouchers by exact voucherType + voucherNumber and returns each match's internal Tally master_id along with date, voucher_number, voucher_type, reference (the <REFERENCE> / $Reference field, e.g. a NEFT UTR or cheque no), party_ledger, amount, and is_cancelled. The master_id is the immutable key needed to unambiguously cancel or delete a specific voucher (voucher numbers can repeat across years/types). CANCELLED vouchers ARE included (so you can locate stray cancelled rows to clean up); optional vouchers are excluded. Read-only. If more than one row comes back, the number is ambiguous for that period — narrow the date range. Pass a single 'date' to search that day, or fromDate/toDate for a range; default is all-time.`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name; leave blank for the active company'),
+        voucherType: z.enum(['Sales', 'Purchase', 'Payment', 'Receipt', 'Contra', 'Journal', 'Debit Note', 'Credit Note']).describe('exact voucher type'),
+        voucherNumber: z.string().describe('exact voucher number as shown in Tally'),
+        date: z.string().optional().describe('YYYY-MM-DD; if given, searches only that day (shorthand for fromDate=toDate=date)'),
+        fromDate: z.string().optional().describe('YYYY-MM-DD; start of the search period (defaults to 2000-04-01)'),
+        toDate: z.string().optional().describe('YYYY-MM-DD; end of the search period (defaults to today)')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      const from = args.fromDate || args.date || '2000-04-01';
+      const to = args.toDate || args.date || new Date().toISOString().slice(0, 10);
+      const inputParams = new Map<string, any>([
+        ['voucherType', args.voucherType],
+        ['voucherNumber', args.voucherNumber],
+        ['fromDate', from],
+        ['toDate', to]
+      ]);
+      if (args.targetCompany) inputParams.set('targetCompany', args.targetCompany);
+
+      const resp = await pull('voucher-lookup', inputParams);
+      if (resp.error) {
+        auditLog('locate-voucher', args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: resp.error });
+      }
+      const rows = Array.isArray(resp.data) ? resp.data : [];
+      auditLog('locate-voucher', args, 'success', Date.now() - start);
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ count: rows.length, vouchers: rows }) }]
+      };
+    }
+  );
+
+  mcpServer.registerTool(
     'ledger-account',
     {
       title: 'Ledger Account',
