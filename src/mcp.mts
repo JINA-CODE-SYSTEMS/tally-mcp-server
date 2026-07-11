@@ -1158,6 +1158,16 @@ async function locateByMasterId(masterId: string, company?: string): Promise<{ v
   return { voucher: rows[0] ?? null };
 }
 
+// Normalize a located voucher's date (a parsed Date from the pull layer, or a string) to YYYY-MM-DD
+// for the Tally delete/cancel envelope. Uses LOCAL date parts to avoid a UTC day-shift.
+export function toIsoDate(d: any): string | undefined {
+  if (d instanceof Date && !isNaN(d.getTime())) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(d ?? ''));
+  return m ? `${m[1]}-${m[2]}-${m[3]}` : undefined;
+}
+
 // Find LIVE (non-cancelled, non-optional) vouchers carrying an exact Reference (a NEFT UTR / cheque no)
 // within a period. This is the natural idempotency key for bank rows: the same instrument reference can
 // only belong to one real transaction, so a non-empty result means it is already booked (by anyone).
@@ -3720,7 +3730,12 @@ export async function registerMcpServer(): Promise<McpServer> {
 
       // gate === 'proceed' — masterId + confirm:true, target verified above. Key the delete to the
       // authoritative type/id from Tally, not the raw args.
-      const xml = buildDeleteVoucherXml({ masterId, voucherType: String(located.voucher_type) }, company);
+      const xml = buildDeleteVoucherXml({
+        masterId,
+        voucherType: String(located.voucher_type),
+        date: toIsoDate(located.date) || args.date,
+        voucherNumber: located.voucher_number != null && String(located.voucher_number).length ? String(located.voucher_number) : undefined,
+      }, company);
       const resp = await pushXml(xml);
       const result = interpretDeleteResponse(resp, masterId);
       if (result.status === 'created_instead') {
