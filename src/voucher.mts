@@ -263,22 +263,26 @@ export function buildCancelVoucherXml(
 }
 
 // Builds a HARD-DELETE envelope (ACTION="Delete"). Unlike buildCancelVoucherXml (mark-cancelled, keeps
-// the row), this removes the voucher outright — no row remains. The target is keyed by its immutable
-// MASTERID; NEVER guess it — resolve it via locate-voucher. VCHTYPE routes Tally to the right register
-// and DATE disambiguates. On a TallyPrime Edit Log company the deletion is auto-recorded in the Edit
-// Log. NOTE: no delete-reason tag is emitted — that tag is version-specific and unverified against a
-// live Edit Log build; if a reasonless delete is rejected there, the tag is added after a live probe.
+// the row), this removes the voucher outright — no row remains.
+//
+// The MASTERID goes on the VOUCHER tag as an ATTRIBUTE, alongside VCHTYPE and ACTION, with the
+// type/date/number repeated as child elements. A live probe proved this is required: emitting MASTERID
+// as a *child* makes Tally's importer reject the delete with "Cannot delete unnamed object: VOUCHER!"
+// — it can't resolve the object's identity from the payload. The attribute form keys the delete to the
+// exact voucher. (If a build still rejects this, the fallback is to key on VCHKEY/REMOTEID from an
+// export.) On a TallyPrime Edit Log company the deletion is auto-recorded in the Edit Log; no
+// delete-reason tag is emitted (version-specific, unverified).
 export function buildDeleteVoucherXml(
-  v: { masterId: string | number; voucherType: string; date?: string },
+  v: { masterId: string | number; voucherType: string; date?: string; voucherNumber?: string },
   targetCompany?: string
 ): string {
   const tallyDate = v.date ? toTallyDate(v.date) : '';
   const svCompany = targetCompany ? `<SVCURRENTCOMPANY>${xmlName(targetCompany)}</SVCURRENTCOMPANY>` : '';
   const body =
-    `<VOUCHER ACTION="Delete" VCHTYPE="${xmlName(v.voucherType)}">` +
-    `<MASTERID>${escapeXml(String(v.masterId))}</MASTERID>` +
-    `<VOUCHERTYPENAME>${xmlName(v.voucherType)}</VOUCHERTYPENAME>` +
+    `<VOUCHER MASTERID="${escapeXml(String(v.masterId))}" VCHTYPE="${xmlName(v.voucherType)}" ACTION="Delete">` +
     (tallyDate ? `<DATE>${tallyDate}</DATE>` : '') +
+    `<VOUCHERTYPENAME>${xmlName(v.voucherType)}</VOUCHERTYPENAME>` +
+    (v.voucherNumber ? `<VOUCHERNUMBER>${escapeXml(String(v.voucherNumber))}</VOUCHERNUMBER>` : '') +
     `</VOUCHER>`;
   return `<?xml version="1.0" encoding="utf-8"?>` +
     `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>` +
