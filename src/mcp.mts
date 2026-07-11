@@ -1169,6 +1169,15 @@ async function findVouchersByReference(reference: string, fromDate: string, toDa
   return { rows: Array.isArray(resp.data) ? resp.data : [] };
 }
 
+// Binds findVouchersByReference to a company for skipIfExists (all-time). Returns matching LIVE rows,
+// or null on a read error so a failed dedupe check never blocks a legitimate write.
+function makeReferenceChecker(company?: string): (reference: string) => Promise<any[] | null> {
+  return async (reference: string) => {
+    const r = await findVouchersByReference(reference, '1990-04-01', '2099-03-31', company);
+    return 'error' in r ? null : r.rows;
+  };
+}
+
 export type VoucherLookupOutcome =
   | { status: 'ok'; voucher: any }
   | { status: 'not_found' }
@@ -1508,7 +1517,8 @@ const voucherInputShape = {
   amount: z.number().optional().describe('DEPRECATED shim — use entries[]. Amount for the debit/credit shim.'),
   narration: z.string().optional(),
   voucherNumber: z.string().optional().describe('optional; blank for auto-numbering'),
-  reference: z.string().optional(),
+  reference: z.string().optional().describe('voucher Reference / Ref No (Tally <REFERENCE>) — put the bank instrument id here (NEFT UTR / IMPS RRN / RTGS ref / cheque no) so the row is dedupe-able'),
+  skipIfExists: z.boolean().optional().describe('if true AND reference is set, first check Tally for a LIVE voucher with that reference; if one exists, SKIP posting (report skipped) instead of creating a duplicate. Makes re-runs / concurrent posting idempotent on the bank reference.'),
   partyLedger: z.string().optional().describe('party ledger for GST/invoice vouchers (PARTYLEDGERNAME)'),
   inventory: z.array(inventoryLineSchema).optional(),
   gst: gstBlockSchema.optional()
@@ -1517,7 +1527,7 @@ type VoucherArgs = {
   voucherType: string; date: string;
   entries?: VoucherEntry[];
   debitLedger?: string; creditLedger?: string; amount?: number;
-  narration?: string; voucherNumber?: string; reference?: string; partyLedger?: string;
+  narration?: string; voucherNumber?: string; reference?: string; skipIfExists?: boolean; partyLedger?: string;
   inventory?: VoucherInput['inventory']; gst?: VoucherInput['gst'];
 };
 
@@ -1555,6 +1565,10 @@ export type VoucherExecOpts = {
   // executeVoucher skips its own reconciliation. When resolution failed, companyError holds why.
   exactCompany?: string;
   companyError?: string;
+  // Company-bound reference-existence lookup for skipIfExists. Returns the matching LIVE vouchers, or
+  // null on a read failure (so a failed check never blocks a legitimate write). Injected by the handler
+  // (bound to findVouchersByReference for the resolved company) to keep executeVoucher I/O-agnostic.
+  checkExisting?: (reference: string) => Promise<any[] | null>;
 };
 
 export async function executeVoucher(
@@ -1609,6 +1623,19 @@ export async function executeVoucher(
   if (opts.knownStockItems?.length && voucher.inventory?.length) {
     const missing = findMissingMasters(voucher.inventory.map(i => i.stockItem), opts.knownStockItems);
     if (missing.length) return errorResult('MASTER_NOT_FOUND', { message: `Unknown stock item(s): ${missing.join(', ')}.` });
+  }
+  // (e) skipIfExists: reference-keyed idempotency. Checked LIVE here — the last step before the write —
+  // to narrow the Gold multi-user race between our check and our post. A read failure returns null and
+  // does NOT block the write. On a hit we skip (or, in dryRun, report wouldSkip) rather than duplicate.
+  if (args.skipIfExists && args.reference && opts.checkExisting) {
+    const existing = await opts.checkExisting(args.reference);
+    if (existing && existing.length > 0) {
+      const summary = existing.map((e: any) => ({ master_id: e.master_id, voucher_number: e.voucher_number, date: e.date, amount: e.amount }));
+      const body = opts.dryRun
+        ? { dryRun: true, wouldSkip: true, reason: 'ALREADY_EXISTS', reference: args.reference, existing: summary }
+        : { skipped: true, reason: 'ALREADY_EXISTS', reference: args.reference, existing: summary };
+      return { content: [{ type: 'text', text: JSON.stringify(body) }] };
+    }
   }
   const xml = buildVoucherXml(voucher, company);
   if (opts.dryRun) {
@@ -1675,7 +1702,7 @@ async function buildVoucherExecOpts(args: { targetCompany?: string; inventory?: 
     fetchMasterNames('ledger', company),
     (args.inventory && (args.inventory as unknown[]).length) ? fetchMasterNames('stockitem', company) : Promise.resolve<string[]>([]),
   ]);
-  return { exactCompany: company, period, knownLedgers, knownStockItems, idempotency: { store: getIdempotencyStore(), now: new Date().toISOString() } };
+  return { exactCompany: company, period, knownLedgers, knownStockItems, checkExisting: makeReferenceChecker(company), idempotency: { store: getIdempotencyStore(), now: new Date().toISOString() } };
 }
 
 // Echoes the exact posting a write WOULD make, without calling Tally (#96 H-10). Used by
@@ -1685,7 +1712,7 @@ function dryRunEcho(template: string, inputParams: Map<string, any>, extra?: obj
 }
 
 // ── batch voucher execution (#97 H-11) ─────────────────────────────────────
-type BatchRow = { index: number; status: 'success' | 'error'; code?: string; message?: string; retryable?: boolean; created?: number; lastVchId?: number };
+type BatchRow = { index: number; status: 'success' | 'error' | 'skipped'; code?: string; message?: string; retryable?: boolean; created?: number; lastVchId?: number; reference?: string };
 
 // Flattens a single executeVoucher result into a per-row batch entry.
 function rowResult(index: number, r: ToolResult): BatchRow {
@@ -1693,11 +1720,13 @@ function rowResult(index: number, r: ToolResult): BatchRow {
     const e: any = r.structuredContent || {};
     return { index, status: 'error', code: e.code ?? 'UNKNOWN', message: e.message, retryable: e.retryable };
   }
-  const body = JSON.parse(r.content[0]!.text) as { created?: number; lastVchId?: number };
+  const body = JSON.parse(r.content[0]!.text) as { created?: number; lastVchId?: number; skipped?: boolean; wouldSkip?: boolean; reference?: string };
+  // A skipIfExists hit (real 'skipped' or dryRun 'wouldSkip') is neither a success nor a failure.
+  if (body.skipped || body.wouldSkip) return { index, status: 'skipped', reference: body.reference };
   return { index, status: 'success', created: body.created, lastVchId: body.lastVchId };
 }
 
-export type BatchResult = { atomic: boolean; aborted: boolean; posted: number; results: BatchRow[] };
+export type BatchResult = { atomic: boolean; aborted: boolean; posted: number; skipped: number; results: BatchRow[] };
 
 // Executes a batch of vouchers. atomic=true: validate ALL rows first (via the deterministic dryRun
 // path); if any fails, abort and post NOTHING. Otherwise post each and report per row (best-effort).
@@ -1710,26 +1739,27 @@ export async function executeVoucherBatch(
   opts: { atomic?: boolean } & VoucherExecOpts
 ): Promise<BatchResult> {
   const { atomic, dryRun, ...baseOpts } = opts;
+  const countSkipped = (rows: BatchRow[]) => rows.filter(r => r.status === 'skipped').length;
   if (atomic) {
     const checks: BatchRow[] = [];
     for (let i = 0; i < vouchers.length; i++) {
       checks.push(rowResult(i, await executeVoucher(vouchers[i]!, { ...baseOpts, dryRun: true })));
     }
     if (checks.some(c => c.status === 'error')) {
-      return { atomic: true, aborted: true, posted: 0, results: checks };
+      return { atomic: true, aborted: true, posted: 0, skipped: countSkipped(checks), results: checks };
     }
-    if (dryRun) return { atomic: true, aborted: false, posted: 0, results: checks };
+    if (dryRun) return { atomic: true, aborted: false, posted: 0, skipped: countSkipped(checks), results: checks };
     const results: BatchRow[] = [];
     for (let i = 0; i < vouchers.length; i++) {
       results.push(rowResult(i, await executeVoucher(vouchers[i]!, baseOpts)));
     }
-    return { atomic: true, aborted: false, posted: results.filter(r => r.status === 'success').length, results };
+    return { atomic: true, aborted: false, posted: results.filter(r => r.status === 'success').length, skipped: countSkipped(results), results };
   }
   const results: BatchRow[] = [];
   for (let i = 0; i < vouchers.length; i++) {
     results.push(rowResult(i, await executeVoucher(vouchers[i]!, { ...baseOpts, dryRun })));
   }
-  return { atomic: false, aborted: false, posted: results.filter(r => r.status === 'success').length, results };
+  return { atomic: false, aborted: false, posted: results.filter(r => r.status === 'success').length, skipped: countSkipped(results), results };
 }
 
 export async function registerMcpServer(): Promise<McpServer> {
@@ -3486,11 +3516,13 @@ export async function registerMcpServer(): Promise<McpServer> {
         anyInventory ? fetchMasterNames('stockitem', company) : Promise.resolve<string[]>([]),
       ]);
       const rows = args.vouchers.map(v => ({ ...(v as VoucherArgs), targetCompany: company }));
-      const batch = await executeVoucherBatch(rows, { atomic: args.atomic ?? false, dryRun: args.dryRun, period, knownLedgers, knownStockItems, exactCompany: company });
+      const batch = await executeVoucherBatch(rows, { atomic: args.atomic ?? false, dryRun: args.dryRun, period, knownLedgers, knownStockItems, exactCompany: company, checkExisting: makeReferenceChecker(company) });
       if (batchKey && !args.dryRun && !batch.aborted) {
         try { store.put(batchKey, batch, new Date().toISOString()); } catch {}
       }
-      const status = args.dryRun ? 'dryrun' : (batch.aborted || batch.posted < args.vouchers.length ? 'error' : 'success');
+      // A skipped row (already-booked reference) is NOT a failure — only a real post error is. So the
+      // batch is 'success' when every row either posted or was skipped.
+      const status = args.dryRun ? 'dryrun' : (batch.aborted || (batch.posted + batch.skipped) < args.vouchers.length ? 'error' : 'success');
       auditLog('create-vouchers', { count: args.vouchers.length, atomic: args.atomic, dryRun: args.dryRun }, status, Date.now() - start);
       return { content: [{ type: 'text', text: JSON.stringify(batch, null, 2) }], isError: batch.aborted };
     }
