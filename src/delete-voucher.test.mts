@@ -29,6 +29,15 @@ test('buildDeleteVoucherXml omits DATE/VOUCHERNUMBER when not supplied (attribut
   assert.equal(/<VOUCHERNUMBER>/.test(xml), false);
 });
 
+// Two live probes proved MASTERID alone fails ("Cannot delete unnamed object"). Tally matches an
+// existing voucher for delete by its REMOTEID (GUID) / VCHKEY — emit them as attributes when available.
+test('buildDeleteVoucherXml keys on REMOTEID (GUID) + VCHKEY when available', () => {
+  const xml = buildDeleteVoucherXml({ masterId: '79092', voucherType: 'Receipt', date: '2026-07-01', voucherNumber: '200', remoteId: 'abc-guid-123', vchKey: '99887766' }, 'ALG');
+  assert.match(xml, /<VOUCHER REMOTEID="abc-guid-123" VCHKEY="99887766" MASTERID="79092" VCHTYPE="Receipt" ACTION="Delete">/);
+  assert.match(xml, /<DATE>20260701<\/DATE>/);
+  assert.match(xml, /<VOUCHERNUMBER>200<\/VOUCHERNUMBER>/);
+});
+
 test('toIsoDate normalizes a parsed Date (local parts) and an ISO string, else undefined', () => {
   assert.equal(toIsoDate(new Date(2026, 6, 1)), '2026-07-01'); // month is 0-based; local parts, no UTC shift
   assert.equal(toIsoDate('2026-07-01T00:00:00'), '2026-07-01');
@@ -86,8 +95,10 @@ test('gate: neither → needs_confirm', () => {
 test('voucher-by-masterid report is declared with the identity fields and filters on $MasterID', () => {
   const fields = reportColumnMetadata('voucher-by-masterid');
   assert.ok(fields, 'voucher-by-masterid must be a declared pull report');
-  assert.deepEqual(fields!.map(f => f.name), ['master_id', 'date', 'voucher_number', 'voucher_type', 'reference', 'party_ledger', 'amount', 'is_cancelled']);
+  assert.deepEqual(fields!.map(f => f.name), ['master_id', 'date', 'voucher_number', 'voucher_type', 'reference', 'party_ledger', 'amount', 'is_cancelled', 'guid', 'vchkey']);
   const xml = fs.readFileSync(path.join(import.meta.dirname, '..', 'pull', 'voucher-by-masterid.xml'), 'utf-8');
   assert.match(xml, /FilterMasterId">\$MasterID = \{masterId\}/); // numeric compare, unquoted
   assert.match(xml, /<TYPE>Voucher<\/TYPE>/);
+  assert.match(xml, /<SET>\$Guid<\/SET>/);        // GUID → REMOTEID for the delete
+  assert.match(xml, /<SET>\$VoucherKey<\/SET>/);  // VCHKEY for the delete
 });

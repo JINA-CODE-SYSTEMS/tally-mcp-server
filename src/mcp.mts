@@ -3714,7 +3714,9 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
 
       const masterId = String(located.master_id);
-      const preview = { master_id: masterId, date: located.date, voucher_number: located.voucher_number, voucher_type: located.voucher_type, reference: located.reference, party_ledger: located.party_ledger, amount: located.amount, is_cancelled: located.is_cancelled };
+      const guid = located.guid != null ? String(located.guid) : '';
+      const vchkey = located.vchkey != null ? String(located.vchkey) : '';
+      const preview = { master_id: masterId, guid, vchkey, date: located.date, voucher_number: located.voucher_number, voucher_type: located.voucher_type, reference: located.reference, party_ledger: located.party_ledger, amount: located.amount, is_cancelled: located.is_cancelled };
 
       const gate = decideDeleteGate({ dryRun: args.dryRun, confirm: args.confirm, hasMasterId: !!argMasterId });
       if (gate === 'dryRun') {
@@ -3735,6 +3737,8 @@ export async function registerMcpServer(): Promise<McpServer> {
         voucherType: String(located.voucher_type),
         date: toIsoDate(located.date) || args.date,
         voucherNumber: located.voucher_number != null && String(located.voucher_number).length ? String(located.voucher_number) : undefined,
+        remoteId: guid || undefined,
+        vchKey: vchkey || undefined,
       }, company);
       const resp = await pushXml(xml);
       const result = interpretDeleteResponse(resp, masterId);
