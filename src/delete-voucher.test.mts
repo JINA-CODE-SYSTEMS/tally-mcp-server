@@ -2,26 +2,38 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import fs from 'node:fs';
 import path from 'node:path';
-import { interpretDeleteResponse, decideDeleteGate } from './mcp.mjs';
+import { interpretDeleteResponse, decideDeleteGate, toIsoDate } from './mcp.mjs';
 import { buildDeleteVoucherXml } from './voucher.mjs';
 import { reportColumnMetadata } from './tally.mjs';
 
 const resp = (o: Partial<{ success: boolean; created: number; altered: number; cancelled: number; deleted: number; lastVchId: number; error: string }>) =>
   ({ success: false, created: 0, altered: 0, cancelled: 0, deleted: 0, lastVchId: 0, ...o });
 
-test('buildDeleteVoucherXml keys a hard delete to the master_id (ACTION=Delete, no ISCANCELLED)', () => {
-  const xml = buildDeleteVoucherXml({ masterId: '4321', voucherType: 'Payment', date: '2026-07-03' }, 'Ross');
-  assert.match(xml, /<VOUCHER ACTION="Delete" VCHTYPE="Payment">/);
-  assert.match(xml, /<MASTERID>4321<\/MASTERID>/);
+// A live probe proved Tally rejects a delete with MASTERID as a CHILD element ("Cannot delete unnamed
+// object: VOUCHER!"). It must be an ATTRIBUTE on the <VOUCHER> tag, with type/date/number as children.
+test('buildDeleteVoucherXml puts MASTERID as an ATTRIBUTE on the VOUCHER tag (not a child)', () => {
+  const xml = buildDeleteVoucherXml({ masterId: '4321', voucherType: 'Payment', date: '2026-07-03', voucherNumber: '200' }, 'Ross');
+  assert.match(xml, /<VOUCHER MASTERID="4321" VCHTYPE="Payment" ACTION="Delete">/);
+  assert.equal(/<MASTERID>/.test(xml), false); // never a child element — that is what Tally rejected
   assert.match(xml, /<DATE>20260703<\/DATE>/);
+  assert.match(xml, /<VOUCHERTYPENAME>Payment<\/VOUCHERTYPENAME>/);
+  assert.match(xml, /<VOUCHERNUMBER>200<\/VOUCHERNUMBER>/);
   assert.match(xml, /<SVCURRENTCOMPANY>Ross<\/SVCURRENTCOMPANY>/);
   assert.equal(/ISCANCELLED/.test(xml), false); // a delete is not a cancel
 });
 
-test('buildDeleteVoucherXml omits DATE when not supplied (master_id is sufficient)', () => {
+test('buildDeleteVoucherXml omits DATE/VOUCHERNUMBER when not supplied (attribute id still present)', () => {
   const xml = buildDeleteVoucherXml({ masterId: '9', voucherType: 'Journal' });
-  assert.match(xml, /<MASTERID>9<\/MASTERID>/);
+  assert.match(xml, /<VOUCHER MASTERID="9" VCHTYPE="Journal" ACTION="Delete">/);
   assert.equal(/<DATE>/.test(xml), false);
+  assert.equal(/<VOUCHERNUMBER>/.test(xml), false);
+});
+
+test('toIsoDate normalizes a parsed Date (local parts) and an ISO string, else undefined', () => {
+  assert.equal(toIsoDate(new Date(2026, 6, 1)), '2026-07-01'); // month is 0-based; local parts, no UTC shift
+  assert.equal(toIsoDate('2026-07-01T00:00:00'), '2026-07-01');
+  assert.equal(toIsoDate('not a date'), undefined);
+  assert.equal(toIsoDate(undefined), undefined);
 });
 
 // The delete reason tag is deliberately NOT emitted (version-specific, unverified). Guard that so it
