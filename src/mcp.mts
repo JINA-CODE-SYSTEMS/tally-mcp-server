@@ -1191,6 +1191,63 @@ async function fetchVoucherKeys(voucherType: string, voucherNumber: string, isoD
   return parseVoucherKeysFromExport(resp, voucherType, voucherNumber);
 }
 
+const VOUCHER_BLOCK_RE = /<VOUCHER\b[\s\S]*?<\/VOUCHER>/g;
+const grabVoucherBlocks = (xml: string): string[] => String(xml || '').match(VOUCHER_BLOCK_RE) || [];
+const reEsc = (s: string) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// Approach A (the permanent delete): fetch the voucher's OWN native export block, which carries Tally's
+// real REMOTEID + VCHKEY as attributes on the <VOUCHER> tag plus the full body. Re-importing that exact
+// block with ACTION="Delete" is the only form this TallyPrime build accepts — MASTERID (child/attr) →
+// "unnamed object", REMOTEID/VCHKEY attribute or <GUID> child on a MINIMAL envelope → rejected, and
+// $VoucherKey is an internal DsList key. We isolate the block UNAMBIGUOUSLY by MasterID so a duplicate
+// voucher number can never delete the wrong voucher: first a server-side $MasterID collection filter,
+// then a Day Book export matched on the <MASTERID> child.
+async function fetchVoucherExportBlock(masterId: string, voucherType: string, voucherNumber: string | undefined, isoDate: string, company?: string): Promise<{ block?: string; candidates?: string[]; error?: string }> {
+  const tallyDate = (isoDate || '').replace(/-/g, '');
+  if (!tallyDate) return { error: 'Missing voucher date for the export.' };
+  const svCompany = company ? `<SVCURRENTCOMPANY>${escapeXml(company)}</SVCURRENTCOMPANY>` : '';
+  const hasRemote = (b: string) => /\bREMOTEID="[^"]+"/i.test(b);
+  const midRe = new RegExp(`<MASTERID>\\s*${reEsc(masterId)}\\s*</MASTERID>`);
+
+  // 1) Collection filtered by $MasterID — Tally returns exactly this voucher, no number ambiguity.
+  const collReq = `<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>ClaudallyVchDel</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVFROMDATE>${tallyDate}</SVFROMDATE><SVTODATE>${tallyDate}</SVTODATE>${svCompany}</STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME="ClaudallyVchDel" ISMODIFY="No"><TYPE>Voucher</TYPE><FILTER>ClaudallyMidF</FILTER></COLLECTION><SYSTEM TYPE="Formulae" NAME="ClaudallyMidF">$MasterID = ${reEsc(masterId)}</SYSTEM></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+  try {
+    const r = await postTallyXML(collReq);
+    const b = grabVoucherBlocks(r).find(hasRemote);
+    if (b) return { block: b };
+  } catch { /* fall through to Day Book */ }
+
+  // 2) Day Book export, matched on the <MASTERID> child.
+  const dbReq = `<ENVELOPE><HEADER><TALLYREQUEST>Export Data</TALLYREQUEST></HEADER><BODY><EXPORTDATA><REQUESTDESC><REPORTNAME>Day Book</REPORTNAME><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVFROMDATE>${tallyDate}</SVFROMDATE><SVTODATE>${tallyDate}</SVTODATE>${svCompany}</STATICVARIABLES></REQUESTDESC></EXPORTDATA></BODY></ENVELOPE>`;
+  let db: string | undefined;
+  try { db = await postTallyXML(dbReq); } catch { return { error: 'Voucher export request to Tally failed.' }; }
+  const all = grabVoucherBlocks(db || '');
+  const byMid = all.find(b => midRe.test(b) && hasRemote(b));
+  if (byMid) return { block: byMid };
+  // Couldn't isolate by id — surface the candidate opening tags (never guess which duplicate to delete).
+  const numRe = voucherNumber ? new RegExp(`<VOUCHERNUMBER>\\s*${reEsc(voucherNumber)}\\s*</VOUCHERNUMBER>`) : null;
+  const typeRe = new RegExp(`VCHTYPE="${reEsc(voucherType)}"`);
+  const candidates = all.filter(b => typeRe.test(b) && (!numRe || numRe.test(b))).map(b => (b.match(/<VOUCHER\b[^>]*>/) || [''])[0]);
+  return { candidates };
+}
+
+// Turn an exported <VOUCHER>…</VOUCHER> block into a delete-import: force ACTION="Delete" on the tag and
+// wrap it in the Vouchers import envelope. Tally matches on the block's own REMOTEID/VCHKEY. Pure/testable.
+export function blockToDeleteImport(block: string, company?: string): string {
+  const openTag = (block.match(/<VOUCHER\b[^>]*>/) || ['<VOUCHER>'])[0];
+  const newOpen = /\bACTION="[^"]*"/i.test(openTag)
+    ? openTag.replace(/\bACTION="[^"]*"/i, 'ACTION="Delete"')
+    : openTag.replace(/^<VOUCHER\b/, '<VOUCHER ACTION="Delete"');
+  const delBlock = block.replace(openTag, newOpen);
+  const svCompany = company ? `<SVCURRENTCOMPANY>${escapeXml(company)}</SVCURRENTCOMPANY>` : '';
+  return `<?xml version="1.0" encoding="utf-8"?>` +
+    `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>` +
+    `<BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME>` +
+    `<STATICVARIABLES>${svCompany}</STATICVARIABLES></REQUESTDESC>` +
+    `<REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF">${delBlock}</TALLYMESSAGE></REQUESTDATA>` +
+    `</IMPORTDATA></BODY></ENVELOPE>`;
+}
+
 // Normalize a located voucher's date (a parsed Date from the pull layer, or a string) to YYYY-MM-DD
 // for the Tally delete/cancel envelope. Uses LOCAL date parts to avoid a UTC day-shift.
 export function toIsoDate(d: any): string | undefined {
@@ -3750,16 +3807,12 @@ export async function registerMcpServer(): Promise<McpServer> {
       const isoDate = toIsoDate(located.date) || args.date;
       const voucherNumber = located.voucher_number != null && String(located.voucher_number).length ? String(located.voucher_number) : undefined;
 
-      // The delete key is the voucher's GUID, supplied as a <GUID> child element. The collection scalar
-      // $Guid comes back empty on this build, so read it from the voucher's NATIVE export (its REMOTEID
-      // attribute is the GUID). NOTE: $VoucherKey (the collection "vchkey") is an internal DsList key,
-      // NOT an import identifier — deliberately unused here.
-      let guid = located.guid != null && String(located.guid) ? String(located.guid) : '';
-      if (!guid && voucherNumber && isoDate) {
-        const keys = await fetchVoucherKeys(String(located.voucher_type), voucherNumber, isoDate, company);
-        if (!('error' in keys)) guid = keys.remoteId || '';
-      }
-      const preview = { master_id: masterId, guid, date: located.date, voucher_number: located.voucher_number, voucher_type: located.voucher_type, reference: located.reference, party_ledger: located.party_ledger, amount: located.amount, is_cancelled: located.is_cancelled };
+      // Approach A: fetch the voucher's OWN native export block (real REMOTEID/VCHKEY attributes),
+      // isolated unambiguously by MasterID, to re-import with ACTION="Delete". Done here (before the gate)
+      // so the dryRun/preview can surface the exact <VOUCHER> tag that would be deleted.
+      const ex = isoDate ? await fetchVoucherExportBlock(masterId, String(located.voucher_type), voucherNumber, isoDate, company) : { error: 'Missing voucher date.' };
+      const voucherTag = ex.block ? (ex.block.match(/<VOUCHER\b[^>]*>/) || [''])[0] : '';
+      const preview = { master_id: masterId, date: located.date, voucher_number: located.voucher_number, voucher_type: located.voucher_type, reference: located.reference, party_ledger: located.party_ledger, amount: located.amount, is_cancelled: located.is_cancelled, export_block_found: !!ex.block, voucher_tag: voucherTag || undefined, candidate_tags: ex.candidates };
 
       const gate = decideDeleteGate({ dryRun: args.dryRun, confirm: args.confirm, hasMasterId: !!argMasterId });
       if (gate === 'dryRun') {
@@ -3773,18 +3826,19 @@ export async function registerMcpServer(): Promise<McpServer> {
         return { content: [{ type: 'text', text: JSON.stringify({ requiresConfirmation: true, wouldDelete: preview, message: `This will PERMANENTLY delete the voucher above (irreversible). To proceed, re-call delete-voucher with masterId:"${masterId}", voucherType:"${located.voucher_type}", confirm:true.` }) }] };
       }
 
-      // gate === 'proceed' — masterId + confirm:true, target verified above. Fail closed if we could not
-      // read the GUID: without it the delete would just bounce as "does not exist".
-      if (!guid) {
+      // gate === 'proceed'. Fail closed unless we isolated the exact voucher's export block — never guess
+      // which duplicate to delete, and never send an envelope Tally will reject.
+      if ('error' in ex && ex.error) {
         auditLog('delete-voucher', args, 'error', Date.now() - start);
-        return errorResult('PRECONDITION_FAILED', { message: `Could not read the voucher's GUID from Tally's export, so a delete would be rejected. Nothing was deleted. (master_id ${masterId}, ${located.voucher_type} #${voucherNumber ?? '?'} on ${isoDate ?? '?'})`, retryable: false });
+        return errorResult('UNKNOWN', { message: `${ex.error} Nothing was deleted (master_id ${masterId}).` });
       }
-      // Key the delete to the voucher's GUID (as a <GUID> child element) + type + date.
-      const xml = buildDeleteVoucherXml({
-        voucherType: String(located.voucher_type),
-        date: isoDate,
-        guid,
-      }, company);
+      if (!ex.block) {
+        auditLog('delete-voucher', args, 'error', Date.now() - start);
+        const n = ex.candidates?.length ?? 0;
+        return errorResult('PRECONDITION_FAILED', { message: `Could not isolate the export block for master_id ${masterId} (${located.voucher_type} #${voucherNumber ?? '?'} on ${isoDate ?? '?'}); ${n} candidate block(s) by number/type. Nothing was deleted.${n ? ' Candidate tags: ' + ex.candidates!.join(' || ') : ''}`, retryable: false });
+      }
+      // Re-import the voucher's own block with ACTION="Delete" — Tally matches on its embedded keys.
+      const xml = blockToDeleteImport(ex.block, company);
       const resp = await pushXml(xml);
       const result = interpretDeleteResponse(resp, masterId);
       if (result.status === 'created_instead') {
