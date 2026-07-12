@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import fs from 'node:fs';
 import path from 'node:path';
-import { interpretDeleteResponse, decideDeleteGate, toIsoDate } from './mcp.mjs';
+import { interpretDeleteResponse, decideDeleteGate, toIsoDate, parseVoucherKeysFromExport } from './mcp.mjs';
 import { buildDeleteVoucherXml } from './voucher.mjs';
 import { reportColumnMetadata } from './tally.mjs';
 
@@ -36,6 +36,30 @@ test('buildDeleteVoucherXml keys on REMOTEID (GUID) + VCHKEY when available', ()
   assert.match(xml, /<VOUCHER REMOTEID="abc-guid-123" VCHKEY="99887766" MASTERID="79092" VCHTYPE="Receipt" ACTION="Delete">/);
   assert.match(xml, /<DATE>20260701<\/DATE>/);
   assert.match(xml, /<VOUCHERNUMBER>200<\/VOUCHERNUMBER>/);
+});
+
+// Real Day Book export shape (from a live Tally): REMOTEID + VCHKEY live as attributes on the
+// <VOUCHER> tag. The collection scalar $Guid comes back empty on this build, so the delete reads keys
+// from here instead. Two vouchers so the number/type match is exercised.
+const EXPORT_SAMPLE = `<ENVELOPE><BODY><IMPORTDATA><REQUESTDATA>
+<TALLYMESSAGE><VOUCHER REMOTEID="ca36e34b-e468-4110-bee2-d33dbe65cdb6-00012742" VCHKEY="ca36e34b-e468-4110-bee2-d33dbe65cdb6-0000b51e:00000008" VCHTYPE="Expenses GST" ACTION="Create" OBJVIEW="Accounting Voucher View"><DATE>20260701</DATE><VOUCHERTYPENAME>Expenses GST</VOUCHERTYPENAME><VOUCHERNUMBER>7</VOUCHERNUMBER></VOUCHER></TALLYMESSAGE>
+<TALLYMESSAGE><VOUCHER REMOTEID="aa11bb22-0000abcd-00099999" VCHKEY="aa11bb22-0000abcd-0000b51e:00000021" VCHTYPE="Receipt" ACTION="Create" OBJVIEW="Accounting Voucher View"><DATE>20260701</DATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>200</VOUCHERNUMBER></VOUCHER></TALLYMESSAGE>
+</REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`;
+
+test('parseVoucherKeysFromExport pulls REMOTEID + VCHKEY for the matching type+number', () => {
+  const k = parseVoucherKeysFromExport(EXPORT_SAMPLE, 'Receipt', '200');
+  assert.equal(k.remoteId, 'aa11bb22-0000abcd-00099999');
+  assert.equal(k.vchKey, 'aa11bb22-0000abcd-0000b51e:00000021');
+});
+
+test('parseVoucherKeysFromExport does not cross-match a different voucher (number must match)', () => {
+  const k = parseVoucherKeysFromExport(EXPORT_SAMPLE, 'Receipt', '7'); // #7 is the Expenses GST one, not a Receipt
+  assert.deepEqual(k, {});
+});
+
+test('parseVoucherKeysFromExport returns {} when no block matches', () => {
+  assert.deepEqual(parseVoucherKeysFromExport(EXPORT_SAMPLE, 'Payment', '999'), {});
+  assert.deepEqual(parseVoucherKeysFromExport('', 'Receipt', '200'), {});
 });
 
 test('toIsoDate normalizes a parsed Date (local parts) and an ISO string, else undefined', () => {
