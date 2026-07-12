@@ -274,21 +274,20 @@ export function buildCancelVoucherXml(
 // empty ones are omitted. On a TallyPrime Edit Log company the deletion is auto-recorded in the Edit
 // Log; no delete-reason tag is emitted (version-specific, unverified).
 export function buildDeleteVoucherXml(
-  v: { masterId: string | number; voucherType: string; date?: string; voucherNumber?: string; remoteId?: string; vchKey?: string },
+  v: { voucherType: string; date?: string; guid?: string },
   targetCompany?: string
 ): string {
   const tallyDate = v.date ? toTallyDate(v.date) : '';
   const svCompany = targetCompany ? `<SVCURRENTCOMPANY>${xmlName(targetCompany)}</SVCURRENTCOMPANY>` : '';
-  const attrs =
-    (v.remoteId ? ` REMOTEID="${escapeXml(String(v.remoteId))}"` : '') +
-    (v.vchKey ? ` VCHKEY="${escapeXml(String(v.vchKey))}"` : '') +
-    ` MASTERID="${escapeXml(String(v.masterId))}"` +
-    ` VCHTYPE="${xmlName(v.voucherType)}" ACTION="Delete"`;
+  // Two live probes settled the identity: Tally matches the voucher for ACTION="Delete" by its GUID,
+  // supplied as a CHILD element — not MASTERID (→ "unnamed object"), not a REMOTEID/VCHKEY attribute
+  // (→ "does not exist"), and NOT $VoucherKey (an internal DsList key, not an import identifier). The
+  // GUID is read from the voucher's native export (its REMOTEID attribute).
   const body =
-    `<VOUCHER${attrs}>` +
+    `<VOUCHER ACTION="Delete">` +
+    (v.guid ? `<GUID>${escapeXml(String(v.guid))}</GUID>` : '') +
     (tallyDate ? `<DATE>${tallyDate}</DATE>` : '') +
     `<VOUCHERTYPENAME>${xmlName(v.voucherType)}</VOUCHERTYPENAME>` +
-    (v.voucherNumber ? `<VOUCHERNUMBER>${escapeXml(String(v.voucherNumber))}</VOUCHERNUMBER>` : '') +
     `</VOUCHER>`;
   return `<?xml version="1.0" encoding="utf-8"?>` +
     `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>` +
