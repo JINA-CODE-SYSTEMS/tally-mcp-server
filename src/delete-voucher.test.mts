@@ -2,30 +2,41 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import fs from 'node:fs';
 import path from 'node:path';
-import { interpretDeleteResponse, decideDeleteGate, toIsoDate, parseVoucherKeysFromExport, blockToDeleteImport } from './mcp.mjs';
+import { interpretDeleteResponse, decideDeleteGate, toIsoDate, parseVoucherKeysFromExport, buildDeleteVariants } from './mcp.mjs';
 import { buildDeleteVoucherXml } from './voucher.mjs';
 import { reportColumnMetadata } from './tally.mjs';
 
-// Approach A (the permanent delete): re-import the voucher's OWN exported block with ACTION="Delete".
-// Tally matches on the block's real REMOTEID/VCHKEY attributes. blockToDeleteImport just flips ACTION
-// and wraps it — the block content (incl. keys) is preserved verbatim.
-const REAL_BLOCK = `<VOUCHER REMOTEID="ca36e34b-e468-4110-bee2-d33dbe65cdb6-00013535" VCHKEY="ca36e34b-e468-4110-bee2-d33dbe65cdb6-0000b51e:00000021" VCHTYPE="Receipt" ACTION="Create" OBJVIEW="Accounting Voucher View"><DATE>20260707</DATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>214</VOUCHERNUMBER><AMOUNT>-200000</AMOUNT></VOUCHER>`;
+// The self-brute-forcing delete: from the voucher's own export block, build candidate delete envelopes
+// and try them in order until one takes. Every single form we tried per-redeploy was rejected by the
+// ALG build, so the tool now tries them all in ONE call and reports the winner.
+const REAL_BLOCK = `<VOUCHER REMOTEID="ca36e34b-e468-4110-bee2-d33dbe65cdb6-00013535" VCHKEY="ca36e34b-e468-4110-bee2-d33dbe65cdb6-0000b481:000000d8" VCHTYPE="Receipt" ACTION="Create" OBJVIEW="Accounting Voucher View"><DATE>20260707</DATE><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><VOUCHERNUMBER>214</VOUCHERNUMBER><AMOUNT>-200000</AMOUNT></VOUCHER>`;
 
-test('blockToDeleteImport flips ACTION to Delete and preserves the real REMOTEID/VCHKEY verbatim', () => {
-  const xml = blockToDeleteImport(REAL_BLOCK, 'ALG CHEMICALS');
-  assert.match(xml, /ACTION="Delete"/);
-  assert.equal(/ACTION="Create"/.test(xml), false); // Create must be replaced, not duplicated
-  assert.equal((xml.match(/ACTION=/g) || []).length, 1); // exactly one ACTION
-  assert.match(xml, /REMOTEID="ca36e34b-e468-4110-bee2-d33dbe65cdb6-00013535"/); // real key kept
-  assert.match(xml, /VCHKEY="ca36e34b-e468-4110-bee2-d33dbe65cdb6-0000b51e:00000021"/);
-  assert.match(xml, /<AMOUNT>-200000<\/AMOUNT>/); // body preserved
-  assert.match(xml, /<REPORTNAME>Vouchers<\/REPORTNAME>/);
-  assert.match(xml, /<SVCURRENTCOMPANY>ALG CHEMICALS<\/SVCURRENTCOMPANY>/);
+test('buildDeleteVariants returns the forms in order, all keyed on this voucher + company', () => {
+  const vs = buildDeleteVariants(REAL_BLOCK, 'Receipt', '214', '2026-07-07', 'ALG CHEMICALS');
+  assert.deepEqual(vs.map(v => v.name), ['block-minus-remoteid', 'vchkey-only', 'block-verbatim', 'remoteid-only']);
+  vs.forEach(v => { assert.match(v.xml, /ACTION="Delete"/); assert.match(v.xml, /<SVCURRENTCOMPANY>ALG CHEMICALS<\/SVCURRENTCOMPANY>/); });
 });
 
-test('blockToDeleteImport inserts ACTION=Delete when the exported tag has none', () => {
-  const xml = blockToDeleteImport('<VOUCHER REMOTEID="g-9" VCHTYPE="Payment"><DATE>20260701</DATE></VOUCHER>');
-  assert.match(xml, /<VOUCHER ACTION="Delete" REMOTEID="g-9" VCHTYPE="Payment">/);
+test('buildDeleteVariants: block-minus-remoteid drops REMOTEID but keeps VCHKEY + body', () => {
+  const v = buildDeleteVariants(REAL_BLOCK, 'Receipt', '214', '2026-07-07').find(x => x.name === 'block-minus-remoteid')!;
+  assert.equal(/REMOTEID=/.test(v.xml), false);
+  assert.match(v.xml, /VCHKEY="ca36e34b-e468-4110-bee2-d33dbe65cdb6-0000b481:000000d8"/);
+  assert.match(v.xml, /<AMOUNT>-200000<\/AMOUNT>/);
+  assert.equal(/ACTION="Create"/.test(v.xml), false);
+});
+
+test('buildDeleteVariants: vchkey-only is a minimal envelope with the real VCHKEY, no REMOTEID/body', () => {
+  const v = buildDeleteVariants(REAL_BLOCK, 'Receipt', '214', '2026-07-07').find(x => x.name === 'vchkey-only')!;
+  assert.match(v.xml, /<VOUCHER VCHKEY="ca36e34b-e468-4110-bee2-d33dbe65cdb6-0000b481:000000d8" VCHTYPE="Receipt" ACTION="Delete">/);
+  assert.match(v.xml, /<VOUCHERNUMBER>214<\/VOUCHERNUMBER>/);
+  assert.equal(/REMOTEID=/.test(v.xml), false);
+  assert.equal(/<AMOUNT>/.test(v.xml), false);
+});
+
+test('buildDeleteVariants: verbatim keeps REMOTEID, remoteid-only is minimal with it', () => {
+  const vs = buildDeleteVariants(REAL_BLOCK, 'Receipt', '214', '2026-07-07');
+  assert.match(vs.find(x => x.name === 'block-verbatim')!.xml, /REMOTEID="ca36e34b-e468-4110-bee2-d33dbe65cdb6-00013535"/);
+  assert.match(vs.find(x => x.name === 'remoteid-only')!.xml, /<VOUCHER REMOTEID="ca36e34b-e468-4110-bee2-d33dbe65cdb6-00013535" VCHTYPE="Receipt" ACTION="Delete">/);
 });
 
 const resp = (o: Partial<{ success: boolean; created: number; altered: number; cancelled: number; deleted: number; lastVchId: number; error: string }>) =>
