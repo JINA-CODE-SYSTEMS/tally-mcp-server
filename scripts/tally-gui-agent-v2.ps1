@@ -148,8 +148,8 @@ RESPOND WITH ONLY A JSON OBJECT, no other text:
 {"action":"<action_type>","value":"<value>","reason":"<brief explanation>"}
 
 Action types:
-- "key": Press a key. value = "enter"|"escape"|"tab"|"backspace"|"up"|"down"|"left"|"right"|"f1"|"f2"|"f3"|"f4"|"f5"|"f10"|"f12"
-- "combo": Key combo. value = "alt+f3"|"alt+f1"|"alt+f2"|"ctrl+a"|etc.
+- "key": Press a key. value = "enter"|"escape"|"tab"|"backspace"|"up"|"down"|"left"|"right"|"f1".."f5"|"f10"|"f12"|any single letter a-z (menu hotkeys, y/n confirms)|any digit 0-9
+- "combo": Key combo. value = modifier (alt|ctrl|shift) + one of f1-f5/f10 or any letter a-z or digit 0-9, e.g. "alt+f3"|"alt+d" (delete voucher)|"alt+x" (cancel)|"ctrl+a"
 - "type": Type text. value = the text to type
 - "wait": Wait and take another screenshot. value = milliseconds (e.g. "2000")
 - "done": Goal achieved.
@@ -295,6 +295,11 @@ function Execute-Action {
                 "f5" = [TallyUI2]::VK_F5; "f10" = [TallyUI2]::VK_F10
                 "f12" = [TallyUI2]::VK_F12
             }
+            # Letters a-z (VK 0x41..0x5A) and digits 0-9 (VK 0x30..0x39) as single key
+            # presses — needed for Tally menu hotkeys (e.g. "k" = Day Book) and Yes/No
+            # confirmations ("y"/"n"), which the clipboard-paste "type" action cannot fire.
+            foreach ($c in 97..122) { $keyMap["$([char]$c)"] = $c - 32 }
+            foreach ($d in 48..57)  { $keyMap["$([char]$d)"] = $d }
             $vk = $keyMap[$Action.value.ToLower()]
             if ($vk) {
                 Write-Host "  Action: Press $($Action.value)"
@@ -309,8 +314,13 @@ function Execute-Action {
             $keyMap = @{
                 "f1" = [TallyUI2]::VK_F1; "f2" = [TallyUI2]::VK_F2; "f3" = [TallyUI2]::VK_F3
                 "f4" = [TallyUI2]::VK_F4; "f5" = [TallyUI2]::VK_F5; "f10" = [TallyUI2]::VK_F10
-                "a" = 0x41; "c" = 0x43; "v" = 0x56; "x" = 0x58
             }
+            # All letters a-z (VK 0x41..0x5A) and digits 0-9 so any modifier chord works —
+            # notably Alt+D (delete voucher), Alt+X (cancel voucher), Alt+2 (delete line),
+            # Alt+R, Ctrl+Enter, etc. Previously only a/c/v/x were mapped, so Alt+D was
+            # silently dropped ("unmapped combo ... ignored").
+            foreach ($c in 97..122) { $keyMap["$([char]$c)"] = $c - 32 }
+            foreach ($d in 48..57)  { $keyMap["$([char]$d)"] = $d }
             if ($parts.Count -ge 2) {
                 $mod = $modMap[$parts[0]]
                 $key = $keyMap[$parts[1]]
