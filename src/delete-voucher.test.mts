@@ -39,6 +39,21 @@ test('buildDeleteVariants: verbatim keeps REMOTEID, remoteid-only is minimal wit
   assert.match(vs.find(x => x.name === 'remoteid-only')!.xml, /<VOUCHER REMOTEID="ca36e34b-e468-4110-bee2-d33dbe65cdb6-00013535" VCHTYPE="Receipt" ACTION="Delete">/);
 });
 
+// When a reference is known, the FIRST form tried is the REMOTEID we derive from it — the exact key we
+// stamp at create-time — so a voucher WE authored deletes without depending on the export block. Absent
+// a reference, deriveRemoteId returns undefined and the derived form is skipped (legacy vouchers).
+test('buildDeleteVariants: a known reference prepends a derived-remoteid form keyed on TMCP-<type>-<ref>', () => {
+  const vs = buildDeleteVariants(REAL_BLOCK, 'Receipt', '214', '2026-07-07', 'ALG', 'RCV00351');
+  assert.equal(vs[0].name, 'derived-remoteid');
+  assert.match(vs[0].xml, /<VOUCHER REMOTEID="TMCP-Receipt-RCV00351" VCHTYPE="Receipt" ACTION="Delete">/);
+  assert.match(vs[0].xml, /<VOUCHERNUMBER>214<\/VOUCHERNUMBER>/);
+});
+
+test('buildDeleteVariants: no reference → no derived form (legacy/hand-keyed vouchers)', () => {
+  const names = buildDeleteVariants(REAL_BLOCK, 'Receipt', '214', '2026-07-07').map(v => v.name);
+  assert.equal(names.includes('derived-remoteid'), false);
+});
+
 const resp = (o: Partial<{ success: boolean; created: number; altered: number; cancelled: number; deleted: number; lastVchId: number; error: string }>) =>
   ({ success: false, created: 0, altered: 0, cancelled: 0, deleted: 0, lastVchId: 0, ...o });
 
