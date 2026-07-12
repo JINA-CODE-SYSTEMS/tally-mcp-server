@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import fs from 'node:fs';
 import path from 'node:path';
-import { interpretDeleteResponse, decideDeleteGate, toIsoDate, parseVoucherKeysFromExport, buildDeleteVariants } from './mcp.mjs';
+import { interpretDeleteResponse, decideDeleteGate, decideBatchDeleteGate, toIsoDate, parseVoucherKeysFromExport, buildDeleteVariants } from './mcp.mjs';
 import { buildDeleteVoucherXml } from './voucher.mjs';
 import { reportColumnMetadata } from './tally.mjs';
 
@@ -154,6 +154,39 @@ test('gate: masterId WITHOUT confirm → needs_confirm', () => {
 
 test('gate: neither → needs_confirm', () => {
   assert.equal(decideDeleteGate({ hasMasterId: false }), 'needs_confirm');
+});
+
+// ── decideBatchDeleteGate: the delete-vouchers (batch) guard. 'proceed' requires confirm:true AND every
+//    target masterId-bound AND expectedCount === target count — three locks, so a wrong or number-only or
+//    mis-sized batch can never delete.
+test('batch gate: dryRun always previews', () => {
+  assert.equal(decideBatchDeleteGate({ dryRun: true, confirm: true, total: 3, withMaster: 3, expectedCount: 3 }).gate, 'dryRun');
+});
+
+test('batch gate: all master-bound + confirm + matching expectedCount → proceed', () => {
+  assert.deepEqual(decideBatchDeleteGate({ confirm: true, total: 3, withMaster: 3, expectedCount: 3 }), { gate: 'proceed' });
+});
+
+test('batch gate: a number-only target (withMaster < total) is refused even with confirm', () => {
+  const g = decideBatchDeleteGate({ confirm: true, total: 3, withMaster: 2, expectedCount: 3 });
+  assert.equal(g.gate, 'needs_confirm');
+  assert.match(g.error!, /masterId/);
+});
+
+test('batch gate: missing expectedCount → needs_confirm', () => {
+  const g = decideBatchDeleteGate({ confirm: true, total: 2, withMaster: 2 });
+  assert.equal(g.gate, 'needs_confirm');
+  assert.match(g.error!, /expectedCount is required/);
+});
+
+test('batch gate: expectedCount mismatch → needs_confirm (mis-sized list aborts)', () => {
+  const g = decideBatchDeleteGate({ confirm: true, total: 3, withMaster: 3, expectedCount: 5 });
+  assert.equal(g.gate, 'needs_confirm');
+  assert.match(g.error!, /does not equal/);
+});
+
+test('batch gate: confirm not set → needs_confirm (no error, just preview)', () => {
+  assert.deepEqual(decideBatchDeleteGate({ total: 2, withMaster: 2, expectedCount: 2 }), { gate: 'needs_confirm' });
 });
 
 // ── voucher-by-masterid report: verifies a master_id against Tally before an irreversible delete.
