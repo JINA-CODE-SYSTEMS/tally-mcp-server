@@ -9,33 +9,26 @@ import { reportColumnMetadata } from './tally.mjs';
 const resp = (o: Partial<{ success: boolean; created: number; altered: number; cancelled: number; deleted: number; lastVchId: number; error: string }>) =>
   ({ success: false, created: 0, altered: 0, cancelled: 0, deleted: 0, lastVchId: 0, ...o });
 
-// A live probe proved Tally rejects a delete with MASTERID as a CHILD element ("Cannot delete unnamed
-// object: VOUCHER!"). It must be an ATTRIBUTE on the <VOUCHER> tag, with type/date/number as children.
-test('buildDeleteVoucherXml puts MASTERID as an ATTRIBUTE on the VOUCHER tag (not a child)', () => {
-  const xml = buildDeleteVoucherXml({ masterId: '4321', voucherType: 'Payment', date: '2026-07-03', voucherNumber: '200' }, 'Ross');
-  assert.match(xml, /<VOUCHER MASTERID="4321" VCHTYPE="Payment" ACTION="Delete">/);
-  assert.equal(/<MASTERID>/.test(xml), false); // never a child element — that is what Tally rejected
-  assert.match(xml, /<DATE>20260703<\/DATE>/);
-  assert.match(xml, /<VOUCHERTYPENAME>Payment<\/VOUCHERTYPENAME>/);
-  assert.match(xml, /<VOUCHERNUMBER>200<\/VOUCHERNUMBER>/);
-  assert.match(xml, /<SVCURRENTCOMPANY>Ross<\/SVCURRENTCOMPANY>/);
+// Three live probes settled the identity: MASTERID (child OR attribute) → "Cannot delete unnamed
+// object"; REMOTEID/VCHKEY attribute + $VoucherKey → "does not exist". Tally matches the voucher by its
+// GUID, supplied as a <GUID> CHILD element inside <VOUCHER ACTION="Delete">.
+test('buildDeleteVoucherXml keys the delete on the GUID as a <GUID> child element', () => {
+  const xml = buildDeleteVoucherXml({ voucherType: 'Receipt', date: '2026-07-07', guid: 'ca36e34b-e468-4110-bee2-d33dbe65cdb6-00013535' }, 'ALG');
+  assert.match(xml, /<VOUCHER ACTION="Delete"><GUID>ca36e34b-e468-4110-bee2-d33dbe65cdb6-00013535<\/GUID>/);
+  assert.match(xml, /<DATE>20260707<\/DATE>/);
+  assert.match(xml, /<VOUCHERTYPENAME>Receipt<\/VOUCHERTYPENAME>/);
+  assert.match(xml, /<SVCURRENTCOMPANY>ALG<\/SVCURRENTCOMPANY>/);
+  // none of the forms Tally rejected:
+  assert.equal(/MASTERID|REMOTEID|VCHKEY/.test(xml), false);
   assert.equal(/ISCANCELLED/.test(xml), false); // a delete is not a cancel
 });
 
-test('buildDeleteVoucherXml omits DATE/VOUCHERNUMBER when not supplied (attribute id still present)', () => {
-  const xml = buildDeleteVoucherXml({ masterId: '9', voucherType: 'Journal' });
-  assert.match(xml, /<VOUCHER MASTERID="9" VCHTYPE="Journal" ACTION="Delete">/);
+test('buildDeleteVoucherXml omits GUID/DATE when not supplied', () => {
+  const xml = buildDeleteVoucherXml({ voucherType: 'Journal' });
+  assert.match(xml, /<VOUCHER ACTION="Delete">/);
+  assert.equal(/<GUID>/.test(xml), false);
   assert.equal(/<DATE>/.test(xml), false);
-  assert.equal(/<VOUCHERNUMBER>/.test(xml), false);
-});
-
-// Two live probes proved MASTERID alone fails ("Cannot delete unnamed object"). Tally matches an
-// existing voucher for delete by its REMOTEID (GUID) / VCHKEY — emit them as attributes when available.
-test('buildDeleteVoucherXml keys on REMOTEID (GUID) + VCHKEY when available', () => {
-  const xml = buildDeleteVoucherXml({ masterId: '79092', voucherType: 'Receipt', date: '2026-07-01', voucherNumber: '200', remoteId: 'abc-guid-123', vchKey: '99887766' }, 'ALG');
-  assert.match(xml, /<VOUCHER REMOTEID="abc-guid-123" VCHKEY="99887766" MASTERID="79092" VCHTYPE="Receipt" ACTION="Delete">/);
-  assert.match(xml, /<DATE>20260701<\/DATE>/);
-  assert.match(xml, /<VOUCHERNUMBER>200<\/VOUCHERNUMBER>/);
+  assert.match(xml, /<VOUCHERTYPENAME>Journal<\/VOUCHERTYPENAME>/);
 });
 
 // Real Day Book export shape (from a live Tally): REMOTEID + VCHKEY live as attributes on the
@@ -72,7 +65,7 @@ test('toIsoDate normalizes a parsed Date (local parts) and an ISO string, else u
 // The delete reason tag is deliberately NOT emitted (version-specific, unverified). Guard that so it
 // isn't reintroduced without a live probe.
 test('buildDeleteVoucherXml emits no delete-reason tag (pending live verification)', () => {
-  const xml = buildDeleteVoucherXml({ masterId: '9', voucherType: 'Journal' });
+  const xml = buildDeleteVoucherXml({ voucherType: 'Journal', guid: 'g-1' });
   assert.equal(/AUDITDELETEDNARRATION|DELETEDREASON|REMOVALREASON/i.test(xml), false);
 });
 
