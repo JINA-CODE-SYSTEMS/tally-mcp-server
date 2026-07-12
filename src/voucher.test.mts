@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildVoucherXml, buildCancelVoucherXml, voucherBalance, toTallyDate, type VoucherInput } from './voucher.mjs';
+import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, deriveRemoteId, voucherBalance, toTallyDate, type VoucherInput } from './voucher.mjs';
 
 test('buildCancelVoucherXml marks the located voucher cancelled (#98)', () => {
   const xml = buildCancelVoucherXml({ voucherType: 'Sales', voucherNumber: 'INV-42', date: '2026-10-10' }, 'Ross');
@@ -109,4 +109,37 @@ test('escapes XML metacharacters in ledger names', () => {
   };
   const xml = buildVoucherXml(v);
   assert.match(xml, /<LEDGERNAME>Smith &amp; Co<\/LEDGERNAME>/);
+});
+
+// ── REMOTEID stamping (durable external key). deriveRemoteId is deterministic from type+reference, so
+//    the SAME reference always yields the SAME key — that's what lets a later delete re-derive it and
+//    match without a lookup, and what makes a re-feed idempotent (Tally alters the same voucher).
+test('deriveRemoteId: deterministic, slugified, namespaced; undefined without a reference', () => {
+  assert.equal(deriveRemoteId('Receipt', 'RCV00351'), 'TMCP-Receipt-RCV00351');
+  assert.equal(deriveRemoteId('Receipt', 'RCV00351'), deriveRemoteId('Receipt', 'RCV00351')); // stable
+  // messy references collapse to a safe slug; leading/trailing separators trimmed
+  assert.equal(deriveRemoteId('Payment', 'IMPS/P2A 618817313928'), 'TMCP-Payment-IMPS-P2A-618817313928');
+  assert.equal(deriveRemoteId('Receipt', undefined), undefined);
+  assert.equal(deriveRemoteId('Receipt', '   '), undefined);
+  assert.equal(deriveRemoteId('Receipt', '///'), undefined); // no alnum survives the slug
+});
+
+test('buildVoucherXml stamps REMOTEID as an attribute when present, omits it otherwise', () => {
+  const base: VoucherInput = {
+    voucherType: 'Receipt', date: '2026-07-07',
+    entries: [{ ledger: 'Bank', drCr: 'dr', amount: 100 }, { ledger: 'Party', drCr: 'cr', amount: 100 }],
+  };
+  const withId = buildVoucherXml({ ...base, remoteId: 'TMCP-Receipt-RCV00351' }, 'ALG');
+  assert.match(withId, /<VOUCHER REMOTEID="TMCP-Receipt-RCV00351" VCHTYPE="Receipt" ACTION="Create">/);
+  const without = buildVoucherXml(base, 'ALG');
+  assert.equal(/REMOTEID=/.test(without), false);
+  assert.match(without, /<VOUCHER VCHTYPE="Receipt" ACTION="Create">/);
+});
+
+test('buildDeleteVoucherXml keys the delete on the REMOTEID attribute when supplied', () => {
+  const xml = buildDeleteVoucherXml({ voucherType: 'Receipt', date: '2026-07-07', remoteId: 'TMCP-Receipt-RCV00351' }, 'ALG');
+  assert.match(xml, /<VOUCHER REMOTEID="TMCP-Receipt-RCV00351" ACTION="Delete">/);
+  assert.match(xml, /<VOUCHERTYPENAME>Receipt<\/VOUCHERTYPENAME>/);
+  assert.match(xml, /<SVCURRENTCOMPANY>ALG<\/SVCURRENTCOMPANY>/);
+  assert.equal(/MASTERID/.test(xml), false); // never keyed on MASTERID (Tally → "unnamed object")
 });

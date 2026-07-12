@@ -36,7 +36,25 @@ export type VoucherInput = {
   partyLedger?: string;           // for GST/invoice vouchers (PARTYLEDGERNAME)
   inventory?: InventoryLine[];
   gst?: GstBlock;
+  remoteId?: string;              // durable external key (REMOTEID) — see deriveRemoteId
 };
+
+// Deterministic REMOTEID for a voucher we author. Tally's REMOTEID is a durable external key: a voucher
+// imported WITH one can later be altered/deleted by re-sending that same REMOTEID (it is how Tally sync
+// round-trips). We derive it from the business reference so the key is reproducible from the SAME inputs
+// — no lookup needed — which makes two things work at once:
+//   • idempotency/dedup: re-feeding the same reference re-keys the SAME voucher (Tally alters, not dupes)
+//   • deletion: buildDeleteVoucherXml can match by this REMOTEID without first exporting the voucher
+// A voucher with no reference gets no derived id (returns undefined) — Tally then auto-assigns identity
+// and the voucher is only deletable via the GUI path, exactly like a hand-keyed one. The namespace
+// prefix keeps our keys from colliding with Tally's own GUID-shaped remote ids.
+export function deriveRemoteId(voucherType: string, reference?: string): string | undefined {
+  const slug = (s: string) => String(s ?? '').trim().replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  const r = slug(reference || '');
+  if (!r) return undefined;
+  const t = slug(voucherType) || 'Vch';
+  return `TMCP-${t}-${r}`;
+}
 
 export function escapeXml(s: string): string {
   return String(s)
@@ -212,8 +230,11 @@ function inventoryXml(line: InventoryLine): string {
 export function buildVoucherXml(v: VoucherInput, targetCompany?: string): string {
   const tallyDate = toTallyDate(v.date);
   const svCompany = targetCompany ? `<SVCURRENTCOMPANY>${xmlName(targetCompany)}</SVCURRENTCOMPANY>` : '';
+  // REMOTEID (durable external key) goes as an ATTRIBUTE on the VOUCHER tag — the same shape Tally uses
+  // when it EXPORTS a voucher, so it round-trips for a later alter/delete. Omitted when absent.
+  const remoteIdAttr = v.remoteId ? ` REMOTEID="${escapeXml(v.remoteId)}"` : '';
   const body =
-    `<VOUCHER VCHTYPE="${xmlName(v.voucherType)}" ACTION="Create">` +
+    `<VOUCHER${remoteIdAttr} VCHTYPE="${xmlName(v.voucherType)}" ACTION="Create">` +
     `<DATE>${tallyDate}</DATE>` +
     `<EFFECTIVEDATE>${tallyDate}</EFFECTIVEDATE>` +
     `<VOUCHERTYPENAME>${xmlName(v.voucherType)}</VOUCHERTYPENAME>` +
@@ -274,17 +295,19 @@ export function buildCancelVoucherXml(
 // empty ones are omitted. On a TallyPrime Edit Log company the deletion is auto-recorded in the Edit
 // Log; no delete-reason tag is emitted (version-specific, unverified).
 export function buildDeleteVoucherXml(
-  v: { voucherType: string; date?: string; guid?: string },
+  v: { voucherType: string; date?: string; guid?: string; remoteId?: string },
   targetCompany?: string
 ): string {
   const tallyDate = v.date ? toTallyDate(v.date) : '';
   const svCompany = targetCompany ? `<SVCURRENTCOMPANY>${xmlName(targetCompany)}</SVCURRENTCOMPANY>` : '';
-  // Two live probes settled the identity: Tally matches the voucher for ACTION="Delete" by its GUID,
-  // supplied as a CHILD element — not MASTERID (→ "unnamed object"), not a REMOTEID/VCHKEY attribute
-  // (→ "does not exist"), and NOT $VoucherKey (an internal DsList key, not an import identifier). The
-  // GUID is read from the voucher's native export (its REMOTEID attribute).
+  // Match precedence: REMOTEID (attribute) is the reliable key for a voucher WE authored with a stamped
+  // remote id — Tally stored it at create-time, so re-sending it targets that exact voucher. This is the
+  // only XML form that works for our own vouchers; legacy/hand-keyed vouchers have no stored REMOTEID and
+  // must be deleted via the GUI (Alt+D). The GUID child is kept as a secondary attempt for the rare build
+  // that exposes a real $Guid. MASTERID is deliberately NOT used — Tally rejects it ("unnamed object").
+  const remoteIdAttr = v.remoteId ? ` REMOTEID="${escapeXml(v.remoteId)}"` : '';
   const body =
-    `<VOUCHER ACTION="Delete">` +
+    `<VOUCHER${remoteIdAttr} ACTION="Delete">` +
     (v.guid ? `<GUID>${escapeXml(String(v.guid))}</GUID>` : '') +
     (tallyDate ? `<DATE>${tallyDate}</DATE>` : '') +
     `<VOUCHERTYPENAME>${xmlName(v.voucherType)}</VOUCHERTYPENAME>` +
