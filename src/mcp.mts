@@ -1370,6 +1370,89 @@ export function decideDeleteGate(a: { dryRun?: boolean; confirm?: boolean; hasMa
   return 'needs_confirm';
 }
 
+// Attempts the XML delete of an ALREADY-RESOLVED voucher (from locateByMasterId / locateVouchers): fetch
+// its own export block, then try the candidate delete forms until one takes — identical to the single
+// delete-voucher handler's loop, factored out so delete-vouchers (batch) can't drift from it. Returns a
+// discriminated outcome; 'requires_gui' means every XML form was a no-op (a legacy/hand-keyed voucher
+// with no stored REMOTEID — those delete only via the GUI Alt+D path). 'created_instead' is the danger
+// signal (a mis-keyed delete that made Tally CREATE a row) and the batch caller MUST halt on it.
+export type ResolvedDeleteResult =
+  | { status: 'deleted'; deleted: number; deleteForm: string; attempts: any[] }
+  | { status: 'created_instead'; form: string; created: number; attempts: any[] }
+  | { status: 'requires_gui'; attempts: any[]; message: string }
+  | { status: 'error'; message: string };
+
+async function deleteResolvedVoucher(located: any, company?: string): Promise<ResolvedDeleteResult> {
+  const masterId = String(located.master_id);
+  const isoDate = toIsoDate(located.date);
+  const voucherNumber = located.voucher_number != null && String(located.voucher_number).length ? String(located.voucher_number) : undefined;
+  if (!isoDate) return { status: 'error', message: `Missing/invalid date for master_id ${masterId}; cannot isolate its export block.` };
+  const ex = await fetchVoucherExportBlock(masterId, String(located.voucher_type), voucherNumber, isoDate, company);
+  if (ex.error) return { status: 'error', message: `${ex.error} (master_id ${masterId})` };
+  if (!ex.block) {
+    const n = ex.candidates?.length ?? 0;
+    return { status: 'error', message: `Could not isolate the export block for master_id ${masterId} (${located.voucher_type} #${voucherNumber ?? '?'})${n ? `; ${n} candidate block(s)` : ''}.` };
+  }
+  const variants = buildDeleteVariants(ex.block, String(located.voucher_type), voucherNumber, isoDate, company, located.reference ? String(located.reference) : undefined);
+  const attempts: Array<{ form: string; deleted: number; created: number; error?: string }> = [];
+  for (const v of variants) {
+    const resp = await pushXml(v.xml);
+    attempts.push({ form: v.name, deleted: resp.deleted, created: resp.created, error: resp.error ? String(resp.error).slice(0, 140) : undefined });
+    if (resp.created > 0) return { status: 'created_instead', form: v.name, created: resp.created, attempts };
+    if (interpretDeleteResponse(resp, masterId).status === 'deleted') return { status: 'deleted', deleted: resp.deleted, deleteForm: v.name, attempts };
+  }
+  return { status: 'requires_gui', attempts, message: `No XML delete form worked for master_id ${masterId} (${located.voucher_type} #${voucherNumber ?? '?'}) — a legacy/hand-keyed voucher with no stored REMOTEID. Delete it via the GUI (Alt+D).` };
+}
+
+// Pure gate for delete-vouchers (batch). 'proceed' (the only writing path) requires: confirm:true, EVERY
+// target masterId-bound (no number-only rows — same TOCTOU protection as single delete, since a number
+// can be renumbered), and an expectedCount that exactly equals the target count (the caller asserts the
+// batch size, so a wrong or oversized list aborts before any write). Anything short of that previews.
+export type BatchDeleteGate = { gate: 'dryRun' | 'needs_confirm' | 'proceed'; error?: string };
+export function decideBatchDeleteGate(a: { dryRun?: boolean; confirm?: boolean; total: number; withMaster: number; expectedCount?: number }): BatchDeleteGate {
+  if (a.dryRun) return { gate: 'dryRun' };
+  if (a.confirm !== true) return { gate: 'needs_confirm' };
+  if (a.withMaster !== a.total) return { gate: 'needs_confirm', error: 'Every target must include masterId to delete (run with dryRun:true first to resolve them). Refusing a number-only batch delete.' };
+  if (a.expectedCount == null) return { gate: 'needs_confirm', error: 'expectedCount is required to confirm — set it to the number of vouchers you intend to delete.' };
+  if (a.expectedCount !== a.total) return { gate: 'needs_confirm', error: `expectedCount ${a.expectedCount} does not equal ${a.total} target(s). Aborting so a mis-sized list can never delete the wrong set.` };
+  return { gate: 'proceed' };
+}
+
+// Resolves ONE batch target against Tally (mirrors the single delete-voucher resolution). A masterId is
+// re-verified (and its type/number cross-checked); an absent master_id resolves by number+date. Returns a
+// normalized status so the batch handler can decide row-by-row without duplicating the lookup logic.
+type DeleteTargetInput = { voucherType: string; masterId?: string; voucherNumber?: string; date?: string };
+async function resolveDeleteTarget(t: DeleteTargetInput, company?: string): Promise<{ status: 'resolved' | 'already_gone' | 'not_found' | 'ambiguous' | 'error' | 'mismatch'; located?: any; message?: string; masterIds?: string[] }> {
+  const mid = (t.masterId || '').trim();
+  if (mid) {
+    const loc = await locateByMasterId(mid, company);
+    if ('error' in loc) return { status: 'error', message: loc.error };
+    if (!loc.voucher) return { status: 'already_gone', message: `master_id ${mid} no longer exists (already deleted?).` };
+    if (String(loc.voucher.voucher_type) !== t.voucherType) return { status: 'mismatch', message: `master_id ${mid} is a ${loc.voucher.voucher_type} (#${loc.voucher.voucher_number}), not a ${t.voucherType}.` };
+    if ((t.voucherNumber || '').trim() && String(loc.voucher.voucher_number) !== String(t.voucherNumber)) return { status: 'mismatch', message: `master_id ${mid} is #${loc.voucher.voucher_number}, but you passed voucherNumber ${t.voucherNumber}.` };
+    return { status: 'resolved', located: loc.voucher };
+  }
+  if (!(t.voucherNumber || '').trim()) return { status: 'error', message: 'Each target needs masterId, or voucherNumber (+ optional date).' };
+  const from = t.date || '1990-04-01';
+  const to = t.date || '2099-03-31';
+  const loc = await locateVouchers(t.voucherType, t.voucherNumber!, from, to, company);
+  if ('error' in loc) return { status: 'error', message: loc.error };
+  const outcome = interpretVoucherLookup(loc.rows);
+  if (outcome.status === 'not_found') return { status: 'not_found', message: `Could not locate ${t.voucherType} #${t.voucherNumber}${t.date ? ' dated ' + t.date : ''}.` };
+  if (outcome.status === 'ambiguous') return { status: 'ambiguous', masterIds: outcome.masterIds, message: `${outcome.masterIds.length} vouchers match ${t.voucherType} #${t.voucherNumber} (master_ids: ${outcome.masterIds.join(', ')}); pass masterId to disambiguate.` };
+  return { status: 'resolved', located: outcome.voucher };
+}
+
+// Compact preview row for a resolved target (what dryRun/needs_confirm surface, and what each result row
+// echoes) — enough for the caller to build the master_id-bound confirm call and to audit the outcome.
+function deleteTargetPreview(input: DeleteTargetInput, r: { status: string; located?: any; message?: string; masterIds?: string[] }): any {
+  if (r.located) {
+    const v = r.located;
+    return { status: r.status, master_id: String(v.master_id), voucher_type: v.voucher_type, voucher_number: v.voucher_number, date: toIsoDate(v.date) || v.date, reference: v.reference, party_ledger: v.party_ledger, amount: v.amount, is_cancelled: v.is_cancelled };
+  }
+  return { status: r.status, voucher_type: input.voucherType, voucher_number: input.voucherNumber, date: input.date, masterId: input.masterId, candidates: r.masterIds, message: r.message };
+}
+
 // Wraps handlePush — injects activeCompany as targetCompany fallback when the caller did not specify one.
 // Reconciles the intended company (a targetCompany arg, or activeCompany — which may be a registry
 // alias/displayName that differs from the exact loaded name) to the EXACT name currently loaded in
@@ -3892,6 +3975,94 @@ export async function registerMcpServer(): Promise<McpServer> {
       // None worked — surface every form's raw counters so we can see exactly what this build rejects.
       auditLog('delete-voucher', args, 'error', Date.now() - start);
       return errorResult('PRECONDITION_FAILED', { message: `No delete form was accepted for master_id ${masterId} (${located.voucher_type} #${voucherNumber ?? '?'}). Nothing was deleted. Per-form results: ${JSON.stringify(attempts)}`, retryable: false });
+    }
+  );
+
+  mcpServer.registerTool(
+    'delete-vouchers',
+    {
+      title: 'Delete Vouchers (batch, permanent)',
+      description: `PERMANENTLY deletes MANY vouchers in one call (batch of the single delete-voucher). Same two-phase, master_id-bound safety: run with dryRun:true first — every target is resolved and verified against Tally and a preview is returned WITH each voucher's master_id; then re-call with those masterId values on each target, expectedCount set to the number of targets, and confirm:true. On confirm EVERY target MUST carry masterId (a number-only batch is refused — a number can be renumbered) and expectedCount MUST equal the target count (a mis-sized list aborts before any write). The batch first resolves ALL targets and aborts with details (nothing deleted) if any is ambiguous / wrong-type / errored; a target whose master_id no longer exists is treated as already-deleted (idempotent skip). Deletion is per-voucher XML: it works for vouchers WE authored with a stamped REMOTEID; a legacy/hand-keyed voucher with no stored REMOTEID comes back status:"requires_gui" (delete those via the GUI Alt+D) rather than failing the batch. If any delete makes Tally CREATE a row (a mis-key) the whole batch HALTS immediately. Max 200 targets. Refused when READONLY_MODE=true.`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name; defaults to the active company'),
+        targets: z.array(z.object({
+          voucherType: z.enum(['Sales', 'Purchase', 'Payment', 'Receipt', 'Contra', 'Journal', 'Debit Note', 'Credit Note']).describe('voucher type; checked against the voucher master_id points to'),
+          masterId: z.string().optional().describe('immutable Tally master_id (from a dryRun preview / locate-voucher). REQUIRED on every target to confirm.'),
+          voucherNumber: z.string().optional().describe('exact voucher number — used only to PREVIEW/resolve when masterId is absent'),
+          date: z.string().optional().describe("the voucher's date (YYYY-MM-DD); narrows a by-number preview")
+        })).min(1).max(200).describe('the vouchers to delete (1..200). Preview by number, confirm by masterId.'),
+        expectedCount: z.number().int().nonnegative().optional().describe('REQUIRED to confirm: the number of vouchers you intend to delete; must equal targets.length or the batch aborts'),
+        dryRun: z.boolean().optional().describe('if true, resolve + return what WOULD be deleted and post nothing'),
+        confirm: z.boolean().optional().describe('must be true (with masterId on every target and a matching expectedCount) to actually delete; otherwise previews')
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      if (process.env.READONLY_MODE === 'true') {
+        auditLog('delete-vouchers', args, 'denied');
+        return errorResult('READONLY');
+      }
+      const targets = args.targets || [];
+      for (const t of targets) {
+        if (t.date && !/^\d{4}-\d{2}-\d{2}$/.test(t.date)) {
+          auditLog('delete-vouchers', args, 'denied');
+          return errorResult('PRECONDITION_FAILED', { message: `target date must be YYYY-MM-DD (got "${t.date}").`, retryable: false });
+        }
+      }
+      // Reconcile the EXACT loaded company once (fail closed), like every write tool.
+      const target = await resolveExactLoadedCompany(args.targetCompany || activeCompany || null);
+      if (!target.ok) {
+        auditLog('delete-vouchers', args, 'error', Date.now() - start);
+        return errorResult('COMPANY_NOT_FOUND', { message: target.message, retryable: false });
+      }
+      const company = target.name;
+
+      // Phase 1: resolve EVERY target against Tally, truthfully (this is the preview).
+      const resolved = await Promise.all(targets.map(t => resolveDeleteTarget(t, company)));
+      const previews = resolved.map((r, i) => deleteTargetPreview(targets[i], r));
+
+      const withMaster = targets.filter(t => (t.masterId || '').trim()).length;
+      const gate = decideBatchDeleteGate({ dryRun: args.dryRun, confirm: args.confirm, total: targets.length, withMaster, expectedCount: args.expectedCount });
+
+      if (gate.gate === 'dryRun') {
+        auditLog('delete-vouchers', args, 'dryrun', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify({ dryRun: true, count: targets.length, wouldDelete: previews }) }] };
+      }
+      if (gate.gate === 'needs_confirm') {
+        auditLog('delete-vouchers', args, 'denied', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify({ requiresConfirmation: true, count: targets.length, wouldDelete: previews, message: gate.error || `This will PERMANENTLY delete ${targets.length} voucher(s) (irreversible). Re-call with masterId on every target, expectedCount:${targets.length}, and confirm:true.` }) }] };
+      }
+
+      // gate === 'proceed'. Fail closed BEFORE any write if any target is ambiguous / wrong-type / errored
+      // — never delete a partial batch built on a bad row. 'already_gone' is fine (idempotent skip).
+      const blocking = resolved.filter(r => r.status === 'ambiguous' || r.status === 'mismatch' || r.status === 'error' || r.status === 'not_found');
+      if (blocking.length) {
+        auditLog('delete-vouchers', args, 'denied', Date.now() - start);
+        return errorResult('PRECONDITION_FAILED', { message: `${blocking.length} of ${targets.length} target(s) did not resolve cleanly — nothing was deleted. Fix these and retry: ${blocking.map(b => b.message).join(' | ')}`, retryable: false });
+      }
+
+      // Phase 2: delete each live target. Halt the whole batch the instant a delete makes Tally CREATE.
+      const results: any[] = [];
+      let deleted = 0, skipped = 0, requiresGui = 0, failed = 0;
+      for (let i = 0; i < resolved.length; i++) {
+        const r = resolved[i];
+        if (r.status === 'already_gone') { results.push({ ...previews[i], status: 'already_gone' }); skipped++; continue; }
+        const out = await deleteResolvedVoucher(r.located, company);
+        if (out.status === 'created_instead') {
+          auditLog('delete-vouchers', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `HALTED mid-batch: deleting master_id ${r.located.master_id} made Tally CREATE ${out.created} voucher(s) via form "${out.form}". ${deleted} voucher(s) were deleted before this; check the Day Book. Remaining targets were NOT processed.`, retryable: false });
+        }
+        if (out.status === 'deleted') { deleted++; results.push({ master_id: String(r.located.master_id), voucher_type: r.located.voucher_type, voucher_number: r.located.voucher_number, status: 'deleted', deleteForm: out.deleteForm }); }
+        else if (out.status === 'requires_gui') { requiresGui++; results.push({ master_id: String(r.located.master_id), voucher_type: r.located.voucher_type, voucher_number: r.located.voucher_number, status: 'requires_gui', message: out.message }); }
+        else { failed++; results.push({ master_id: String(r.located.master_id), voucher_type: r.located.voucher_type, voucher_number: r.located.voucher_number, status: 'failed', message: out.message }); }
+      }
+      auditLog('delete-vouchers', args, failed > 0 ? 'error' : 'success', Date.now() - start);
+      return { content: [{ type: 'text', text: JSON.stringify({ success: failed === 0, deleted, skipped, requiresGui, failed, results }) }] };
     }
   );
 
