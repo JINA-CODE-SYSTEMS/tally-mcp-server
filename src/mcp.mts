@@ -3750,20 +3750,16 @@ export async function registerMcpServer(): Promise<McpServer> {
       const isoDate = toIsoDate(located.date) || args.date;
       const voucherNumber = located.voucher_number != null && String(located.voucher_number).length ? String(located.voucher_number) : undefined;
 
-      // The durable delete keys. The collection scalar $Guid/$VoucherKey come back empty on this build,
-      // so read REMOTEID/VCHKEY from Tally's NATIVE Day Book export instead (fall back to the collection
-      // fields for builds where they DO populate). These are what the importer needs to identify the
-      // voucher for ACTION="Delete" — without them Tally rejects it as an "unnamed object".
-      let remoteId = located.guid != null ? String(located.guid) : '';
-      let vchKey = located.vchkey != null ? String(located.vchkey) : '';
-      if ((!remoteId || !vchKey) && voucherNumber && isoDate) {
+      // The delete key is the voucher's GUID, supplied as a <GUID> child element. The collection scalar
+      // $Guid comes back empty on this build, so read it from the voucher's NATIVE export (its REMOTEID
+      // attribute is the GUID). NOTE: $VoucherKey (the collection "vchkey") is an internal DsList key,
+      // NOT an import identifier — deliberately unused here.
+      let guid = located.guid != null && String(located.guid) ? String(located.guid) : '';
+      if (!guid && voucherNumber && isoDate) {
         const keys = await fetchVoucherKeys(String(located.voucher_type), voucherNumber, isoDate, company);
-        if (!('error' in keys)) {
-          remoteId = remoteId || keys.remoteId || '';
-          vchKey = vchKey || keys.vchKey || '';
-        }
+        if (!('error' in keys)) guid = keys.remoteId || '';
       }
-      const preview = { master_id: masterId, remote_id: remoteId, vch_key: vchKey, date: located.date, voucher_number: located.voucher_number, voucher_type: located.voucher_type, reference: located.reference, party_ledger: located.party_ledger, amount: located.amount, is_cancelled: located.is_cancelled };
+      const preview = { master_id: masterId, guid, date: located.date, voucher_number: located.voucher_number, voucher_type: located.voucher_type, reference: located.reference, party_ledger: located.party_ledger, amount: located.amount, is_cancelled: located.is_cancelled };
 
       const gate = decideDeleteGate({ dryRun: args.dryRun, confirm: args.confirm, hasMasterId: !!argMasterId });
       if (gate === 'dryRun') {
@@ -3778,19 +3774,16 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
 
       // gate === 'proceed' — masterId + confirm:true, target verified above. Fail closed if we could not
-      // read a durable key: without REMOTEID/VCHKEY the import would just bounce as "unnamed object".
-      if (!remoteId && !vchKey) {
+      // read the GUID: without it the delete would just bounce as "does not exist".
+      if (!guid) {
         auditLog('delete-voucher', args, 'error', Date.now() - start);
-        return errorResult('PRECONDITION_FAILED', { message: `Could not read the voucher's REMOTEID/VCHKEY from Tally's export, so a delete would be rejected as an "unnamed object". Nothing was deleted. (master_id ${masterId}, ${located.voucher_type} #${voucherNumber ?? '?'} on ${isoDate ?? '?'})`, retryable: false });
+        return errorResult('PRECONDITION_FAILED', { message: `Could not read the voucher's GUID from Tally's export, so a delete would be rejected. Nothing was deleted. (master_id ${masterId}, ${located.voucher_type} #${voucherNumber ?? '?'} on ${isoDate ?? '?'})`, retryable: false });
       }
-      // Key the delete to the authoritative type/id + the durable REMOTEID/VCHKEY from Tally.
+      // Key the delete to the voucher's GUID (as a <GUID> child element) + type + date.
       const xml = buildDeleteVoucherXml({
-        masterId,
         voucherType: String(located.voucher_type),
         date: isoDate,
-        voucherNumber,
-        remoteId: remoteId || undefined,
-        vchKey: vchKey || undefined,
+        guid,
       }, company);
       const resp = await pushXml(xml);
       const result = interpretDeleteResponse(resp, masterId);
