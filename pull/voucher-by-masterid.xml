@@ -31,7 +31,7 @@
                         <SCROLLED>Vertical</SCROLLED>
                     </PART>
                     <LINE NAME="MyLine01">
-                        <FIELDS>FldMasterId,FldDate,FldVoucherNumber,FldVoucherType,FldReference,FldPartyLedger,FldAmount,FldIsCancelled</FIELDS>
+                        <FIELDS>FldMasterId,FldDate,FldVoucherNumber,FldVoucherType,FldReference,FldPartyLedger,FldAmount,FldIsCancelled,FldGuid,FldVchKey</FIELDS>
                         <XMLTAG>ROW</XMLTAG>
                     </LINE>
                     <FIELD NAME="FldMasterId">
@@ -66,9 +66,17 @@
                         <SET>if $IsCancelled then "Yes" else "No"</SET>
                         <XMLTAG>F08</XMLTAG>
                     </FIELD>
+                    <FIELD NAME="FldGuid">
+                        <SET>$Guid</SET>
+                        <XMLTAG>F09</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldVchKey">
+                        <SET>$VoucherKey</SET>
+                        <XMLTAG>F10</XMLTAG>
+                    </FIELD>
                     <COLLECTION NAME="MyCollection">
                         <TYPE>Voucher</TYPE>
-                        <FETCH>MasterID,Reference,VoucherNumber,VoucherTypeName,Date,PartyLedgerName,Amount</FETCH>
+                        <FETCH>MasterID,Guid,VoucherKey,Reference,VoucherNumber,VoucherTypeName,Date,PartyLedgerName,Amount</FETCH>
                         <FILTER>FilterMasterId</FILTER>
                     </COLLECTION>
                     <SYSTEM TYPE="Formulae" NAME="FilterMasterId">$MasterID = {masterId}</SYSTEM>

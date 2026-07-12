@@ -125,6 +125,16 @@
                         "identifier": "F08",
                         "name": "is_cancelled",
                         "datatype": "string"
+                    },
+                    {
+                        "identifier": "F09",
+                        "name": "guid",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F10",
+                        "name": "vchkey",
+                        "datatype": "string"
                     }
                 ]
             }
