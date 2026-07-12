@@ -6,7 +6,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import { cacheTable, executeSQL, validateSQL } from './database.mjs';
 import { handlePull, handlePush, jsonToTSV, pingTally, postTallyXML, pushXml, resolveGSTLedgers } from './tally.mjs';
-import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, voucherBalance, isDateInOpenPeriod, findMissingMasters, referencedLedgers, decodeXmlEntities, type VoucherEntry, type VoucherInput } from './voucher.mjs';
+import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, voucherBalance, isDateInOpenPeriod, findMissingMasters, referencedLedgers, decodeXmlEntities, escapeXml, type VoucherEntry, type VoucherInput } from './voucher.mjs';
 import type { ModelPushResponse } from './models.mjs';
 import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
 
@@ -1156,6 +1156,39 @@ async function locateByMasterId(masterId: string, company?: string): Promise<{ v
   if (resp.error) return { error: resp.error };
   const rows = Array.isArray(resp.data) ? resp.data : [];
   return { voucher: rows[0] ?? null };
+}
+
+// Parse a voucher's durable delete keys (REMOTEID/GUID + VCHKEY) out of Tally's NATIVE Day Book export
+// XML. A live probe showed the collection scalar $Guid/$VoucherKey come back empty on some builds, but
+// the native export carries both as attributes on the <VOUCHER> tag — this reads them from there.
+// Matches the block by exact VOUCHERNUMBER + voucher type (attribute or child). Pure/testable.
+export function parseVoucherKeysFromExport(exportXml: string, voucherType: string, voucherNumber: string): { remoteId?: string; vchKey?: string } {
+  const esc = (s: string) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const blocks = String(exportXml || '').match(/<VOUCHER\b[\s\S]*?<\/VOUCHER>/g) || [];
+  const numRe = new RegExp(`<VOUCHERNUMBER>\\s*${esc(voucherNumber)}\\s*</VOUCHERNUMBER>`);
+  const typeAttrRe = new RegExp(`VCHTYPE="${esc(voucherType)}"`);
+  const typeChildRe = new RegExp(`<VOUCHERTYPENAME>\\s*${esc(voucherType)}\\s*</VOUCHERTYPENAME>`);
+  const target = blocks.find(b => numRe.test(b) && (typeAttrRe.test(b) || typeChildRe.test(b)));
+  if (!target) return {};
+  const tag = (target.match(/<VOUCHER\b[^>]*>/) || [''])[0];
+  return {
+    remoteId: (tag.match(/\bREMOTEID="([^"]*)"/) || [])[1] || undefined,
+    vchKey: (tag.match(/\bVCHKEY="([^"]*)"/) || [])[1] || undefined,
+  };
+}
+
+// Fetch a voucher's REMOTEID/VCHKEY by exporting the native Day Book for its date (the durable keys the
+// importer needs for ACTION="Delete"). Returns {} if the block/keys can't be found, or {error} on a
+// transport failure — the caller decides whether to proceed.
+async function fetchVoucherKeys(voucherType: string, voucherNumber: string, isoDate: string, company?: string): Promise<{ remoteId?: string; vchKey?: string } | { error: string }> {
+  const tallyDate = (isoDate || '').replace(/-/g, '');
+  if (!tallyDate) return { error: 'Missing voucher date for the key export.' };
+  const svCompany = company ? `<SVCURRENTCOMPANY>${escapeXml(company)}</SVCURRENTCOMPANY>` : '';
+  const req = `<ENVELOPE><HEADER><TALLYREQUEST>Export Data</TALLYREQUEST></HEADER><BODY><EXPORTDATA><REQUESTDESC><REPORTNAME>Day Book</REPORTNAME><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVFROMDATE>${tallyDate}</SVFROMDATE><SVTODATE>${tallyDate}</SVTODATE>${svCompany}</STATICVARIABLES></REQUESTDESC></EXPORTDATA></BODY></ENVELOPE>`;
+  let resp: string | undefined;
+  try { resp = await postTallyXML(req); } catch { return { error: 'Day Book export request to Tally failed.' }; }
+  if (!resp) return { error: 'Empty Day Book export response from Tally.' };
+  return parseVoucherKeysFromExport(resp, voucherType, voucherNumber);
 }
 
 // Normalize a located voucher's date (a parsed Date from the pull layer, or a string) to YYYY-MM-DD
@@ -3714,7 +3747,23 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
 
       const masterId = String(located.master_id);
-      const preview = { master_id: masterId, date: located.date, voucher_number: located.voucher_number, voucher_type: located.voucher_type, reference: located.reference, party_ledger: located.party_ledger, amount: located.amount, is_cancelled: located.is_cancelled };
+      const isoDate = toIsoDate(located.date) || args.date;
+      const voucherNumber = located.voucher_number != null && String(located.voucher_number).length ? String(located.voucher_number) : undefined;
+
+      // The durable delete keys. The collection scalar $Guid/$VoucherKey come back empty on this build,
+      // so read REMOTEID/VCHKEY from Tally's NATIVE Day Book export instead (fall back to the collection
+      // fields for builds where they DO populate). These are what the importer needs to identify the
+      // voucher for ACTION="Delete" — without them Tally rejects it as an "unnamed object".
+      let remoteId = located.guid != null ? String(located.guid) : '';
+      let vchKey = located.vchkey != null ? String(located.vchkey) : '';
+      if ((!remoteId || !vchKey) && voucherNumber && isoDate) {
+        const keys = await fetchVoucherKeys(String(located.voucher_type), voucherNumber, isoDate, company);
+        if (!('error' in keys)) {
+          remoteId = remoteId || keys.remoteId || '';
+          vchKey = vchKey || keys.vchKey || '';
+        }
+      }
+      const preview = { master_id: masterId, remote_id: remoteId, vch_key: vchKey, date: located.date, voucher_number: located.voucher_number, voucher_type: located.voucher_type, reference: located.reference, party_ledger: located.party_ledger, amount: located.amount, is_cancelled: located.is_cancelled };
 
       const gate = decideDeleteGate({ dryRun: args.dryRun, confirm: args.confirm, hasMasterId: !!argMasterId });
       if (gate === 'dryRun') {
@@ -3728,13 +3777,20 @@ export async function registerMcpServer(): Promise<McpServer> {
         return { content: [{ type: 'text', text: JSON.stringify({ requiresConfirmation: true, wouldDelete: preview, message: `This will PERMANENTLY delete the voucher above (irreversible). To proceed, re-call delete-voucher with masterId:"${masterId}", voucherType:"${located.voucher_type}", confirm:true.` }) }] };
       }
 
-      // gate === 'proceed' — masterId + confirm:true, target verified above. Key the delete to the
-      // authoritative type/id from Tally, not the raw args.
+      // gate === 'proceed' — masterId + confirm:true, target verified above. Fail closed if we could not
+      // read a durable key: without REMOTEID/VCHKEY the import would just bounce as "unnamed object".
+      if (!remoteId && !vchKey) {
+        auditLog('delete-voucher', args, 'error', Date.now() - start);
+        return errorResult('PRECONDITION_FAILED', { message: `Could not read the voucher's REMOTEID/VCHKEY from Tally's export, so a delete would be rejected as an "unnamed object". Nothing was deleted. (master_id ${masterId}, ${located.voucher_type} #${voucherNumber ?? '?'} on ${isoDate ?? '?'})`, retryable: false });
+      }
+      // Key the delete to the authoritative type/id + the durable REMOTEID/VCHKEY from Tally.
       const xml = buildDeleteVoucherXml({
         masterId,
         voucherType: String(located.voucher_type),
-        date: toIsoDate(located.date) || args.date,
-        voucherNumber: located.voucher_number != null && String(located.voucher_number).length ? String(located.voucher_number) : undefined,
+        date: isoDate,
+        voucherNumber,
+        remoteId: remoteId || undefined,
+        vchKey: vchKey || undefined,
       }, company);
       const resp = await pushXml(xml);
       const result = interpretDeleteResponse(resp, masterId);

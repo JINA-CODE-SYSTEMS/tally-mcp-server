@@ -265,21 +265,27 @@ export function buildCancelVoucherXml(
 // Builds a HARD-DELETE envelope (ACTION="Delete"). Unlike buildCancelVoucherXml (mark-cancelled, keeps
 // the row), this removes the voucher outright — no row remains.
 //
-// The MASTERID goes on the VOUCHER tag as an ATTRIBUTE, alongside VCHTYPE and ACTION, with the
-// type/date/number repeated as child elements. A live probe proved this is required: emitting MASTERID
-// as a *child* makes Tally's importer reject the delete with "Cannot delete unnamed object: VOUCHER!"
-// — it can't resolve the object's identity from the payload. The attribute form keys the delete to the
-// exact voucher. (If a build still rejects this, the fallback is to key on VCHKEY/REMOTEID from an
-// export.) On a TallyPrime Edit Log company the deletion is auto-recorded in the Edit Log; no
-// delete-reason tag is emitted (version-specific, unverified).
+// Identity attributes go on the VOUCHER tag (never as child elements), with type/date/number repeated
+// as children. Two live probes proved a voucher cannot be deleted by MASTERID alone — Tally's importer
+// rejects it with "Cannot delete unnamed object: VOUCHER!", because a voucher has no name and MASTERID
+// is not sufficient identity for an ACTION="Delete". The importer matches an existing voucher by its
+// REMOTEID (the GUID) / VCHKEY, which must be read from the voucher first (locate-voucher fetches $Guid
+// and $VoucherKey). So we emit REMOTEID + VCHKEY when available (MASTERID kept as a further handle);
+// empty ones are omitted. On a TallyPrime Edit Log company the deletion is auto-recorded in the Edit
+// Log; no delete-reason tag is emitted (version-specific, unverified).
 export function buildDeleteVoucherXml(
-  v: { masterId: string | number; voucherType: string; date?: string; voucherNumber?: string },
+  v: { masterId: string | number; voucherType: string; date?: string; voucherNumber?: string; remoteId?: string; vchKey?: string },
   targetCompany?: string
 ): string {
   const tallyDate = v.date ? toTallyDate(v.date) : '';
   const svCompany = targetCompany ? `<SVCURRENTCOMPANY>${xmlName(targetCompany)}</SVCURRENTCOMPANY>` : '';
+  const attrs =
+    (v.remoteId ? ` REMOTEID="${escapeXml(String(v.remoteId))}"` : '') +
+    (v.vchKey ? ` VCHKEY="${escapeXml(String(v.vchKey))}"` : '') +
+    ` MASTERID="${escapeXml(String(v.masterId))}"` +
+    ` VCHTYPE="${xmlName(v.voucherType)}" ACTION="Delete"`;
   const body =
-    `<VOUCHER MASTERID="${escapeXml(String(v.masterId))}" VCHTYPE="${xmlName(v.voucherType)}" ACTION="Delete">` +
+    `<VOUCHER${attrs}>` +
     (tallyDate ? `<DATE>${tallyDate}</DATE>` : '') +
     `<VOUCHERTYPENAME>${xmlName(v.voucherType)}</VOUCHERTYPENAME>` +
     (v.voucherNumber ? `<VOUCHERNUMBER>${escapeXml(String(v.voucherNumber))}</VOUCHERNUMBER>` : '') +
