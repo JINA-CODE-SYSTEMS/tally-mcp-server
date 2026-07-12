@@ -6,7 +6,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import { cacheTable, executeSQL, validateSQL } from './database.mjs';
 import { handlePull, handlePush, jsonToTSV, pingTally, postTallyXML, pushXml, resolveGSTLedgers } from './tally.mjs';
-import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, voucherBalance, isDateInOpenPeriod, findMissingMasters, referencedLedgers, decodeXmlEntities, escapeXml, type VoucherEntry, type VoucherInput } from './voucher.mjs';
+import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, voucherBalance, isDateInOpenPeriod, findMissingMasters, referencedLedgers, decodeXmlEntities, escapeXml, xmlName, type VoucherEntry, type VoucherInput } from './voucher.mjs';
 import type { ModelPushResponse } from './models.mjs';
 import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
 
@@ -1233,19 +1233,44 @@ async function fetchVoucherExportBlock(masterId: string, voucherType: string, vo
 
 // Turn an exported <VOUCHER>…</VOUCHER> block into a delete-import: force ACTION="Delete" on the tag and
 // wrap it in the Vouchers import envelope. Tally matches on the block's own REMOTEID/VCHKEY. Pure/testable.
-export function blockToDeleteImport(block: string, company?: string): string {
-  const openTag = (block.match(/<VOUCHER\b[^>]*>/) || ['<VOUCHER>'])[0];
-  const newOpen = /\bACTION="[^"]*"/i.test(openTag)
-    ? openTag.replace(/\bACTION="[^"]*"/i, 'ACTION="Delete"')
-    : openTag.replace(/^<VOUCHER\b/, '<VOUCHER ACTION="Delete"');
-  const delBlock = block.replace(openTag, newOpen);
+function wrapVoucherImport(inner: string, company?: string): string {
   const svCompany = company ? `<SVCURRENTCOMPANY>${escapeXml(company)}</SVCURRENTCOMPANY>` : '';
   return `<?xml version="1.0" encoding="utf-8"?>` +
     `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>` +
     `<BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME>` +
     `<STATICVARIABLES>${svCompany}</STATICVARIABLES></REQUESTDESC>` +
-    `<REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF">${delBlock}</TALLYMESSAGE></REQUESTDATA>` +
+    `<REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF">${inner}</TALLYMESSAGE></REQUESTDATA>` +
     `</IMPORTDATA></BODY></ENVELOPE>`;
+}
+const setDeleteAction = (block: string): string => {
+  const openTag = (block.match(/<VOUCHER\b[^>]*>/) || ['<VOUCHER>'])[0];
+  const newOpen = /\bACTION="[^"]*"/i.test(openTag)
+    ? openTag.replace(/\bACTION="[^"]*"/i, 'ACTION="Delete"')
+    : openTag.replace(/^<VOUCHER\b/, '<VOUCHER ACTION="Delete"');
+  return block.replace(openTag, newOpen);
+};
+
+// Different TallyPrime builds accept a voucher DELETE keyed differently, and every minimal form we tried
+// on the ALG build was rejected (MASTERID/GUID → "unnamed object"; REMOTEID → "does not exist"). Rather
+// than keep guessing one form per redeploy, build the candidate delete envelopes from the voucher's own
+// export block and let the tool try them in order until one returns deleted>=1 — self-healing across
+// builds. Ordered most-to-least likely (dropping REMOTEID first, since it makes Tally attempt a
+// synced-object match that fails for locally-created vouchers). All variants key on THIS voucher's own
+// block/keys, so none can touch a duplicate. Pure/testable.
+export function buildDeleteVariants(block: string, voucherType: string, voucherNumber: string | undefined, isoDate: string | undefined, company?: string): Array<{ name: string; xml: string }> {
+  const tallyDate = (isoDate || '').replace(/-/g, '');
+  const openTag = (block.match(/<VOUCHER\b[^>]*>/) || ['<VOUCHER>'])[0];
+  const remoteId = (openTag.match(/\bREMOTEID="([^"]*)"/) || [])[1] || '';
+  const vchKey = (openTag.match(/\bVCHKEY="([^"]*)"/) || [])[1] || '';
+  const blockNoRemote = block.replace(openTag, openTag.replace(/\s*REMOTEID="[^"]*"/i, ''));
+  const kids = `${tallyDate ? `<DATE>${tallyDate}</DATE>` : ''}<VOUCHERTYPENAME>${xmlName(voucherType)}</VOUCHERTYPENAME>${voucherNumber ? `<VOUCHERNUMBER>${escapeXml(voucherNumber)}</VOUCHERNUMBER>` : ''}`;
+  const minimal = (attrs: string) => `<VOUCHER${attrs} VCHTYPE="${xmlName(voucherType)}" ACTION="Delete">${kids}</VOUCHER>`;
+  const out: Array<{ name: string; xml: string }> = [];
+  out.push({ name: 'block-minus-remoteid', xml: wrapVoucherImport(setDeleteAction(blockNoRemote), company) });
+  if (vchKey) out.push({ name: 'vchkey-only', xml: wrapVoucherImport(minimal(` VCHKEY="${escapeXml(vchKey)}"`), company) });
+  out.push({ name: 'block-verbatim', xml: wrapVoucherImport(setDeleteAction(block), company) });
+  if (remoteId) out.push({ name: 'remoteid-only', xml: wrapVoucherImport(minimal(` REMOTEID="${escapeXml(remoteId)}"`), company) });
+  return out;
 }
 
 // Normalize a located voucher's date (a parsed Date from the pull layer, or a string) to YYYY-MM-DD
@@ -3837,20 +3862,26 @@ export async function registerMcpServer(): Promise<McpServer> {
         const n = ex.candidates?.length ?? 0;
         return errorResult('PRECONDITION_FAILED', { message: `Could not isolate the export block for master_id ${masterId} (${located.voucher_type} #${voucherNumber ?? '?'} on ${isoDate ?? '?'}); ${n} candidate block(s) by number/type. Nothing was deleted.${n ? ' Candidate tags: ' + ex.candidates!.join(' || ') : ''}`, retryable: false });
       }
-      // Re-import the voucher's own block with ACTION="Delete" — Tally matches on its embedded keys.
-      const xml = blockToDeleteImport(ex.block, company);
-      const resp = await pushXml(xml);
-      const result = interpretDeleteResponse(resp, masterId);
-      if (result.status === 'created_instead') {
-        auditLog('delete-voucher', args, 'error', Date.now() - start);
-        return errorResult('PRECONDITION_FAILED', { message: `Refusing to report success: the delete import made Tally CREATE ${result.created} voucher(s) rather than delete master_id ${masterId}. The voucher was NOT deleted — check the Day Book.`, retryable: false });
+      // Try the candidate delete forms (all keyed on THIS voucher's own block) until one takes. A failed
+      // form is a no-op; the first that returns deleted>=1 wins. Stop immediately if any form makes Tally
+      // CREATE a voucher (should never happen for a delete) rather than risk junk rows.
+      const variants = buildDeleteVariants(ex.block, String(located.voucher_type), voucherNumber, isoDate, company);
+      const attempts: Array<{ form: string; deleted: number; created: number; error?: string }> = [];
+      for (const v of variants) {
+        const resp = await pushXml(v.xml);
+        attempts.push({ form: v.name, deleted: resp.deleted, created: resp.created, error: resp.error ? String(resp.error).slice(0, 140) : undefined });
+        if (resp.created > 0) {
+          auditLog('delete-voucher', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `Aborted: delete form "${v.name}" made Tally CREATE ${resp.created} voucher(s) instead of deleting master_id ${masterId}. Check the Day Book. Attempts: ${JSON.stringify(attempts)}`, retryable: false });
+        }
+        if (interpretDeleteResponse(resp, masterId).status === 'deleted') {
+          auditLog('delete-voucher', args, 'success', Date.now() - start);
+          return { content: [{ type: 'text', text: JSON.stringify({ success: true, deleted: resp.deleted, deleteForm: v.name, masterId, voucher: preview }) }] };
+        }
       }
-      if (result.status === 'failed') {
-        auditLog('delete-voucher', args, 'error', Date.now() - start);
-        return errorResult('PRECONDITION_FAILED', { message: result.message, retryable: false });
-      }
-      auditLog('delete-voucher', args, 'success', Date.now() - start);
-      return { content: [{ type: 'text', text: JSON.stringify({ success: true, deleted: result.deleted, masterId, voucher: preview }) }] };
+      // None worked — surface every form's raw counters so we can see exactly what this build rejects.
+      auditLog('delete-voucher', args, 'error', Date.now() - start);
+      return errorResult('PRECONDITION_FAILED', { message: `No delete form was accepted for master_id ${masterId} (${located.voucher_type} #${voucherNumber ?? '?'}). Nothing was deleted. Per-form results: ${JSON.stringify(attempts)}`, retryable: false });
     }
   );
 
