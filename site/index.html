@@ -10,204 +10,438 @@
   <meta property="og:title" content="Claudally — Drive Tally Prime with Claude">
   <meta property="og:description" content="Open-source Tally Prime ↔ MCP server. Talk to your books in plain language from any MCP client.">
   <meta property="og:url" content="https://claudally.jinacode.systems">
-  <meta name="theme-color" content="#F5620A">
+  <meta name="theme-color" content="#0A0705">
 
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='112' fill='%23F5620A'/%3E%3Cpath d='M256 106Q280 200 374 224Q280 248 256 342Q232 248 138 224Q232 200 256 106Z' fill='white'/%3E%3C/svg%3E">
 
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+
+  <script>document.documentElement.className += ' js';</script>
+
   <style>
     :root {
-      --orange-1: #FF9A2E;
-      --orange-2: #F5620A;
-      --ink: #1c1917;
-      --muted: #6b6560;
-      --bg: #fbf7f2;
-      --card: #ffffff;
-      --border: #efe7dc;
-      --code-bg: #1c1613;
-      --code-ink: #f5e9dd;
+      --bg: #0A0705;
+      --bg2: #0D0A07;
+      --card: #14100C;
+      --ink: #F5EFE8;
+      --muted: #A29A91;
+      --line: rgba(245,239,232,.09);
+      --o1: #FF9A2E;
+      --o2: #F5620A;
+      --num: #7FD39A;
+      --font-d: "Space Grotesk", -apple-system, sans-serif;
+      --font-b: "Inter", -apple-system, sans-serif;
+      --font-m: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+      --ease: cubic-bezier(.16, 1, .3, 1);
+      color-scheme: dark;
     }
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --ink: #f5efe8;
-        --muted: #a49c94;
-        --bg: #14100d;
-        --card: #1e1813;
-        --border: #2c2419;
-        --code-bg: #0d0a08;
-        --code-ink: #f5e9dd;
-      }
-    }
-    * { box-sizing: border-box; }
+    * { box-sizing: border-box; margin: 0; }
     html { scroll-behavior: smooth; }
     body {
-      margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      color: var(--ink);
       background: var(--bg);
-      line-height: 1.6;
+      color: var(--ink);
+      font-family: var(--font-b);
+      font-size: 16px;
+      line-height: 1.65;
       -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
     }
+    ::selection { background: var(--o2); color: #0A0705; }
     a { color: inherit; }
-    .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
-    .brand-grad { background: linear-gradient(135deg, var(--orange-1), var(--orange-2)); }
-
-    /* Header */
-    header {
-      position: sticky; top: 0; z-index: 20;
-      backdrop-filter: saturate(180%) blur(12px);
-      background: color-mix(in srgb, var(--bg) 82%, transparent);
-      border-bottom: 1px solid var(--border);
-    }
-    .nav { display: flex; align-items: center; justify-content: space-between; height: 64px; }
-    .nav-brand { display: flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: -.01em; text-decoration: none; }
-    .nav-brand .tile { width: 30px; height: 30px; border-radius: 8px; }
-    .nav-links { display: flex; align-items: center; gap: 22px; font-size: 15px; }
-    .nav-links a { text-decoration: none; color: var(--muted); font-weight: 500; transition: color .15s; }
-    .nav-links a:hover { color: var(--ink); }
-    .nav-links a.ghbtn { color: var(--ink); }
-    @media (max-width: 620px) { .nav-links .hide-sm { display: none; } }
-
-    /* Buttons */
-    .btn {
-      display: inline-flex; align-items: center; gap: 8px;
-      font-weight: 600; font-size: 15px; text-decoration: none;
-      padding: 12px 22px; border-radius: 12px; border: 1px solid transparent;
-      transition: transform .12s ease, box-shadow .12s ease, background .12s;
-    }
-    .btn:active { transform: translateY(1px); }
-    .btn-primary { color: #fff; box-shadow: 0 6px 20px -6px rgba(245,98,10,.6); }
-    .btn-primary:hover { box-shadow: 0 10px 28px -8px rgba(245,98,10,.75); }
-    .btn-ghost { background: var(--card); border-color: var(--border); color: var(--ink); }
-    .btn-ghost:hover { border-color: color-mix(in srgb, var(--orange-2) 45%, var(--border)); }
-
-    /* Hero */
-    .hero { text-align: center; padding: 80px 0 48px; }
-    .hero .logo { width: 96px; height: 96px; border-radius: 26px; box-shadow: 0 20px 50px -18px rgba(245,98,10,.6); }
-    .hero h1 { font-size: clamp(40px, 7vw, 68px); line-height: 1.02; letter-spacing: -.035em; margin: 26px 0 6px; }
-    .hero .tag {
-      display: inline-block; font-size: clamp(19px, 3vw, 24px); font-weight: 600;
-      background: linear-gradient(135deg, var(--orange-1), var(--orange-2));
+    :focus-visible { outline: 2px solid var(--o1); outline-offset: 3px; border-radius: 4px; }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 0 28px; }
+    .grad-text {
+      background: linear-gradient(120deg, var(--o1), var(--o2));
       -webkit-background-clip: text; background-clip: text; color: transparent;
-      margin: 0 0 18px;
     }
-    .hero p.lede { max-width: 640px; margin: 0 auto 32px; font-size: 18px; color: var(--muted); }
-    .cta { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
-    .byline { margin-top: 34px; font-size: 14px; color: var(--muted); }
-    .byline strong { color: var(--ink); }
-    .tested { margin: 14px 0 0; font-size: 13.5px; color: var(--muted); }
-    .tested strong { color: var(--orange-2); font-weight: 600; }
-    .badges { margin-top: 18px; display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+    .brand-grad { background: linear-gradient(135deg, var(--o1), var(--o2)); }
+
+    /* ---------- WebGL canvas + ambience ---------- */
+    #gl {
+      position: fixed; inset: 0; width: 100%; height: 100%;
+      z-index: 0; pointer-events: none; display: block;
+    }
+    .hero-glow {
+      position: fixed; inset: 0; z-index: 0; pointer-events: none;
+      background:
+        radial-gradient(52% 42% at 50% 78%, rgba(245,98,10,.13), transparent 70%),
+        radial-gradient(60% 40% at 50% -10%, rgba(255,154,46,.06), transparent 70%);
+    }
+    .grain {
+      position: fixed; inset: 0; z-index: 60; pointer-events: none; opacity: .05;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    }
+    .page { position: relative; z-index: 1; }
+
+    /* ---------- Preloader ---------- */
+    #preloader {
+      position: fixed; inset: 0; z-index: 100; display: none;
+      background: var(--bg);
+      align-items: center; justify-content: center; flex-direction: column; gap: 26px;
+      transition: transform .85s cubic-bezier(.76, 0, .24, 1);
+    }
+    .js #preloader { display: flex; }
+    #preloader.done { transform: translateY(-101%); }
+    #preloader svg { width: 58px; height: 58px; animation: pulse 1.6s ease-in-out infinite; }
+    @keyframes pulse { 50% { transform: scale(1.12); opacity: .82; } }
+    #pre-num {
+      font-family: var(--font-m); font-size: 13px; letter-spacing: .3em;
+      color: var(--muted);
+    }
+
+    /* ---------- Cursor ---------- */
+    .cur-dot, .cur-ring {
+      position: fixed; top: 0; left: 0; z-index: 110; pointer-events: none;
+      border-radius: 50%; mix-blend-mode: difference; display: none;
+    }
+    .cur-dot { width: 7px; height: 7px; background: #fff; margin: -3.5px 0 0 -3.5px; }
+    .cur-ring {
+      width: 34px; height: 34px; border: 1.5px solid #fff; margin: -17px 0 0 -17px;
+      transition: width .3s var(--ease), height .3s var(--ease), margin .3s var(--ease), opacity .3s;
+    }
+    .cur-ring.on { width: 58px; height: 58px; margin: -29px 0 0 -29px; opacity: .7; }
+    @media (hover: hover) and (pointer: fine) {
+      .has-cursor .cur-dot, .has-cursor .cur-ring { display: block; }
+      .has-cursor, .has-cursor a, .has-cursor button { cursor: none; }
+    }
+
+    /* ---------- Progress bar ---------- */
+    #progress {
+      position: fixed; top: 0; left: 0; right: 0; height: 2px; z-index: 55;
+      background: linear-gradient(90deg, var(--o1), var(--o2));
+      transform: scaleX(0); transform-origin: 0 50%;
+    }
+
+    /* ---------- Nav ---------- */
+    #nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 50;
+      transition: background .4s, border-color .4s, backdrop-filter .4s;
+      border-bottom: 1px solid transparent;
+    }
+    #nav.scrolled {
+      background: rgba(10,7,5,.72);
+      -webkit-backdrop-filter: saturate(160%) blur(14px);
+      backdrop-filter: saturate(160%) blur(14px);
+      border-bottom-color: var(--line);
+    }
+    .nav-in { display: flex; align-items: center; justify-content: space-between; height: 68px; }
+    .nav-brand {
+      display: flex; align-items: center; gap: 11px; text-decoration: none;
+      font-family: var(--font-d); font-weight: 700; font-size: 17px; letter-spacing: -.01em;
+    }
+    .nav-brand .tile { width: 30px; height: 30px; border-radius: 8px; }
+    .nav-links { display: flex; align-items: center; gap: 26px; }
+    .nav-links a {
+      text-decoration: none; color: var(--muted); font-size: 14px; font-weight: 500;
+      transition: color .2s;
+    }
+    .nav-links a:hover { color: var(--ink); }
+    .nav-links a.gh {
+      color: var(--ink); border: 1px solid var(--line); border-radius: 999px;
+      padding: 8px 16px; display: inline-flex; align-items: center; gap: 8px;
+      transition: border-color .2s, background .2s;
+    }
+    .nav-links a.gh:hover { border-color: rgba(245,98,10,.55); background: rgba(245,98,10,.08); }
+    @media (max-width: 680px) { .nav-links .hide-sm { display: none; } }
+
+    /* ---------- Buttons ---------- */
+    .btn {
+      display: inline-flex; align-items: center; gap: 9px;
+      font-family: var(--font-d); font-weight: 600; font-size: 15px; text-decoration: none;
+      padding: 15px 28px; border-radius: 999px; border: 1px solid transparent;
+      transition: box-shadow .3s, border-color .2s, background .2s, transform .35s var(--ease);
+      will-change: transform;
+    }
+    .btn-primary {
+      color: #fff;
+      box-shadow: 0 8px 32px -8px rgba(245,98,10,.55), inset 0 1px 0 rgba(255,255,255,.22);
+    }
+    .btn-primary:hover { box-shadow: 0 14px 44px -10px rgba(245,98,10,.85), inset 0 1px 0 rgba(255,255,255,.22); }
+    .btn-ghost { border-color: var(--line); color: var(--ink); background: rgba(245,239,232,.02); }
+    .btn-ghost:hover { border-color: rgba(245,98,10,.5); background: rgba(245,98,10,.07); }
+
+    /* ---------- Hero ---------- */
+    .hero {
+      position: relative; min-height: 100vh; min-height: 100svh;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      text-align: center; padding: 110px 28px 90px;
+    }
+    .eyebrow {
+      font-family: var(--font-m); font-size: 12px; font-weight: 500;
+      letter-spacing: .22em; text-transform: uppercase; color: var(--muted);
+    }
+    .eyebrow .o { color: var(--o1); }
+    .hero .eyebrow { margin-bottom: 30px; }
+    .hero-title {
+      font-family: var(--font-d); font-weight: 700;
+      font-size: clamp(50px, 9.2vw, 126px);
+      line-height: .98; letter-spacing: -.045em;
+    }
+    .hero-line { display: block; overflow: hidden; padding: 0 .06em .05em; }
+    .hero-line .inner { display: inline-block; will-change: transform; }
+    .js .hero-line .inner { transform: translateY(118%); transition: transform 1.25s var(--ease); }
+    .js.ready .hero-line:nth-child(1) .inner { transition-delay: .12s; transform: none; }
+    .js.ready .hero-line:nth-child(2) .inner { transition-delay: .24s; transform: none; }
+    .hero .lede {
+      max-width: 620px; margin: 34px auto 40px; color: var(--muted);
+      font-size: clamp(16px, 2vw, 19px);
+    }
+    .cta { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+    .badges { margin-top: 44px; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
     .pill {
-      font-size: 12.5px; font-weight: 600; padding: 5px 12px; border-radius: 999px;
-      background: var(--card); border: 1px solid var(--border); color: var(--muted);
+      font-family: var(--font-m); font-size: 12px; color: var(--muted);
+      padding: 7px 15px; border-radius: 999px; border: 1px solid var(--line);
+      background: rgba(20,16,12,.5);
     }
+    .tested { margin-top: 20px; font-size: 13.5px; color: var(--muted); }
+    .tested strong { color: var(--o1); font-weight: 600; }
+    .byline { margin-top: 10px; font-size: 13px; color: var(--muted); opacity: .8; }
+    .byline strong { color: var(--ink); font-weight: 600; }
 
-    /* Terminal mock */
-    .demo { max-width: 720px; margin: 56px auto 0; }
+    .js .stage { opacity: 0; transform: translateY(28px); }
+    .js .stage { transition: opacity 1s ease, transform 1.1s var(--ease); }
+    .js.ready .stage { opacity: 1; transform: none; }
+    .js.ready .stage-1 { transition-delay: .05s; }
+    .js.ready .stage-2 { transition-delay: .42s; }
+    .js.ready .stage-3 { transition-delay: .52s; }
+    .js.ready .stage-4 { transition-delay: .62s; }
+    .js.ready .stage-5 { transition-delay: .72s; }
+
+    .scroll-hint {
+      position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%);
+      display: flex; flex-direction: column; align-items: center; gap: 12px;
+      font-family: var(--font-m); font-size: 10px; letter-spacing: .34em; color: var(--muted);
+    }
+    .scroll-hint .rail {
+      width: 1px; height: 44px; background: var(--line); position: relative; overflow: hidden;
+    }
+    .scroll-hint .rail::after {
+      content: ""; position: absolute; left: 0; top: -40%; width: 100%; height: 40%;
+      background: linear-gradient(var(--o1), var(--o2));
+      animation: drop 1.9s var(--ease) infinite;
+    }
+    @keyframes drop { to { top: 110%; } }
+
+    /* ---------- Marquee ---------- */
+    .marquee {
+      border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
+      padding: 30px 0; overflow: hidden; position: relative;
+    }
+    .mq-track { display: flex; width: max-content; animation: mq 36s linear infinite; }
+    .mq-set { display: flex; align-items: center; gap: 52px; padding-right: 52px; }
+    .mq-set .w {
+      font-family: var(--font-d); font-weight: 600; font-size: clamp(30px, 4.4vw, 52px);
+      line-height: 1; white-space: nowrap; letter-spacing: .005em;
+      color: transparent; -webkit-text-stroke: 1px rgba(245,239,232,.3);
+    }
+    .mq-set .s { color: var(--o2); font-size: clamp(15px, 2vw, 24px); }
+    @keyframes mq { to { transform: translateX(-50%); } }
+
+    /* ---------- Sections ---------- */
+    section.block { padding: 130px 0; position: relative; }
+    .sec-head { max-width: 780px; margin-bottom: 64px; }
+    .sec-head .eyebrow { margin-bottom: 18px; }
+    h2.sec {
+      font-family: var(--font-d); font-weight: 600; letter-spacing: -.03em;
+      font-size: clamp(34px, 5vw, 58px); line-height: 1.06;
+    }
+    p.sub { color: var(--muted); font-size: 17px; max-width: 600px; margin-top: 18px; }
+
+    .js [data-reveal] {
+      opacity: 0; transform: translateY(44px);
+      transition: opacity .9s ease calc(var(--d, 0) * 1ms), transform 1.05s var(--ease) calc(var(--d, 0) * 1ms);
+    }
+    .js [data-reveal].in { opacity: 1; transform: none; }
+
+    /* ---------- Terminal demo ---------- */
+    .demo { padding: 40px 0 120px; perspective: 1400px; }
     .term {
-      background: var(--code-bg); border-radius: 16px; overflow: hidden;
-      box-shadow: 0 30px 70px -30px rgba(0,0,0,.5); border: 1px solid rgba(255,255,255,.06);
+      max-width: 780px; margin: 0 auto;
+      background: rgba(13,10,7,.88); border: 1px solid rgba(245,239,232,.1);
+      border-radius: 18px; overflow: hidden;
+      -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+      box-shadow: 0 40px 90px -35px rgba(0,0,0,.85), 0 24px 90px -40px rgba(245,98,10,.28);
+      transform-style: preserve-3d; will-change: transform;
+      transition: transform .25s ease-out;
     }
-    .term-bar { display: flex; align-items: center; gap: 7px; padding: 13px 16px; border-bottom: 1px solid rgba(255,255,255,.07); }
+    .term-bar {
+      display: flex; align-items: center; gap: 8px; padding: 15px 18px;
+      border-bottom: 1px solid rgba(245,239,232,.07);
+    }
     .dot { width: 11px; height: 11px; border-radius: 50%; }
-    .term-title { margin-left: 10px; color: #9a8f84; font-size: 12.5px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .term-body { padding: 22px 22px 26px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px; color: var(--code-ink); }
-    .term-body .you { color: #ffb765; }
-    .term-body .ai { color: #e9ddce; }
-    .term-body .muted2 { color: #8a7f74; }
-    .term-body .num { color: #7fd39a; }
-    .term-body p { margin: 0 0 14px; }
+    .term-title { margin-left: 10px; color: #8a7f74; font-size: 12px; font-family: var(--font-m); }
+    .term-body {
+      padding: 26px 26px 30px; min-height: 232px;
+      font-family: var(--font-m); font-size: 13.5px; line-height: 1.75; color: #EFE4D6;
+      text-align: left;
+    }
+    .term-body p { margin: 0 0 15px; }
     .term-body p:last-child { margin-bottom: 0; }
+    .t-tag { color: var(--o1); font-weight: 500; }
+    .t-tag.ai { color: #c9bfb2; }
+    .term-body .dim { color: #8a7f74; }
+    .term-body .num { color: var(--num); font-weight: 500; font-style: normal; }
+    .caret {
+      display: inline-block; width: 8px; height: 15px; margin-left: 3px;
+      background: var(--o1); vertical-align: -2px; animation: blink 1s steps(2) infinite;
+    }
+    @keyframes blink { 50% { opacity: 0; } }
 
-    /* Section shell */
-    section.block { padding: 72px 0; }
-    .eyebrow { text-align: center; font-size: 13px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--orange-2); margin: 0 0 10px; }
-    h2.sec { text-align: center; font-size: clamp(28px, 4.5vw, 40px); letter-spacing: -.03em; margin: 0 0 14px; }
-    p.sub { text-align: center; color: var(--muted); max-width: 620px; margin: 0 auto 48px; font-size: 17px; }
-
-    /* Feature grid */
-    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
-    @media (max-width: 860px) { .grid { grid-template-columns: repeat(2, 1fr); } }
-    @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+    /* ---------- Feature cards ---------- */
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+    @media (max-width: 940px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
     .card {
-      background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 26px;
-      transition: transform .15s ease, border-color .15s;
+      position: relative; overflow: hidden;
+      background: var(--card); border: 1px solid var(--line); border-radius: 18px;
+      padding: 30px 28px;
+      transition: transform .45s var(--ease), border-color .3s;
     }
-    .card:hover { transform: translateY(-3px); border-color: color-mix(in srgb, var(--orange-2) 35%, var(--border)); }
-    .card .ico { width: 42px; height: 42px; border-radius: 11px; display: grid; place-items: center; margin-bottom: 16px; }
+    .card::before {
+      content: ""; position: absolute; inset: 0; pointer-events: none; opacity: 0;
+      background: radial-gradient(240px circle at var(--mx, 50%) var(--my, 50%), rgba(255,122,26,.13), transparent 65%);
+      transition: opacity .4s;
+    }
+    .card:hover { transform: translateY(-5px); border-color: rgba(245,98,10,.4); }
+    .card:hover::before { opacity: 1; }
+    .card .ico {
+      width: 44px; height: 44px; border-radius: 12px;
+      display: grid; place-items: center; margin-bottom: 20px;
+      box-shadow: 0 10px 26px -10px rgba(245,98,10,.65);
+    }
     .card .ico svg { width: 22px; height: 22px; stroke: #fff; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-    .card h3 { margin: 0 0 7px; font-size: 18px; letter-spacing: -.01em; }
-    .card p { margin: 0; color: var(--muted); font-size: 15px; }
+    .card h3 { font-family: var(--font-d); font-size: 18px; font-weight: 600; letter-spacing: -.01em; margin-bottom: 8px; }
+    .card p { color: var(--muted); font-size: 14.5px; }
 
-    /* Steps */
-    .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; counter-reset: step; }
-    @media (max-width: 760px) { .steps { grid-template-columns: 1fr; } }
-    .step { position: relative; padding-left: 4px; }
-    .step .n {
-      width: 40px; height: 40px; border-radius: 11px; color: #fff; font-weight: 700; font-size: 18px;
-      display: grid; place-items: center; margin-bottom: 16px;
+    /* ---------- Steps ---------- */
+    .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 44px; }
+    @media (max-width: 780px) { .steps { grid-template-columns: 1fr; gap: 52px; } }
+    .step .ghost {
+      font-family: var(--font-d); font-weight: 700; font-size: 92px; line-height: 1;
+      color: transparent; -webkit-text-stroke: 1.5px rgba(245,98,10,.55);
+      margin-bottom: 18px;
     }
-    .step h3 { margin: 0 0 7px; font-size: 19px; letter-spacing: -.01em; }
-    .step p { margin: 0; color: var(--muted); font-size: 15px; }
-    .step code { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 1px 6px; font-size: 13px; }
+    .step h3 { font-family: var(--font-d); font-size: 20px; font-weight: 600; letter-spacing: -.01em; margin-bottom: 9px; }
+    .step p { color: var(--muted); font-size: 15px; }
+    .step code {
+      font-family: var(--font-m); font-size: 12.5px; color: var(--ink);
+      background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 2px 7px;
+    }
 
-    /* Plugin card */
+    /* ---------- Plugin ---------- */
     .plugin-card {
-      display: flex; align-items: center; gap: 40px;
-      background: var(--card); border: 1px solid var(--border); border-radius: 22px;
-      padding: 44px; position: relative; overflow: hidden;
+      display: flex; align-items: center; gap: 48px; position: relative; overflow: hidden;
+      background: var(--card); border: 1px solid var(--line); border-radius: 26px; padding: 54px;
     }
     .plugin-card::before {
       content: ""; position: absolute; inset: 0; pointer-events: none;
-      background: radial-gradient(120% 140% at 100% 0%, color-mix(in srgb, var(--orange-2) 12%, transparent), transparent 55%);
+      background: radial-gradient(110% 130% at 100% 0%, rgba(245,98,10,.16), transparent 55%);
     }
     .plugin-body { position: relative; flex: 1; }
-    .plugin-badge { width: 128px; height: 128px; border-radius: 30px; flex-shrink: 0; display: grid; place-items: center; box-shadow: 0 20px 44px -18px rgba(245,98,10,.6); position: relative; }
-    .plugin-badge svg { width: 60px; height: 60px; }
-    @media (max-width: 720px) { .plugin-card { flex-direction: column-reverse; align-items: flex-start; padding: 32px; gap: 26px; } }
-
-    /* Trust band */
-    .band { background: var(--card); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
-    .band .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 30px; }
-    @media (max-width: 760px) { .band .grid3 { grid-template-columns: 1fr; text-align: center; } }
-    .trust h3 { margin: 0 0 6px; font-size: 17px; }
-    .trust p { margin: 0; color: var(--muted); font-size: 15px; }
-    .trust .k { color: var(--orange-2); font-weight: 700; }
-
-    /* Install */
-    .install { max-width: 720px; margin: 0 auto; }
-    pre.code {
-      background: var(--code-bg); color: var(--code-ink); border-radius: 14px; padding: 22px 24px;
-      overflow-x: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px; line-height: 1.7;
-      border: 1px solid rgba(255,255,255,.06);
+    .plugin-body h2 { font-family: var(--font-d); font-weight: 600; letter-spacing: -.025em; font-size: clamp(26px, 3.6vw, 38px); margin-bottom: 14px; }
+    .plugin-body > p { color: var(--muted); font-size: 16.5px; max-width: 54ch; margin-bottom: 26px; }
+    .plugin-note { color: var(--muted); font-size: 13.5px; margin-top: 22px; max-width: 54ch; }
+    .plugin-note strong { color: var(--ink); }
+    .plugin-badge {
+      width: 132px; height: 132px; border-radius: 32px; flex-shrink: 0;
+      display: grid; place-items: center; position: relative;
+      box-shadow: 0 24px 50px -18px rgba(245,98,10,.6);
+      animation: floaty 6s ease-in-out infinite alternate;
     }
-    pre.code .c { color: #8a7f74; }
-    pre.code .p { color: #ffb765; }
-    .install .note { text-align: center; margin-top: 22px; color: var(--muted); font-size: 15px; }
+    .plugin-badge svg { width: 62px; height: 62px; }
+    @keyframes floaty { to { transform: translateY(-14px) rotate(2deg); } }
+    @media (max-width: 760px) { .plugin-card { flex-direction: column-reverse; align-items: flex-start; padding: 36px 30px; gap: 30px; } }
 
-    /* Final CTA */
-    .finalcta { text-align: center; padding: 84px 0; }
-    .finalcta h2 { font-size: clamp(30px, 5vw, 46px); letter-spacing: -.03em; margin: 0 0 14px; }
-    .finalcta p { color: var(--muted); font-size: 18px; margin: 0 0 30px; }
+    /* ---------- Trust band ---------- */
+    .band { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--bg2); }
+    .band .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 44px; }
+    @media (max-width: 780px) { .band .grid3 { grid-template-columns: 1fr; } }
+    .trust h3 { font-family: var(--font-d); font-size: 24px; font-weight: 600; letter-spacing: -.02em; margin-bottom: 10px; }
+    .trust .k { color: var(--o1); }
+    .trust p { color: var(--muted); font-size: 15px; }
 
-    /* Footer */
-    footer { border-top: 1px solid var(--border); padding: 44px 0 60px; }
-    .foot { display: flex; align-items: flex-start; justify-content: space-between; gap: 30px; flex-wrap: wrap; }
-    .foot .brand { display: flex; align-items: center; gap: 11px; font-weight: 700; }
-    .foot .tile { width: 34px; height: 34px; border-radius: 9px; }
-    .foot .cols { display: flex; gap: 56px; flex-wrap: wrap; }
-    .foot .col h4 { margin: 0 0 12px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
-    .foot .col a { display: block; text-decoration: none; color: var(--ink); font-size: 15px; margin-bottom: 9px; opacity: .85; }
-    .foot .col a:hover { opacity: 1; color: var(--orange-2); }
-    .legal { margin-top: 40px; padding-top: 22px; border-top: 1px solid var(--border); color: var(--muted); font-size: 13.5px; }
+    /* ---------- Install ---------- */
+    .install { max-width: 780px; }
+    .install .term-body { min-height: 0; }
+    .copy-btn {
+      margin-left: auto; font-family: var(--font-m); font-size: 11.5px; letter-spacing: .06em;
+      color: var(--muted); background: rgba(245,239,232,.05); border: 1px solid var(--line);
+      border-radius: 7px; padding: 5px 12px; transition: color .2s, border-color .2s;
+    }
+    .copy-btn:hover { color: var(--ink); border-color: rgba(245,98,10,.5); }
+    pre { font-family: var(--font-m); overflow-x: auto; }
+    pre .c { color: #8a7f74; }
+    pre .p { color: var(--o1); }
+    .install-note { color: var(--muted); font-size: 14.5px; margin-top: 24px; }
+    .install-note a { color: var(--o1); text-decoration: none; }
+    .install-note a:hover { text-decoration: underline; }
+
+    /* ---------- Final CTA ---------- */
+    .finalcta { text-align: center; padding: 170px 28px; position: relative; overflow: hidden; }
+    .finalcta::before {
+      content: ""; position: absolute; left: 50%; top: 58%; transform: translate(-50%, -50%);
+      width: 760px; height: 760px; border-radius: 50%; pointer-events: none;
+      background: radial-gradient(circle, rgba(245,98,10,.17), transparent 62%);
+    }
+    .finalcta h2 {
+      position: relative; font-family: var(--font-d); font-weight: 700;
+      font-size: clamp(44px, 8vw, 100px); letter-spacing: -.04em; line-height: 1; margin-bottom: 22px;
+    }
+    .finalcta p { position: relative; color: var(--muted); font-size: 18px; margin-bottom: 40px; }
+    .finalcta .cta { position: relative; }
+
+    /* ---------- Footer ---------- */
+    footer { border-top: 1px solid var(--line); padding: 60px 0 70px; background: var(--bg2); }
+    .foot { display: flex; align-items: flex-start; justify-content: space-between; gap: 40px; flex-wrap: wrap; }
+    .foot .brand { display: flex; align-items: center; gap: 11px; font-family: var(--font-d); font-weight: 700; font-size: 17px; }
+    .foot .tile { width: 32px; height: 32px; border-radius: 9px; }
+    .foot .blurb { color: var(--muted); max-width: 320px; margin-top: 16px; font-size: 14px; }
+    .foot .cols { display: flex; gap: 70px; flex-wrap: wrap; }
+    .foot h4 {
+      font-family: var(--font-m); font-size: 11px; font-weight: 500; text-transform: uppercase;
+      letter-spacing: .18em; color: var(--muted); margin-bottom: 16px;
+    }
+    .foot .col a {
+      display: block; text-decoration: none; color: var(--ink); font-size: 14.5px;
+      margin-bottom: 10px; opacity: .85; transition: color .2s, opacity .2s;
+    }
+    .foot .col a:hover { opacity: 1; color: var(--o1); }
+    .legal {
+      margin-top: 48px; padding-top: 26px; border-top: 1px solid var(--line);
+      color: var(--muted); font-size: 13px;
+    }
     .legal a { color: var(--muted); }
+
+    /* ---------- Reduced motion ---------- */
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      .js [data-reveal], .js .stage, .js .hero-line .inner { opacity: 1; transform: none; transition: none; }
+      .mq-track, .scroll-hint .rail::after, .plugin-badge, #preloader svg, .caret { animation: none; }
+      .btn, .card, .term { transition: none; }
+    }
   </style>
 </head>
 <body>
 
-  <header>
-    <div class="wrap nav">
-      <a class="nav-brand" href="#top">
+  <div id="progress" aria-hidden="true"></div>
+
+  <div id="preloader" aria-hidden="true">
+    <svg viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+      <defs><linearGradient id="tpre" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FF9A2E"/><stop offset="1" stop-color="#F5620A"/></linearGradient></defs>
+      <path d="M256 40Q296 196 472 236Q296 276 256 432Q216 276 40 236Q216 196 256 40Z" fill="url(#tpre)"/>
+    </svg>
+    <span id="pre-num">000</span>
+  </div>
+
+  <canvas id="gl" aria-hidden="true"></canvas>
+  <div class="hero-glow" aria-hidden="true"></div>
+  <div class="grain" aria-hidden="true"></div>
+
+  <header id="nav">
+    <div class="wrap nav-in">
+      <a class="nav-brand" href="#top" data-hover>
         <svg class="tile" viewBox="0 0 512 512" aria-hidden="true">
           <defs><linearGradient id="tnav" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#FF9A2E"/><stop offset="1" stop-color="#F5620A"/></linearGradient></defs>
           <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#tnav)"/>
@@ -218,118 +452,139 @@
         </svg>
         Claudally
       </a>
-      <nav class="nav-links">
+      <nav class="nav-links" aria-label="Main">
         <a href="#features" class="hide-sm">Features</a>
         <a href="#how" class="hide-sm">How it works</a>
         <a href="#plugin" class="hide-sm">Plugin</a>
-        <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/README.md">Docs</a>
-        <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server" class="ghbtn">GitHub ↗</a>
+        <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/README.md" class="hide-sm">Docs</a>
+        <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server" class="gh">
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+          GitHub
+        </a>
       </nav>
     </div>
   </header>
 
   <a id="top"></a>
-  <main>
+  <main class="page">
 
     <!-- HERO -->
-    <section class="hero wrap">
-      <svg class="logo" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" aria-label="Claudally logo">
-        <defs>
-          <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0" stop-color="#FF9A2E"/><stop offset="1" stop-color="#F5620A"/>
-          </linearGradient>
-          <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0" stop-color="#fff" stop-opacity=".18"/><stop offset=".5" stop-color="#fff" stop-opacity="0"/>
-          </linearGradient>
-        </defs>
-        <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#tile)"/>
-        <rect x="16" y="16" width="480" height="240" rx="112" fill="url(#sheen)"/>
-        <path d="M256 106Q280 200 374 224Q280 248 256 342Q232 248 138 224Q232 200 256 106Z" fill="#fff"/>
-        <rect x="172" y="372" width="168" height="20" rx="10" fill="#fff" fill-opacity=".95"/>
-        <rect x="190" y="404" width="132" height="20" rx="10" fill="#fff" fill-opacity=".78"/>
-        <rect x="208" y="436" width="96" height="20" rx="10" fill="#fff" fill-opacity=".60"/>
-      </svg>
-
-      <h1>Claudally</h1>
-      <span class="tag">Drive Tally Prime with Claude</span>
-      <p class="lede">
-        An open-source Tally&nbsp;Prime&nbsp;ERP&nbsp;↔&nbsp;MCP server. Query financial reports, manage
-        masters, post vouchers, and analyse GST — in plain language, from Claude, ChatGPT, Copilot,
-        or any MCP client.
+    <section class="hero">
+      <p class="eyebrow stage stage-1"><span class="o">[</span> Claudally — open-source Tally Prime ↔ MCP server <span class="o">]</span></p>
+      <h1 class="hero-title" aria-label="Drive Tally Prime with Claude.">
+        <span class="hero-line" aria-hidden="true"><span class="inner">Drive Tally Prime</span></span>
+        <span class="hero-line" aria-hidden="true"><span class="inner">with <span class="grad-text">Claude.</span></span></span>
+      </h1>
+      <p class="lede stage stage-2">
+        Query financial reports, manage masters, post vouchers, and analyse GST — in plain
+        language, from Claude, ChatGPT, Copilot, or any MCP client. Open source, local-first.
       </p>
-
-      <div class="cta">
-        <a class="btn btn-primary brand-grad" href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/installer.md">Get started</a>
-        <a class="btn btn-ghost" href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server">
-          <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      <div class="cta stage stage-3">
+        <a class="btn btn-primary brand-grad magnetic" href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/installer.md">Get started</a>
+        <a class="btn btn-ghost magnetic" href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server">
+          <svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
           Star on GitHub
         </a>
       </div>
-
-      <div class="badges">
-        <span class="pill">🔒 Local-first &amp; self-hosted</span>
+      <div class="badges stage stage-4">
+        <span class="pill">🔒 local-first &amp; self-hosted</span>
         <span class="pill">⚖️ AGPL-3.0 open source</span>
         <span class="pill">🪟 5-minute Windows installer</span>
       </div>
-      <p class="tested">✓ Tested with Claude <strong>Opus&nbsp;4+</strong> and <strong>Sonnet&nbsp;5 (beta)</strong></p>
+      <p class="tested stage stage-5">✓ Tested with Claude <strong>Opus&nbsp;4+</strong> and <strong>Sonnet&nbsp;5&nbsp;(beta)</strong></p>
+      <p class="byline stage stage-5">by <strong>JINA CODE SYSTEMS LLP</strong></p>
 
-      <p class="byline">by <strong>JINA CODE SYSTEMS LLP</strong></p>
+      <div class="scroll-hint" aria-hidden="true">
+        <span>SCROLL</span>
+        <span class="rail"></span>
+      </div>
+    </section>
 
-      <!-- Terminal demo -->
-      <div class="demo">
-        <div class="term">
-          <div class="term-bar">
-            <span class="dot" style="background:#ff5f57"></span>
-            <span class="dot" style="background:#febc2e"></span>
-            <span class="dot" style="background:#28c840"></span>
-            <span class="term-title">Claude · Claudally</span>
-          </div>
-          <div class="term-body">
-            <p><span class="you">You&nbsp;›</span> What was my GST liability last quarter?</p>
-            <p><span class="ai">Claude&nbsp;›</span> <span class="muted2">reading GSTR-3B from Tally…</span><br>
-              Output tax <span class="num">₹4,12,860</span> − Input credit <span class="num">₹2,88,140</span>
-              = net payable <span class="num">₹1,24,720</span> for Jul–Sep.</p>
-            <p><span class="you">You&nbsp;›</span> Post a sales invoice to Acme Ltd for ₹50,000 + 18% GST.</p>
-            <p><span class="ai">Claude&nbsp;›</span> <span class="muted2">created voucher #1043</span> ✓ — taxable ₹50,000,
-              CGST ₹4,500, SGST ₹4,500, total <span class="num">₹59,000</span>.</p>
-          </div>
+    <!-- MARQUEE -->
+    <div class="marquee" aria-hidden="true">
+      <div class="mq-track">
+        <div class="mq-set">
+          <span class="w">Balance Sheet</span><span class="s">✦</span>
+          <span class="w">GSTR-1</span><span class="s">✦</span>
+          <span class="w">Vouchers</span><span class="s">✦</span>
+          <span class="w">Trial Balance</span><span class="s">✦</span>
+          <span class="w">Ledgers</span><span class="s">✦</span>
+          <span class="w">Stock Items</span><span class="s">✦</span>
+          <span class="w">GSTR-3B</span><span class="s">✦</span>
+          <span class="w">Profit &amp; Loss</span><span class="s">✦</span>
+          <span class="w">HSN Summary</span><span class="s">✦</span>
+          <span class="w">Outstanding Bills</span><span class="s">✦</span>
+        </div>
+        <div class="mq-set">
+          <span class="w">Balance Sheet</span><span class="s">✦</span>
+          <span class="w">GSTR-1</span><span class="s">✦</span>
+          <span class="w">Vouchers</span><span class="s">✦</span>
+          <span class="w">Trial Balance</span><span class="s">✦</span>
+          <span class="w">Ledgers</span><span class="s">✦</span>
+          <span class="w">Stock Items</span><span class="s">✦</span>
+          <span class="w">GSTR-3B</span><span class="s">✦</span>
+          <span class="w">Profit &amp; Loss</span><span class="s">✦</span>
+          <span class="w">HSN Summary</span><span class="s">✦</span>
+          <span class="w">Outstanding Bills</span><span class="s">✦</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- TERMINAL DEMO -->
+    <section class="demo wrap" id="demo">
+      <div class="term" id="term-tilt" data-reveal>
+        <div class="term-bar">
+          <span class="dot" style="background:#ff5f57"></span>
+          <span class="dot" style="background:#febc2e"></span>
+          <span class="dot" style="background:#28c840"></span>
+          <span class="term-title">Claude · Claudally</span>
+        </div>
+        <div class="term-body" id="term-body">
+          <p><span class="t-tag">You ›</span> What was my GST liability last quarter?</p>
+          <p><span class="t-tag ai">Claude ›</span> <span class="dim">reading GSTR-3B from Tally…</span><br>
+            Output tax <span class="num">₹4,12,860</span> − input credit <span class="num">₹2,88,140</span>
+            = net payable <span class="num">₹1,24,720</span> for Jul–Sep.</p>
+          <p><span class="t-tag">You ›</span> Post a sales invoice to Acme Ltd for ₹50,000 + 18% GST.</p>
+          <p><span class="t-tag ai">Claude ›</span> <span class="dim">created voucher #1043 ✓</span> — taxable
+            <span class="num">₹50,000</span>, CGST ₹4,500, SGST ₹4,500, total <span class="num">₹59,000</span>.</p>
         </div>
       </div>
     </section>
 
     <!-- FEATURES -->
     <section class="block wrap" id="features">
-      <p class="eyebrow">What it does</p>
-      <h2 class="sec">Your whole ledger, one conversation away</h2>
-      <p class="sub">Every Claudally tool maps to Tally's own XML API — deterministic, auditable, and safe to run on live books.</p>
-
+      <div class="sec-head" data-reveal>
+        <p class="eyebrow"><span class="o">01</span> — What it does</p>
+        <h2 class="sec">Your whole ledger,<br><span class="grad-text">one conversation away.</span></h2>
+        <p class="sub">Every Claudally tool maps to Tally's own XML API — deterministic, auditable, and safe to run on live books.</p>
+      </div>
       <div class="grid">
-        <div class="card">
+        <div class="card" data-reveal style="--d:0">
           <div class="ico brand-grad"><svg viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="M7 14l3-3 3 3 5-6"/></svg></div>
           <h3>Financial reports</h3>
           <p>Balance sheet, P&amp;L, trial balance, cash &amp; bank, outstanding bills — pulled live and explained in plain English.</p>
         </div>
-        <div class="card">
+        <div class="card" data-reveal style="--d:70">
           <div class="ico brand-grad"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg></div>
           <h3>GST returns</h3>
           <p>GSTR-1 / GSTR-3B summaries, HSN breakups, and per-voucher tax detail — reconciled straight from your data.</p>
         </div>
-        <div class="card">
+        <div class="card" data-reveal style="--d:140">
           <div class="ico brand-grad"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></div>
           <h3>Post vouchers</h3>
           <p>Sales, purchase, payment, receipt, journal — single or batch, with dry-run preview and reversible entries.</p>
         </div>
-        <div class="card">
+        <div class="card" data-reveal style="--d:0">
           <div class="ico brand-grad"><svg viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg></div>
           <h3>Manage masters</h3>
           <p>Create and configure ledgers, groups, and stock items — including GST-ready tax ledgers that populate returns.</p>
         </div>
-        <div class="card">
+        <div class="card" data-reveal style="--d:70">
           <div class="ico brand-grad"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-9-9"/><path d="M21 3v6h-6"/></svg></div>
           <h3>Multi-company</h3>
           <p>List, load, switch, and unlock protected companies — Silver or Gold edition — without restarting Tally.</p>
         </div>
-        <div class="card">
+        <div class="card" data-reveal style="--d:140">
           <div class="ico brand-grad"><svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
           <h3>Yours, privately</h3>
           <p>Runs on your machine or your server. Data never leaves your control. Optional Cloudflare Tunnel for remote access.</p>
@@ -339,23 +594,24 @@
 
     <!-- HOW IT WORKS -->
     <section class="block wrap" id="how">
-      <p class="eyebrow">How it works</p>
-      <h2 class="sec">Running in three steps</h2>
-      <p class="sub">From "nothing installed" to talking to your books in under five minutes.</p>
-
+      <div class="sec-head" data-reveal>
+        <p class="eyebrow"><span class="o">02</span> — How it works</p>
+        <h2 class="sec">Running in <span class="grad-text">three steps.</span></h2>
+        <p class="sub">From "nothing installed" to talking to your books in under five minutes.</p>
+      </div>
       <div class="steps">
-        <div class="step">
-          <div class="n brand-grad">1</div>
+        <div class="step" data-reveal style="--d:0">
+          <div class="ghost">01</div>
           <h3>Install the agent</h3>
           <p>Run the Windows installer on the PC with Tally Prime. It bundles Node.js, the service, and <code>cloudflared</code> — no dependencies to chase.</p>
         </div>
-        <div class="step">
-          <div class="n brand-grad">2</div>
+        <div class="step" data-reveal style="--d:90">
+          <div class="ghost">02</div>
           <h3>Connect your client</h3>
           <p>Add the server URL to Claude, ChatGPT, or Copilot as an MCP connector. OAuth handles auth; pick a company and you're live.</p>
         </div>
-        <div class="step">
-          <div class="n brand-grad">3</div>
+        <div class="step" data-reveal style="--d:180">
+          <div class="ghost">03</div>
           <h3>Just ask</h3>
           <p>"Show me overdue receivables." "File-ready GSTR-1 for June?" "Book this expense." Claudally does the rest — deterministically.</p>
         </div>
@@ -364,26 +620,24 @@
 
     <!-- CLAUDE PLUGIN -->
     <section class="block wrap" id="plugin">
-      <div class="plugin-card">
+      <div class="plugin-card" data-reveal>
         <div class="plugin-body">
-          <p class="eyebrow" style="text-align:left; margin-bottom:12px;">Claude plugin</p>
-          <h2 style="text-align:left; font-size:clamp(26px,4vw,34px); letter-spacing:-.03em; margin:0 0 12px;">
-            Tally&nbsp;Feeding — books that stay in your house style
-          </h2>
-          <p style="color:var(--muted); font-size:17px; margin:0 0 22px; max-width:52ch;">
+          <p class="eyebrow" style="margin-bottom:14px;"><span class="o">03</span> — Claude plugin</p>
+          <h2>Tally&nbsp;Feeding — books that stay in your house style</h2>
+          <p>
             An optional Claude plugin that profiles how your firm <em>actually</em> posts — numbering,
             narration style, ledger pairings — confirms it with you, then feeds ledgers, stock items,
             and GST / non-GST vouchers that match, consistently across sessions. Skill only: it drives
             Claudally, and your connection stays in your own settings.
           </p>
           <div class="cta" style="justify-content:flex-start;">
-            <a class="btn btn-primary brand-grad" href="tally-feeding.plugin" download>
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>
+            <a class="btn btn-primary brand-grad magnetic" href="tally-feeding.plugin" download>
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>
               Download plugin
             </a>
-            <a class="btn btn-ghost" href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server">View source</a>
+            <a class="btn btn-ghost magnetic" href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server">View source</a>
           </div>
-          <p style="color:var(--muted); font-size:14px; margin:20px 0 0;">
+          <p class="plugin-note">
             Install it in <strong>Claude Cowork</strong> (plugin install / marketplace), then connect a
             working folder for your client sheets. Requires the Claudally server connected as an MCP connector.
           </p>
@@ -400,15 +654,15 @@
     <section class="band">
       <div class="block wrap">
         <div class="grid3">
-          <div class="trust">
+          <div class="trust" data-reveal style="--d:0">
             <h3><span class="k">Local-first</span> by design</h3>
             <p>The server talks to Tally over localhost XML. Your financial data stays on your infrastructure — nothing is sent to a third party.</p>
           </div>
-          <div class="trust">
+          <div class="trust" data-reveal style="--d:90">
             <h3><span class="k">Deterministic</span> writes</h3>
             <p>Every voucher and master goes through Tally's native XML API, never GUI guessing — with read-only mode, audit logs, and dry-run.</p>
           </div>
-          <div class="trust">
+          <div class="trust" data-reveal style="--d:180">
             <h3><span class="k">Truly</span> open source</h3>
             <p>AGPL-3.0. Read the code, self-host it, fork it. No lock-in, no per-seat pricing, no black box between you and your ledger.</p>
           </div>
@@ -417,18 +671,31 @@
     </section>
 
     <!-- INSTALL -->
-    <section class="block wrap">
-      <p class="eyebrow">Quick start</p>
-      <h2 class="sec">Prefer the source?</h2>
-      <p class="sub">Clone and build in a few commands — or grab the one-click Windows installer for production.</p>
-      <div class="install">
-<pre class="code"><span class="c"># clone &amp; build</span>
+    <section class="block wrap" id="install">
+      <div class="sec-head" data-reveal>
+        <p class="eyebrow"><span class="o">04</span> — Quick start</p>
+        <h2 class="sec">Prefer the <span class="grad-text">source?</span></h2>
+        <p class="sub">Clone and build in a few commands — or grab the one-click Windows installer for production.</p>
+      </div>
+      <div class="install" data-reveal>
+        <div class="term">
+          <div class="term-bar">
+            <span class="dot" style="background:#ff5f57"></span>
+            <span class="dot" style="background:#febc2e"></span>
+            <span class="dot" style="background:#28c840"></span>
+            <span class="term-title">terminal — clone &amp; build</span>
+            <button class="copy-btn" id="copy-btn" data-hover>copy</button>
+          </div>
+          <div class="term-body">
+<pre id="install-code"><span class="c"># clone &amp; build</span>
 git clone https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server.git
 <span class="p">cd</span> tally-mcp-server
 npm install <span class="p">&amp;&amp;</span> npx tsc
 
 <span class="c"># then point your MCP client at the running server</span></pre>
-        <p class="note">
+          </div>
+        </div>
+        <p class="install-note">
           For production Windows boxes, use the <a href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/installer.md">installer</a>
           — portable Node, NSSM service, and Cloudflare Tunnel, all bundled.
         </p>
@@ -436,12 +703,12 @@ npm install <span class="p">&amp;&amp;</span> npx tsc
     </section>
 
     <!-- FINAL CTA -->
-    <section class="finalcta wrap">
-      <h2>Talk to your books.</h2>
-      <p>Free, open source, and running in minutes.</p>
-      <div class="cta">
-        <a class="btn btn-primary brand-grad" href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/installer.md">Get started</a>
-        <a class="btn btn-ghost" href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/README.md">Read the docs</a>
+    <section class="finalcta">
+      <h2 data-reveal>Talk to <span class="grad-text">your books.</span></h2>
+      <p data-reveal style="--d:80">Free, open source, and running in minutes.</p>
+      <div class="cta" data-reveal style="--d:160">
+        <a class="btn btn-primary brand-grad magnetic" href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/installer.md">Get started</a>
+        <a class="btn btn-ghost magnetic" href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/README.md">Read the docs</a>
       </div>
     </section>
 
@@ -462,9 +729,7 @@ npm install <span class="p">&amp;&amp;</span> npx tsc
             </svg>
             Claudally
           </div>
-          <p style="color:var(--muted); max-width:320px; margin:14px 0 0; font-size:14.5px;">
-            Claude + Tally. An open-source bridge between Tally Prime ERP and AI assistants.
-          </p>
+          <p class="blurb">Claude + Tally. An open-source bridge between Tally Prime ERP and AI assistants.</p>
         </div>
         <div class="cols">
           <div class="col">
@@ -492,6 +757,428 @@ npm install <span class="p">&amp;&amp;</span> npx tsc
       </div>
     </div>
   </footer>
+
+  <!-- UI interactions (no dependencies — must run even if the WebGL module fails) -->
+  <script>
+  (function () {
+    var doc = document.documentElement;
+    var reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    var fine = matchMedia('(hover: hover) and (pointer: fine)').matches;
+
+    /* Preloader */
+    var pre = document.getElementById('preloader');
+    var num = document.getElementById('pre-num');
+    var finished = false;
+    function finish() {
+      if (finished) return;
+      finished = true;
+      doc.classList.add('ready');
+      if (pre) {
+        pre.classList.add('done');
+        setTimeout(function () { pre.remove(); }, 950);
+      }
+    }
+    if (pre && !reduced) {
+      var t0 = performance.now(), DUR = 1100;
+      (function tick(now) {
+        var p = Math.min(1, (now - t0) / DUR);
+        var e = 1 - Math.pow(1 - p, 3);
+        if (num) num.textContent = String(Math.round(e * 100)).padStart(3, '0');
+        if (p < 1) requestAnimationFrame(tick); else finish();
+      })(t0);
+      setTimeout(finish, 3000); /* safety net */
+    } else {
+      finish();
+    }
+
+    /* Nav state + scroll progress */
+    var nav = document.getElementById('nav');
+    var bar = document.getElementById('progress');
+    var queued = false;
+    function onScroll() {
+      if (queued) return;
+      queued = true;
+      requestAnimationFrame(function () {
+        queued = false;
+        var y = scrollY;
+        nav.classList.toggle('scrolled', y > 24);
+        var h = doc.scrollHeight - innerHeight;
+        bar.style.transform = 'scaleX(' + (h > 0 ? y / h : 0) + ')';
+      });
+    }
+    addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
+
+    /* Scroll reveals */
+    if ('IntersectionObserver' in window) {
+      var io = new IntersectionObserver(function (es) {
+        es.forEach(function (e) {
+          if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+        });
+      }, { threshold: .12, rootMargin: '0px 0px -8% 0px' });
+      document.querySelectorAll('[data-reveal]').forEach(function (el) { io.observe(el); });
+    } else {
+      document.querySelectorAll('[data-reveal]').forEach(function (el) { el.classList.add('in'); });
+    }
+
+    /* Custom cursor */
+    if (fine) {
+      var dot = document.createElement('div'); dot.className = 'cur-dot';
+      var ring = document.createElement('div'); ring.className = 'cur-ring';
+      document.body.appendChild(dot); document.body.appendChild(ring);
+      var cx = innerWidth / 2, cy = innerHeight / 2, rx = cx, ry = cy, shown = false;
+      addEventListener('pointermove', function (e) {
+        cx = e.clientX; cy = e.clientY;
+        if (!shown) { shown = true; rx = cx; ry = cy; doc.classList.add('has-cursor'); }
+        dot.style.transform = 'translate(' + cx + 'px,' + cy + 'px)';
+        var t = e.target.closest && e.target.closest('a, button, [data-hover]');
+        ring.classList.toggle('on', !!t);
+      }, { passive: true });
+      (function follow() {
+        rx += (cx - rx) * .16; ry += (cy - ry) * .16;
+        ring.style.transform = 'translate(' + rx + 'px,' + ry + 'px)';
+        requestAnimationFrame(follow);
+      })();
+    }
+
+    /* Magnetic buttons */
+    if (fine && !reduced) {
+      document.querySelectorAll('.magnetic').forEach(function (el) {
+        el.addEventListener('pointermove', function (e) {
+          var r = el.getBoundingClientRect();
+          var dx = (e.clientX - r.left - r.width / 2) / r.width;
+          var dy = (e.clientY - r.top - r.height / 2) / r.height;
+          el.style.transform = 'translate(' + (dx * 10).toFixed(1) + 'px,' + (dy * 8).toFixed(1) + 'px)';
+        });
+        el.addEventListener('pointerleave', function () { el.style.transform = ''; });
+      });
+    }
+
+    /* Card hover glow follows the pointer */
+    document.querySelectorAll('.card').forEach(function (c) {
+      c.addEventListener('pointermove', function (e) {
+        var r = c.getBoundingClientRect();
+        c.style.setProperty('--mx', (e.clientX - r.left) + 'px');
+        c.style.setProperty('--my', (e.clientY - r.top) + 'px');
+      });
+    });
+
+    /* Terminal tilt */
+    var term = document.getElementById('term-tilt');
+    if (term && fine && !reduced) {
+      var sec = term.parentElement;
+      sec.addEventListener('pointermove', function (e) {
+        var r = sec.getBoundingClientRect();
+        var px = (e.clientX - r.left) / r.width - .5;
+        var py = (e.clientY - r.top) / r.height - .5;
+        term.style.transform = 'rotateX(' + (-py * 5).toFixed(2) + 'deg) rotateY(' + (px * 7).toFixed(2) + 'deg)';
+      });
+      sec.addEventListener('pointerleave', function () { term.style.transform = ''; });
+    }
+
+    /* Terminal typing loop (static markup above is the no-JS / reduced-motion fallback) */
+    var body = document.getElementById('term-body');
+    var PAIRS = [
+      {
+        q: 'What was my GST liability last quarter?',
+        think: 'reading GSTR-3B from Tally…',
+        a: 'Output tax <span class="num">₹4,12,860</span> − input credit <span class="num">₹2,88,140</span> = net payable <span class="num">₹1,24,720</span> for Jul–Sep.'
+      },
+      {
+        q: 'Post a sales invoice to Acme Ltd for ₹50,000 + 18% GST.',
+        think: 'creating voucher…',
+        a: '<span class="dim">created voucher #1043 ✓</span> — taxable <span class="num">₹50,000</span>, CGST ₹4,500, SGST ₹4,500, total <span class="num">₹59,000</span>.'
+      }
+    ];
+    function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+    async function runDemo() {
+      for (;;) {
+        body.innerHTML = '';
+        for (var i = 0; i < PAIRS.length; i++) {
+          var pair = PAIRS[i];
+          var q = document.createElement('p');
+          q.innerHTML = '<span class="t-tag">You ›</span> <span class="t-q"></span><span class="caret"></span>';
+          body.appendChild(q);
+          var qs = q.querySelector('.t-q');
+          for (var k = 0; k < pair.q.length; k++) {
+            qs.textContent += pair.q[k];
+            await sleep(24);
+          }
+          await sleep(420);
+          q.querySelector('.caret').remove();
+          var a = document.createElement('p');
+          a.innerHTML = '<span class="t-tag ai">Claude ›</span> <span class="dim">' + pair.think + '</span>';
+          body.appendChild(a);
+          await sleep(950);
+          a.innerHTML = '<span class="t-tag ai">Claude ›</span> ' + pair.a;
+          await sleep(1500);
+        }
+        await sleep(3400);
+      }
+    }
+    if (body && !reduced && 'IntersectionObserver' in window) {
+      var started = false;
+      var tio = new IntersectionObserver(function (es) {
+        if (!started && es.some(function (e) { return e.isIntersecting; })) {
+          started = true; tio.disconnect(); runDemo();
+        }
+      }, { threshold: .35 });
+      tio.observe(body);
+    }
+
+    /* Copy install snippet */
+    var copyBtn = document.getElementById('copy-btn');
+    if (copyBtn) {
+      copyBtn.addEventListener('click', function () {
+        var code = document.getElementById('install-code').innerText;
+        navigator.clipboard.writeText(code).then(function () {
+          copyBtn.textContent = 'copied ✓';
+          setTimeout(function () { copyBtn.textContent = 'copy'; }, 1600);
+        }, function () {
+          copyBtn.textContent = 'select & ctrl+c';
+          setTimeout(function () { copyBtn.textContent = 'copy'; }, 1600);
+        });
+      });
+    }
+  })();
+  </script>
+
+  <!-- WebGL particle terrain (three.js) -->
+  <script type="importmap">
+  { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.min.js" } }
+  </script>
+  <script type="module">
+  import * as THREE from 'three';
+
+  const canvas = document.getElementById('gl');
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const isMobile = matchMedia('(max-width: 760px)').matches;
+
+  try { init(); } catch (e) { canvas.style.display = 'none'; }
+
+  function init() {
+    const renderer = new THREE.WebGLRenderer({
+      canvas, alpha: true, antialias: false, powerPreference: 'high-performance'
+    });
+    renderer.setClearColor(0x000000, 0);
+    const DPR = Math.min(window.devicePixelRatio || 1, isMobile ? 1.5 : 1.75);
+    renderer.setPixelRatio(DPR);
+    renderer.setSize(innerWidth, innerHeight, false);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, .1, 90);
+
+    /* Particle grid */
+    const COLS = isMobile ? 150 : 260;
+    const ROWS = isMobile ? 90 : 150;
+    const W = 46, D = 30;
+    const count = COLS * ROWS;
+    const positions = new Float32Array(count * 3);
+    const rand = new Float32Array(count);
+    let p = 0;
+    for (let iz = 0; iz < ROWS; iz++) {
+      for (let ix = 0; ix < COLS; ix++) {
+        positions[p * 3]     = (ix / (COLS - 1) - .5) * W;
+        positions[p * 3 + 1] = 0;
+        positions[p * 3 + 2] = (iz / (ROWS - 1) - .5) * D;
+        rand[p] = Math.random();
+        p++;
+      }
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute('aRand', new THREE.BufferAttribute(rand, 1));
+
+    const uniforms = {
+      uTime:       { value: 0 },
+      uScroll:     { value: 0 },
+      uPixelRatio: { value: DPR },
+      uMouse:      { value: new THREE.Vector2(999, 999) },
+      uColorA:     { value: new THREE.Color('#FFB24D') },
+      uColorB:     { value: new THREE.Color('#F5620A') },
+      uColorDeep:  { value: new THREE.Color('#571F04') }
+    };
+
+    const mat = new THREE.ShaderMaterial({
+      uniforms,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      vertexShader: /* glsl */`
+        uniform float uTime, uScroll, uPixelRatio;
+        uniform vec2 uMouse;
+        attribute float aRand;
+        varying float vElev, vGlow, vFade, vFar;
+
+        /* Ashima 3D simplex noise */
+        vec4 permute(vec4 x){ return mod(((x*34.0)+1.0)*x, 289.0); }
+        vec4 taylorInvSqrt(vec4 r){ return 1.79284291400159 - 0.85373472095314 * r; }
+        float snoise(vec3 v){
+          const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+          const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+          vec3 i  = floor(v + dot(v, C.yyy));
+          vec3 x0 = v - i + dot(i, C.xxx);
+          vec3 g = step(x0.yzx, x0.xyz);
+          vec3 l = 1.0 - g;
+          vec3 i1 = min(g.xyz, l.zxy);
+          vec3 i2 = max(g.xyz, l.zxy);
+          vec3 x1 = x0 - i1 + 1.0 * C.xxx;
+          vec3 x2 = x0 - i2 + 2.0 * C.xxx;
+          vec3 x3 = x0 - 1.0 + 3.0 * C.xxx;
+          i = mod(i, 289.0);
+          vec4 p = permute(permute(permute(
+                    i.z + vec4(0.0, i1.z, i2.z, 1.0))
+                  + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+                  + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+          float n_ = 1.0/7.0;
+          vec3 ns = n_ * D.wyz - D.xzx;
+          vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+          vec4 x_ = floor(j * ns.z);
+          vec4 y_ = floor(j - 7.0 * x_);
+          vec4 x = x_ * ns.x + ns.yyyy;
+          vec4 y = y_ * ns.x + ns.yyyy;
+          vec4 h = 1.0 - abs(x) - abs(y);
+          vec4 b0 = vec4(x.xy, y.xy);
+          vec4 b1 = vec4(x.zw, y.zw);
+          vec4 s0 = floor(b0) * 2.0 + 1.0;
+          vec4 s1 = floor(b1) * 2.0 + 1.0;
+          vec4 sh = -step(h, vec4(0.0));
+          vec4 a0 = b0.xzyw + s0.xzyw * sh.xxyy;
+          vec4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
+          vec3 p0 = vec3(a0.xy, h.x);
+          vec3 p1 = vec3(a0.zw, h.y);
+          vec3 p2 = vec3(a1.xy, h.z);
+          vec3 p3 = vec3(a1.zw, h.w);
+          vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+          p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+          vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+          m = m * m;
+          return 42.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+        }
+
+        float fbm(vec3 q) {
+          float v = 0.0, a = 0.5;
+          for (int i = 0; i < 3; i++) {
+            v += a * snoise(q);
+            q *= 2.03;
+            a *= 0.5;
+          }
+          return v;
+        }
+
+        void main() {
+          vec3 pos = position;
+          float t = uTime * 0.22;
+
+          float e = fbm(vec3(pos.x * 0.11, pos.z * 0.13, t));
+          float m = smoothstep(4.5, 0.0, distance(pos.xz, uMouse));
+          pos.y += e * 2.3 + m * 1.6;
+
+          /* scroll: particles disperse upward and fade */
+          float s = uScroll;
+          pos.y += s * s * (2.0 + aRand * 14.0);
+          pos.x += s * (aRand - 0.5) * 7.0;
+
+          vElev = clamp(e * 0.5 + 0.5, 0.0, 1.0);
+          vGlow = m;
+          vFade = 1.0 - s;
+
+          vec4 mv = modelViewMatrix * vec4(pos, 1.0);
+          gl_Position = projectionMatrix * mv;
+          vFar = smoothstep(34.0, 12.0, -mv.z);
+          gl_PointSize = (0.34 + vElev * 0.32 + m * 0.9) * uPixelRatio * (100.0 / -mv.z);
+        }
+      `,
+      fragmentShader: /* glsl */`
+        uniform vec3 uColorA, uColorB, uColorDeep;
+        varying float vElev, vGlow, vFade, vFar;
+        void main() {
+          float d = length(gl_PointCoord - 0.5);
+          float disc = smoothstep(0.5, 0.12, d);
+          vec3 col = mix(uColorDeep, mix(uColorB, uColorA, vElev), 0.3 + 0.7 * vElev);
+          col = mix(col, vec3(1.0, 0.86, 0.62), vGlow * 0.85);
+          float a = disc * (0.72 + vGlow * 0.28) * vFade * vFar;
+          if (a < 0.004) discard;
+          gl_FragColor = vec4(col, a);
+        }
+      `
+    });
+
+    scene.add(new THREE.Points(geo, mat));
+
+    /* Pointer → world position on the y=0 plane */
+    const ndc = new THREE.Vector2(0, 0);
+    const ray = new THREE.Raycaster();
+    const planeY = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    const hit = new THREE.Vector3();
+    const mouseTarget = new THREE.Vector2(999, 999);
+    let hasMouse = false;
+    addEventListener('pointermove', (e) => {
+      ndc.x = (e.clientX / innerWidth) * 2 - 1;
+      ndc.y = -(e.clientY / innerHeight) * 2 + 1;
+      hasMouse = true;
+    }, { passive: true });
+
+    /* Scroll drives dissolve + canvas fade */
+    let scrollT = 0;
+    function readScroll() {
+      scrollT = Math.min(1, Math.max(0, scrollY / (innerHeight * 1.05)));
+    }
+    addEventListener('scroll', readScroll, { passive: true });
+    readScroll();
+
+    addEventListener('resize', () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight, false);
+    });
+
+    canvas.addEventListener('webglcontextlost', (e) => {
+      e.preventDefault();
+      canvas.style.display = 'none';
+    });
+
+    const camPos = new THREE.Vector3(0, 5.6, 10.8);
+    let camX = 0, camY = 0;
+
+    function frame(time) {
+      const t = time * 0.001;
+      const s = uniforms.uScroll.value += (scrollT - uniforms.uScroll.value) * 0.07;
+      canvas.style.opacity = Math.max(0, 1 - s * 1.06).toFixed(3);
+
+      if (s < 0.995) {
+        uniforms.uTime.value = t;
+
+        if (hasMouse) {
+          ray.setFromCamera(ndc, camera);
+          if (ray.ray.intersectPlane(planeY, hit)) mouseTarget.set(hit.x, hit.z);
+        }
+        uniforms.uMouse.value.lerp(mouseTarget, 0.08);
+
+        camX += ((hasMouse ? ndc.x : 0) * 1.15 + Math.sin(t * 0.12) * 0.35 - camX) * 0.04;
+        camY += ((hasMouse ? ndc.y : 0) * -0.5 - camY) * 0.04;
+        camera.position.set(camPos.x + camX, camPos.y + camY + s * 2.6, camPos.z);
+        camera.lookAt(0, 0.4 + s * 1.6, 0);
+
+        renderer.render(scene, camera);
+      }
+      requestAnimationFrame(frame);
+    }
+
+    if (reduced) {
+      /* one static frame, no animation loop */
+      uniforms.uTime.value = 3.7;
+      camera.position.copy(camPos);
+      camera.lookAt(0, 0.4, 0);
+      renderer.render(scene, camera);
+      addEventListener('scroll', () => {
+        canvas.style.opacity = Math.max(0, 1 - scrollT * 1.06).toFixed(3);
+      }, { passive: true });
+    } else {
+      requestAnimationFrame(frame);
+    }
+  }
+  </script>
 
 </body>
 </html>
