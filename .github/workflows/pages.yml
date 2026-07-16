@@ -43,7 +43,7 @@ jobs:
           cp tally-feeding.plugin site/tally-feeding.plugin
 
       - name: Upload site artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: site
 
