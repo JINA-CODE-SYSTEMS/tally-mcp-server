@@ -33,7 +33,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Configure Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       # Stage assets kept at their canonical source (no committed duplicates in site/):
       # the brand logo (regenerated from the SVG master) and the downloadable Claude plugin.
