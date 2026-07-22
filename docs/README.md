@@ -21,6 +21,8 @@ all copies, forks, and derivative works — see [NOTICE](../NOTICE) for the full
 
 **Claudally** is an [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that bridges **Tally Prime ERP** with AI assistants like Claude, ChatGPT, GitHub Copilot, and any MCP-compatible client. Query financial reports, manage masters, create vouchers, and analyse GST data — all through natural language.
 
+> **Prefer a plain REST API?** The same engine and local-agent deployment can be driven from your own backend over HTTPS instead of MCP — see the **[REST API version](api-version.md)**.
+
 ## Features
 
 - **29 MCP tools** — financial reports, master data, stock, GST, voucher creation, plus dedicated company-management tools (`load-company`, `set-active-company`, `list-loaded-companies`, `list-available-companies`)

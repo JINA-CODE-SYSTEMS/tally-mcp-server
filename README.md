@@ -29,6 +29,7 @@ all copies, forks, and derivative works — see [NOTICE](NOTICE) for the full cl
 | --- | --- |
 | **Install** | [Windows installer](docs/installer.md) · [remote server (Windows)](docs/server-setup-windows.md) · [remote server (Linux)](docs/server-setup-linux.md) |
 | **Connect** | [Which URL?](docs/README.md#connecting--which-url) · [Cloudflare Tunnel](docs/cloudflare-tunnel-provisioning.md) · [Security & hardening](docs/cloudflare-tunnel-provisioning.md#security--hardening) |
+| **API** | [REST API version](docs/api-version.md) — same local agent, driven from your own backend over HTTPS instead of MCP |
 | **Reference** | [Security assessment](docs/security-assessment.md) · [Changelog](docs/CHANGELOG.md) · [Design notes](docs/dev/) |
 
 ## Quick start (from source)
