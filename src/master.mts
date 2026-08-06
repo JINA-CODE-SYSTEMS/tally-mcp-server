@@ -107,11 +107,53 @@ export function describeNameIssues(name: string): string[] {
   return issues;
 }
 
+// MOJIBAKE — UTF-8 bytes that were decoded as Latin-1 somewhere upstream. "XI’AN" (U+2019) becomes
+// "XIâ€™AN": U+00E2 U+0080 U+0099. The C1 characters are invisible, so the name reads as merely odd
+// rather than broken.
+//
+// This class must NEVER be handed to sanitizeMasterName. U+0080 and U+0099 fall inside the C1 range, so
+// stripping control characters leaves "XIâAN" — still wrong, but now clean-looking enough to pass review
+// and be written back. Deleting bytes cannot recover a character; only re-decoding can.
+export function looksLikeMojibake(s: string): boolean {
+  // A C1 control immediately preceded by a Latin-1 high char is the signature of a misdecoded multi-byte
+  // sequence. A bare C1 on its own is just a stray control character and belongs to sanitizeMasterName.
+  return /[\u00C0-\u00FF][\u0080-\u009F]/.test(String(s ?? ''));
+}
+
+// Reverses the misdecoding: map each character back to the byte it came from, then decode as UTF-8.
+// Every character in a Latin-1-misdecoded string is <= U+00FF by construction; anything outside that
+// range means the string is not (purely) mojibake, so we decline rather than corrupt it further.
+export function demojibake(s: string): string {
+  const src = String(s ?? '');
+  const bytes: number[] = [];
+  for (const ch of src) {
+    const cp = ch.codePointAt(0)!;
+    if (cp > 0xFF) return src;            // not a Latin-1 round-trip — leave it alone
+    bytes.push(cp);
+  }
+  try {
+    const decoded = new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array(bytes));
+    return decoded;
+  } catch {
+    return src;                            // not valid UTF-8 underneath; don't guess
+  }
+}
+
+// Folds typographic quotes to their ASCII equivalents. Applied to a demojibaked name so the repaired
+// master cannot be re-broken by the same encoding round-trip later.
+export function foldSmartQuotes(s: string): string {
+  return String(s ?? '')
+    .replace(/[\u2018\u2019\u201B]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[–—]/g, '-');
+}
+
 export type NameRepair = {
   stored: string;          // exactly what Tally holds today
   proposed: string;        // what it should be
   issues: string[];
   collidesWith?: string;   // an existing master the rename would collide with
+  needsReview?: boolean;   // proposed name was reconstructed, not merely cleaned — confirm before writing
 };
 
 // Splits the master list into what can be repaired and what must not be touched.
@@ -131,6 +173,22 @@ export function planMasterNameRepairs(stored: string[]): { repairs: NameRepair[]
     if (list) list.push(s); else byKey.set(k, [s]);
   }
   for (const s of stored) {
+    // Mojibake is reconstructed, not cleaned, so it never joins the auto-applied set. sanitizeMasterName
+    // would DELETE the C1 bytes and yield a wrong-but-plausible name ("XIâAN ..." where the
+    // apostrophe belongs) that reads as fine and would be written back unnoticed. Re-decoding recovers the
+    // real character, but a reconstruction is a guess about intent — so it is surfaced for confirmation.
+    if (looksLikeMojibake(s)) {
+      const recovered = sanitizeMasterName(foldSmartQuotes(demojibake(s)));
+      const sharing = (byKey.get(masterKey(recovered)) ?? []).filter(o => o !== s);
+      blocked.push({
+        stored: s,
+        proposed: recovered,
+        issues: [...describeNameIssues(s), 'mojibake: UTF-8 decoded as Latin-1; name reconstructed by re-decoding, not by stripping'],
+        needsReview: true,
+        ...(sharing.length ? { collidesWith: sharing[0]! } : {}),
+      });
+      continue;
+    }
     const proposed = sanitizeMasterName(s);
     if (!proposed || proposed === s) continue;          // already clean, or nothing left after cleaning
     const issues = describeNameIssues(s);
