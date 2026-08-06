@@ -6,7 +6,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import { cacheTable, executeSQL, validateSQL } from './database.mjs';
 import { handlePull, handlePush, jsonToTSV, pingTally, postTallyXML, pushXml, resolveGSTLedgers } from './tally.mjs';
-import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, buildAlterVoucherXml, applyPatchToBlock, deriveRemoteId, voucherBalance, isDateInOpenPeriod, findMissingMasters, canonicalizeVoucherMasters, referencedLedgers, decodeXmlEntities, escapeXml, xmlName, type VoucherEntry, type VoucherInput, type VoucherPatch } from './voucher.mjs';
+import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, buildAlterVoucherXml, applyPatchToBlock, alterWouldBlankVoucher, blockHasLedgerEntries, deriveRemoteId, voucherBalance, isDateInOpenPeriod, findMissingMasters, canonicalizeVoucherMasters, referencedLedgers, decodeXmlEntities, escapeXml, xmlName, type VoucherEntry, type VoucherInput, type VoucherPatch } from './voucher.mjs';
 import { MASTER_TAGS, MASTER_COLLECTION_TYPES, planMasterNameRepairs, buildRenameMasterXml, verifyRename, buildMasterNamesCollectionXml, parseMasterNamesFromCollection } from './master.mjs';
 import type { ModelPushResponse } from './models.mjs';
 import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
@@ -1178,17 +1178,35 @@ export function parseVoucherKeysFromExport(exportXml: string, voucherType: strin
   };
 }
 
-// Fetch a voucher's REMOTEID/VCHKEY by exporting the native Day Book for its date (the durable keys the
-// importer needs for ACTION="Delete"). Returns {} if the block/keys can't be found, or {error} on a
-// transport failure — the caller decides whether to proceed.
+// A date-filtered Voucher collection — the reliable way to read vouchers on these builds.
+//
+// THE DAY BOOK REPORT CANNOT BE USED FOR THIS. Verified live: on the TallyPrime Edit Log build these
+// books run on, `<REPORTNAME>Day Book</REPORTNAME>` returns exactly ONE voucher (number
+// "INPUT NOT CLAIM", dated the company's ENDINGAT) no matter what SVFROMDATE/SVTODATE, envelope shape,
+// date format or company scoping is sent — even for a full-year range. A TDL Voucher collection over the
+// same period returns 13,269. Every code path that reached for voucher identity through the Day Book
+// therefore found nothing and concluded the voucher had no durable keys, which is how a legitimately
+// keyed voucher got misdiagnosed as "legacy/hand-keyed, GUI only" and how an alter keyed on nothing
+// became a create.
+function voucherCollectionRequest(id: string, filterFormula: string, tallyDate?: string, company?: string): string {
+  const svCompany = company ? `<SVCURRENTCOMPANY>${escapeXml(company)}</SVCURRENTCOMPANY>` : '';
+  const dates = tallyDate ? `<SVFROMDATE>${tallyDate}</SVFROMDATE><SVTODATE>${tallyDate}</SVTODATE>` : '';
+  return `<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>${id}</ID></HEADER>` +
+    `<BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>${dates}${svCompany}</STATICVARIABLES>` +
+    `<TDL><TDLMESSAGE><COLLECTION NAME="${id}" ISINITIALIZE="Yes"><TYPE>Voucher</TYPE><FILTER>${id}F</FILTER></COLLECTION>` +
+    `<SYSTEM TYPE="Formulae" NAME="${id}F">${filterFormula}</SYSTEM></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+}
+
+// Fetch a voucher's REMOTEID/VCHKEY (the durable keys the importer needs for ACTION="Delete"/"Alter").
+// Returns {} if the keys can't be found, or {error} on a transport failure — the caller decides whether
+// to proceed. Reads via the collection, never the Day Book; see voucherCollectionRequest.
 async function fetchVoucherKeys(voucherType: string, voucherNumber: string, isoDate: string, company?: string): Promise<{ remoteId?: string; vchKey?: string } | { error: string }> {
   const tallyDate = (isoDate || '').replace(/-/g, '');
   if (!tallyDate) return { error: 'Missing voucher date for the key export.' };
-  const svCompany = company ? `<SVCURRENTCOMPANY>${escapeXml(company)}</SVCURRENTCOMPANY>` : '';
-  const req = `<ENVELOPE><HEADER><TALLYREQUEST>Export Data</TALLYREQUEST></HEADER><BODY><EXPORTDATA><REQUESTDESC><REPORTNAME>Day Book</REPORTNAME><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVFROMDATE>${tallyDate}</SVFROMDATE><SVTODATE>${tallyDate}</SVTODATE>${svCompany}</STATICVARIABLES></REQUESTDESC></EXPORTDATA></BODY></ENVELOPE>`;
+  const req = voucherCollectionRequest('ClaudallyVchKeys', `$Date = $$Date:"${tallyDate}"`, tallyDate, company);
   let resp: string | undefined;
-  try { resp = await postTallyXML(req); } catch { return { error: 'Day Book export request to Tally failed.' }; }
-  if (!resp) return { error: 'Empty Day Book export response from Tally.' };
+  try { resp = await postTallyXML(req); } catch { return { error: 'Voucher collection request to Tally failed.' }; }
+  if (!resp) return { error: 'Empty voucher collection response from Tally.' };
   return parseVoucherKeysFromExport(resp, voucherType, voucherNumber);
 }
 
@@ -1218,8 +1236,10 @@ async function fetchVoucherExportBlock(masterId: string, voucherType: string, vo
     if (b) return { block: b };
   } catch { /* fall through to Day Book */ }
 
-  // 2) Day Book export, matched on the <MASTERID> child.
-  const dbReq = `<ENVELOPE><HEADER><TALLYREQUEST>Export Data</TALLYREQUEST></HEADER><BODY><EXPORTDATA><REQUESTDESC><REPORTNAME>Day Book</REPORTNAME><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVFROMDATE>${tallyDate}</SVFROMDATE><SVTODATE>${tallyDate}</SVTODATE>${svCompany}</STATICVARIABLES></REQUESTDESC></EXPORTDATA></BODY></ENVELOPE>`;
+  // 2) Same-date collection, matched on the <MASTERID> child. This replaces a Day Book export, which
+  // returns a single fixed voucher on these builds and so could never match anything — see
+  // voucherCollectionRequest.
+  const dbReq = voucherCollectionRequest('ClaudallyVchDay', `$Date = $$Date:"${tallyDate}"`, tallyDate, company);
   let db: string | undefined;
   try { db = await postTallyXML(dbReq); } catch { return { error: 'Voucher export request to Tally failed.' }; }
   const all = grabVoucherBlocks(db || '');
@@ -4363,7 +4383,20 @@ export async function registerMcpServer(): Promise<McpServer> {
         const n = ex.candidates?.length ?? 0;
         return errorResult('PRECONDITION_FAILED', { message: `Could not isolate the export block for master_id ${masterId} (${located.voucher_type} #${voucherNumber ?? '?'} on ${isoDate ?? '?'}); ${n} candidate block(s) by number/type. Nothing was altered.`, retryable: false });
       }
-      // PRE-WRITE GATE. An Alter that cannot match does not fail — Tally creates a new voucher instead.
+      // PRE-WRITE GATE 1. Alter REPLACES content, and applyPatchToBlock re-imports the block we fetched.
+      // If that block came back without its accounting lines and the patch does not supply any, the alter
+      // would write the voucher back EMPTY — a date-only correction would silently destroy the entries it
+      // was meant to preserve. This build's $MasterID collection really does return such a block, so this
+      // is a live hazard rather than a defensive formality.
+      if (alterWouldBlankVoucher(ex.block, patch)) {
+        auditLog('alter-voucher', args, 'denied', Date.now() - start);
+        return errorResult('PRECONDITION_FAILED', {
+          message: `Refusing to alter master_id ${masterId}: the export block Tally returned carries no ledger entries, and this patch does not supply any (changing ${changes.join(', ')}). Applying it would REPLACE the voucher with one that has no accounting lines. NOTHING WAS WRITTEN.`,
+          remedy: 'Re-send the patch with the complete intended entries[], which replaces the lines outright and does not depend on what the export returned.',
+          retryable: false,
+        });
+      }
+      // PRE-WRITE GATE 2. An Alter that cannot match does not fail — Tally creates a new voucher instead.
       // buildAlterVariants returns no forms for a voucher carrying neither REMOTEID nor VCHKEY, which is
       // the only honest answer for a legacy/hand-keyed one: there is nothing to key on. Refusing here
       // means nothing is written at all, rather than the caller learning it from a created>0 response
