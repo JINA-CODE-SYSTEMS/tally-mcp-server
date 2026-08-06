@@ -6,7 +6,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import { cacheTable, executeSQL, validateSQL } from './database.mjs';
 import { handlePull, handlePush, jsonToTSV, pingTally, postTallyXML, pushXml, resolveGSTLedgers } from './tally.mjs';
-import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, deriveRemoteId, voucherBalance, isDateInOpenPeriod, findMissingMasters, referencedLedgers, decodeXmlEntities, escapeXml, xmlName, type VoucherEntry, type VoucherInput } from './voucher.mjs';
+import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, buildAlterVoucherXml, applyPatchToBlock, deriveRemoteId, voucherBalance, isDateInOpenPeriod, findMissingMasters, referencedLedgers, decodeXmlEntities, escapeXml, xmlName, type VoucherEntry, type VoucherInput, type VoucherPatch } from './voucher.mjs';
 import type { ModelPushResponse } from './models.mjs';
 import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
 
@@ -1279,6 +1279,54 @@ export function buildDeleteVariants(block: string, voucherType: string, voucherN
   return out;
 }
 
+// Candidate ALTER envelopes for one voucher, ordered most-to-least likely, mirroring the delete path.
+// Same rationale: different TallyPrime builds accept a different keying, so rather than pinning one
+// form per redeploy we try each until one reports altered>=1. Every variant is keyed on THIS voucher's
+// own exported block/keys, so none can reach a duplicate.
+//
+// Order matters. The block-derived forms go first because they carry Tally's own identity attributes
+// verbatim plus every field we never modelled. REMOTEID-stripped precedes verbatim for the reason the
+// delete path found: a REMOTEID present makes Tally attempt a synced-object match that fails for
+// locally-created vouchers. Pure/testable.
+export function buildAlterVariants(
+  block: string,
+  patch: VoucherPatch,
+  voucherType: string,
+  voucherNumber: string | undefined,
+  isoDate: string | undefined,
+  company?: string
+): Array<{ name: string; xml: string }> {
+  const openTag = (block.match(/<VOUCHER\b[^>]*>/) || ['<VOUCHER>'])[0];
+  const remoteId = (openTag.match(/\bREMOTEID="([^"]*)"/) || [])[1] || '';
+  const vchKey = (openTag.match(/\bVCHKEY="([^"]*)"/) || [])[1] || '';
+  const blockNoRemote = block.replace(openTag, openTag.replace(/\s*REMOTEID="[^"]*"/i, ''));
+  const out: Array<{ name: string; xml: string }> = [];
+  out.push({ name: 'block-minus-remoteid', xml: wrapVoucherImport(applyPatchToBlock(blockNoRemote, patch), company) });
+  out.push({ name: 'block-verbatim', xml: wrapVoucherImport(applyPatchToBlock(block, patch), company) });
+  const minimal = (id: { remoteId?: string; vchKey?: string }) =>
+    buildAlterVoucherXml({ ...patch, ...id, voucherType, voucherNumber, date: patch.date || isoDate }, company);
+  if (remoteId && vchKey) out.push({ name: 'minimal-remoteid-vchkey', xml: minimal({ remoteId, vchKey }) });
+  if (vchKey) out.push({ name: 'minimal-vchkey', xml: minimal({ vchKey }) });
+  if (remoteId) out.push({ name: 'minimal-remoteid', xml: minimal({ remoteId }) });
+  return out;
+}
+
+export type AlterOutcome =
+  | { status: 'altered'; altered: number }
+  | { status: 'created_instead'; created: number }
+  | { status: 'failed'; message: string };
+
+// An Alter that fails to MATCH is the dangerous case: Tally falls back to creating a brand-new voucher,
+// leaving the mis-booked original in place plus a duplicate. created>0 is therefore treated as a hard
+// abort, never as success — the same guard the cancel/delete paths carry.
+export function interpretAlterResponse(resp: ModelPushResponse, masterId: string): AlterOutcome {
+  if (resp.created > 0) return { status: 'created_instead', created: resp.created };
+  if (!resp.success || resp.altered === 0) {
+    return { status: 'failed', message: resp.error || `Alter did not take effect for master_id ${masterId} (altered=${resp.altered}).` };
+  }
+  return { status: 'altered', altered: resp.altered };
+}
+
 // Normalize a located voucher's date (a parsed Date from the pull layer, or a string) to YYYY-MM-DD
 // for the Tally delete/cancel envelope. Uses LOCAL date parts to avoid a UTC day-shift.
 export function toIsoDate(d: any): string | undefined {
@@ -1723,7 +1771,7 @@ const gstBlockSchema = z.object({
 });
 // The full voucher shape, shared by create-voucher and create-vouchers.
 const voucherInputShape = {
-  voucherType: z.enum(['Sales', 'Purchase', 'Payment', 'Receipt', 'Contra', 'Journal', 'Debit Note', 'Credit Note']),
+  voucherType: z.string().min(1).describe('exact voucher type as it exists in the company — a base type ("Sales", "Payment") or a company-specific one ("RM Purchase", "Contra - Mahad"). Validated at runtime against the company\'s own voucher types; list them with list-master collection=vouchertype.'),
   date: z.string().describe('voucher date in YYYY-MM-DD format'),
   entries: z.array(voucherEntrySchema).optional().describe('fully-resolved ledger lines; MUST balance (sum of dr amounts == sum of cr amounts). Preferred over the deprecated debitLedger/creditLedger/amount form.'),
   debitLedger: z.string().optional().describe('DEPRECATED shim — use entries[]. Kept for back-compat: forms a 2-line voucher with creditLedger + amount.'),
@@ -1759,6 +1807,27 @@ export function normalizeVoucherEntries(args: VoucherArgs): { entries: VoucherEn
   return { error: 'Provide entries[] (preferred) or the debitLedger + creditLedger + amount shim.' };
 }
 
+// The four base types a GST voucher can behave as. A company-specific type ("RM Purchase") posts
+// exactly like its base type but its NAME carries no reliable signal — "Service Purchase" is a
+// purchase, "PERFORMA INVOICE" is a sale, and no substring rule separates them. So the class is
+// stated by the caller and only inferred when the name IS a base type. Getting this wrong would book
+// input tax on a sale (or vice versa), so it fails closed rather than guessing. Pure — no I/O.
+export const GST_BASE_VOUCHER_CLASSES = ['Sales', 'Purchase', 'Debit Note', 'Credit Note'] as const;
+export type GstVoucherClass = typeof GST_BASE_VOUCHER_CLASSES[number];
+
+export function resolveGstVoucherClass(
+  voucherType: string,
+  voucherClass?: string
+): { class: GstVoucherClass } | { error: string } {
+  const match = (s: string | undefined) =>
+    s ? GST_BASE_VOUCHER_CLASSES.find(b => b.toLowerCase() === s.trim().toLowerCase()) : undefined;
+  const stated = match(voucherClass);
+  if (stated) return { class: stated };
+  const base = match(voucherType);
+  if (base) return { class: base };
+  return { error: `Voucher type "${voucherType}" is not one of the base GST types (${GST_BASE_VOUCHER_CLASSES.join(', ')}), so the GST posting direction is ambiguous. Pass voucherClass to say which one it behaves as.` };
+}
+
 type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean; structuredContent?: any };
 
 // Assembles + posts a single voucher, applying the deterministic host invariants (#94/#95). Shared by
@@ -1773,6 +1842,9 @@ export type VoucherExecOpts = {
   // unavailable list). Fetched by the handler via list-master.
   knownLedgers?: string[];
   knownStockItems?: string[];
+  // Exact voucher-type names for this company (list-master collection=vouchertype). Empty/omitted →
+  // skip, same tolerance as the other master lists.
+  knownVoucherTypes?: string[];
   // Idempotency: replay the stored result for a repeated key instead of re-posting (#95/#97).
   idempotency?: { store: IdempotencyStore; now: string };
   // The EXACT loaded company name to stamp the import with (resolved by the handler). When provided,
@@ -1834,6 +1906,19 @@ export async function executeVoucher(
   }
   // (c) referenced masters exist (#95 H-9 → MASTER_NOT_FOUND). Exact-name only; skipped when the
   // known list is unavailable so a fetch failure never blocks a legitimate write.
+  // The voucher type is one of those masters: the valid set is per-company, not a fixed list. Real
+  // books routinely define their own ("RM Purchase", "Service Purchase", "Contra - Mahad"), so a
+  // compile-time enum here would reject types that exist and accept types that don't.
+  if (opts.knownVoucherTypes?.length) {
+    const missing = findMissingMasters([args.voucherType], opts.knownVoucherTypes);
+    if (missing.length) {
+      return errorResult('MASTER_NOT_FOUND', {
+        message: `Unknown voucher type: "${args.voucherType}" does not exist in this company.`,
+        remedy: `Use one of the company's ${opts.knownVoucherTypes.length} voucher types: ${opts.knownVoucherTypes.join(', ')}.`,
+        retryable: false,
+      });
+    }
+  }
   if (opts.knownLedgers?.length) {
     const missing = findMissingMasters(referencedLedgers(voucher), opts.knownLedgers);
     if (missing.length) return errorResult('MASTER_NOT_FOUND', { message: `Unknown ledger(s): ${missing.join(', ')}.` });
@@ -1915,12 +2000,13 @@ async function buildVoucherExecOpts(args: { targetCompany?: string; inventory?: 
     return { companyError: target.message, idempotency: { store: getIdempotencyStore(), now: new Date().toISOString() } };
   }
   const company = target.name;
-  const [period, knownLedgers, knownStockItems] = await Promise.all([
+  const [period, knownLedgers, knownStockItems, knownVoucherTypes] = await Promise.all([
     fetchPeriodForWrite(company),
     fetchMasterNames('ledger', company),
     (args.inventory && (args.inventory as unknown[]).length) ? fetchMasterNames('stockitem', company) : Promise.resolve<string[]>([]),
+    fetchMasterNames('vouchertype', company),
   ]);
-  return { exactCompany: company, period, knownLedgers, knownStockItems, checkExisting: makeReferenceChecker(company), idempotency: { store: getIdempotencyStore(), now: new Date().toISOString() } };
+  return { exactCompany: company, period, knownLedgers, knownStockItems, knownVoucherTypes, checkExisting: makeReferenceChecker(company), idempotency: { store: getIdempotencyStore(), now: new Date().toISOString() } };
 }
 
 // Echoes the exact posting a write WOULD make, without calling Tally (#96 H-10). Used by
@@ -3338,7 +3424,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       description: `Finds existing vouchers by exact voucherType + voucherNumber and returns each match's internal Tally master_id along with date, voucher_number, voucher_type, reference (the <REFERENCE> / $Reference field, e.g. a NEFT UTR or cheque no), party_ledger, amount, and is_cancelled. The master_id is the immutable key needed to unambiguously cancel or delete a specific voucher (voucher numbers can repeat across years/types). CANCELLED vouchers ARE included (so you can locate stray cancelled rows to clean up); optional vouchers are excluded. Read-only. If more than one row comes back, the number is ambiguous for that period — narrow the date range. Pass a single 'date' to search that day, or fromDate/toDate for a range; default is all-time.`,
       inputSchema: {
         targetCompany: z.string().optional().describe('optional company name; leave blank for the active company'),
-        voucherType: z.enum(['Sales', 'Purchase', 'Payment', 'Receipt', 'Contra', 'Journal', 'Debit Note', 'Credit Note']).describe('exact voucher type'),
+        voucherType: z.string().min(1).describe('exact voucher type as it exists in the company, including company-specific ones ("RM Purchase"); list them with list-master collection=vouchertype'),
         voucherNumber: z.string().describe('exact voucher number as shown in Tally'),
         date: z.string().optional().describe('YYYY-MM-DD; if given, searches only that day (shorthand for fromDate=toDate=date)'),
         fromDate: z.string().optional().describe('YYYY-MM-DD; start of the search period (defaults to 2000-04-01)'),
@@ -3728,13 +3814,14 @@ export async function registerMcpServer(): Promise<McpServer> {
       const company = target.name;
       // One invariant context for the whole batch (fetch period + masters once).
       const anyInventory = args.vouchers.some(v => (v.inventory as unknown[] | undefined)?.length);
-      const [period, knownLedgers, knownStockItems] = await Promise.all([
+      const [period, knownLedgers, knownStockItems, knownVoucherTypes] = await Promise.all([
         fetchPeriodForWrite(company),
         fetchMasterNames('ledger', company),
         anyInventory ? fetchMasterNames('stockitem', company) : Promise.resolve<string[]>([]),
+        fetchMasterNames('vouchertype', company),
       ]);
       const rows = args.vouchers.map(v => ({ ...(v as VoucherArgs), targetCompany: company }));
-      const batch = await executeVoucherBatch(rows, { atomic: args.atomic ?? false, dryRun: args.dryRun, period, knownLedgers, knownStockItems, exactCompany: company, checkExisting: makeReferenceChecker(company) });
+      const batch = await executeVoucherBatch(rows, { atomic: args.atomic ?? false, dryRun: args.dryRun, period, knownLedgers, knownStockItems, knownVoucherTypes, exactCompany: company, checkExisting: makeReferenceChecker(company) });
       if (batchKey && !args.dryRun && !batch.aborted) {
         try { store.put(batchKey, batch, new Date().toISOString()); } catch {}
       }
@@ -3753,7 +3840,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       description: `Cancels a posted voucher (mark-cancelled: ACTION="Cancel" + ISCANCELLED — Edit-Log-safe, keeps the row with a cancellation trail). The target is resolved to its immutable master_id first (via locate-voucher) and the cancel is keyed to that id, so Tally can NEVER create a duplicate cancelled voucher instead of cancelling the target. Pass masterId directly to skip the lookup. If the number matches more than one voucher in the period the call fails with the candidate master_ids rather than guessing. An already-cancelled voucher is a no-op success. mode defaults to 'cancel'; for a reversing contra entry, post a normal create-voucher with the dr/cr swapped. Refused when READONLY_MODE=true. Returns { success, cancelled, masterId }.`,
       inputSchema: {
         targetCompany: z.string().optional().describe('optional company name; defaults to the active company'),
-        voucherType: z.enum(['Sales', 'Purchase', 'Payment', 'Receipt', 'Contra', 'Journal', 'Debit Note', 'Credit Note']).describe('voucher type of the target voucher'),
+        voucherType: z.string().min(1).describe('voucher type of the target voucher, exactly as it exists in the company (company-specific types included)'),
         voucherNumber: z.string().describe('exact voucher number to cancel'),
         date: z.string().describe('the target voucher\'s original date (YYYY-MM-DD), used to locate it'),
         masterId: z.string().optional().describe('internal Tally master_id from locate-voucher; if given, skips the lookup and cancels exactly this voucher (recommended when the number is not unique)'),
@@ -3840,7 +3927,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       description: `PERMANENTLY deletes a voucher (ACTION="Delete"), leaving NO row — unlike reverse-voucher which only marks it cancelled. Irreversible. TWO-STEP, master_id-bound flow: first call with voucherType + voucherNumber (+ optional date) to PREVIEW — the tool resolves the exact voucher, verifies it against Tally, and returns its details plus its immutable master_id. Then delete by re-calling with that masterId AND confirm:true. A delete ONLY happens when both masterId and confirm:true are present, so it can never be bound to a voucher number (Tally can renumber). A number matching more than one voucher fails with the candidates. masterId is always re-verified against Tally (fails closed if it no longer exists), and the exact loaded company is reconciled first. dryRun:true previews with no write. Refused when READONLY_MODE=true.`,
       inputSchema: {
         targetCompany: z.string().optional().describe('optional company name; defaults to the active company'),
-        voucherType: z.enum(['Sales', 'Purchase', 'Payment', 'Receipt', 'Contra', 'Journal', 'Debit Note', 'Credit Note']).describe('voucher type; when resolving by number it filters the lookup, and it is checked against the voucher master_id points to'),
+        voucherType: z.string().min(1).describe('voucher type exactly as it exists in the company (company-specific types included); when resolving by number it filters the lookup, and it is checked against the voucher master_id points to'),
         voucherNumber: z.string().optional().describe('exact voucher number, used to PREVIEW/resolve the voucher when masterId is not given'),
         date: z.string().optional().describe('the voucher\'s date (YYYY-MM-DD); narrows the lookup when resolving by number'),
         masterId: z.string().optional().describe('immutable Tally master_id (from a preview / locate-voucher). Required together with confirm:true to actually delete.'),
@@ -3979,6 +4066,189 @@ export async function registerMcpServer(): Promise<McpServer> {
   );
 
   mcpServer.registerTool(
+    'alter-voucher',
+    {
+      title: 'Alter Voucher (correct in place)',
+      description: `Corrects an EXISTING voucher in place by posting ACTION="Alter" keyed on the voucher's own REMOTEID / VCHKEY. This is the correction route for TallyPrime Edit Log builds where both Cancel and Delete are refused ("Cannot delete unnamed object: VOUCHER") — there, a mis-booked voucher is otherwise uncorrectable. Alter REPLACES content rather than merging: if you pass entries[] they become the voucher's COMPLETE new ledger lines (and must balance); fields you omit keep whatever Tally currently holds, including GST details and flags this server does not model. Two-phase and master_id-bound like delete-voucher: call with dryRun:true to see the resolved voucher and the exact XML, then re-call with that masterId and confirm:true. If any alter form makes Tally CREATE a voucher instead of matching (which would leave the original plus a duplicate) the call ABORTS immediately. On an Edit Log company the change is recorded in the Edit Log. Refused when READONLY_MODE=true.`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name; defaults to the active company'),
+        voucherType: z.string().min(1).describe('voucher type exactly as it exists in the company; checked against the voucher master_id points to'),
+        masterId: z.string().optional().describe('immutable Tally master_id (from a dryRun preview / locate-voucher). REQUIRED to confirm.'),
+        voucherNumber: z.string().optional().describe('exact voucher number — used only to resolve the target when masterId is absent'),
+        date: z.string().optional().describe("the target voucher's CURRENT date (YYYY-MM-DD); narrows a by-number lookup"),
+        entries: z.array(voucherEntrySchema).optional().describe('the COMPLETE new set of ledger lines, replacing all existing ones. Must balance (sum of dr == sum of cr). Omit to leave the accounting untouched.'),
+        inventory: z.array(inventoryLineSchema).optional().describe('the COMPLETE new set of inventory lines, replacing all existing ones. Omit to leave stock untouched.'),
+        newDate: z.string().optional().describe('optional new voucher date (YYYY-MM-DD). Omit to keep the current date.'),
+        newVoucherNumber: z.string().optional().describe('optional new voucher number. Omit to keep the current one.'),
+        narration: z.string().optional().describe('optional new narration (replaces the existing one)'),
+        reference: z.string().optional().describe('optional new Reference / Ref No (replaces the existing one)'),
+        partyLedger: z.string().optional().describe('optional new party ledger (PARTYLEDGERNAME)'),
+        confirm: z.boolean().optional().describe('must be true (together with masterId) to actually write. Without it the call returns a preview.'),
+        dryRun: z.boolean().optional().describe('if true, resolve + validate and echo the exact XML that WOULD be posted, writing nothing'),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      if (process.env.READONLY_MODE === 'true') {
+        auditLog('alter-voucher', args, 'denied');
+        return errorResult('READONLY');
+      }
+      for (const [label, value] of [['date', args.date], ['newDate', args.newDate]] as const) {
+        if (value && !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+          auditLog('alter-voucher', args, 'denied');
+          return errorResult('PRECONDITION_FAILED', { message: `${label} must be in YYYY-MM-DD format.`, retryable: false });
+        }
+      }
+      const patch: VoucherPatch = {
+        entries: args.entries, inventory: args.inventory, date: args.newDate,
+        narration: args.narration, voucherNumber: args.newVoucherNumber,
+        reference: args.reference, partyLedger: args.partyLedger,
+      };
+      // An alter with nothing to change would still post a write — refuse rather than touch the voucher.
+      const changes = Object.entries(patch).filter(([, v]) => v !== undefined).map(([k]) => k);
+      if (!changes.length) {
+        auditLog('alter-voucher', args, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: 'Nothing to alter. Supply at least one of entries, inventory, newDate, newVoucherNumber, narration, reference, partyLedger.', retryable: false });
+      }
+      // Replacement entries carry the same invariants a create does — an alter can unbalance a voucher
+      // just as easily as a create can.
+      if (args.entries?.length) {
+        if (args.entries.some(e => !(e.amount > 0))) {
+          auditLog('alter-voucher', args, 'denied');
+          return errorResult('PRECONDITION_FAILED', { message: 'Every entry amount must be greater than 0.', retryable: false });
+        }
+        const bal = voucherBalance(args.entries);
+        if (!bal.balanced) {
+          auditLog('alter-voucher', args, 'denied');
+          return errorResult('UNBALANCED', { message: `Replacement entries do not balance: debits ${bal.debit} != credits ${bal.credit}.` });
+        }
+      }
+      const argMasterId = (args.masterId || '').trim();
+      if (!argMasterId && !(args.voucherNumber || '').trim()) {
+        auditLog('alter-voucher', args, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: 'Provide masterId (from a preview / locate-voucher), or voucherNumber (+ optional date) to preview the voucher.', retryable: false });
+      }
+
+      const target = await resolveExactLoadedCompany(args.targetCompany || activeCompany || null);
+      if (!target.ok) {
+        auditLog('alter-voucher', args, 'error', Date.now() - start);
+        return errorResult('COMPANY_NOT_FOUND', { message: target.message, retryable: false });
+      }
+      const company = target.name;
+
+      // Every ledger the replacement lines reference must exist, or the alter would post to nowhere.
+      if (args.entries?.length || args.partyLedger) {
+        const knownLedgers = await fetchMasterNames('ledger', company);
+        const referenced = [...(args.entries || []).map(e => e.ledger), ...(args.partyLedger ? [args.partyLedger] : []),
+          ...(args.inventory || []).flatMap(i => i.accountingLedger ? [i.accountingLedger] : [])];
+        const missing = knownLedgers.length ? findMissingMasters(referenced, knownLedgers) : [];
+        if (missing.length) {
+          auditLog('alter-voucher', args, 'error', Date.now() - start);
+          return errorResult('MASTER_NOT_FOUND', { message: `Unknown ledger(s): ${missing.join(', ')}. Nothing was altered.`, retryable: false });
+        }
+      }
+
+      // Resolve the REAL voucher, so the preview is truthful and a stale/renumbered id fails closed
+      // BEFORE the write — the same boundary delete-voucher enforces.
+      let located: any;
+      if (argMasterId) {
+        const loc = await locateByMasterId(argMasterId, company);
+        if ('error' in loc) {
+          auditLog('alter-voucher', args, 'error', Date.now() - start);
+          return errorResult('UNKNOWN', { message: loc.error });
+        }
+        if (!loc.voucher) {
+          auditLog('alter-voucher', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `No voucher with master_id ${argMasterId} exists in ${company}.`, retryable: false });
+        }
+        located = loc.voucher;
+        if (String(located.voucher_type) !== args.voucherType) {
+          auditLog('alter-voucher', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `master_id ${argMasterId} is a ${located.voucher_type} voucher (#${located.voucher_number}), not a ${args.voucherType}. Refusing — re-check the target.`, retryable: false });
+        }
+      } else {
+        const loc = await locateVouchers(args.voucherType, args.voucherNumber!, args.date || '1990-04-01', args.date || '2099-03-31', company);
+        if ('error' in loc) {
+          auditLog('alter-voucher', args, 'error', Date.now() - start);
+          return errorResult('UNKNOWN', { message: loc.error });
+        }
+        const outcome = interpretVoucherLookup(loc.rows);
+        if (outcome.status === 'not_found') {
+          auditLog('alter-voucher', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `Could not locate ${args.voucherType} #${args.voucherNumber}${args.date ? ' dated ' + args.date : ''}. Check the number/date, or pass masterId.`, retryable: false });
+        }
+        if (outcome.status === 'ambiguous') {
+          auditLog('alter-voucher', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `Ambiguous: ${outcome.masterIds.length} vouchers match ${args.voucherType} #${args.voucherNumber} (master_ids: ${outcome.masterIds.join(', ')}). Re-call with masterId to pick exactly one.`, retryable: false });
+        }
+        located = outcome.voucher;
+      }
+
+      const masterId = String(located.master_id);
+      const isoDate = toIsoDate(located.date) || args.date;
+      const voucherNumber = located.voucher_number != null && String(located.voucher_number).length ? String(located.voucher_number) : undefined;
+      // A cancelled voucher has no content worth correcting; altering one silently would look like it
+      // worked while the row stays cancelled.
+      if (located.is_cancelled === true || String(located.is_cancelled).toLowerCase() === 'yes') {
+        auditLog('alter-voucher', args, 'error', Date.now() - start);
+        return errorResult('PRECONDITION_FAILED', { message: `master_id ${masterId} is a CANCELLED voucher; altering it would not restore it. Post a fresh voucher instead.`, retryable: false });
+      }
+
+      const ex = isoDate ? await fetchVoucherExportBlock(masterId, String(located.voucher_type), voucherNumber, isoDate, company) : { error: 'Missing voucher date.' };
+      const voucherTag = ex.block ? (ex.block.match(/<VOUCHER\b[^>]*>/) || [''])[0] : '';
+      const variants = ex.block ? buildAlterVariants(ex.block, patch, String(located.voucher_type), voucherNumber, isoDate, company) : [];
+      const preview = {
+        master_id: masterId, date: located.date, voucher_number: located.voucher_number,
+        voucher_type: located.voucher_type, reference: located.reference, party_ledger: located.party_ledger,
+        amount: located.amount, is_cancelled: located.is_cancelled,
+        export_block_found: !!ex.block, voucher_tag: voucherTag || undefined, candidate_tags: ex.candidates,
+        changes,
+      };
+
+      const gate = decideDeleteGate({ dryRun: args.dryRun, confirm: args.confirm, hasMasterId: !!argMasterId });
+      if (gate === 'dryRun') {
+        auditLog('alter-voucher', args, 'dryrun', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify({ dryRun: true, wouldAlter: preview, forms: variants.map(v => ({ form: v.name, xml: v.xml })) }, null, 2) }] };
+      }
+      if (gate === 'needs_confirm') {
+        auditLog('alter-voucher', args, 'denied', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify({ requiresConfirmation: true, wouldAlter: preview, message: `This will REPLACE the content of the voucher above (${changes.join(', ')}). To proceed, re-call alter-voucher with masterId:"${masterId}", voucherType:"${located.voucher_type}", confirm:true.` }) }] };
+      }
+
+      if ('error' in ex && ex.error) {
+        auditLog('alter-voucher', args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: `${ex.error} Nothing was altered (master_id ${masterId}).` });
+      }
+      if (!ex.block) {
+        auditLog('alter-voucher', args, 'error', Date.now() - start);
+        const n = ex.candidates?.length ?? 0;
+        return errorResult('PRECONDITION_FAILED', { message: `Could not isolate the export block for master_id ${masterId} (${located.voucher_type} #${voucherNumber ?? '?'} on ${isoDate ?? '?'}); ${n} candidate block(s) by number/type. Nothing was altered.`, retryable: false });
+      }
+      const attempts: Array<{ form: string; altered: number; created: number; error?: string }> = [];
+      for (const v of variants) {
+        const resp = await pushXml(v.xml);
+        attempts.push({ form: v.name, altered: resp.altered, created: resp.created, error: resp.error ? String(resp.error).slice(0, 140) : undefined });
+        const outcome = interpretAlterResponse(resp, masterId);
+        if (outcome.status === 'created_instead') {
+          auditLog('alter-voucher', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `Aborted: alter form "${v.name}" made Tally CREATE ${outcome.created} voucher(s) instead of altering master_id ${masterId}. The original is unchanged and a duplicate may now exist — check the Day Book. Attempts: ${JSON.stringify(attempts)}`, retryable: false });
+        }
+        if (outcome.status === 'altered') {
+          auditLog('alter-voucher', args, 'success', Date.now() - start);
+          return { content: [{ type: 'text', text: JSON.stringify({ success: true, altered: outcome.altered, alterForm: v.name, masterId, changes, voucher: preview }) }] };
+        }
+      }
+      auditLog('alter-voucher', args, 'error', Date.now() - start);
+      return errorResult('PRECONDITION_FAILED', { message: `No alter form was accepted for master_id ${masterId} (${located.voucher_type} #${voucherNumber ?? '?'}). Nothing was altered. Per-form results: ${JSON.stringify(attempts)}`, retryable: false });
+    }
+  );
+
+  mcpServer.registerTool(
     'delete-vouchers',
     {
       title: 'Delete Vouchers (batch, permanent)',
@@ -3986,7 +4256,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       inputSchema: {
         targetCompany: z.string().optional().describe('optional company name; defaults to the active company'),
         targets: z.array(z.object({
-          voucherType: z.enum(['Sales', 'Purchase', 'Payment', 'Receipt', 'Contra', 'Journal', 'Debit Note', 'Credit Note']).describe('voucher type; checked against the voucher master_id points to'),
+          voucherType: z.string().min(1).describe('voucher type exactly as it exists in the company (company-specific types included); checked against the voucher master_id points to'),
           masterId: z.string().optional().describe('immutable Tally master_id (from a dryRun preview / locate-voucher). REQUIRED on every target to confirm.'),
           voucherNumber: z.string().optional().describe('exact voucher number — used only to PREVIEW/resolve when masterId is absent'),
           date: z.string().optional().describe("the voucher's date (YYYY-MM-DD); narrows a by-number preview")
@@ -4246,7 +4516,8 @@ export async function registerMcpServer(): Promise<McpServer> {
       description: `creates a GST-compliant voucher (Sales, Purchase, Debit Note, Credit Note) in Tally Prime with automatic tax ledger allocation. Provide taxable value and GST rate — the tool will auto-calculate CGST+SGST (intra-state) or IGST (inter-state) based on place of supply. Tax ledger names are auto-resolved from Tally. Party ledger and sale/purchase ledger names must exactly match existing ledgers — validate using list-master tool with collection as ledger. For Debit Note / Credit Note, provide originalInvoiceNumber and optionally originalInvoiceDate to link back to the original invoice. Returns success status with created voucher ID`,
       inputSchema: {
         targetCompany: z.string().optional().describe('optional company name. leave it blank or skip this to choose for default company'),
-        voucherType: z.enum(['Sales', 'Purchase', 'Debit Note', 'Credit Note']).describe('type of GST voucher to create'),
+        voucherType: z.string().min(1).describe('exact voucher type as it exists in the company — a base type ("Sales", "Purchase", "Debit Note", "Credit Note") or a company-specific one ("RM Purchase", "GST SALES"). Validated at runtime; list them with list-master collection=vouchertype. For a name that is not itself a base type, also pass voucherClass.'),
+        voucherClass: z.enum(['Sales', 'Purchase', 'Debit Note', 'Credit Note']).optional().describe('which base type a company-specific voucherType behaves as. Required when voucherType is not itself one of the four base types, because the GST posting direction (output tax for a sale, input tax for a purchase) cannot be inferred from a custom name.'),
         date: z.string().describe('voucher date in YYYY-MM-DD format'),
         partyLedger: z.string().describe('exact party (customer/supplier) ledger name — validate using list-master tool with collection as ledger'),
         salePurchaseLedger: z.string().describe('exact sales or purchase ledger name — validate using list-master tool with collection as ledger'),
@@ -4311,9 +4582,30 @@ export async function registerMcpServer(): Promise<McpServer> {
       let sgstLedger = args.sgstLedger;
       let igstLedger = args.igstLedger;
 
+      // Resolve which base type this voucher behaves as before any tax decision depends on it.
+      const cls = resolveGstVoucherClass(args.voucherType, args.voucherClass);
+      if ('error' in cls) {
+        auditLog('create-gst-voucher', args, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: cls.error, retryable: false });
+      }
+      const voucherClass = cls.class;
+      // The voucher type must exist in THIS company (custom types are the norm). Tolerant: an
+      // unavailable list skips the check rather than blocking a legitimate write.
+      {
+        const knownVoucherTypes = await fetchMasterNames('vouchertype', args.targetCompany || activeCompany || undefined);
+        if (knownVoucherTypes.length && findMissingMasters([args.voucherType], knownVoucherTypes).length) {
+          auditLog('create-gst-voucher', args, 'denied');
+          return errorResult('MASTER_NOT_FOUND', {
+            message: `Unknown voucher type: "${args.voucherType}" does not exist in this company.`,
+            remedy: `Use one of the company's ${knownVoucherTypes.length} voucher types: ${knownVoucherTypes.join(', ')}.`,
+            retryable: false,
+          });
+        }
+      }
+
       // A sale (Sales / Credit Note) books OUTPUT tax; a purchase (Purchase / Debit Note) books INPUT
       // tax. Pass the direction so auto-resolve never picks an input-tax ledger for a sales voucher.
-      const gstNature: 'output' | 'input' = (args.voucherType === 'Sales' || args.voucherType === 'Credit Note') ? 'output' : 'input';
+      const gstNature: 'output' | 'input' = (voucherClass === 'Sales' || voucherClass === 'Credit Note') ? 'output' : 'input';
 
       if ((!args.isInterState && (!cgstLedger || !sgstLedger)) || (args.isInterState && !igstLedger)) {
         const resolveParams = new Map<string, any>();
@@ -4350,8 +4642,8 @@ export async function registerMcpServer(): Promise<McpServer> {
 
       const totalInvoiceValue = Math.round((taxableValue + cgstAmount + sgstAmount + igstAmount) * 100) / 100;
 
-      const isSalesType = args.voucherType === 'Sales' || args.voucherType === 'Credit Note';
-      const isPurchaseType = args.voucherType === 'Purchase' || args.voucherType === 'Debit Note';
+      const isSalesType = voucherClass === 'Sales' || voucherClass === 'Credit Note';
+      const isPurchaseType = voucherClass === 'Purchase' || voucherClass === 'Debit Note';
 
       let inputParams = new Map<string, any>([
         ['voucherType', args.voucherType],

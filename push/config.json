@@ -7,8 +7,7 @@
                     "name": "voucherType",
                     "datatype": "string",
                     "required": true,
-                    "validation_regex": "^(Sales|Purchase|Payment|Receipt|Contra|Journal|Debit Note|Credit Note)$",
-                    "validation_message": "Invalid voucher type. Must be one of: Sales, Purchase, Payment, Receipt, Contra, Journal, Debit Note, Credit Note"
+                    "_comment": "No enum here: the valid set is per-company (companies define their own types, e.g. 'RM Purchase'). Existence is checked at runtime against list-master collection=vouchertype."
                 },
                 {
                     "name": "date",
@@ -152,8 +151,7 @@
                     "name": "voucherType",
                     "datatype": "string",
                     "required": true,
-                    "validation_regex": "^(Sales|Purchase|Debit Note|Credit Note)$",
-                    "validation_message": "Invalid voucher type for GST. Must be one of: Sales, Purchase, Debit Note, Credit Note"
+                    "_comment": "No enum here: a GST voucher may use a company-specific type (e.g. 'GST SALES', 'RM Purchase'). Existence is checked at runtime against list-master collection=vouchertype, and the sale/purchase direction comes from the caller's voucherClass."
                 },
                 {
                     "name": "date",

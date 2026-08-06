@@ -255,6 +255,107 @@ export function buildVoucherXml(v: VoucherInput, targetCompany?: string): string
     `</IMPORTDATA></BODY></ENVELOPE>`;
 }
 
+// ── ALTER ──────────────────────────────────────────────────────────────────────────────────────────
+// Correcting a mis-booked voucher in place. On the Edit Log builds we hit, BOTH Cancel and Delete are
+// refused ("Cannot delete unnamed object: VOUCHER") across every envelope form, which leaves a wrongly
+// booked voucher uncorrectable. ACTION="Alter" keyed on the voucher's own REMOTEID / VCHKEY is the
+// route that still works there.
+//
+// Alter REPLACES content — it is not a delta. So a patch that supplies entries must supply the COMPLETE
+// new entry set; anything omitted from the patch is left exactly as Tally exported it.
+
+export type VoucherPatch = {
+  entries?: VoucherEntry[];
+  inventory?: InventoryLine[];
+  date?: string;                  // YYYY-MM-DD; rewrites DATE and EFFECTIVEDATE together
+  narration?: string;
+  voucherNumber?: string;
+  reference?: string;
+  partyLedger?: string;
+};
+export type VoucherIdentity = { remoteId?: string; vchKey?: string };
+
+// Replace a scalar child in a voucher block, or insert it when absent. Only the FIRST occurrence is
+// touched and only at the voucher's own level — the nested allocation lists carry no tags of these
+// names, so a plain non-greedy match cannot stray into them.
+function setChild(block: string, tag: string, value: string): string {
+  const re = new RegExp(`<${tag}>[\\s\\S]*?</${tag}>`);
+  const el = `<${tag}>${value}</${tag}>`;
+  if (re.test(block)) return block.replace(re, el);
+  return block.replace(/<\/VOUCHER>\s*$/, `${el}</VOUCHER>`);
+}
+
+// Drop every occurrence of a repeating list. Safe non-greedy: the closing tag name is unique to the
+// list itself, so nested lists (BILLALLOCATIONS.LIST, ACCOUNTINGALLOCATIONS.LIST, …) are carried along
+// with their parent rather than cutting the match short.
+function dropLists(block: string, listTag: string): string {
+  return block.replace(new RegExp(`<${listTag.replace('.', '\\.')}>[\\s\\S]*?</${listTag.replace('.', '\\.')}>`, 'g'), '');
+}
+
+const setAction = (block: string, action: string): string => {
+  const openTag = (block.match(/<VOUCHER\b[^>]*>/) || ['<VOUCHER>'])[0];
+  const newOpen = /\bACTION="[^"]*"/i.test(openTag)
+    ? openTag.replace(/\bACTION="[^"]*"/i, `ACTION="${action}"`)
+    : openTag.replace(/^<VOUCHER\b/, `<VOUCHER ACTION="${action}"`);
+  return block.replace(openTag, newOpen);
+};
+
+// Rewrite a voucher's OWN exported block into an alter-import. Keeping Tally's exported block as the
+// base (rather than synthesising a fresh body) preserves the fields we never modelled — GST
+// registration details, voucher-class flags, UDFs — which a synthesised body would silently drop.
+export function applyPatchToBlock(block: string, patch: VoucherPatch): string {
+  let out = setAction(block, 'Alter');
+  if (patch.entries?.length) {
+    out = dropLists(out, 'ALLLEDGERENTRIES.LIST');
+    out = dropLists(out, 'LEDGERENTRIES.LIST');
+    out = out.replace(/<\/VOUCHER>\s*$/, `${patch.entries.map(ledgerEntryXml).join('')}</VOUCHER>`);
+  }
+  if (patch.inventory?.length) {
+    out = dropLists(out, 'ALLINVENTORYENTRIES.LIST');
+    out = out.replace(/<\/VOUCHER>\s*$/, `${patch.inventory.map(inventoryXml).join('')}</VOUCHER>`);
+  }
+  if (patch.date) {
+    const d = toTallyDate(patch.date);
+    out = setChild(out, 'DATE', d);
+    out = setChild(out, 'EFFECTIVEDATE', d);
+  }
+  if (patch.narration !== undefined) out = setChild(out, 'NARRATION', escapeXml(patch.narration));
+  if (patch.voucherNumber !== undefined) out = setChild(out, 'VOUCHERNUMBER', escapeXml(patch.voucherNumber));
+  if (patch.reference !== undefined) out = setChild(out, 'REFERENCE', escapeXml(patch.reference));
+  if (patch.partyLedger !== undefined) out = setChild(out, 'PARTYLEDGERNAME', xmlName(patch.partyLedger));
+  return out;
+}
+
+// A minimal alter envelope built from scratch, keyed only on the identity attributes. Used as a
+// fallback for builds that reject a full re-imported block.
+export function buildAlterVoucherXml(
+  v: { voucherType: string; date?: string; voucherNumber?: string } & VoucherPatch & VoucherIdentity,
+  targetCompany?: string
+): string {
+  const tallyDate = v.date ? toTallyDate(v.date) : '';
+  const svCompany = targetCompany ? `<SVCURRENTCOMPANY>${xmlName(targetCompany)}</SVCURRENTCOMPANY>` : '';
+  const attrs =
+    (v.remoteId ? ` REMOTEID="${escapeXml(v.remoteId)}"` : '') +
+    (v.vchKey ? ` VCHKEY="${escapeXml(v.vchKey)}"` : '');
+  const body =
+    `<VOUCHER${attrs} VCHTYPE="${xmlName(v.voucherType)}" ACTION="Alter">` +
+    (tallyDate ? `<DATE>${tallyDate}</DATE><EFFECTIVEDATE>${tallyDate}</EFFECTIVEDATE>` : '') +
+    `<VOUCHERTYPENAME>${xmlName(v.voucherType)}</VOUCHERTYPENAME>` +
+    (v.voucherNumber ? `<VOUCHERNUMBER>${escapeXml(v.voucherNumber)}</VOUCHERNUMBER>` : '') +
+    (v.partyLedger ? `<PARTYLEDGERNAME>${xmlName(v.partyLedger)}</PARTYLEDGERNAME>` : '') +
+    (v.reference ? `<REFERENCE>${escapeXml(v.reference)}</REFERENCE>` : '') +
+    (v.narration ? `<NARRATION>${escapeXml(v.narration)}</NARRATION>` : '') +
+    (v.entries?.length ? v.entries.map(ledgerEntryXml).join('') : '') +
+    (v.inventory?.length ? v.inventory.map(inventoryXml).join('') : '') +
+    `</VOUCHER>`;
+  return `<?xml version="1.0" encoding="utf-8"?>` +
+    `<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER>` +
+    `<BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME>` +
+    `<STATICVARIABLES>${svCompany}</STATICVARIABLES></REQUESTDESC>` +
+    `<REQUESTDATA><TALLYMESSAGE xmlns:UDF="TallyUDF">${body}</TALLYMESSAGE></REQUESTDATA>` +
+    `</IMPORTDATA></BODY></ENVELOPE>`;
+}
+
 // Builds a cancel envelope for reverse-voucher (#98 H-12), mark-cancelled semantics (Edit-Log-safe):
 // ACTION="Cancel" + ISCANCELLED on the target voucher. When masterId is supplied, Tally keys the
 // cancel to that exact immutable id — this is what stops the classic gotcha where a Cancel that can't
