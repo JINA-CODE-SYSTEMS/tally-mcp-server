@@ -7,6 +7,7 @@ import { z } from 'zod';
 import { cacheTable, executeSQL, validateSQL } from './database.mjs';
 import { handlePull, handlePush, jsonToTSV, pingTally, postTallyXML, pushXml, resolveGSTLedgers } from './tally.mjs';
 import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, buildAlterVoucherXml, applyPatchToBlock, deriveRemoteId, voucherBalance, isDateInOpenPeriod, findMissingMasters, canonicalizeVoucherMasters, referencedLedgers, decodeXmlEntities, escapeXml, xmlName, type VoucherEntry, type VoucherInput, type VoucherPatch } from './voucher.mjs';
+import { MASTER_TAGS, MASTER_COLLECTION_TYPES, planMasterNameRepairs, buildRenameMasterXml, verifyRename, buildMasterNamesCollectionXml, parseMasterNamesFromCollection } from './master.mjs';
 import type { ModelPushResponse } from './models.mjs';
 import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
 
@@ -2000,8 +2001,28 @@ function getIdempotencyStore(): IdempotencyStore {
   return _idempotencyStore;
 }
 
-// Fetches exact master names for the MASTER_NOT_FOUND check. Tolerant: any failure → [] (skip).
+// Fetches master names for the MASTER_NOT_FOUND check and for write-path canonicalization.
+// Tolerant: any failure → [] (skip), so an unavailable master list never blocks a legitimate write.
+//
+// Reads the RAW COLLECTION, not the list-master template. Verified live against a 3,632-ledger company:
+// both paths return the same masters, but the template projection TRIMS a name's trailing CRLF while the
+// collection preserves it (as numeric character references in the NAME attribute). Since Tally matches
+// masters on import by exact string equality, a trimmed name is a different master as far as the
+// importer is concerned — reading through the template makes a malformed name indistinguishable from a
+// clean one, the existence check passes, and the posting is rejected into suspense.
+//
+// Falls back to the template path only when the collection read yields nothing, so a Tally build that
+// dislikes the raw query degrades to the old behaviour rather than blocking writes entirely.
 async function fetchMasterNames(collection: string, company?: string): Promise<string[]> {
+  const collectionType = MASTER_COLLECTION_TYPES[collection];
+  const tag = MASTER_TAGS[collection];
+  if (collectionType && tag) {
+    try {
+      const resp = await postTallyXML(buildMasterNamesCollectionXml(collectionType, company));
+      const names = parseMasterNamesFromCollection(resp, tag);
+      if (names.length) return names;
+    } catch { /* fall through to the template path */ }
+  }
   try {
     const p = new Map<string, any>([['collection', collection]]);
     if (company) p.set('targetCompany', company);
@@ -3186,6 +3207,88 @@ export async function registerMcpServer(): Promise<McpServer> {
         auditLog('search-master', args, 'error', Date.now() - start);
         return errorResult('UNKNOWN', { message: 'search-master failed.', logs: String(err) });
       }
+    }
+  );
+
+  mcpServer.registerTool(
+    'repair-master-names',
+    {
+      title: 'Repair Master Names (invisible characters)',
+      description: `Finds and fixes masters whose STORED name carries characters no Tally report can show you — a trailing CRLF from a spreadsheet paste, a stray tab, leading/trailing spaces. Such a master displays correctly everywhere and still fails every import, because Tally matches masters by exact string equality: the voucher is rejected and the posting lands in suspense. Defaults to a read-only scan; pass confirm:true to apply the renames. Internal spacing is never touched (double spaces are real, load-bearing parts of some names), and a rename that would collide with an existing master is refused rather than merging two ledgers.`,
+      inputSchema: {
+        collection: z.enum(['ledger', 'group', 'stockitem', 'stockgroup', 'vouchertype', 'costcentre', 'costcategory', 'godown', 'currency', 'unit']).optional().describe('master collection to scan; defaults to ledger'),
+        targetCompany: z.string().optional().describe('optional company name; defaults to the active company'),
+        only: z.array(z.string()).optional().describe('optional: restrict the repair to masters whose cleaned name is one of these (exact, case-insensitive). Omit to act on every malformed master found.'),
+        confirm: z.boolean().optional().describe('must be true to actually rename. Without it the tool only reports what it would do.'),
+      },
+      annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async (args) => {
+      const start = Date.now();
+      const collection = args.collection ?? 'ledger';
+      const tag = MASTER_TAGS[collection];
+      if (!tag) {
+        auditLog('repair-master-names', args, 'error', Date.now() - start);
+        return errorResult('PRECONDITION_FAILED', { message: `Unsupported collection "${collection}".`, retryable: false });
+      }
+      const company = (args.targetCompany && args.targetCompany.trim()) || activeCompany || undefined;
+
+      // fetchMasterNames decodes entities WITHOUT trimming, so the list holds the exact stored bytes —
+      // which is the only reason a malformed name is detectable here at all. Anything that trimmed on
+      // the way in would hide precisely what we are looking for.
+      const stored = await fetchMasterNames(collection, company);
+      if (!stored.length) {
+        auditLog('repair-master-names', args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: `Could not read the ${collection} list${company ? ` for "${company}"` : ''} (empty response). Nothing was changed.` });
+      }
+
+      let { repairs, blocked } = planMasterNameRepairs(stored);
+      if (args.only?.length) {
+        const want = new Set(args.only.map(s => s.trim().toLowerCase()));
+        repairs = repairs.filter(r => want.has(r.proposed.trim().toLowerCase()));
+        blocked = blocked.filter(r => want.has(r.proposed.trim().toLowerCase()));
+      }
+      // JSON-quote both forms: the whole point is characters the operator cannot otherwise see.
+      const show = (rs: typeof repairs) => rs.map(r => ({
+        stored: JSON.stringify(r.stored), proposed: JSON.stringify(r.proposed),
+        issues: r.issues, ...(r.collidesWith ? { collidesWith: JSON.stringify(r.collidesWith) } : {}),
+      }));
+
+      if (!args.confirm) {
+        auditLog('repair-master-names', args, 'dryrun', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify({
+          dryRun: true, collection, company: company ?? null, scanned: stored.length,
+          wouldRepair: show(repairs), blocked: show(blocked),
+          message: repairs.length
+            ? `${repairs.length} master(s) would be renamed. Re-call with confirm:true to apply.`
+            : 'No malformed master names found.',
+        }, null, 2) }] };
+      }
+
+      const results: any[] = [];
+      let renamed = 0;
+      for (const r of repairs) {
+        const resp = await pushXml(buildRenameMasterXml(tag, r.stored, r.proposed, company));
+        // Never trust the response counters to tell a match from a fallback create — re-read and compare.
+        // An ACTION="Alter" that fails to match CREATES a master, exactly as it does for vouchers.
+        const after = await fetchMasterNames(collection, company);
+        const verdict = verifyRename(stored, after, r.stored, r.proposed);
+        if (verdict.status === 'created_instead') {
+          auditLog('repair-master-names', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', {
+            message: `HALTED: renaming ${JSON.stringify(r.stored)} made Tally CREATE a master instead of renaming it (${verdict.before} → ${verdict.after}). A duplicate now exists and must be removed in Tally. ${renamed} rename(s) succeeded before this; the remaining ${repairs.length - renamed - 1} were NOT attempted.`,
+            retryable: false,
+          });
+        }
+        if (verdict.status === 'renamed') { renamed++; results.push({ from: JSON.stringify(r.stored), to: r.proposed, status: 'renamed' }); }
+        else results.push({ from: JSON.stringify(r.stored), to: r.proposed, status: 'not_applied', reason: verdict.reason, tallyError: resp.error ?? undefined });
+      }
+
+      auditLog('repair-master-names', args, renamed === repairs.length ? 'success' : 'error', Date.now() - start);
+      return { content: [{ type: 'text', text: JSON.stringify({
+        collection, company: company ?? null, renamed, attempted: repairs.length,
+        results, blocked: show(blocked),
+      }, null, 2) }] };
     }
   );
 
