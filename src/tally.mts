@@ -283,7 +283,7 @@ function extractReport(reportConfig: m.ModelPullReportInfo, reportInputParams: M
 
             let parseString = (iStr: string): string => {
                 iStr = utility.String.unescapeHTML(iStr);
-                iStr = iStr.replace(/&#\d+;/g, ''); //remove unreadable characters;
+                iStr = utility.String.decodeNumericRefs(iStr); //decode &#NNN;, dropping only control chars
                 return iStr;
             }
 

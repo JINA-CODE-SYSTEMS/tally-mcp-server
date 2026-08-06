@@ -89,6 +89,27 @@ class _utility {
                 .replace(/\&gt;/g, ">")
                 .replace(/\&quot;/g, "\"")
                 .replace(/\&apos;/g, "'");
+        },
+
+        // Numeric character references in Tally's export. The read path used to DELETE these outright
+        // ("remove unreadable characters"), which silently corrupts any master name containing a
+        // legitimate non-ASCII character — "Café" read back as "Caf", a name with a non-breaking space
+        // read back without it. That name then round-trips onto the write path, where Tally correctly
+        // reports a ledger that "does not exist", and the posting lands in suspense.
+        //
+        // So: DECODE the reference, and drop only what the original intent was actually after — the C0/C1
+        // control characters, which are genuinely unreadable and cannot be part of a usable Tally name.
+        decodeNumericRefs(value: string): string {
+            const isControl = (cp: number) => cp < 0x20 || (cp >= 0x7f && cp <= 0x9f);
+            return String(value)
+                .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => {
+                    const cp = parseInt(hex, 16);
+                    return Number.isFinite(cp) && !isControl(cp) ? String.fromCodePoint(cp) : '';
+                })
+                .replace(/&#(\d+);/g, (_, dec) => {
+                    const cp = parseInt(dec, 10);
+                    return Number.isFinite(cp) && !isControl(cp) ? String.fromCodePoint(cp) : '';
+                });
         }
     }
     Number = {
