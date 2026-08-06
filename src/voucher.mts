@@ -398,6 +398,28 @@ const setAction = (block: string, action: string): string => {
   return block.replace(openTag, newOpen);
 };
 
+// Does an exported block actually carry the voucher's accounting lines?
+//
+// This is a SAFETY precondition, not a formality. applyPatchToBlock rewrites and re-imports the block it
+// is given, and ALTER REPLACES CONTENT — so altering a block that has no ledger entries writes a voucher
+// with no ledger entries, silently emptying a real transaction. The danger case is a patch that does not
+// itself supply entries (a date-only or narration-only correction): there is then nothing to refill what
+// the skeletal block omitted.
+//
+// It is a live hazard, not a theoretical one. On the TallyPrime build these books run on, the
+// $MasterID-filtered collection returns a ~1166-byte block with NO ALLLEDGERENTRIES.LIST, while the same
+// collection with an explicit native-method list returns ~2481 bytes WITH them. The two are
+// indistinguishable to a caller that only checks whether a block came back.
+export function blockHasLedgerEntries(block: string): boolean {
+  return /<(?:ALL)?LEDGERENTRIES\.LIST>/i.test(String(block ?? ''));
+}
+
+// Would applying this patch to this block destroy accounting lines? True when the block carries none and
+// the patch supplies none — the combination that yields an empty voucher.
+export function alterWouldBlankVoucher(block: string, patch: VoucherPatch): boolean {
+  return !blockHasLedgerEntries(block) && !patch.entries?.length;
+}
+
 // Rewrite a voucher's OWN exported block into an alter-import. Keeping Tally's exported block as the
 // base (rather than synthesising a fresh body) preserves the fields we never modelled — GST
 // registration details, voucher-class flags, UDFs — which a synthesised body would silently drop.
