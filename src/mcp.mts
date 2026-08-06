@@ -6,7 +6,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import { cacheTable, executeSQL, validateSQL } from './database.mjs';
 import { handlePull, handlePush, jsonToTSV, pingTally, postTallyXML, pushXml, resolveGSTLedgers } from './tally.mjs';
-import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, buildAlterVoucherXml, applyPatchToBlock, deriveRemoteId, voucherBalance, isDateInOpenPeriod, findMissingMasters, referencedLedgers, decodeXmlEntities, escapeXml, xmlName, type VoucherEntry, type VoucherInput, type VoucherPatch } from './voucher.mjs';
+import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, buildAlterVoucherXml, applyPatchToBlock, deriveRemoteId, voucherBalance, isDateInOpenPeriod, findMissingMasters, canonicalizeVoucherMasters, referencedLedgers, decodeXmlEntities, escapeXml, xmlName, type VoucherEntry, type VoucherInput, type VoucherPatch } from './voucher.mjs';
 import type { ModelPushResponse } from './models.mjs';
 import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
 
@@ -1279,15 +1279,27 @@ export function buildDeleteVariants(block: string, voucherType: string, voucherN
   return out;
 }
 
-// Candidate ALTER envelopes for one voucher, ordered most-to-least likely, mirroring the delete path.
-// Same rationale: different TallyPrime builds accept a different keying, so rather than pinning one
-// form per redeploy we try each until one reports altered>=1. Every variant is keyed on THIS voucher's
-// own exported block/keys, so none can reach a duplicate.
+// Candidate ALTER envelopes for one voucher, ordered most-to-least likely: different TallyPrime builds
+// accept a different keying, so rather than pinning one form per redeploy we try each until one reports
+// altered>=1.
 //
-// Order matters. The block-derived forms go first because they carry Tally's own identity attributes
-// verbatim plus every field we never modelled. REMOTEID-stripped precedes verbatim for the reason the
-// delete path found: a REMOTEID present makes Tally attempt a synced-object match that fails for
-// locally-created vouchers. Pure/testable.
+// ALTER IS NOT SYMMETRIC WITH DELETE, and the difference decides the shape of this function. A Delete
+// that fails to match is a no-op — the delete path can therefore afford to throw every form at Tally and
+// see what sticks. An Alter that fails to match is NOT a no-op: Tally falls back to CREATING a new
+// voucher, so a form that cannot possibly match does not merely fail, it writes a duplicate into the
+// books. interpretAlterResponse can only observe that after the fact.
+//
+// So every variant here must carry an identity attribute that Tally can match on:
+//   • no REMOTEID and no VCHKEY  → NO variants at all. A legacy/hand-keyed voucher has no stored
+//     identity, so no XML form can target it; returning [] is what lets the caller abort BEFORE writing
+//     rather than discover it from a created>0 response. Such vouchers are GUI-only (Alt+D), exactly as
+//     on the delete path.
+//   • REMOTEID-stripped is emitted ONLY when a VCHKEY survives to identify the voucher. The delete path
+//     strips REMOTEID first because a stale synced-object id can make a match fail there harmlessly;
+//     doing that here when REMOTEID is the only key removes the very thing being matched on, which is
+//     precisely how an alter turns into a create.
+// Verbatim leads because it carries Tally's own identity attributes plus every field we never modelled.
+// Pure/testable.
 export function buildAlterVariants(
   block: string,
   patch: VoucherPatch,
@@ -1299,15 +1311,16 @@ export function buildAlterVariants(
   const openTag = (block.match(/<VOUCHER\b[^>]*>/) || ['<VOUCHER>'])[0];
   const remoteId = (openTag.match(/\bREMOTEID="([^"]*)"/) || [])[1] || '';
   const vchKey = (openTag.match(/\bVCHKEY="([^"]*)"/) || [])[1] || '';
-  const blockNoRemote = block.replace(openTag, openTag.replace(/\s*REMOTEID="[^"]*"/i, ''));
   const out: Array<{ name: string; xml: string }> = [];
-  out.push({ name: 'block-minus-remoteid', xml: wrapVoucherImport(applyPatchToBlock(blockNoRemote, patch), company) });
-  out.push({ name: 'block-verbatim', xml: wrapVoucherImport(applyPatchToBlock(block, patch), company) });
+  if (!remoteId && !vchKey) return out;   // unkeyed → every form would create, not alter
+  const blockNoRemote = block.replace(openTag, openTag.replace(/\s*REMOTEID="[^"]*"/i, ''));
   const minimal = (id: { remoteId?: string; vchKey?: string }) =>
     buildAlterVoucherXml({ ...patch, ...id, voucherType, voucherNumber, date: patch.date || isoDate }, company);
+  out.push({ name: 'block-verbatim', xml: wrapVoucherImport(applyPatchToBlock(block, patch), company) });
   if (remoteId && vchKey) out.push({ name: 'minimal-remoteid-vchkey', xml: minimal({ remoteId, vchKey }) });
   if (vchKey) out.push({ name: 'minimal-vchkey', xml: minimal({ vchKey }) });
   if (remoteId) out.push({ name: 'minimal-remoteid', xml: minimal({ remoteId }) });
+  if (vchKey) out.push({ name: 'block-minus-remoteid', xml: wrapVoucherImport(applyPatchToBlock(blockNoRemote, patch), company) });
   return out;
 }
 
@@ -1894,7 +1907,7 @@ export async function executeVoucher(
   // from its reference (no lookup) — an explicit args.remoteId wins; otherwise derive from the reference.
   // A voucher with no reference gets none (undefined) and stays GUI-delete-only, like a hand-keyed one.
   const remoteId = args.remoteId ?? deriveRemoteId(args.voucherType, args.reference);
-  const voucher: VoucherInput = {
+  let voucher: VoucherInput = {
     voucherType: args.voucherType, date: args.date, entries,
     narration: args.narration, voucherNumber: args.voucherNumber, reference: args.reference,
     partyLedger: args.partyLedger, inventory: args.inventory, gst: args.gst, remoteId,
@@ -1927,6 +1940,24 @@ export async function executeVoucher(
     const missing = findMissingMasters(voucher.inventory.map(i => i.stockItem), opts.knownStockItems);
     if (missing.length) return errorResult('MASTER_NOT_FOUND', { message: `Unknown stock item(s): ${missing.join(', ')}.` });
   }
+  // (c2) Rewrite every accepted master name to the EXACT bytes Tally stores. The checks above compare on
+  // masterKey — entity-decoded, case-folded, EDGE-trimmed — so a name differing from the stored one only
+  // in that normalization PASSES them, and is then rejected by Tally's exact-equality importer with the
+  // posting landing in suspense. Ledgers carrying a pasted-in trailing CRLF are the live case; see
+  // resolveMasterNames. Canonicalizing here (rather than at the read boundary) keeps the read surfaces
+  // showing the human-readable name while the import carries the real one.
+  const canon = canonicalizeVoucherMasters(
+    voucher, opts.knownLedgers ?? [], opts.knownStockItems ?? [], opts.knownVoucherTypes ?? []);
+  if (canon.ambiguous.length) {
+    const detail = canon.ambiguous
+      .map(a => `${JSON.stringify(a.name)} → ${a.candidates.map(c => JSON.stringify(c)).join(' | ')}`).join('; ');
+    return errorResult('MASTER_NOT_FOUND', {
+      message: `Ambiguous master name(s): ${detail}.`,
+      remedy: 'Two masters in this company differ only by case or edge whitespace, so there is no safe pick. Pass the name exactly as stored (the candidates above are JSON-quoted to show the difference), or rename one of them in Tally.',
+      retryable: false,
+    });
+  }
+  voucher = canon.voucher;
   // (e) skipIfExists: reference-keyed idempotency. Checked LIVE here — the last step before the write —
   // to narrow the Gold multi-user race between our check and our post. A read failure returns null and
   // does NOT block the write. On a hit we skip (or, in dryRun, report wouldSkip) rather than duplicate.
@@ -4229,6 +4260,19 @@ export async function registerMcpServer(): Promise<McpServer> {
         const n = ex.candidates?.length ?? 0;
         return errorResult('PRECONDITION_FAILED', { message: `Could not isolate the export block for master_id ${masterId} (${located.voucher_type} #${voucherNumber ?? '?'} on ${isoDate ?? '?'}); ${n} candidate block(s) by number/type. Nothing was altered.`, retryable: false });
       }
+      // PRE-WRITE GATE. An Alter that cannot match does not fail — Tally creates a new voucher instead.
+      // buildAlterVariants returns no forms for a voucher carrying neither REMOTEID nor VCHKEY, which is
+      // the only honest answer for a legacy/hand-keyed one: there is nothing to key on. Refusing here
+      // means nothing is written at all, rather than the caller learning it from a created>0 response
+      // with a duplicate already in the books.
+      if (!variants.length) {
+        auditLog('alter-voucher', args, 'denied', Date.now() - start);
+        return errorResult('PRECONDITION_FAILED', {
+          message: `master_id ${masterId} (${located.voucher_type} #${voucherNumber ?? '?'}${isoDate ? ' on ' + isoDate : ''}) has no stored REMOTEID or VCHKEY — a legacy/hand-keyed voucher. No XML alter form can target it, and attempting one would make Tally CREATE a duplicate rather than alter it. NOTHING WAS WRITTEN.`,
+          remedy: 'Correct it in the Tally GUI, or post a correcting entry instead.',
+          retryable: false,
+        });
+      }
       const attempts: Array<{ form: string; altered: number; created: number; error?: string }> = [];
       for (const v of variants) {
         const resp = await pushXml(v.xml);
@@ -4236,7 +4280,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         const outcome = interpretAlterResponse(resp, masterId);
         if (outcome.status === 'created_instead') {
           auditLog('alter-voucher', args, 'error', Date.now() - start);
-          return errorResult('PRECONDITION_FAILED', { message: `Aborted: alter form "${v.name}" made Tally CREATE ${outcome.created} voucher(s) instead of altering master_id ${masterId}. The original is unchanged and a duplicate may now exist — check the Day Book. Attempts: ${JSON.stringify(attempts)}`, retryable: false });
+          return errorResult('PRECONDITION_FAILED', { message: `Aborted: alter form "${v.name}" made Tally CREATE ${outcome.created} voucher(s) instead of altering master_id ${masterId}. A DUPLICATE NOW EXISTS and the original is unchanged — find the new voucher in the Day Book and remove it. No further alter forms were tried. Attempts: ${JSON.stringify(attempts)}`, retryable: false });
         }
         if (outcome.status === 'altered') {
           auditLog('alter-voucher', args, 'success', Date.now() - start);
