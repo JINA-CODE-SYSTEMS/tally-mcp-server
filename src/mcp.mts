@@ -1229,7 +1229,22 @@ async function fetchVoucherExportBlock(masterId: string, voucherType: string, vo
   const midRe = new RegExp(`<MASTERID>\\s*${reEsc(masterId)}\\s*</MASTERID>`);
 
   // 1) Collection filtered by $MasterID — Tally returns exactly this voucher, no number ambiguity.
-  const collReq = `<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>ClaudallyVchDel</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVFROMDATE>${tallyDate}</SVFROMDATE><SVTODATE>${tallyDate}</SVTODATE>${svCompany}</STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME="ClaudallyVchDel" ISMODIFY="No"><TYPE>Voucher</TYPE><FILTER>ClaudallyMidF</FILTER></COLLECTION><SYSTEM TYPE="Formulae" NAME="ClaudallyMidF">$MasterID = ${reEsc(masterId)}</SYSTEM></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+  // The native methods MUST be listed explicitly. A collection with only a FILTER returns a ~1.2 KB
+  // block with no ALLLEDGERENTRIES.LIST at all — re-importing that as an Alter would blank the voucher.
+  //
+  // Two wildcard shapes look like they solve it and do not: `<NATIVEMETHOD>*</NATIVEMETHOD>`,
+  // `*.*` and `<FETCH>*</FETCH>` all return ~24 KB — big enough to pass any size check — while STILL
+  // carrying no ledger entries. And `AllLedgerEntries` on its own returns the entries but drops
+  // PARTYLEDGERNAME, so a re-import would silently unset the party. Only the explicit list below returns
+  // a block that is complete enough to re-import (verified live: 37 KB / 17 KB on real vouchers, with
+  // entries, inventory and party all present).
+  //
+  // This is why the safety check is blockHasLedgerEntries() and not a byte threshold — the dangerous
+  // shapes are the large ones.
+  const NATIVE = ['Date', 'EffectiveDate', 'VoucherTypeName', 'VoucherNumber', 'Reference', 'ReferenceDate',
+    'Narration', 'PartyLedgerName', 'MasterId', 'IsCancelled', 'AllLedgerEntries', 'LedgerEntries',
+    'AllInventoryEntries'].map(m => `<NATIVEMETHOD>${m}</NATIVEMETHOD>`).join('');
+  const collReq = `<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>ClaudallyVchDel</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT><SVFROMDATE>${tallyDate}</SVFROMDATE><SVTODATE>${tallyDate}</SVTODATE>${svCompany}</STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME="ClaudallyVchDel" ISINITIALIZE="Yes"><TYPE>Voucher</TYPE><FILTER>ClaudallyMidF</FILTER>${NATIVE}</COLLECTION><SYSTEM TYPE="Formulae" NAME="ClaudallyMidF">$MasterId = ${reEsc(masterId)}</SYSTEM></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
   try {
     const r = await postTallyXML(collReq);
     const b = grabVoucherBlocks(r).find(hasRemote);

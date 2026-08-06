@@ -406,10 +406,13 @@ const setAction = (block: string, action: string): string => {
 // itself supply entries (a date-only or narration-only correction): there is then nothing to refill what
 // the skeletal block omitted.
 //
-// It is a live hazard, not a theoretical one. On the TallyPrime build these books run on, the
-// $MasterID-filtered collection returns a ~1166-byte block with NO ALLLEDGERENTRIES.LIST, while the same
-// collection with an explicit native-method list returns ~2481 bytes WITH them. The two are
-// indistinguishable to a caller that only checks whether a block came back.
+// It is a live hazard, not a theoretical one. On the TallyPrime build these books run on, a
+// $MasterID-filtered collection with no native-method list returns a ~1.2 KB block with NO
+// ALLLEDGERENTRIES.LIST, and only an explicit method list brings the entries back.
+//
+// SIZE IS NOT A PROXY FOR COMPLETENESS, which is why this tests for the element rather than a byte
+// threshold: the wildcard shapes (`<NATIVEMETHOD>*</NATIVEMETHOD>`, `*.*`, `<FETCH>*</FETCH>`) return
+// ~24 KB and still carry no ledger entries — large, plausible, and exactly as destructive to re-import.
 export function blockHasLedgerEntries(block: string): boolean {
   return /<(?:ALL)?LEDGERENTRIES\.LIST>/i.test(String(block ?? ''));
 }
