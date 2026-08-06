@@ -1862,7 +1862,7 @@ export function resolveGstVoucherClass(
   return { error: `Voucher type "${voucherType}" is not one of the base GST types (${GST_BASE_VOUCHER_CLASSES.join(', ')}), so the GST posting direction is ambiguous. Pass voucherClass to say which one it behaves as.` };
 }
 
-type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean; structuredContent?: any };
+export type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean; structuredContent?: any };
 
 // Assembles + posts a single voucher, applying the deterministic host invariants (#94/#95). Shared by
 // create-voucher, create-vouchers (#97), and the dryRun path (#96). With opts.dryRun it echoes the
@@ -2003,7 +2003,31 @@ export async function executeVoucher(
     if (/duplicat/i.test(resp.error || '')) return errorResult('DUPLICATE', { message: resp.error });
     return errorResult('UNKNOWN', { message: resp.error || 'Failed to create voucher.' });
   }
-  const result = { success: true, created: resp.created, lastVchId: resp.lastVchId };
+  // Report EVERY counter Tally moved, not just `created`.
+  //
+  // A create-voucher call can legitimately come back CREATED=0, ALTERED=1. It happens when a previous
+  // attempt at the same voucher was REJECTED (e.g. "Ledger 'X' does not exist!"): deriveRemoteId is
+  // deterministic from (voucherType, reference), so the retry carries the identical REMOTEID, and Tally
+  // completes the write as an alter of the binding the failed attempt left behind — at the masterid that
+  // attempt reserved. Confirmed live: three vouchers retried after a ledger-name failure landed at
+  // masterids 14699/14700/14710 (= 14699 + their index in the original batch) reporting created:0.
+  //
+  // Reporting only `created` turned that into `{success:true, created:0}` — which reads as "nothing was
+  // written" while a voucher WAS written. A caller that retries on it duplicates a real transaction. The
+  // voucher is identified by `masterId` (Tally's LASTVCHID is the new voucher's master id), so a caller
+  // can confirm the write by reading that id back rather than inferring anything from a counter.
+  const written = resp.created + resp.altered;
+  const result = {
+    success: true,
+    written,                       // total records Tally actually touched — never 0 on this path
+    created: resp.created,
+    altered: resp.altered,         // >0 means Tally matched an existing binding instead of making a new row
+    masterId: resp.lastVchId,      // the voucher's master id; read it back to verify
+    lastVchId: resp.lastVchId,     // kept for back-compat with existing callers
+    ...(resp.created === 0 && resp.altered > 0
+      ? { note: 'Tally ALTERED an existing binding rather than creating a new row — typically a retry of a voucher whose earlier attempt was rejected. The voucher IS written; do not retry. Verify by reading master id ' + resp.lastVchId + '.' }
+      : {}),
+  };
   // (d) record the idempotency key so a replay short-circuits (#95/#97).
   if (args.idempotencyKey && opts.idempotency) {
     try { opts.idempotency.store.put(args.idempotencyKey, result, opts.idempotency.now); } catch {}
@@ -2088,18 +2112,29 @@ function dryRunEcho(template: string, inputParams: Map<string, any>, extra?: obj
 }
 
 // ── batch voucher execution (#97 H-11) ─────────────────────────────────────
-type BatchRow = { index: number; status: 'success' | 'error' | 'skipped'; code?: string; message?: string; retryable?: boolean; created?: number; lastVchId?: number; reference?: string };
+export type BatchRow = { index: number; status: 'success' | 'error' | 'skipped'; code?: string; message?: string; retryable?: boolean; written?: number; created?: number; altered?: number; masterId?: number; lastVchId?: number; reference?: string; note?: string };
 
 // Flattens a single executeVoucher result into a per-row batch entry.
-function rowResult(index: number, r: ToolResult): BatchRow {
+//
+// Carries `altered` and `written` through, not just `created`. A retried voucher whose earlier attempt
+// was rejected comes back created:0 / altered:1 — a row reporting only created:0 reads as "not posted"
+// and invites a retry that would duplicate it. This is exactly what the batch results recorded for the
+// three vouchers reposted after their ledger names were repaired.
+export function rowResult(index: number, r: ToolResult): BatchRow {
   if (r.isError) {
     const e: any = r.structuredContent || {};
     return { index, status: 'error', code: e.code ?? 'UNKNOWN', message: e.message, retryable: e.retryable };
   }
-  const body = JSON.parse(r.content[0]!.text) as { created?: number; lastVchId?: number; skipped?: boolean; wouldSkip?: boolean; reference?: string };
+  const body = JSON.parse(r.content[0]!.text) as { written?: number; created?: number; altered?: number; masterId?: number; lastVchId?: number; skipped?: boolean; wouldSkip?: boolean; reference?: string; note?: string };
   // A skipIfExists hit (real 'skipped' or dryRun 'wouldSkip') is neither a success nor a failure.
   if (body.skipped || body.wouldSkip) return { index, status: 'skipped', reference: body.reference };
-  return { index, status: 'success', created: body.created, lastVchId: body.lastVchId };
+  return {
+    index, status: 'success',
+    written: body.written ?? ((body.created ?? 0) + (body.altered ?? 0)),
+    created: body.created, altered: body.altered,
+    masterId: body.masterId ?? body.lastVchId, lastVchId: body.lastVchId,
+    ...(body.note ? { note: body.note } : {}),
+  };
 }
 
 export type BatchResult = { atomic: boolean; aborted: boolean; posted: number; skipped: number; results: BatchRow[] };
