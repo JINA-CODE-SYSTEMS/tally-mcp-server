@@ -85,14 +85,39 @@ test('scalar values are XML-escaped', () => {
 });
 
 // ── variant ordering ───────────────────────────────────────────────────────
-test('buildAlterVariants tries the REMOTEID-stripped block first, then verbatim, then minimal forms', () => {
+// Ordering here is a SAFETY property, not a performance one. An Alter that fails to match does not
+// no-op: Tally creates a new voucher. So the keyed forms lead, and any form that would drop the last
+// remaining identity attribute is not emitted at all.
+test('buildAlterVariants leads with the verbatim keyed block and defers the REMOTEID-stripped form', () => {
   const variants = buildAlterVariants(BLOCK, { entries: NEW_ENTRIES }, 'Payment', '673', '2026-04-10', 'ALG CHEMICALS');
   assert.deepEqual(variants.map(v => v.name), [
-    'block-minus-remoteid', 'block-verbatim', 'minimal-remoteid-vchkey', 'minimal-vchkey', 'minimal-remoteid',
+    'block-verbatim', 'minimal-remoteid-vchkey', 'minimal-vchkey', 'minimal-remoteid', 'block-minus-remoteid',
   ]);
-  // The first form must genuinely have dropped the attribute, not merely be labelled so.
-  assert.equal(variants[0]!.xml.includes(REMOTE), false);
-  assert.match(variants[1]!.xml, new RegExp(REMOTE));
+  assert.match(variants[0]!.xml, new RegExp(REMOTE));
+  // The stripped form must genuinely have dropped the attribute, not merely be labelled so — and it is
+  // only safe to send because VCHKEY survives to identify the voucher.
+  const stripped = variants.at(-1)!;
+  assert.equal(stripped.xml.includes(REMOTE), false);
+  assert.match(stripped.xml, new RegExp(VCHKEY.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+});
+
+test('an unkeyed voucher yields NO variants — the caller must not write at all', () => {
+  // The live incident: voucher 673 was hand-keyed, so it had neither identity attribute. Every form
+  // previously emitted for it was unmatchable, and the first one Tally saw became a new voucher (1026).
+  // Returning [] is what lets the handler refuse before anything is written.
+  const unkeyed = BLOCK
+    .replace(new RegExp(` REMOTEID="${REMOTE}"`), '')
+    .replace(new RegExp(` VCHKEY="${VCHKEY.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`), '');
+  assert.equal(/REMOTEID=/.test(unkeyed), false, 'fixture sanity: no REMOTEID');
+  assert.equal(/VCHKEY=/.test(unkeyed), false, 'fixture sanity: no VCHKEY');
+  assert.deepEqual(buildAlterVariants(unkeyed, { entries: NEW_ENTRIES }, 'Payment', '673', '2026-04-10'), []);
+});
+
+test('every emitted variant carries at least one identity attribute', () => {
+  // The invariant that makes create-instead-of-alter unreachable by construction.
+  for (const v of buildAlterVariants(BLOCK, { entries: NEW_ENTRIES }, 'Payment', '673', '2026-04-10')) {
+    assert.ok(/REMOTEID="|VCHKEY="/.test(v.xml), `${v.name} has nothing for Tally to match on`);
+  }
 });
 
 test('every alter variant carries ACTION="Alter" and the target company', () => {
@@ -104,10 +129,17 @@ test('every alter variant carries ACTION="Alter" and the target company', () => 
   }
 });
 
-test('a block with no VCHKEY yields no vchkey-keyed variants', () => {
-  const noKey = BLOCK.replace(new RegExp(` VCHKEY="${VCHKEY}"`), '');
+test('with REMOTEID but no VCHKEY, the REMOTEID-stripped form is withheld', () => {
+  // Stripping the only key left would make the alter unmatchable — i.e. a create.
+  const noKey = BLOCK.replace(new RegExp(` VCHKEY="${VCHKEY.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`), '');
   const names = buildAlterVariants(noKey, { entries: NEW_ENTRIES }, 'Payment', '673', '2026-04-10').map(v => v.name);
-  assert.deepEqual(names, ['block-minus-remoteid', 'block-verbatim', 'minimal-remoteid']);
+  assert.deepEqual(names, ['block-verbatim', 'minimal-remoteid']);
+});
+
+test('with VCHKEY but no REMOTEID, the stripped form is still safe to offer', () => {
+  const noRemote = BLOCK.replace(new RegExp(` REMOTEID="${REMOTE}"`), '');
+  const names = buildAlterVariants(noRemote, { entries: NEW_ENTRIES }, 'Payment', '673', '2026-04-10').map(v => v.name);
+  assert.deepEqual(names, ['block-verbatim', 'minimal-vchkey', 'block-minus-remoteid']);
 });
 
 test('buildAlterVoucherXml emits both identity attributes when supplied', () => {

@@ -59,7 +59,14 @@ export function deriveRemoteId(voucherType: string, reference?: string): string 
 export function escapeXml(s: string): string {
   return String(s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+    .replace(/"/g, '&quot;').replace(/'/g, '&apos;')
+    // Control characters MUST leave as numeric character references, not literally. XML line-ending
+    // normalization rewrites a literal CR (and CRLF) to a bare LF in parsed content — so a master name
+    // genuinely containing CR would reach Tally altered and miss its exact-match lookup, sending the
+    // posting to suspense. This is why Tally itself exports such names as "...LIMITED&#13;&#10;". LF and
+    // TAB decode back identically either way and are escaped too, so a name round-trips byte-for-byte.
+    // Must run AFTER the &-escape above, or the ampersands introduced here would be double-escaped.
+    .replace(/\r/g, '&#13;').replace(/\n/g, '&#10;').replace(/\t/g, '&#9;');
 }
 
 // Inverse of escapeXml: decode the predefined + numeric XML entities back to literal characters.
@@ -147,6 +154,97 @@ export function referencedLedgers(v: VoucherInput): string[] {
   if (v.partyLedger) names.push(v.partyLedger);
   for (const inv of v.inventory || []) if (inv.accountingLedger) names.push(inv.accountingLedger);
   return names;
+}
+
+// Maps a caller-supplied master name onto the EXACT name Tally stores, when the two differ only by the
+// normalization masterKey() already tolerates: XML-entity form, case, and EDGE whitespace.
+//
+// This is load-bearing, not cosmetic. Tally's importer matches a master by exact string equality, so a
+// name that is right to the eye but two characters short is rejected and the posting silently lands in
+// suspense. Real books carry such names: a ledger created by pasting from a spreadsheet keeps the
+// pasted line break, so Tally stores "BHARTI AIRTEL LIMITED\r\n" and exports it as
+// "BHARTI AIRTEL LIMITED&#13;&#10;". Every read surface shows the trimmed form — that is what a caller
+// reads back and types — findMissingMasters then ACCEPTS it (it compares on the edge-trimmed key) and
+// the import is rejected anyway. Rewriting to the stored bytes here is what closes that gap; the
+// existence check alone cannot, because passing its check is exactly the failure mode.
+//
+// INTERNAL whitespace is never touched. "MATRIX  SEAFOODS INDIA LIMITED" and "S D  Fine-Chem Limited"
+// are real, distinct ledgers whose double spaces are part of the name — collapsing them would break
+// masters that currently work in order to fix ones that don't.
+//
+// Ambiguity is reported, never guessed: when two stored masters share a key (one with and one without a
+// trailing newline, say) there is no safe pick, so the caller disambiguates rather than have a posting
+// land on whichever happened to come first. A caller who passed one of them byte-exact is not
+// ambiguous — they already said which.
+export type MasterResolution = {
+  resolved: Map<string, string>;
+  ambiguous: Array<{ name: string; candidates: string[] }>;
+};
+
+export function resolveMasterNames(referenced: string[], known: string[]): MasterResolution {
+  const byKey = new Map<string, string[]>();
+  for (const k of known) {
+    const key = masterKey(k);
+    if (!key) continue;
+    const list = byKey.get(key);
+    if (list) { if (!list.includes(k)) list.push(k); }
+    else byKey.set(key, [k]);
+  }
+  const resolved = new Map<string, string>();
+  const ambiguous: Array<{ name: string; candidates: string[] }> = [];
+  for (const r of referenced) {
+    const key = masterKey(r);
+    if (!key) continue;
+    const cands = byKey.get(key);
+    if (!cands?.length) continue;          // unknown master → left alone; findMissingMasters reports it
+    const exact = cands.find(c => c === r);
+    if (exact !== undefined) { resolved.set(r, exact); continue; }
+    if (cands.length > 1) {
+      if (!ambiguous.some(a => a.name === r)) ambiguous.push({ name: r, candidates: [...cands] });
+      continue;
+    }
+    resolved.set(r, cands[0]!);
+  }
+  return { resolved, ambiguous };
+}
+
+// Rewrites every master name a voucher references to its exact stored spelling, returning the ambiguous
+// ones so the caller can refuse the write instead of posting to a guessed master. An empty `known` list
+// means "unknown" and leaves that class of name untouched, matching findMissingMasters' tolerance.
+export function canonicalizeVoucherMasters(
+  v: VoucherInput,
+  knownLedgers: string[] = [],
+  knownStockItems: string[] = [],
+  knownVoucherTypes: string[] = []
+): { voucher: VoucherInput; ambiguous: Array<{ name: string; candidates: string[] }> } {
+  const ambiguous: Array<{ name: string; candidates: string[] }> = [];
+  let out: VoucherInput = v;
+  if (knownLedgers.length) {
+    const { resolved, ambiguous: amb } = resolveMasterNames(referencedLedgers(out), knownLedgers);
+    ambiguous.push(...amb);
+    const fix = (n: string) => resolved.get(n) ?? n;
+    out = {
+      ...out,
+      entries: out.entries.map(e => ({ ...e, ledger: fix(e.ledger) })),
+      ...(out.partyLedger !== undefined ? { partyLedger: fix(out.partyLedger) } : {}),
+      ...(out.inventory ? {
+        inventory: out.inventory.map(i =>
+          i.accountingLedger !== undefined ? { ...i, accountingLedger: fix(i.accountingLedger) } : i),
+      } : {}),
+    };
+  }
+  if (knownStockItems.length && out.inventory?.length) {
+    const { resolved, ambiguous: amb } = resolveMasterNames(out.inventory.map(i => i.stockItem), knownStockItems);
+    ambiguous.push(...amb);
+    out = { ...out, inventory: out.inventory.map(i => ({ ...i, stockItem: resolved.get(i.stockItem) ?? i.stockItem })) };
+  }
+  if (knownVoucherTypes.length) {
+    const { resolved, ambiguous: amb } = resolveMasterNames([out.voucherType], knownVoucherTypes);
+    ambiguous.push(...amb);
+    const t = resolved.get(out.voucherType);
+    if (t !== undefined) out = { ...out, voucherType: t };
+  }
+  return { voucher: out, ambiguous };
 }
 
 function signedAmount(entry: VoucherEntry): string {
