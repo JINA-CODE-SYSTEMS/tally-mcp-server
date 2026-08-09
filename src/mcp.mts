@@ -6,7 +6,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import { cacheTable, executeSQL, validateSQL } from './database.mjs';
 import { handlePull, handlePush, jsonToTSV, pingTally, postTallyXML, pushXml, resolveGSTLedgers } from './tally.mjs';
-import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, buildAlterVoucherXml, applyPatchToBlock, alterWouldBlankVoucher, blockHasLedgerEntries, deriveRemoteId, voucherBalance, isDateInOpenPeriod, findMissingMasters, canonicalizeVoucherMasters, referencedLedgers, decodeXmlEntities, escapeXml, xmlName, type VoucherEntry, type VoucherInput, type VoucherPatch } from './voucher.mjs';
+import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, buildAlterVoucherXml, applyPatchToBlock, alterWouldBlankVoucher, blockHasLedgerEntries, deriveRemoteId, findRemoteIdCollisions, voucherBalance, isDateInOpenPeriod, findMissingMasters, canonicalizeVoucherMasters, referencedLedgers, decodeXmlEntities, escapeXml, xmlName, type VoucherEntry, type VoucherInput, type VoucherPatch } from './voucher.mjs';
 import { MASTER_TAGS, MASTER_COLLECTION_TYPES, planMasterNameRepairs, buildRenameMasterXml, verifyRename, buildMasterNamesCollectionXml, parseMasterNamesFromCollection } from './master.mjs';
 import type { ModelPushResponse } from './models.mjs';
 import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
@@ -1293,7 +1293,7 @@ const setDeleteAction = (block: string): string => {
 // builds. Ordered most-to-least likely (dropping REMOTEID first, since it makes Tally attempt a
 // synced-object match that fails for locally-created vouchers). All variants key on THIS voucher's own
 // block/keys, so none can touch a duplicate. Pure/testable.
-export function buildDeleteVariants(block: string, voucherType: string, voucherNumber: string | undefined, isoDate: string | undefined, company?: string, reference?: string): Array<{ name: string; xml: string }> {
+export function buildDeleteVariants(block: string, voucherType: string, voucherNumber: string | undefined, isoDate: string | undefined, company?: string, reference?: string, partyLedger?: string): Array<{ name: string; xml: string }> {
   const tallyDate = (isoDate || '').replace(/-/g, '');
   const openTag = (block.match(/<VOUCHER\b[^>]*>/) || ['<VOUCHER>'])[0];
   const remoteId = (openTag.match(/\bREMOTEID="([^"]*)"/) || [])[1] || '';
@@ -1306,8 +1306,14 @@ export function buildDeleteVariants(block: string, voucherType: string, voucherN
   // exact key we stamped at create-time, so this matches without needing the export block at all. For
   // legacy/hand-keyed vouchers deriveRemoteId returns undefined (no reference → no stamp) and this is
   // skipped, falling through to the export-block forms (which do not work for such vouchers — GUI only).
-  const derived = deriveRemoteId(voucherType, reference);
-  if (derived && derived !== remoteId) out.push({ name: 'derived-remoteid', xml: wrapVoucherImport(minimal(` REMOTEID="${escapeXml(derived)}"`), company) });
+  // Both derivations are tried: vouchers stamped BEFORE the party-aware key carry the legacy shape,
+  // and a Delete that fails to match is a harmless no-op — so spraying both shapes is safe and keeps
+  // old vouchers deletable.
+  const derivedNew = deriveRemoteId(voucherType, reference, partyLedger);
+  const derivedLegacy = deriveRemoteId(voucherType, reference);
+  for (const derived of [...new Set([derivedNew, derivedLegacy])]) {
+    if (derived && derived !== remoteId) out.push({ name: derived === derivedLegacy && derived !== derivedNew ? 'derived-remoteid-legacy' : 'derived-remoteid', xml: wrapVoucherImport(minimal(` REMOTEID="${escapeXml(derived)}"`), company) });
+  }
   out.push({ name: 'block-minus-remoteid', xml: wrapVoucherImport(setDeleteAction(blockNoRemote), company) });
   if (vchKey) out.push({ name: 'vchkey-only', xml: wrapVoucherImport(minimal(` VCHKEY="${escapeXml(vchKey)}"`), company) });
   out.push({ name: 'block-verbatim', xml: wrapVoucherImport(setDeleteAction(block), company) });
@@ -1490,7 +1496,7 @@ async function deleteResolvedVoucher(located: any, company?: string): Promise<Re
     const n = ex.candidates?.length ?? 0;
     return { status: 'error', message: `Could not isolate the export block for master_id ${masterId} (${located.voucher_type} #${voucherNumber ?? '?'})${n ? `; ${n} candidate block(s)` : ''}.` };
   }
-  const variants = buildDeleteVariants(ex.block, String(located.voucher_type), voucherNumber, isoDate, company, located.reference ? String(located.reference) : undefined);
+  const variants = buildDeleteVariants(ex.block, String(located.voucher_type), voucherNumber, isoDate, company, located.reference ? String(located.reference) : undefined, located.party_ledger ? String(located.party_ledger) : undefined);
   const attempts: Array<{ form: string; deleted: number; created: number; error?: string }> = [];
   for (const v of variants) {
     const resp = await pushXml(v.xml);
@@ -1942,7 +1948,7 @@ export async function executeVoucher(
   // Stamp a durable REMOTEID so this voucher can later be altered/deleted by re-deriving the same key
   // from its reference (no lookup) — an explicit args.remoteId wins; otherwise derive from the reference.
   // A voucher with no reference gets none (undefined) and stays GUI-delete-only, like a hand-keyed one.
-  const remoteId = args.remoteId ?? deriveRemoteId(args.voucherType, args.reference);
+  const remoteId = args.remoteId ?? deriveRemoteId(args.voucherType, args.reference, args.partyLedger);
   let voucher: VoucherInput = {
     voucherType: args.voucherType, date: args.date, entries,
     narration: args.narration, voucherNumber: args.voucherNumber, reference: args.reference,
@@ -4025,6 +4031,19 @@ export async function registerMcpServer(): Promise<McpServer> {
         fetchMasterNames('vouchertype', company),
       ]);
       const rows = args.vouchers.map(v => ({ ...(v as VoucherArgs), targetCompany: company }));
+      // Two rows deriving the SAME REMOTEID is guaranteed data loss (the second re-keys the first
+      // voucher instead of creating — created:0/altered:1, bill gone, no error), so the batch is
+      // refused outright regardless of atomic mode. Distinct parties no longer collide on a shared
+      // printed invoice number, so this now only fires for genuine duplicates within the batch.
+      const idCollisions = findRemoteIdCollisions(rows);
+      if (idCollisions.length) {
+        auditLog('create-vouchers', { count: args.vouchers.length, collisions: idCollisions.length }, 'denied');
+        return errorResult('PRECONDITION_FAILED', {
+          message: `Refusing batch: ${idCollisions.length} REMOTEID collision(s) between rows — posting would silently replace the earlier voucher(s) instead of creating. Colliding rows (0-based): ${idCollisions.map(c => `[${c.rows.join(', ')}] -> ${c.remoteId}`).join('; ')}. NOTHING WAS POSTED.`,
+          remedy: 'Give the colliding rows distinct references (e.g. party-suffixed), or post them in separate calls if they are genuinely the same bill being corrected.',
+          retryable: false,
+        });
+      }
       const batch = await executeVoucherBatch(rows, { atomic: args.atomic ?? false, dryRun: args.dryRun, period, knownLedgers, knownStockItems, knownVoucherTypes, exactCompany: company, checkExisting: makeReferenceChecker(company) });
       if (batchKey && !args.dryRun && !batch.aborted) {
         try { store.put(batchKey, batch, new Date().toISOString()); } catch {}
@@ -4249,7 +4268,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       // Try the candidate delete forms (all keyed on THIS voucher's own block) until one takes. A failed
       // form is a no-op; the first that returns deleted>=1 wins. Stop immediately if any form makes Tally
       // CREATE a voucher (should never happen for a delete) rather than risk junk rows.
-      const variants = buildDeleteVariants(ex.block, String(located.voucher_type), voucherNumber, isoDate, company, located.reference ? String(located.reference) : undefined);
+      const variants = buildDeleteVariants(ex.block, String(located.voucher_type), voucherNumber, isoDate, company, located.reference ? String(located.reference) : undefined, located.party_ledger ? String(located.party_ledger) : undefined);
       const attempts: Array<{ form: string; deleted: number; created: number; error?: string }> = [];
       for (const v of variants) {
         const resp = await pushXml(v.xml);

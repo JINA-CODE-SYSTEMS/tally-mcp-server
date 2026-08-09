@@ -48,12 +48,35 @@ export type VoucherInput = {
 // A voucher with no reference gets no derived id (returns undefined) — Tally then auto-assigns identity
 // and the voucher is only deletable via the GUI path, exactly like a hand-keyed one. The namespace
 // prefix keeps our keys from colliding with Tally's own GUID-shaped remote ids.
-export function deriveRemoteId(voucherType: string, reference?: string): string | undefined {
+// The PARTY is part of the key. Two suppliers legitimately share printed invoice numbers ("09", "076"),
+// and a reference-only key made their rows collide: within one batch the second row re-keyed the FIRST
+// voucher (created:0, altered:1) and silently replaced it — a bill vanished with no error. Party-less
+// vouchers keep the legacy shape so their existing stamped ids still round-trip.
+export function deriveRemoteId(voucherType: string, reference?: string, partyLedger?: string): string | undefined {
   const slug = (s: string) => String(s ?? '').trim().replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
   const r = slug(reference || '');
   if (!r) return undefined;
   const t = slug(voucherType) || 'Vch';
-  return `TMCP-${t}-${r}`;
+  const p = slug(partyLedger || '').slice(0, 32);
+  return p ? `TMCP-${t}-${p}-${r}` : `TMCP-${t}-${r}`;
+}
+
+// Batch-level guard: rows of one create-vouchers call whose effective REMOTEID (explicit or derived)
+// coincides. Posting such a batch is guaranteed data loss — Tally re-keys the later row onto the
+// earlier voucher instead of creating it — so the caller must refuse the batch outright. Rows with no
+// id (no reference) can never collide this way and are ignored.
+export function findRemoteIdCollisions(
+  rows: Array<{ voucherType: string; reference?: string; partyLedger?: string; remoteId?: string }>
+): Array<{ remoteId: string; rows: number[] }> {
+  const byId = new Map<string, number[]>();
+  rows.forEach((row, i) => {
+    const id = row.remoteId ?? deriveRemoteId(row.voucherType, row.reference, row.partyLedger);
+    if (!id) return;
+    const list = byId.get(id) ?? [];
+    list.push(i);
+    byId.set(id, list);
+  });
+  return [...byId.entries()].filter(([, list]) => list.length > 1).map(([remoteId, list]) => ({ remoteId, rows: list }));
 }
 
 export function escapeXml(s: string): string {
@@ -373,13 +396,25 @@ export type VoucherPatch = {
 };
 export type VoucherIdentity = { remoteId?: string; vchKey?: string };
 
-// Replace a scalar child in a voucher block, or insert it when absent. Only the FIRST occurrence is
-// touched and only at the voucher's own level — the nested allocation lists carry no tags of these
-// names, so a plain non-greedy match cannot stray into them.
+// Replace a scalar child in a voucher block, or insert it when absent.
+//
+// The tag MUST be matched in its attribute-bearing form. Tally exports the voucher header as
+// <DATE TYPE="Date">…</DATE>, <NARRATION TYPE="String">…</NARRATION> and so on, so a bare-<TAG>
+// pattern misses the field it is aiming at. That miss is not a harmless no-op: the nested
+// allocation lists DO carry tags of these names (BANKALLOCATIONS.LIST has its own bare <DATE>),
+// so the pattern silently landed on the bank allocation instead, rewriting the wrong element
+// while the voucher's own date sailed through untouched — and Tally still answered altered=1.
+//
+// Only the FIRST occurrence is touched, which is always the voucher's own: Tally emits the header
+// scalars ahead of ALLLEDGERENTRIES.LIST. \b keeps <REFERENCE> off <REFERENCEDATE>, and the
+// negative lookahead keeps the paired form off a self-closing <TAG/> whose real closing tag may
+// be thousands of characters further on.
 function setChild(block: string, tag: string, value: string): string {
-  const re = new RegExp(`<${tag}>[\\s\\S]*?</${tag}>`);
   const el = `<${tag}>${value}</${tag}>`;
-  if (re.test(block)) return block.replace(re, el);
+  const paired = new RegExp(`<${tag}\\b(?![^>]*/>)[^>]*>[\\s\\S]*?</${tag}>`);
+  if (paired.test(block)) return block.replace(paired, el);
+  const selfClosing = new RegExp(`<${tag}\\b[^>]*/>`);
+  if (selfClosing.test(block)) return block.replace(selfClosing, el);
   return block.replace(/<\/VOUCHER>\s*$/, `${el}</VOUCHER>`);
 }
 
