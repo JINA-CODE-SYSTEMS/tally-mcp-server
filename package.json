@@ -41,7 +41,7 @@
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "express-rate-limit": "^8.5.2",
-    "fast-xml-parser": "^5.9.3",
+    "fast-xml-parser": "^5.10.1",
     "helmet": "^8.2.0",
     "nunjucks": "^3.2.4"
   },
