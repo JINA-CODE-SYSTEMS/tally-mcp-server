@@ -35,12 +35,19 @@
 #     b) A ruleset / branch protection on `main` requiring these checks:
 #          Build & Type Check, Tests (Node 20), Tests (Node 22),
 #          Security Scan, Secret Leak Detection, File Safety Checks
-#     c) Settings -> Actions -> General ->
-#          "Allow GitHub Actions to create and approve pull requests" = enabled
+#     c) OPTIONAL: Settings -> Actions -> General ->
+#          "Allow GitHub Actions to create and approve pull requests"
 #
-#   (c) is required because `main` requires one approving review. Without it,
-#   auto-merge is set but the PR waits indefinitely for an approval that never
-#   arrives — the workflow appears to work while doing nothing.
+#   (c) is what makes merges fully unattended, because `main` requires one
+#   approving review and Dependabot cannot approve its own PR. It is frequently
+#   locked off by ORGANISATION policy, in which case the repo-level control is
+#   greyed out and only an org owner can change it — and enabling it org-wide to
+#   suit one repo is usually the wrong trade.
+#
+#   Without (c) this workflow still does most of the work: auto-merge is set, CI
+#   runs, and the PR merges itself the moment a human clicks Approve. One click
+#   instead of review + merge + branch cleanup. The approve step below is
+#   deliberately non-fatal so that this degradation is quiet rather than red.
 #
 #   Without (b) this workflow is a liability rather than a safeguard. The
 #   approval in the step below is granted WITHOUT human review, so required
@@ -74,11 +81,21 @@ jobs:
       # PR, so without this the auto-merge below is queued and never satisfied.
       # Scoped to the same patch/minor condition as the merge step — majors are
       # never approved automatically.
+      # Non-fatal by design — see (c) in the header. If org policy forbids Actions
+      # from approving, that is a supported outcome, not a build failure: the PR
+      # simply waits for a human approval and then merges itself. Failing here
+      # would put a red X on a PR that is otherwise perfectly healthy.
       - name: Approve (patch and minor only)
         if: |
           steps.meta.outputs.update-type == 'version-update:semver-patch' ||
           steps.meta.outputs.update-type == 'version-update:semver-minor'
-        run: gh pr review --approve "$PR_URL"
+        continue-on-error: true
+        run: |
+          if gh pr review --approve "$PR_URL"; then
+            echo "::notice::Approved automatically — auto-merge will land this once required checks pass."
+          else
+            echo "::notice::Automatic approval refused (org policy disallows Actions approving PRs). Auto-merge is still set: this PR merges itself as soon as a human approves it."
+          fi
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
