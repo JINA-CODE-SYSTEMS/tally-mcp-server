@@ -48,6 +48,9 @@ param(
     # -NssmSha256 <sha256> from a trusted source to enable verification of the NSSM zip.
     [string]$NodeSha256    = '',
     [string]$NssmSha256    = '',
+    # Version stamped into the installer and its filename. CI passes the git tag; a local build
+    # that omits it gets the .iss fallback (0.0.0-dev), which is meant to look unreleasable.
+    [string]$Version       = '',
     [switch]$DownloadDeps,
     [switch]$SkipBuild,
     [string]$InnoSetupPath = $null
@@ -256,7 +259,13 @@ Write-Host "==> Using ISCC.exe: $InnoSetupPath" -ForegroundColor Cyan
 # --- 5. Compile the installer --------------------------------------------
 $iss = Join-Path $repoRoot 'scripts\installer\tally-mcp.iss'
 Write-Host "==> Compiling $iss" -ForegroundColor Cyan
-& $InnoSetupPath $iss
+$isccArgs = @()
+if ($Version) {
+    Write-Host "==> Stamping version $Version" -ForegroundColor Cyan
+    $isccArgs += "/DMyAppVersion=$Version"
+}
+$isccArgs += $iss
+& $InnoSetupPath @isccArgs
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit $LASTEXITCODE" }
 
 $out = Get-ChildItem -Path (Join-Path $repoRoot 'dist-installer') -Filter 'Claudally-Setup-*.exe' |

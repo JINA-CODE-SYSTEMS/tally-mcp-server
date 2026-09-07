@@ -2213,7 +2213,9 @@ export async function registerMcpServer(): Promise<McpServer> {
   const mcpServer = new McpServer({
     name: 'Claudally',
     title: 'Claudally',
-    version: '1.0.0',
+    // getServerVersion() reads package.json, which the release build verifies against the git tag.
+    // This was hardcoded to '1.0.0', so every MCP client saw a version unrelated to what shipped.
+    version: getServerVersion(),
     description: 'Drive Tally Prime with Claude — query reports, manage masters, post vouchers, and analyse GST.',
     websiteUrl: 'https://claudally.jinacode.systems',
     // Tell the client which logo to show (MCP icons). Hosted on the public landing site so any

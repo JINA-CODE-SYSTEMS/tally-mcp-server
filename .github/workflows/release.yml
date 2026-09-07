@@ -1,0 +1,212 @@
+# Builds Claudally-Setup-<version>.exe on a Windows runner and publishes it as a GitHub Release.
+#
+# ─── Why this exists ─────────────────────────────────────────────────────────
+#
+# Until now the installer was built only on a maintainer's desktop, so the Windows
+# half of this project — the installer, the PowerShell GUI agent, TallyUI.cs — was
+# never compiled by automation. A CI-built release from public source is also a
+# hard prerequisite for every code-signing route available to us.
+#
+# ─── Security notes — read before editing ────────────────────────────────────
+#
+# 1. Triggers on TAG PUSH and manual dispatch only. NEVER on pull_request.
+#    Signing credentials will live in repository secrets. This is a public repo,
+#    so anyone can open a PR; a workflow that both builds releases and runs on
+#    untrusted PR content is how signing material leaks. Keep it tag-only.
+#
+# 2. Workflow logs on a public repo are world-readable. Nothing secret may be
+#    echoed here, and that constraint tightens once signing is wired in (#175).
+#
+# 3. Bundled dependencies are integrity-checked by build-installer.ps1: Node.js
+#    against its official SHASUMS256.txt, and NSSM against -NssmSha256 when a
+#    pinned hash is supplied. nssm.cc publishes no signed checksums, so that
+#    hash must come from a trusted source — see NSSM_SHA256 below.
+#
+# 4. Artifacts are NOT yet code-signed (#175). Until they are, the published
+#    SHA-256 is the only way a customer can verify a download, so the release
+#    notes must always carry it.
+#
+# 5. This job builds the artifact customers execute as Administrator, and will
+#    hold signing credentials. It is therefore treated as a privileged build:
+#
+#      - it runs in the `release` ENVIRONMENT, so signing secrets are scoped to
+#        that environment and can require a human approval before the job starts.
+#        Secrets stored there are unreachable from any other workflow or job.
+#      - checkout uses persist-credentials:false, so the job token is not left
+#        in .git/config where a dependency's build script could find and use it.
+#      - npm ci runs with --ignore-scripts. Dependency lifecycle scripts are the
+#        classic supply-chain vector, and they matter more here because
+#        patch/minor dependency updates auto-merge without human review (#168).
+#        Verified: the full suite passes with scripts disabled.
+#      - every action is pinned to a full commit SHA, not a movable tag.
+#      - workflow_dispatch is refused from anywhere but the default branch, so a
+#        pushed branch cannot be used to run a modified version of this file.
+#
+# 6. Only accounts with push access can create a tag or dispatch this workflow.
+#    Fork pull requests can neither trigger it nor read its secrets. Keep it
+#    that way: never add a pull_request or pull_request_target trigger.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build, without the leading v (e.g. 0.1.0). Produces a draft release.'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Windows installer
+    runs-on: windows-latest
+    # Scopes signing secrets to this environment and lets a required reviewer gate the build.
+    # Configure at Settings -> Environments -> release.
+    environment: release
+    permissions:
+      contents: write
+      id-token: write       # build provenance
+      attestations: write   # build provenance
+
+    steps:
+      # Refuse to run a dispatched build from an arbitrary branch: someone with write access could
+      # otherwise push a branch carrying a modified copy of this workflow and dispatch it.
+      - name: Guard the trigger ref
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
+             && [ "${{ github.ref }}" != "refs/heads/${{ github.event.repository.default_branch }}" ]; then
+            echo "::error::Dispatch this workflow from the default branch only (got ${{ github.ref }})."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Do not leave the job token in .git/config, where anything later in the build could use it.
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '20'
+          cache: npm
+
+      # The tag is the single source of truth for the version. package.json must agree, or the
+      # release, the installer filename and the runtime would drift apart the way they already had
+      # (package.json said 1.0.0 while the .iss hardcoded 1.1.0).
+      - name: Resolve and verify version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            '${{ inputs.version }}'
+          } else {
+            '${{ github.ref_name }}' -replace '^v', ''
+          }
+          if ($v -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') {
+            throw "Version '$v' is not semver. Tag releases as vMAJOR.MINOR.PATCH."
+          }
+          $pkg = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($pkg -ne $v) {
+            throw "Version mismatch: tag says '$v' but package.json says '$pkg'. Update package.json and re-tag."
+          }
+          Write-Host "Building version $v"
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # --ignore-scripts: dependency lifecycle scripts execute arbitrary code on a runner that
+      # builds the binary customers run as Administrator. Verified that the full suite passes
+      # without them, so there is no reason to allow them here.
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Typecheck and test
+        run: |
+          npx tsc --noEmit
+          npm test
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        env:
+          # nssm.cc publishes no signed checksums. Set this repository variable to a SHA-256
+          # obtained from a trusted source to harden the build; the script warns loudly when it
+          # is absent rather than silently trusting the download.
+          NSSM_SHA256: ${{ vars.NSSM_SHA256 }}
+        run: |
+          # Not $args — that is a PowerShell automatic variable.
+          $buildArgs = @('-DownloadDeps', '-Version', '${{ steps.ver.outputs.version }}')
+          if ($env:NSSM_SHA256) { $buildArgs += @('-NssmSha256', $env:NSSM_SHA256) }
+          & .\scripts\installer\build-installer.ps1 @buildArgs
+
+      - name: Hash the installer
+        id: hash
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem dist-installer\Claudally-Setup-*.exe | Select-Object -First 1
+          if (-not $exe) { throw "No installer produced in dist-installer/" }
+          $sha = (Get-FileHash -Path $exe.FullName -Algorithm SHA256).Hash.ToLower()
+          "$sha  $($exe.Name)" | Out-File -FilePath "$($exe.FullName).sha256" -Encoding ascii
+          Write-Host "$($exe.Name)  $([math]::Round($exe.Length/1MB,1)) MB  sha256=$sha"
+          "path=$($exe.FullName)"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "name=$($exe.Name)"      | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sha=$sha"               | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Claudally-Setup-${{ steps.ver.outputs.version }}
+          path: |
+            dist-installer/Claudally-Setup-*.exe
+            dist-installer/Claudally-Setup-*.exe.sha256
+          retention-days: 14
+
+      # Cryptographic provenance: proves this exact binary was produced by this workflow, from this
+      # commit, in this repository. Verifiable by anyone with `gh attestation verify <file> -R <repo>`
+      # — including before code signing exists, and it attests something a signature does not:
+      # not just who published it, but what source it was built from.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: ${{ steps.hash.outputs.path }}
+
+      # Notes come from .github/release-notes.md.tmpl so they can be edited without touching this
+      # workflow. A manual dispatch produces a DRAFT, so a build can be exercised end to end
+      # without publishing something a customer might install. Tag pushes publish for real.
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = '${{ steps.ver.outputs.version }}'
+          if (gh release view "v$v" 2>$null) {
+            throw "Release v$v already exists. Bump the version rather than overwriting a published artifact."
+          }
+
+          $notes = Get-Content .github/release-notes.md.tmpl -Raw
+          $notes = $notes.Replace('{{VERSION}}', $v)
+          $notes = $notes.Replace('{{FILE}}', '${{ steps.hash.outputs.name }}')
+          $notes = $notes.Replace('{{SHA}}', '${{ steps.hash.outputs.sha }}')
+          $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          $notes | Out-File -FilePath $notesFile -Encoding utf8
+
+          $createArgs = @(
+            "v$v",
+            '${{ steps.hash.outputs.path }}',
+            '${{ steps.hash.outputs.path }}.sha256',
+            '--title', "Claudally $v",
+            '--notes-file', $notesFile
+          )
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch') { $createArgs += '--draft' }
+
+          gh release create @createArgs
+          if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
