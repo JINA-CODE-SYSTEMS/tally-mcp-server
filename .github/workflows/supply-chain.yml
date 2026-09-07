@@ -1,0 +1,104 @@
+# Static analysis and dependency gating.
+#
+# Why both, and why now: patch/minor dependency updates auto-merge without human review (#168),
+# and the release workflow builds a binary customers run as Administrator. That combination means
+# a bad dependency could reach a signed installer with nobody having read it. `npm audit` only
+# catches packages with a PUBLISHED advisory; these two checks cover the gap either side of it.
+#
+# Both are free on public repositories.
+#
+# Actions are pinned to full commit SHAs. A tag can be repointed by whoever controls the action
+# repo; a SHA cannot.
+
+name: Supply Chain
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly re-scan: CodeQL adds queries and advisories land after code stops changing, so a
+    # repository that is quiet is not the same as a repository that is still clean.
+    - cron: '17 5 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supply-chain-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ──────────────────────────────────────────────
+  # CodeQL — static analysis of our own code
+  # ──────────────────────────────────────────────
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # publish findings to the Security tab
+      actions: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@5ba2889ada762081db2c4f32a729827dce632c7b # v3
+        with:
+          languages: javascript-typescript
+          # security-and-quality is broader than the default suite. This codebase builds XML for a
+          # financial system and shells out to PowerShell, so injection and unsafe-construction
+          # queries earn their runtime here.
+          queries: security-and-quality
+
+      - name: Build
+        run: |
+          npm ci --ignore-scripts
+          npm run build
+
+      - name: Analyse
+        uses: github/codeql-action/analyze@5ba2889ada762081db2c4f32a729827dce632c7b # v3
+        with:
+          category: /language:javascript-typescript
+
+  # ──────────────────────────────────────────────
+  # Dependency review — gate what enters the tree
+  # ──────────────────────────────────────────────
+  # Runs only on pull requests, because it compares the PR against its base. This is the check that
+  # stands between an auto-merged dependency bump and main: npm audit reports what is already
+  # installed, whereas this refuses the change on the way in, and also catches licence drift —
+  # which matters because a non-open-source dependency would end our code-signing eligibility (#175).
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure
+          # Denies SOURCE-AVAILABLE licences only — these are not OSI-approved, so a dependency
+          # under one would break the "OSI-approved Open Source licence, no proprietary component"
+          # criterion that qualifies us for free code signing (#175), as well as being a licensing
+          # problem in its own right.
+          #
+          # Deliberately NOT denied: LGPL, MPL, EPL and the other copyleft licences. They are all
+          # OSI-approved and compatible with AGPL-3.0-or-later, so denying them would reject
+          # dependencies we are perfectly entitled to use.
+          deny-licenses: >-
+            BUSL-1.1,
+            SSPL-1.0,
+            Elastic-2.0
