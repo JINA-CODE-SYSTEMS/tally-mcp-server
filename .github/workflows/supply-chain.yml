@@ -90,13 +90,15 @@ jobs:
         with:
           fail-on-severity: high
           comment-summary-in-pr: on-failure
-          # AGPL-3.0-or-later with no commercial dual-licensing is what qualifies this project for
-          # free open-source code signing. A copyleft-incompatible or proprietary dependency would
-          # be a licensing problem and an eligibility problem at once.
+          # Denies SOURCE-AVAILABLE licences only — these are not OSI-approved, so a dependency
+          # under one would break the "OSI-approved Open Source licence, no proprietary component"
+          # criterion that qualifies us for free code signing (#175), as well as being a licensing
+          # problem in its own right.
+          #
+          # Deliberately NOT denied: LGPL, MPL, EPL and the other copyleft licences. They are all
+          # OSI-approved and compatible with AGPL-3.0-or-later, so denying them would reject
+          # dependencies we are perfectly entitled to use.
           deny-licenses: >-
-            LGPL-2.0,
-            LGPL-2.1,
-            BSL-1.1,
+            BUSL-1.1,
             SSPL-1.0,
-            Elastic-2.0,
-            BUSL-1.1
+            Elastic-2.0
