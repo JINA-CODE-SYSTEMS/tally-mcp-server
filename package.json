@@ -36,7 +36,7 @@
   "homepage": "https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server#readme",
   "dependencies": {
     "@duckdb/node-api": "^1.4.1-r.4",
-    "@modelcontextprotocol/sdk": "^1.18.2",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "cors": "^2.8.6",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
