@@ -169,7 +169,7 @@ jobs:
           "sha=$sha"               | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: Claudally-Setup-${{ steps.ver.outputs.version }}
           path: |
@@ -182,7 +182,7 @@ jobs:
       # — including before code signing exists, and it attests something a signature does not:
       # not just who published it, but what source it was built from.
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        uses: actions/attest-build-provenance@8beda2b7ed98355c0e97c0a63bec38ae472e66c4 # v4
         with:
           subject-path: ${{ steps.hash.outputs.path }}
 
