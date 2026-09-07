@@ -45,21 +45,31 @@ if (-not $ShowConsole) {
 # against an agent older than its required minimum (issue #15 - version handshake).
 # Format: MAJOR.MINOR.PATCH. Bump MINOR on any new IPC action or response field;
 # bump PATCH on internal fixes that callers can ignore.
-$Script:AgentVersion = "1.6.2"
+$Script:AgentVersion = "1.6.3"
 
 # --- Single-instance guard ---------------------------------------------------------------------
-# Only ONE agent may run. Multiple instances race on the command/result files and each spawns its own
-# overlay window. A named session mutex enforces this across EVERY launch path (at-logon trigger, the
-# 1-min crash-respawn heartbeat, Restart-Self on script change, manual starts, reinstalls). We wait a
-# few seconds so a Restart-Self predecessor can exit and release the mutex before we give up; an
-# abandoned mutex (predecessor exited without releasing) still counts as acquired.
-$Script:SingleInstanceMutex = New-Object System.Threading.Mutex($false, 'TallyMCPAgentSingleInstance')
-$haveMutex = $false
-try { $haveMutex = $Script:SingleInstanceMutex.WaitOne(4000) }
-catch [System.Threading.AbandonedMutexException] { $haveMutex = $true }
-if (-not $haveMutex) {
-    Write-Host "Another Tally GUI agent is already running - exiting this duplicate instance."
-    exit 0
+# Only ONE *watch-mode* agent may run. Multiple watchers race on the command/result files and each
+# spawns its own overlay window. A named session mutex enforces this across every watch-mode launch
+# path (at-logon trigger, the 1-min crash-respawn heartbeat, Restart-Self on script change, manual
+# starts, reinstalls). We wait a few seconds so a Restart-Self predecessor can exit and release the
+# mutex before we give up; an abandoned mutex (predecessor exited without releasing) still counts as
+# acquired.
+#
+# One-shot (-Once) runs are exempt, and must stay exempt. They are short-lived children of the MCP
+# server that read one command from stdin, print one JSON result to stdout and exit - they never poll
+# the IPC files and never build the overlay, so they cannot race a watcher. Taking the mutex here
+# broke in-session transport on exactly the machines that matter: any box with the companion agent
+# installed holds this mutex for the agent's whole lifetime, so every one-shot child was refused with
+# a plain-text line and exit 0 - which the caller cannot tell apart from a timeout.
+if (-not $Once) {
+    $Script:SingleInstanceMutex = New-Object System.Threading.Mutex($false, 'TallyMCPAgentSingleInstance')
+    $haveMutex = $false
+    try { $haveMutex = $Script:SingleInstanceMutex.WaitOne(4000) }
+    catch [System.Threading.AbandonedMutexException] { $haveMutex = $true }
+    if (-not $haveMutex) {
+        Write-Host "Another Tally GUI agent is already running - exiting this duplicate instance."
+        exit 0
+    }
 }
 
 if (-not $WatchDir) {
