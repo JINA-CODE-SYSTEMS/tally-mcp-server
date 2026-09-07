@@ -12,7 +12,12 @@ param(
     [string]$LLMProvider = $null,   # "anthropic" or "openai" (auto-detected from available API key)
     [int]$MaxSteps = 15,            # Safety limit per command
     [switch]$NoSelfRestart,         # Disable self-watching auto-restart (for debugging)
-    [switch]$ShowConsole            # Keep the console window visible (debugging); hidden by default
+    [switch]$ShowConsole,           # Keep the console window visible (debugging); hidden by default
+    # One-shot mode: read a single command as JSON on stdin, execute it, print the result as JSON on
+    # stdout, exit. Used when the MCP server already runs in the user's interactive session and can
+    # invoke this script directly, so there is nothing to bridge and no file IPC. The command never
+    # touches disk, which matters because select-and-unlock-company carries a decrypted password.
+    [switch]$Once
 )
 
 # --- Hide our own console window --------------------------------------------------------------
@@ -40,21 +45,31 @@ if (-not $ShowConsole) {
 # against an agent older than its required minimum (issue #15 - version handshake).
 # Format: MAJOR.MINOR.PATCH. Bump MINOR on any new IPC action or response field;
 # bump PATCH on internal fixes that callers can ignore.
-$Script:AgentVersion = "1.6.2"
+$Script:AgentVersion = "1.6.3"
 
 # --- Single-instance guard ---------------------------------------------------------------------
-# Only ONE agent may run. Multiple instances race on the command/result files and each spawns its own
-# overlay window. A named session mutex enforces this across EVERY launch path (at-logon trigger, the
-# 1-min crash-respawn heartbeat, Restart-Self on script change, manual starts, reinstalls). We wait a
-# few seconds so a Restart-Self predecessor can exit and release the mutex before we give up; an
-# abandoned mutex (predecessor exited without releasing) still counts as acquired.
-$Script:SingleInstanceMutex = New-Object System.Threading.Mutex($false, 'TallyMCPAgentSingleInstance')
-$haveMutex = $false
-try { $haveMutex = $Script:SingleInstanceMutex.WaitOne(4000) }
-catch [System.Threading.AbandonedMutexException] { $haveMutex = $true }
-if (-not $haveMutex) {
-    Write-Host "Another Tally GUI agent is already running - exiting this duplicate instance."
-    exit 0
+# Only ONE *watch-mode* agent may run. Multiple watchers race on the command/result files and each
+# spawns its own overlay window. A named session mutex enforces this across every watch-mode launch
+# path (at-logon trigger, the 1-min crash-respawn heartbeat, Restart-Self on script change, manual
+# starts, reinstalls). We wait a few seconds so a Restart-Self predecessor can exit and release the
+# mutex before we give up; an abandoned mutex (predecessor exited without releasing) still counts as
+# acquired.
+#
+# One-shot (-Once) runs are exempt, and must stay exempt. They are short-lived children of the MCP
+# server that read one command from stdin, print one JSON result to stdout and exit - they never poll
+# the IPC files and never build the overlay, so they cannot race a watcher. Taking the mutex here
+# broke in-session transport on exactly the machines that matter: any box with the companion agent
+# installed holds this mutex for the agent's whole lifetime, so every one-shot child was refused with
+# a plain-text line and exit 0 - which the caller cannot tell apart from a timeout.
+if (-not $Once) {
+    $Script:SingleInstanceMutex = New-Object System.Threading.Mutex($false, 'TallyMCPAgentSingleInstance')
+    $haveMutex = $false
+    try { $haveMutex = $Script:SingleInstanceMutex.WaitOne(4000) }
+    catch [System.Threading.AbandonedMutexException] { $haveMutex = $true }
+    if (-not $haveMutex) {
+        Write-Host "Another Tally GUI agent is already running - exiting this duplicate instance."
+        exit 0
+    }
 }
 
 if (-not $WatchDir) {
@@ -384,7 +399,14 @@ function Write-Result {
     if ($Extra) {
         foreach ($k in $Extra.Keys) { $payload[$k] = $Extra[$k] }
     }
-    $result = $payload | ConvertTo-Json -Depth 3
+    $result = $payload | ConvertTo-Json -Depth 3 -Compress
+    if ($Once) {
+        # One-shot: the caller reads our stdout. Emitted on a single line so the parent can pick the
+        # result out of any surrounding PowerShell host chatter.
+        [Console]::Out.WriteLine($result)
+        [Console]::Out.Flush()
+        return
+    }
     # Write UTF-8 WITHOUT BOM. .NET's [Encoding]::UTF8 prepends a BOM, which breaks Node's JSON.parse on the read side.
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($ResultFile, $result, $utf8NoBom)
@@ -617,14 +639,19 @@ function Invoke-LLMGuidedAction {
 }
 
 # --- Main watch loop ---
-Write-Host "=== MCP Tally GUI Agent v2 (LLM-Guided) ==="
-Write-Host "Version:  $Script:AgentVersion"
-Write-Host "Watching: $CommandFile"
-Write-Host "Results:  $ResultFile"
-Write-Host "Provider: $LLMProvider"
-Write-Host "Max steps per command: $MaxSteps"
-Write-Host "Self-restart on script change: $(-not $NoSelfRestart)"
-Write-Host "Agent started. Polling every 500ms for commands..."
+# The startup banner is for the watch-mode console. In one-shot mode the caller parses our stdout,
+# so keep it quiet — and skip the overlay runspace below, which costs an STA thread and a WinForms
+# load that a single short-lived command has no use for.
+if (-not $Once) {
+    Write-Host "=== MCP Tally GUI Agent v2 (LLM-Guided) ==="
+    Write-Host "Version:  $Script:AgentVersion"
+    Write-Host "Watching: $CommandFile"
+    Write-Host "Results:  $ResultFile"
+    Write-Host "Provider: $LLMProvider"
+    Write-Host "Max steps per command: $MaxSteps"
+    Write-Host "Self-restart on script change: $(-not $NoSelfRestart)"
+    Write-Host "Agent started. Polling every 500ms for commands..."
+}
 
 # --- Claude-control visual overlay -------------------------------------------------------------
 # A topmost, CLICK-THROUGH orange frame around the Tally window while the agent is driving it, so the
@@ -635,6 +662,7 @@ Write-Host "Agent started. Polling every 500ms for commands..."
 # never appears in what Claude sees.
 $Script:OverlayState = [hashtable]::Synchronized(@{ Show = $false; Until = [datetime]::MinValue; Rect = $null; Hwnd = [IntPtr]::Zero; Stop = $false })
 try {
+    if ($Once) { throw 'overlay skipped in one-shot mode' }
     $rs = [runspacefactory]::CreateRunspace()
     $rs.ApartmentState = 'STA'; $rs.ThreadOptions = 'ReuseThread'; $rs.Open()
     $rs.SessionStateProxy.SetVariable('State', $Script:OverlayState)
@@ -764,6 +792,429 @@ function Show-ClaudeOverlay {
 }
 function Hide-ClaudeOverlay { if ($Script:OverlayState) { try { $Script:OverlayState.Show = $false } catch {} } }
 
+# The command handler, shared by both transports.
+#
+#   watch mode (-Once absent) polls _mcp_gui_command.json and writes _mcp_gui_result.json. That
+#   file IPC exists only to cross Windows Session 0 isolation, which applies when the MCP server
+#   runs as a service and therefore has no desktop of its own.
+#
+#   one-shot mode (-Once) reads a single command from stdin and prints the result to stdout. Used
+#   when the MCP server already runs in the interactive session, so nothing has to be bridged —
+#   and, importantly, no credential is written to disk on the way.
+#
+# Identical dispatch either way: the transport changes, the behaviour does not.
+function Invoke-AgentCommand {
+    param([Parameter(Mandatory = $true)] $Cmd)
+
+    # The switch body below was written against $cmd, $cmdId and $cmdMaxSteps.
+    $cmd = $Cmd
+    $cmdId = if ($cmd.commandId) { [string]$cmd.commandId } else { "" }
+    $cmdMaxSteps = if ($cmd.maxSteps) { [int]$cmd.maxSteps } else { 0 }
+
+        Write-Host "`n=== Received command: $($cmd.action) ==="
+
+        # Show the "Claude is controlling Tally" frame for GUI-driving commands (screenshot/ping
+        # excluded — screenshot must be clean, ping is passive). Auto-hides ~6s after the last action.
+        if (@('select-company','load-on-startup','sendkeys','select-and-unlock-company','switch-company','start-tally') -contains ([string]$cmd.action)) {
+            if (Get-Command Show-ClaudeOverlay -ErrorAction SilentlyContinue) { Show-ClaudeOverlay }
+        }
+
+        switch ($cmd.action) {
+            "select-company" {
+                if ($LLMProvider -eq "none") {
+                    Write-Result -Status "error" -Message "select-company requires an LLM key (ANTHROPIC_API_KEY or OPENAI_API_KEY). Use load-company (tally.ini-driven) for LLM-free company loading." -Strategy "select-company" -CommandId $cmdId
+                } else {
+                    Invoke-LLMGuidedAction -CompanyName $cmd.companyName -Action "select-company" -CommandId $cmdId -MaxStepsOverride $cmdMaxSteps
+                }
+            }
+            "load-on-startup" {
+                if ($LLMProvider -eq "none") {
+                    Write-Result -Status "error" -Message "load-on-startup requires an LLM key. Use load-company (tally.ini-driven) instead." -Strategy "load-on-startup" -CommandId $cmdId
+                } else {
+                    Invoke-LLMGuidedAction -CompanyName $cmd.companyName -Action "load-on-startup" -CommandId $cmdId -MaxStepsOverride $cmdMaxSteps
+                }
+            }
+            "ping" {
+                $extra = @{
+                    llmProvider = $LLMProvider
+                    scriptPath  = $Script:AgentScriptPath
+                    scriptMTime = if ($Script:AgentScriptMTime) { $Script:AgentScriptMTime.ToString('o') } else { $null }
+                    pid         = $PID
+                }
+                Write-Result -Status "success" -Message "Agent v2 is alive (LLM: $LLMProvider, version: $Script:AgentVersion)" -Strategy "ping" -CommandId $cmdId -Extra $extra
+            }
+            "screenshot" {
+                # Capture the current Tally window so the caller (an MCP client / Claude) can SEE the
+                # on-screen state and choose the next keystrokes - the interactive, human-supervised
+                # alternative to the blind deterministic select-and-unlock sequence. Pairs with "sendkeys".
+                try {
+                    $hwnd = Find-TallyWindow
+                    if ($hwnd -eq [IntPtr]::Zero) {
+                        Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "screenshot" -CommandId $cmdId
+                    } else {
+                        [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                        Start-Sleep -Milliseconds 300
+                        $shot = Get-Screenshot -Hwnd $hwnd
+                        if ($shot) {
+                            Write-Result -Status "success" -Message "Captured Tally window" -Strategy "screenshot" -CommandId $cmdId -Extra @{ screenshotFile = (Split-Path $shot -Leaf) }
+                        } else {
+                            Write-Result -Status "error" -Message "Screenshot capture failed (window may be minimized)" -Strategy "screenshot" -CommandId $cmdId
+                        }
+                    }
+                } catch {
+                    Write-Result -Status "error" -Message "Screenshot exception: $_" -Strategy "screenshot" -CommandId $cmdId
+                }
+            }
+            "sendkeys" {
+                # Execute an ordered list of keystroke steps (type / key / combo / wait) in the Tally
+                # window. Focus is re-asserted before each step so a stray focus-steal can't leak a typed
+                # password into another window. Reuses Execute-Action, the same primitive the LLM loop uses.
+                try {
+                    $hwnd = Find-TallyWindow
+                    if ($hwnd -eq [IntPtr]::Zero) {
+                        Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "sendkeys" -CommandId $cmdId
+                    } elseif (-not $cmd.keys) {
+                        Write-Result -Status "error" -Message "No keys provided" -Strategy "sendkeys" -CommandId $cmdId
+                    } else {
+                        [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                        Start-Sleep -Milliseconds 300
+                        $done = 0
+                        foreach ($step in @($cmd.keys)) {
+                            if ($null -eq $step -or -not $step.action) { continue }
+                            if ([TallyUI2]::GetForegroundWindow() -ne $hwnd) {
+                                [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                                Start-Sleep -Milliseconds 200
+                            }
+                            Execute-Action -Action $step
+                            $done++
+                        }
+                        Write-Result -Status "success" -Message "Executed $done key action(s)" -Strategy "sendkeys" -CommandId $cmdId -Extra @{ steps = $done }
+                    }
+                } catch {
+                    Write-Result -Status "error" -Message "sendkeys exception: $_" -Strategy "sendkeys" -CommandId $cmdId
+                }
+            }
+            "select-and-unlock-company" {
+                # Deterministic keystroke flow: type company id (already at Select Company) -> Enter -> type credentials -> Enter.
+                # IMPORTANT: do NOT send Alt+F3 first - on Tally Prime Edit Log it activates a "Specify Path" sub-mode,
+                # not the regular Select Company list. After Tally launches with no company loaded, the company list is
+                # already in focus and accepts typed input directly.
+                # No LLM, works regardless of password type. Used by load-company when auto-load via tally.ini's
+                # Load= directive can't proceed past the credential prompt.
+                $companyId = if ($cmd.companyId) { [string]$cmd.companyId } else { "" }
+                $userName  = if ($cmd.userName)  { [string]$cmd.userName }  else { "" }
+                $password  = if ($cmd.password)  { [string]$cmd.password }  else { "" }
+                $waitMsAfterEnter = if ($cmd.waitMsAfterEnter) { [int]$cmd.waitMsAfterEnter } else { 3000 }
+                $waitMsAfterCreds = if ($cmd.waitMsAfterCreds) { [int]$cmd.waitMsAfterCreds } else { 3000 }
+                if (-not $companyId) {
+                    Write-Result -Status "error" -Message "Missing companyId" -Strategy "select-and-unlock" -CommandId $cmdId
+                } else {
+                    try {
+                        $hwnd = Find-TallyWindow
+                        if ($hwnd -eq [IntPtr]::Zero) {
+                            Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "select-and-unlock" -CommandId $cmdId
+                        } else {
+                            [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                            Start-Sleep -Milliseconds 500
+
+                            # Reset to a known state by Escaping out of any wedged dialog from a prior run.
+                            # Two Escapes is safe: closes innermost dialog, then any outer modal. If we were already
+                            # at the bare Select Company list, Escape there is a no-op.
+                            [TallyUI2]::PressKey([TallyUI2]::VK_ESCAPE)
+                            Start-Sleep -Milliseconds 300
+                            [TallyUI2]::PressKey([TallyUI2]::VK_ESCAPE)
+                            Start-Sleep -Milliseconds 500
+
+                            # Type the company id (folder id) directly into the Select Company list.
+                            # Tally auto-jumps the highlight to the matching folder as we type.
+                            [TallyUI2]::TypeString($companyId)
+                            Start-Sleep -Milliseconds 800
+
+                            # Tally Prime's standard data layout is folder -> company. The first Enter
+                            # drills into the highlighted folder; the second Enter selects the company
+                            # inside it. After the second Enter, Tally either loads the company directly
+                            # (no password) or shows the credential prompt (password-protected).
+                            # Caller can override the count via $cmd.enterPresses (default: 2).
+                            $enterPresses = if ($cmd.enterPresses) { [int]$cmd.enterPresses } else { 2 }
+                            if ($enterPresses -lt 1) { $enterPresses = 1 }
+                            if ($enterPresses -gt 4) { $enterPresses = 4 }
+                            for ($_ep = 0; $_ep -lt $enterPresses; $_ep++) {
+                                [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
+                                if ($_ep -lt ($enterPresses - 1)) {
+                                    # Inter-Enter wait: let Tally render the folder contents before the next Enter.
+                                    Start-Sleep -Milliseconds 1500
+                                }
+                            }
+                            Start-Sleep -Milliseconds $waitMsAfterEnter
+
+                            # If credentials were supplied, enter them
+                            if ($userName) {
+                                [TallyUI2]::TypeString($userName)
+                                Start-Sleep -Milliseconds 300
+                                [TallyUI2]::PressKey([TallyUI2]::VK_TAB)
+                                Start-Sleep -Milliseconds 300
+                            }
+                            if ($password) {
+                                # Re-assert focus right before typing the password so a stray click or
+                                # focus-steal between the Enters above and now doesn't leak the password
+                                # into another window. Cheap re-check with existing helpers; ForceForeground
+                                # is a no-op when Tally is already the foreground window.
+                                if ([TallyUI2]::GetForegroundWindow() -ne $hwnd) {
+                                    [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                                    Start-Sleep -Milliseconds 300
+                                }
+                                [TallyUI2]::TypeString($password)
+                                Start-Sleep -Milliseconds 300
+                            }
+                            if ($userName -or $password) {
+                                [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
+                                Start-Sleep -Milliseconds $waitMsAfterCreds
+                            }
+
+                            # VERIFY GROUND TRUTH before claiming success. Everything above is open-loop:
+                            # Tally may have rejected the password, the list may never have had focus, or
+                            # the wrong folder/company may have been highlighted. Ask Tally what is actually
+                            # loaded and let the verifier report success / error / unverified accordingly,
+                            # instead of unconditionally reporting "keystrokes sent" as success.
+                            $ctx = if ($userName -or $password) { " with credentials" } else { "" }
+                            Write-VerifiedLoadResult -Requested $companyId -Strategy "select-and-unlock" -CommandId $cmdId -Context $ctx
+                        }
+                    } catch {
+                        Write-Result -Status "error" -Message "Exception: $_" -Strategy "select-and-unlock" -CommandId $cmdId
+                    }
+                }
+            }
+            "switch-company" {
+                # Switch the RESIDENT company on a LIVE Tally WITHOUT restarting it. This is the whole point:
+                # load-company kills + relaunches tally.exe, which drops the XML port 9000 and the hosted OAuth
+                # session -> forces a manual reconnect. Switching via Tally's own "Select Company" screen keeps
+                # Tally (and the connection) up.
+                #
+                # Composition of two ALREADY-PROVEN sequences:
+                #   1. PREFIX (open Select Company on a running Tally): Alt+F3 -> F1. This mirrors the LLM
+                #      select-company fallback above (search "typed company name search"), which empirically
+                #      opens the Select Company list on this Tally build. Alt+F3 = Company menu, F1 = Select Company.
+                #   2. TAIL (pick + unlock): identical to select-and-unlock-company - type the folder id, Enter to
+                #      drill the folder, Enter to select the company, then type credentials if supplied.
+                #
+                # SAFETY: we deliberately do NOT send a blind Escape first. From the Gateway a stray Escape pops
+                # the "Quit?" prompt (which has bitten us before). The caller is expected to anchor at a READ-ONLY
+                # screen (Gateway / a report) first - the MCP tool documents this and short-circuits when the target
+                # is already resident. Everything here is open-loop, so we VERIFY the outcome against Tally's XML
+                # server (Write-VerifiedLoadResult) and fail closed: a wrong/failed switch is never reported as success.
+                $companyId   = if ($cmd.companyId)   { [string]$cmd.companyId }   else { "" }
+                $companyName = if ($cmd.companyName) { [string]$cmd.companyName } else { "" }
+                $userName    = if ($cmd.userName)    { [string]$cmd.userName }    else { "" }
+                $password    = if ($cmd.password)    { [string]$cmd.password }    else { "" }
+                $waitMsAfterEnter = if ($cmd.waitMsAfterEnter) { [int]$cmd.waitMsAfterEnter } else { 3000 }
+                $waitMsAfterCreds = if ($cmd.waitMsAfterCreds) { [int]$cmd.waitMsAfterCreds } else { 3000 }
+                if (-not $companyId) {
+                    Write-Result -Status "error" -Message "Missing companyId" -Strategy "switch-company" -CommandId $cmdId
+                } else {
+                    try {
+                        $hwnd = Find-TallyWindow
+                        if ($hwnd -eq [IntPtr]::Zero) {
+                            Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "switch-company" -CommandId $cmdId
+                        } else {
+                            [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                            Start-Sleep -Milliseconds 500
+
+                            # PREFIX: open the Select Company list on the running Tally (Alt+F3 -> F1).
+                            [TallyUI2]::PressCombo([TallyUI2]::VK_MENU, [TallyUI2]::VK_F3)
+                            Start-Sleep -Milliseconds 800
+                            [TallyUI2]::PressKey([TallyUI2]::VK_F1)
+                            Start-Sleep -Milliseconds 900
+
+                            # TAIL: type the folder id; Tally auto-jumps the highlight to the matching folder.
+                            [TallyUI2]::TypeString($companyId)
+                            Start-Sleep -Milliseconds 800
+
+                            # folder -> company drill (default 2 Enters), same as select-and-unlock-company.
+                            $enterPresses = if ($cmd.enterPresses) { [int]$cmd.enterPresses } else { 2 }
+                            if ($enterPresses -lt 1) { $enterPresses = 1 }
+                            if ($enterPresses -gt 4) { $enterPresses = 4 }
+                            for ($_ep = 0; $_ep -lt $enterPresses; $_ep++) {
+                                [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
+                                if ($_ep -lt ($enterPresses - 1)) {
+                                    Start-Sleep -Milliseconds 1500
+                                }
+                            }
+                            Start-Sleep -Milliseconds $waitMsAfterEnter
+
+                            # Credentials, if the company is protected. TypeString (scan-code) not clipboard paste:
+                            # masked/TallyVault fields can silently reject a paste, so char typing is safer here.
+                            if ($userName) {
+                                [TallyUI2]::TypeString($userName)
+                                Start-Sleep -Milliseconds 300
+                                [TallyUI2]::PressKey([TallyUI2]::VK_TAB)
+                                Start-Sleep -Milliseconds 300
+                            }
+                            if ($password) {
+                                if ([TallyUI2]::GetForegroundWindow() -ne $hwnd) {
+                                    [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                                    Start-Sleep -Milliseconds 300
+                                }
+                                [TallyUI2]::TypeString($password)
+                                Start-Sleep -Milliseconds 300
+                            }
+                            if ($userName -or $password) {
+                                [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
+                                Start-Sleep -Milliseconds $waitMsAfterCreds
+                            }
+
+                            # CHECKPOINT: ground-truth verify (get-period / loaded-list agrees). Prefer the real
+                            # display name for the match; fall back to the folder id.
+                            $requested = if ($companyName) { $companyName } else { $companyId }
+                            $ctx = if ($userName -or $password) { " with credentials" } else { "" }
+                            Write-VerifiedLoadResult -Requested $requested -Strategy "switch-company" -CommandId $cmdId -Context $ctx
+                        }
+                    } catch {
+                        Write-Result -Status "error" -Message "Exception: $_" -Strategy "switch-company" -CommandId $cmdId
+                    }
+                }
+            }
+            "start-tally" {
+                # Spawn tally.exe in this agent's session (which is the user's interactive desktop session).
+                # The MCP service can't do this directly when running in Session 0 - that's why it delegates here.
+                # Security: the executable path comes from trusted local config (TALLY_EXE_PATH from .env,
+                # else the standard install path), NOT from the IPC command. Honouring $cmd.exePath would let
+                # any writer of the (previously world-writable) command file launch an arbitrary executable
+                # in the operator's interactive session.
+                $exe = if ($env:TALLY_EXE_PATH) { [string]$env:TALLY_EXE_PATH } else { "C:\Program Files\TallyPrimeEditLog\tally.exe" }
+                $waitSec = if ($cmd.waitSec) { [int]$cmd.waitSec } else { 30 }
+                if (-not (Test-Path $exe)) {
+                    Write-Result -Status "error" -Message "tally.exe not found at $exe" -Strategy "start-tally" -CommandId $cmdId
+                } else {
+                    try {
+                        Start-Process -FilePath $exe | Out-Null
+                        # Poll for the Tally window to appear - confirms the GUI is up before declaring success
+                        $deadline = (Get-Date).AddSeconds($waitSec)
+                        $hwnd = [IntPtr]::Zero
+                        while ((Get-Date) -lt $deadline) {
+                            $hwnd = Find-TallyWindow
+                            if ($hwnd -ne [IntPtr]::Zero) { break }
+                            Start-Sleep -Milliseconds 500
+                        }
+                        if ($hwnd -ne [IntPtr]::Zero) {
+                            Write-Result -Status "success" -Message "Tally started; window detected within timeout" -Strategy "start-tally" -CommandId $cmdId
+                        } else {
+                            Write-Result -Status "error" -Message "Tally process spawned but no window appeared within ${waitSec}s" -Strategy "start-tally" -CommandId $cmdId
+                        }
+                    } catch {
+                        Write-Result -Status "error" -Message "Start-Process failed: $_" -Strategy "start-tally" -CommandId $cmdId
+                    }
+                }
+            }
+            "press-key" {
+                # Step-by-step primitive: press one named key. Lets an LLM drive Tally
+                # interactively (screenshot -> reason -> press a key -> screenshot ->
+                # reason -> ...) instead of relying on the monolithic
+                # select-and-unlock-company keystroke blast.
+                $keyName = if ($cmd.keyName) { [string]$cmd.keyName } else { "" }
+                $keyMap = @{
+                    "enter" = [TallyUI2]::VK_RETURN; "return" = [TallyUI2]::VK_RETURN
+                    "escape" = [TallyUI2]::VK_ESCAPE; "esc" = [TallyUI2]::VK_ESCAPE
+                    "tab" = [TallyUI2]::VK_TAB; "backspace" = [TallyUI2]::VK_BACK; "back" = [TallyUI2]::VK_BACK
+                    "up" = [TallyUI2]::VK_UP; "down" = [TallyUI2]::VK_DOWN
+                    "left" = [TallyUI2]::VK_LEFT; "right" = [TallyUI2]::VK_RIGHT
+                    "f1" = [TallyUI2]::VK_F1; "f2" = [TallyUI2]::VK_F2; "f3" = [TallyUI2]::VK_F3
+                    "f4" = [TallyUI2]::VK_F4; "f5" = [TallyUI2]::VK_F5
+                    "f10" = [TallyUI2]::VK_F10; "f12" = [TallyUI2]::VK_F12
+                }
+                $vk = $keyMap[$keyName.ToLower()]
+                if (-not $vk) {
+                    $valid = ($keyMap.Keys | Sort-Object) -join ', '
+                    Write-Result -Status "error" -Message "Unknown keyName '$keyName'. Valid: $valid" -Strategy "press-key" -CommandId $cmdId
+                } else {
+                    try {
+                        $hwnd = Find-TallyWindow
+                        if ($hwnd -eq [IntPtr]::Zero) {
+                            Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "press-key" -CommandId $cmdId
+                        } else {
+                            [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                            Start-Sleep -Milliseconds 300
+                            [TallyUI2]::PressKey($vk)
+                            Start-Sleep -Milliseconds 300
+                            Write-Result -Status "success" -Message "Pressed $keyName" -Strategy "press-key" -CommandId $cmdId
+                        }
+                    } catch {
+                        Write-Result -Status "error" -Message "Exception: $_" -Strategy "press-key" -CommandId $cmdId
+                    }
+                }
+            }
+            "type-text" {
+                # Step-by-step primitive: type a string into the current Tally focus.
+                $text = if ($cmd.text) { [string]$cmd.text } else { "" }
+                if (-not $text) {
+                    Write-Result -Status "error" -Message "Missing 'text' field" -Strategy "type-text" -CommandId $cmdId
+                } else {
+                    try {
+                        $hwnd = Find-TallyWindow
+                        if ($hwnd -eq [IntPtr]::Zero) {
+                            Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "type-text" -CommandId $cmdId
+                        } else {
+                            [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                            Start-Sleep -Milliseconds 300
+                            [TallyUI2]::TypeString($text)
+                            Start-Sleep -Milliseconds 300
+                            # Length only - never echo the text itself in case a caller
+                            # routes a password through here.
+                            Write-Result -Status "success" -Message "Typed $($text.Length) chars" -Strategy "type-text" -CommandId $cmdId
+                        }
+                    } catch {
+                        Write-Result -Status "error" -Message "Exception: $_" -Strategy "type-text" -CommandId $cmdId
+                    }
+                }
+            }
+            "bring-foreground" {
+                # Quick state probe + focus. Useful before an LLM-driven sequence to make
+                # sure subsequent press-key / type-text actions land in Tally and not in
+                # some other window the user accidentally clicked into.
+                try {
+                    $hwnd = Find-TallyWindow
+                    if ($hwnd -eq [IntPtr]::Zero) {
+                        Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "bring-foreground" -CommandId $cmdId
+                    } else {
+                        [TallyUI2]::ForceForeground($hwnd) | Out-Null
+                        Start-Sleep -Milliseconds 300
+                        Write-Result -Status "success" -Message "Tally brought to foreground" -Strategy "bring-foreground" -CommandId $cmdId
+                    }
+                } catch {
+                    Write-Result -Status "error" -Message "Exception: $_" -Strategy "bring-foreground" -CommandId $cmdId
+                }
+            }
+            "exit" {
+                Write-Result -Status "success" -Message "Shutting down" -Strategy "exit" -CommandId $cmdId
+                exit 0
+            }
+            default {
+                Write-Result -Status "error" -Message "Unknown action: $($cmd.action)" -Strategy "unknown" -CommandId $cmdId
+            }
+        }
+}
+
+# --- One-shot entry ------------------------------------------------------------------------------
+# Runs a single command from stdin and exits. Deliberately placed before the watch loop so one-shot
+# invocations never start polling, never self-restart, and never touch the IPC files.
+if ($Once) {
+    try {
+        $stdin = [Console]::In.ReadToEnd()
+        if ([string]::IsNullOrWhiteSpace($stdin)) {
+            Write-Result -Status "error" -Message "No command received on stdin." -Strategy "once"
+            exit 1
+        }
+        $onceCmd = $stdin | ConvertFrom-Json
+        Invoke-AgentCommand -Cmd $onceCmd
+        exit 0
+    }
+    catch {
+        # Report as a normal result so the caller gets structured output on every path rather than
+        # having to distinguish a crash from a refusal.
+        Write-Result -Status "error" -Message "Exception: $_" -Strategy "once"
+        exit 1
+    }
+}
+
 while ($true) {
     # Check if our own script file changed on disk between iterations. If so, the user/deploy
     # has shipped a new agent version; re-launch into the new version and exit this process.
@@ -781,389 +1232,9 @@ while ($true) {
         }
 
         if ($cmdText) {
+            # Invoke-AgentCommand derives commandId / maxSteps from the command itself.
             $cmd = $cmdText | ConvertFrom-Json
-            $cmdId = if ($cmd.commandId) { [string]$cmd.commandId } else { "" }
-            $cmdMaxSteps = if ($cmd.maxSteps) { [int]$cmd.maxSteps } else { 0 }
-            Write-Host "`n=== Received command: $($cmd.action) ==="
-
-            # Show the "Claude is controlling Tally" frame for GUI-driving commands (screenshot/ping
-            # excluded — screenshot must be clean, ping is passive). Auto-hides ~6s after the last action.
-            if (@('select-company','load-on-startup','sendkeys','select-and-unlock-company','switch-company','start-tally') -contains ([string]$cmd.action)) {
-                if (Get-Command Show-ClaudeOverlay -ErrorAction SilentlyContinue) { Show-ClaudeOverlay }
-            }
-
-            switch ($cmd.action) {
-                "select-company" {
-                    if ($LLMProvider -eq "none") {
-                        Write-Result -Status "error" -Message "select-company requires an LLM key (ANTHROPIC_API_KEY or OPENAI_API_KEY). Use load-company (tally.ini-driven) for LLM-free company loading." -Strategy "select-company" -CommandId $cmdId
-                    } else {
-                        Invoke-LLMGuidedAction -CompanyName $cmd.companyName -Action "select-company" -CommandId $cmdId -MaxStepsOverride $cmdMaxSteps
-                    }
-                }
-                "load-on-startup" {
-                    if ($LLMProvider -eq "none") {
-                        Write-Result -Status "error" -Message "load-on-startup requires an LLM key. Use load-company (tally.ini-driven) instead." -Strategy "load-on-startup" -CommandId $cmdId
-                    } else {
-                        Invoke-LLMGuidedAction -CompanyName $cmd.companyName -Action "load-on-startup" -CommandId $cmdId -MaxStepsOverride $cmdMaxSteps
-                    }
-                }
-                "ping" {
-                    $extra = @{
-                        llmProvider = $LLMProvider
-                        scriptPath  = $Script:AgentScriptPath
-                        scriptMTime = if ($Script:AgentScriptMTime) { $Script:AgentScriptMTime.ToString('o') } else { $null }
-                        pid         = $PID
-                    }
-                    Write-Result -Status "success" -Message "Agent v2 is alive (LLM: $LLMProvider, version: $Script:AgentVersion)" -Strategy "ping" -CommandId $cmdId -Extra $extra
-                }
-                "screenshot" {
-                    # Capture the current Tally window so the caller (an MCP client / Claude) can SEE the
-                    # on-screen state and choose the next keystrokes - the interactive, human-supervised
-                    # alternative to the blind deterministic select-and-unlock sequence. Pairs with "sendkeys".
-                    try {
-                        $hwnd = Find-TallyWindow
-                        if ($hwnd -eq [IntPtr]::Zero) {
-                            Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "screenshot" -CommandId $cmdId
-                        } else {
-                            [TallyUI2]::ForceForeground($hwnd) | Out-Null
-                            Start-Sleep -Milliseconds 300
-                            $shot = Get-Screenshot -Hwnd $hwnd
-                            if ($shot) {
-                                Write-Result -Status "success" -Message "Captured Tally window" -Strategy "screenshot" -CommandId $cmdId -Extra @{ screenshotFile = (Split-Path $shot -Leaf) }
-                            } else {
-                                Write-Result -Status "error" -Message "Screenshot capture failed (window may be minimized)" -Strategy "screenshot" -CommandId $cmdId
-                            }
-                        }
-                    } catch {
-                        Write-Result -Status "error" -Message "Screenshot exception: $_" -Strategy "screenshot" -CommandId $cmdId
-                    }
-                }
-                "sendkeys" {
-                    # Execute an ordered list of keystroke steps (type / key / combo / wait) in the Tally
-                    # window. Focus is re-asserted before each step so a stray focus-steal can't leak a typed
-                    # password into another window. Reuses Execute-Action, the same primitive the LLM loop uses.
-                    try {
-                        $hwnd = Find-TallyWindow
-                        if ($hwnd -eq [IntPtr]::Zero) {
-                            Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "sendkeys" -CommandId $cmdId
-                        } elseif (-not $cmd.keys) {
-                            Write-Result -Status "error" -Message "No keys provided" -Strategy "sendkeys" -CommandId $cmdId
-                        } else {
-                            [TallyUI2]::ForceForeground($hwnd) | Out-Null
-                            Start-Sleep -Milliseconds 300
-                            $done = 0
-                            foreach ($step in @($cmd.keys)) {
-                                if ($null -eq $step -or -not $step.action) { continue }
-                                if ([TallyUI2]::GetForegroundWindow() -ne $hwnd) {
-                                    [TallyUI2]::ForceForeground($hwnd) | Out-Null
-                                    Start-Sleep -Milliseconds 200
-                                }
-                                Execute-Action -Action $step
-                                $done++
-                            }
-                            Write-Result -Status "success" -Message "Executed $done key action(s)" -Strategy "sendkeys" -CommandId $cmdId -Extra @{ steps = $done }
-                        }
-                    } catch {
-                        Write-Result -Status "error" -Message "sendkeys exception: $_" -Strategy "sendkeys" -CommandId $cmdId
-                    }
-                }
-                "select-and-unlock-company" {
-                    # Deterministic keystroke flow: type company id (already at Select Company) -> Enter -> type credentials -> Enter.
-                    # IMPORTANT: do NOT send Alt+F3 first - on Tally Prime Edit Log it activates a "Specify Path" sub-mode,
-                    # not the regular Select Company list. After Tally launches with no company loaded, the company list is
-                    # already in focus and accepts typed input directly.
-                    # No LLM, works regardless of password type. Used by load-company when auto-load via tally.ini's
-                    # Load= directive can't proceed past the credential prompt.
-                    $companyId = if ($cmd.companyId) { [string]$cmd.companyId } else { "" }
-                    $userName  = if ($cmd.userName)  { [string]$cmd.userName }  else { "" }
-                    $password  = if ($cmd.password)  { [string]$cmd.password }  else { "" }
-                    $waitMsAfterEnter = if ($cmd.waitMsAfterEnter) { [int]$cmd.waitMsAfterEnter } else { 3000 }
-                    $waitMsAfterCreds = if ($cmd.waitMsAfterCreds) { [int]$cmd.waitMsAfterCreds } else { 3000 }
-                    if (-not $companyId) {
-                        Write-Result -Status "error" -Message "Missing companyId" -Strategy "select-and-unlock" -CommandId $cmdId
-                    } else {
-                        try {
-                            $hwnd = Find-TallyWindow
-                            if ($hwnd -eq [IntPtr]::Zero) {
-                                Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "select-and-unlock" -CommandId $cmdId
-                            } else {
-                                [TallyUI2]::ForceForeground($hwnd) | Out-Null
-                                Start-Sleep -Milliseconds 500
-
-                                # Reset to a known state by Escaping out of any wedged dialog from a prior run.
-                                # Two Escapes is safe: closes innermost dialog, then any outer modal. If we were already
-                                # at the bare Select Company list, Escape there is a no-op.
-                                [TallyUI2]::PressKey([TallyUI2]::VK_ESCAPE)
-                                Start-Sleep -Milliseconds 300
-                                [TallyUI2]::PressKey([TallyUI2]::VK_ESCAPE)
-                                Start-Sleep -Milliseconds 500
-
-                                # Type the company id (folder id) directly into the Select Company list.
-                                # Tally auto-jumps the highlight to the matching folder as we type.
-                                [TallyUI2]::TypeString($companyId)
-                                Start-Sleep -Milliseconds 800
-
-                                # Tally Prime's standard data layout is folder -> company. The first Enter
-                                # drills into the highlighted folder; the second Enter selects the company
-                                # inside it. After the second Enter, Tally either loads the company directly
-                                # (no password) or shows the credential prompt (password-protected).
-                                # Caller can override the count via $cmd.enterPresses (default: 2).
-                                $enterPresses = if ($cmd.enterPresses) { [int]$cmd.enterPresses } else { 2 }
-                                if ($enterPresses -lt 1) { $enterPresses = 1 }
-                                if ($enterPresses -gt 4) { $enterPresses = 4 }
-                                for ($_ep = 0; $_ep -lt $enterPresses; $_ep++) {
-                                    [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
-                                    if ($_ep -lt ($enterPresses - 1)) {
-                                        # Inter-Enter wait: let Tally render the folder contents before the next Enter.
-                                        Start-Sleep -Milliseconds 1500
-                                    }
-                                }
-                                Start-Sleep -Milliseconds $waitMsAfterEnter
-
-                                # If credentials were supplied, enter them
-                                if ($userName) {
-                                    [TallyUI2]::TypeString($userName)
-                                    Start-Sleep -Milliseconds 300
-                                    [TallyUI2]::PressKey([TallyUI2]::VK_TAB)
-                                    Start-Sleep -Milliseconds 300
-                                }
-                                if ($password) {
-                                    # Re-assert focus right before typing the password so a stray click or
-                                    # focus-steal between the Enters above and now doesn't leak the password
-                                    # into another window. Cheap re-check with existing helpers; ForceForeground
-                                    # is a no-op when Tally is already the foreground window.
-                                    if ([TallyUI2]::GetForegroundWindow() -ne $hwnd) {
-                                        [TallyUI2]::ForceForeground($hwnd) | Out-Null
-                                        Start-Sleep -Milliseconds 300
-                                    }
-                                    [TallyUI2]::TypeString($password)
-                                    Start-Sleep -Milliseconds 300
-                                }
-                                if ($userName -or $password) {
-                                    [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
-                                    Start-Sleep -Milliseconds $waitMsAfterCreds
-                                }
-
-                                # VERIFY GROUND TRUTH before claiming success. Everything above is open-loop:
-                                # Tally may have rejected the password, the list may never have had focus, or
-                                # the wrong folder/company may have been highlighted. Ask Tally what is actually
-                                # loaded and let the verifier report success / error / unverified accordingly,
-                                # instead of unconditionally reporting "keystrokes sent" as success.
-                                $ctx = if ($userName -or $password) { " with credentials" } else { "" }
-                                Write-VerifiedLoadResult -Requested $companyId -Strategy "select-and-unlock" -CommandId $cmdId -Context $ctx
-                            }
-                        } catch {
-                            Write-Result -Status "error" -Message "Exception: $_" -Strategy "select-and-unlock" -CommandId $cmdId
-                        }
-                    }
-                }
-                "switch-company" {
-                    # Switch the RESIDENT company on a LIVE Tally WITHOUT restarting it. This is the whole point:
-                    # load-company kills + relaunches tally.exe, which drops the XML port 9000 and the hosted OAuth
-                    # session -> forces a manual reconnect. Switching via Tally's own "Select Company" screen keeps
-                    # Tally (and the connection) up.
-                    #
-                    # Composition of two ALREADY-PROVEN sequences:
-                    #   1. PREFIX (open Select Company on a running Tally): Alt+F3 -> F1. This mirrors the LLM
-                    #      select-company fallback above (search "typed company name search"), which empirically
-                    #      opens the Select Company list on this Tally build. Alt+F3 = Company menu, F1 = Select Company.
-                    #   2. TAIL (pick + unlock): identical to select-and-unlock-company - type the folder id, Enter to
-                    #      drill the folder, Enter to select the company, then type credentials if supplied.
-                    #
-                    # SAFETY: we deliberately do NOT send a blind Escape first. From the Gateway a stray Escape pops
-                    # the "Quit?" prompt (which has bitten us before). The caller is expected to anchor at a READ-ONLY
-                    # screen (Gateway / a report) first - the MCP tool documents this and short-circuits when the target
-                    # is already resident. Everything here is open-loop, so we VERIFY the outcome against Tally's XML
-                    # server (Write-VerifiedLoadResult) and fail closed: a wrong/failed switch is never reported as success.
-                    $companyId   = if ($cmd.companyId)   { [string]$cmd.companyId }   else { "" }
-                    $companyName = if ($cmd.companyName) { [string]$cmd.companyName } else { "" }
-                    $userName    = if ($cmd.userName)    { [string]$cmd.userName }    else { "" }
-                    $password    = if ($cmd.password)    { [string]$cmd.password }    else { "" }
-                    $waitMsAfterEnter = if ($cmd.waitMsAfterEnter) { [int]$cmd.waitMsAfterEnter } else { 3000 }
-                    $waitMsAfterCreds = if ($cmd.waitMsAfterCreds) { [int]$cmd.waitMsAfterCreds } else { 3000 }
-                    if (-not $companyId) {
-                        Write-Result -Status "error" -Message "Missing companyId" -Strategy "switch-company" -CommandId $cmdId
-                    } else {
-                        try {
-                            $hwnd = Find-TallyWindow
-                            if ($hwnd -eq [IntPtr]::Zero) {
-                                Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "switch-company" -CommandId $cmdId
-                            } else {
-                                [TallyUI2]::ForceForeground($hwnd) | Out-Null
-                                Start-Sleep -Milliseconds 500
-
-                                # PREFIX: open the Select Company list on the running Tally (Alt+F3 -> F1).
-                                [TallyUI2]::PressCombo([TallyUI2]::VK_MENU, [TallyUI2]::VK_F3)
-                                Start-Sleep -Milliseconds 800
-                                [TallyUI2]::PressKey([TallyUI2]::VK_F1)
-                                Start-Sleep -Milliseconds 900
-
-                                # TAIL: type the folder id; Tally auto-jumps the highlight to the matching folder.
-                                [TallyUI2]::TypeString($companyId)
-                                Start-Sleep -Milliseconds 800
-
-                                # folder -> company drill (default 2 Enters), same as select-and-unlock-company.
-                                $enterPresses = if ($cmd.enterPresses) { [int]$cmd.enterPresses } else { 2 }
-                                if ($enterPresses -lt 1) { $enterPresses = 1 }
-                                if ($enterPresses -gt 4) { $enterPresses = 4 }
-                                for ($_ep = 0; $_ep -lt $enterPresses; $_ep++) {
-                                    [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
-                                    if ($_ep -lt ($enterPresses - 1)) {
-                                        Start-Sleep -Milliseconds 1500
-                                    }
-                                }
-                                Start-Sleep -Milliseconds $waitMsAfterEnter
-
-                                # Credentials, if the company is protected. TypeString (scan-code) not clipboard paste:
-                                # masked/TallyVault fields can silently reject a paste, so char typing is safer here.
-                                if ($userName) {
-                                    [TallyUI2]::TypeString($userName)
-                                    Start-Sleep -Milliseconds 300
-                                    [TallyUI2]::PressKey([TallyUI2]::VK_TAB)
-                                    Start-Sleep -Milliseconds 300
-                                }
-                                if ($password) {
-                                    if ([TallyUI2]::GetForegroundWindow() -ne $hwnd) {
-                                        [TallyUI2]::ForceForeground($hwnd) | Out-Null
-                                        Start-Sleep -Milliseconds 300
-                                    }
-                                    [TallyUI2]::TypeString($password)
-                                    Start-Sleep -Milliseconds 300
-                                }
-                                if ($userName -or $password) {
-                                    [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
-                                    Start-Sleep -Milliseconds $waitMsAfterCreds
-                                }
-
-                                # CHECKPOINT: ground-truth verify (get-period / loaded-list agrees). Prefer the real
-                                # display name for the match; fall back to the folder id.
-                                $requested = if ($companyName) { $companyName } else { $companyId }
-                                $ctx = if ($userName -or $password) { " with credentials" } else { "" }
-                                Write-VerifiedLoadResult -Requested $requested -Strategy "switch-company" -CommandId $cmdId -Context $ctx
-                            }
-                        } catch {
-                            Write-Result -Status "error" -Message "Exception: $_" -Strategy "switch-company" -CommandId $cmdId
-                        }
-                    }
-                }
-                "start-tally" {
-                    # Spawn tally.exe in this agent's session (which is the user's interactive desktop session).
-                    # The MCP service can't do this directly when running in Session 0 - that's why it delegates here.
-                    # Security: the executable path comes from trusted local config (TALLY_EXE_PATH from .env,
-                    # else the standard install path), NOT from the IPC command. Honouring $cmd.exePath would let
-                    # any writer of the (previously world-writable) command file launch an arbitrary executable
-                    # in the operator's interactive session.
-                    $exe = if ($env:TALLY_EXE_PATH) { [string]$env:TALLY_EXE_PATH } else { "C:\Program Files\TallyPrimeEditLog\tally.exe" }
-                    $waitSec = if ($cmd.waitSec) { [int]$cmd.waitSec } else { 30 }
-                    if (-not (Test-Path $exe)) {
-                        Write-Result -Status "error" -Message "tally.exe not found at $exe" -Strategy "start-tally" -CommandId $cmdId
-                    } else {
-                        try {
-                            Start-Process -FilePath $exe | Out-Null
-                            # Poll for the Tally window to appear - confirms the GUI is up before declaring success
-                            $deadline = (Get-Date).AddSeconds($waitSec)
-                            $hwnd = [IntPtr]::Zero
-                            while ((Get-Date) -lt $deadline) {
-                                $hwnd = Find-TallyWindow
-                                if ($hwnd -ne [IntPtr]::Zero) { break }
-                                Start-Sleep -Milliseconds 500
-                            }
-                            if ($hwnd -ne [IntPtr]::Zero) {
-                                Write-Result -Status "success" -Message "Tally started; window detected within timeout" -Strategy "start-tally" -CommandId $cmdId
-                            } else {
-                                Write-Result -Status "error" -Message "Tally process spawned but no window appeared within ${waitSec}s" -Strategy "start-tally" -CommandId $cmdId
-                            }
-                        } catch {
-                            Write-Result -Status "error" -Message "Start-Process failed: $_" -Strategy "start-tally" -CommandId $cmdId
-                        }
-                    }
-                }
-                "press-key" {
-                    # Step-by-step primitive: press one named key. Lets an LLM drive Tally
-                    # interactively (screenshot -> reason -> press a key -> screenshot ->
-                    # reason -> ...) instead of relying on the monolithic
-                    # select-and-unlock-company keystroke blast.
-                    $keyName = if ($cmd.keyName) { [string]$cmd.keyName } else { "" }
-                    $keyMap = @{
-                        "enter" = [TallyUI2]::VK_RETURN; "return" = [TallyUI2]::VK_RETURN
-                        "escape" = [TallyUI2]::VK_ESCAPE; "esc" = [TallyUI2]::VK_ESCAPE
-                        "tab" = [TallyUI2]::VK_TAB; "backspace" = [TallyUI2]::VK_BACK; "back" = [TallyUI2]::VK_BACK
-                        "up" = [TallyUI2]::VK_UP; "down" = [TallyUI2]::VK_DOWN
-                        "left" = [TallyUI2]::VK_LEFT; "right" = [TallyUI2]::VK_RIGHT
-                        "f1" = [TallyUI2]::VK_F1; "f2" = [TallyUI2]::VK_F2; "f3" = [TallyUI2]::VK_F3
-                        "f4" = [TallyUI2]::VK_F4; "f5" = [TallyUI2]::VK_F5
-                        "f10" = [TallyUI2]::VK_F10; "f12" = [TallyUI2]::VK_F12
-                    }
-                    $vk = $keyMap[$keyName.ToLower()]
-                    if (-not $vk) {
-                        $valid = ($keyMap.Keys | Sort-Object) -join ', '
-                        Write-Result -Status "error" -Message "Unknown keyName '$keyName'. Valid: $valid" -Strategy "press-key" -CommandId $cmdId
-                    } else {
-                        try {
-                            $hwnd = Find-TallyWindow
-                            if ($hwnd -eq [IntPtr]::Zero) {
-                                Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "press-key" -CommandId $cmdId
-                            } else {
-                                [TallyUI2]::ForceForeground($hwnd) | Out-Null
-                                Start-Sleep -Milliseconds 300
-                                [TallyUI2]::PressKey($vk)
-                                Start-Sleep -Milliseconds 300
-                                Write-Result -Status "success" -Message "Pressed $keyName" -Strategy "press-key" -CommandId $cmdId
-                            }
-                        } catch {
-                            Write-Result -Status "error" -Message "Exception: $_" -Strategy "press-key" -CommandId $cmdId
-                        }
-                    }
-                }
-                "type-text" {
-                    # Step-by-step primitive: type a string into the current Tally focus.
-                    $text = if ($cmd.text) { [string]$cmd.text } else { "" }
-                    if (-not $text) {
-                        Write-Result -Status "error" -Message "Missing 'text' field" -Strategy "type-text" -CommandId $cmdId
-                    } else {
-                        try {
-                            $hwnd = Find-TallyWindow
-                            if ($hwnd -eq [IntPtr]::Zero) {
-                                Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "type-text" -CommandId $cmdId
-                            } else {
-                                [TallyUI2]::ForceForeground($hwnd) | Out-Null
-                                Start-Sleep -Milliseconds 300
-                                [TallyUI2]::TypeString($text)
-                                Start-Sleep -Milliseconds 300
-                                # Length only - never echo the text itself in case a caller
-                                # routes a password through here.
-                                Write-Result -Status "success" -Message "Typed $($text.Length) chars" -Strategy "type-text" -CommandId $cmdId
-                            }
-                        } catch {
-                            Write-Result -Status "error" -Message "Exception: $_" -Strategy "type-text" -CommandId $cmdId
-                        }
-                    }
-                }
-                "bring-foreground" {
-                    # Quick state probe + focus. Useful before an LLM-driven sequence to make
-                    # sure subsequent press-key / type-text actions land in Tally and not in
-                    # some other window the user accidentally clicked into.
-                    try {
-                        $hwnd = Find-TallyWindow
-                        if ($hwnd -eq [IntPtr]::Zero) {
-                            Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "bring-foreground" -CommandId $cmdId
-                        } else {
-                            [TallyUI2]::ForceForeground($hwnd) | Out-Null
-                            Start-Sleep -Milliseconds 300
-                            Write-Result -Status "success" -Message "Tally brought to foreground" -Strategy "bring-foreground" -CommandId $cmdId
-                        }
-                    } catch {
-                        Write-Result -Status "error" -Message "Exception: $_" -Strategy "bring-foreground" -CommandId $cmdId
-                    }
-                }
-                "exit" {
-                    Write-Result -Status "success" -Message "Shutting down" -Strategy "exit" -CommandId $cmdId
-                    exit 0
-                }
-                default {
-                    Write-Result -Status "error" -Message "Unknown action: $($cmd.action)" -Strategy "unknown" -CommandId $cmdId
-                }
-            }
+            Invoke-AgentCommand -Cmd $cmd
         }
     }
     catch {

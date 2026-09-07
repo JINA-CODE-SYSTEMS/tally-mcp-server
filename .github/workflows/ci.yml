@@ -191,3 +191,54 @@ jobs:
           }
           Write-Host 'No PSScriptAnalyzer errors'
 
+
+      # Regression test for the transport seam (PR #190). The one-shot (-Once) path is how the MCP
+      # server drives Tally in-session, and it MUST work while the companion watch-mode agent is
+      # running - that is the normal state of every production box. An earlier revision took the
+      # single-instance mutex before branching on -Once, so every one-shot child was refused with a
+      # plain-text line and exit 0; the caller parses stdout as JSON, so that surfaced as a null
+      # result indistinguishable from a timeout. This step holds the mutex in the runner's own
+      # process (exactly what an installed agent does) and proves a one-shot child still answers.
+      - name: One-shot agent answers while a watcher holds the mutex
+        shell: pwsh
+        run: |
+          $mutex = New-Object System.Threading.Mutex($false, 'TallyMCPAgentSingleInstance')
+          if (-not $mutex.WaitOne(5000)) { throw 'could not acquire the mutex to simulate a running watcher' }
+          try {
+            $out = '{"action":"ping","commandId":"ci-oneshot"}' |
+              & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                  -File scripts\tally-gui-agent-v2.ps1 -Once 2>&1 | Out-String
+
+            Write-Host "--- agent stdout ---`n$out--------------------"
+
+            # Mirror parseGuiAgentStdout: take the last complete JSON line, ignoring host chatter.
+            $json = $out -split "`r?`n" |
+              ForEach-Object { $_.TrimStart([char]0xFEFF).Trim() } |
+              Where-Object { $_.StartsWith('{') -and $_.EndsWith('}') } |
+              Select-Object -Last 1
+
+            if (-not $json) { throw 'one-shot produced no JSON result while a watcher held the mutex (regression: the single-instance guard is refusing -Once)' }
+
+            $result = $json | ConvertFrom-Json
+            if ($result.status -ne 'success')    { throw "one-shot ping returned status '$($result.status)': $($result.message)" }
+            if (-not $result.agentVersion)       { throw 'one-shot ping returned no agentVersion' }
+            Write-Host "one-shot OK while watcher held the mutex (agentVersion $($result.agentVersion))"
+          }
+          finally { $mutex.ReleaseMutex(); $mutex.Dispose() }
+
+      # The flip side: the guard must still refuse a second WATCH-mode agent, or two watchers will
+      # race on the IPC files and each spawn an overlay.
+      - name: A second watch-mode agent is still refused
+        shell: pwsh
+        run: |
+          $mutex = New-Object System.Threading.Mutex($false, 'TallyMCPAgentSingleInstance')
+          if (-not $mutex.WaitOne(5000)) { throw 'could not acquire the mutex to simulate a running watcher' }
+          try {
+            $out = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                     -File scripts\tally-gui-agent-v2.ps1 -WatchDir $env:RUNNER_TEMP 2>&1 | Out-String
+            if ($out -notmatch 'already running') {
+              throw "a duplicate watch-mode agent was NOT refused; it printed:`n$out"
+            }
+            Write-Host 'duplicate watch-mode agent correctly refused'
+          }
+          finally { $mutex.ReleaseMutex(); $mutex.Dispose() }
