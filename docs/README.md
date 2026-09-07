@@ -50,11 +50,31 @@ Port = 9000
 
 ### Option A — Windows installer (recommended for client deployments)
 
+**→ [Download the latest installer](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/releases/latest)**
+
 A double-click **`Claudally-Setup-<version>.exe`** takes a Windows box from
 "nothing installed" to "service running" in under 5 minutes. Bundles portable
 Node.js, NSSM, and `cloudflared`; registers the Windows service and the GUI
 agent at-logon task. See [docs/installer.md](installer.md) for build
 instructions.
+
+#### Verify the download before running it
+
+Releases are **not yet code-signed** ([#175](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/175)), so Windows will warn about an unrecognised
+publisher. Two checks confirm you have exactly the file we built — the SHA-256 is on the
+release page and also ships as a `.sha256` asset:
+
+```powershell
+Get-FileHash -Algorithm SHA256 .\Claudally-Setup-<version>.exe
+```
+
+```powershell
+gh attestation verify .\Claudally-Setup-<version>.exe -R JINA-CODE-SYSTEMS/tally-mcp-server
+```
+
+The second is the stronger check: every release carries signed build provenance, so this
+proves the binary was produced by our public CI from a specific commit — not merely that it
+matches a number we published. **If either check fails, do not run the file.**
 
 **The setup wizard collects (most values auto-detect — usually just click Next):**
 

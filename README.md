@@ -31,6 +31,19 @@ all copies, forks, and derivative works — see [NOTICE](NOTICE) for the full cl
 | **Connect** | [Which URL?](docs/README.md#connecting--which-url) · [Cloudflare Tunnel](docs/cloudflare-tunnel-provisioning.md) · [Security & hardening](docs/cloudflare-tunnel-provisioning.md#security--hardening) |
 | **Reference** | [Security assessment](docs/security-assessment.md) · [Changelog](docs/CHANGELOG.md) · [Design notes](docs/dev/) |
 
+## Download
+
+**→ [Get the latest Windows installer](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/releases/latest)**
+
+A double-click takes a Windows box from "nothing installed" to "service running" in under
+5 minutes — portable Node.js, NSSM and `cloudflared` are bundled.
+
+Releases are not code-signed yet, so verify before running: the SHA-256 is published on the
+release page, and every build carries signed provenance you can check with
+`gh attestation verify <file> -R JINA-CODE-SYSTEMS/tally-mcp-server`. See
+[the install guide](docs/README.md#option-a--windows-installer-recommended-for-client-deployments)
+for details.
+
 ## Quick start (from source)
 
 ```bash
