@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, fix/gui-hardening]
+    branches: [main]
   pull_request:
-    branches: [main, fix/gui-hardening]
+    branches: [main]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -101,7 +101,7 @@ jobs:
           fetch-depth: 0
 
       - name: TruffleHog secret scan
-        uses: trufflesecurity/trufflehog@main
+        uses: trufflesecurity/trufflehog@363923b901c911a9164f50b6c423f47c15372b1c # v3.97.4
         with:
           extra_args: --only-verified
 
@@ -113,17 +113,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Required: the check below diffs against origin/main. On the default
+          # shallow clone that ref is absent, git errors, stderr is discarded and
+          # the gate silently passes regardless of what the PR contains.
+          fetch-depth: 0
 
       - name: Block sensitive files
         run: |
           BLOCKED=0
           # Check for log files
-          if git diff --name-only --diff-filter=A origin/main...HEAD 2>/dev/null | grep -iE '\.(log|env|pem|key|pfx|p12)$'; then
+          if git diff --name-only --diff-filter=A origin/main...HEAD | grep -iE '\.(log|env|pem|key|pfx|p12)$'; then
             echo "::error::Sensitive file types detected in PR. Remove them before merging."
             BLOCKED=1
           fi
           # Check for common secret patterns in added lines
-          if git diff origin/main...HEAD 2>/dev/null | grep -iE '^\+.*(password|secret|token|api_key)\s*[:=]\s*.{8,}'; then
+          if git diff origin/main...HEAD | grep -iE '^\+.*(password|secret|token|api_key)\s*[:=]\s*.{8,}'; then
             echo "::warning::Possible hardcoded secret detected. Please review."
           fi
           if [ "$BLOCKED" -eq 1 ]; then exit 1; fi
