@@ -110,6 +110,15 @@ function Unprotect-PasswordViaHelper {
 # ---------------------------------------------------------------------------
 
 function Invoke-LoadCompanyViaAgent {
+    # PSScriptAnalyzer flags the Username/Password pair here, and it is a TRUE finding rather than
+    # a false positive. But SecureString would be theatre: a few lines below, the password is
+    # written into _mcp_gui_command.json as plaintext, because that file IS the transport to the
+    # GUI agent running in the interactive session. Wrapping the parameter and then immediately
+    # unwrapping it for the IPC file would hide a real exposure behind a passing check without
+    # removing it. The actual fix is issue #171, which drives Tally in-session and hands the
+    # credential straight to a child process, so it never reaches disk at all.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingUsernameAndPasswordParams', '',
+        Justification = 'Plaintext is inherent to the current file-IPC transport. Removed by #171, not by a SecureString wrapper.')]
     param(
         [string]$RegistryPath,
         [string]$FolderId,
