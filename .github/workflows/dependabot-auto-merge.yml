@@ -1,0 +1,106 @@
+# Auto-merge low-risk Dependabot updates so the dependency queue drains itself.
+#
+# Why this file exists: a stalled Dependabot queue is a security problem, not a
+# tidiness problem. `open-pull-requests-limit` caps the number of open version-update
+# PRs, so an unattended backlog silently stops NEW updates from ever being opened.
+#
+# ─── Security notes — read before editing ────────────────────────────────────
+#
+# 1. Trigger is `pull_request`, NEVER `pull_request_target`.
+#    `pull_request_target` runs in the context of the BASE repo, which means
+#    untrusted PR code would execute with a write-scoped token and access to
+#    secrets. That is the single most common way public repos get compromised.
+#    This workflow never checks out or executes PR content at all.
+#
+# 2. Author is checked explicitly. `github.event.pull_request.user.login` is set
+#    by GitHub from the PR record; it is not attacker-supplied PR content.
+#
+# 3. Actions are pinned to a full commit SHA, not a moving tag. A tag can be
+#    repointed by whoever controls the action repo; a SHA cannot.
+#
+# 4. Permissions are the minimum needed to set auto-merge on a PR.
+#
+# 5. MAJOR version bumps are deliberately excluded and always need a human.
+#    That covers both semver majors (e.g. typescript 6 -> 7) and GitHub Action
+#    majors, where a new major can pull in a materially different supply chain.
+#
+# ─── REQUIRED REPO CONFIGURATION ─────────────────────────────────────────────
+#
+#   `gh pr merge --auto` queues the merge for when required status checks pass.
+#   If the branch has NO required status checks, auto-merge lands the PR
+#   IMMEDIATELY with nothing verified.
+#
+#   Before enabling this workflow you MUST:
+#     a) Settings -> General -> "Allow auto-merge"  = enabled
+#     b) A ruleset / branch protection on `main` requiring these checks:
+#          Build & Type Check, Tests (Node 20), Tests (Node 22),
+#          Security Scan, Secret Leak Detection, File Safety Checks
+#     c) Settings -> Actions -> General ->
+#          "Allow GitHub Actions to create and approve pull requests" = enabled
+#
+#   (c) is required because `main` requires one approving review. Without it,
+#   auto-merge is set but the PR waits indefinitely for an approval that never
+#   arrives — the workflow appears to work while doing nothing.
+#
+#   Without (b) this workflow is a liability rather than a safeguard. The
+#   approval in the step below is granted WITHOUT human review, so required
+#   status checks are the only thing standing between a bad dependency update
+#   and `main`. Do not enable this workflow until (b) is in place.
+
+name: Dependabot auto-merge
+
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    name: Auto-merge patch and minor updates
+    runs-on: ubuntu-latest
+    # Only ever act on PRs opened by Dependabot itself.
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        # dependabot/fetch-metadata v2 pinned to commit 21025c7
+        uses: dependabot/fetch-metadata@21025c705c08248db411dc16f3619e6b5f9ea21a
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # `main` requires one approving review. Dependabot cannot approve its own
+      # PR, so without this the auto-merge below is queued and never satisfied.
+      # Scoped to the same patch/minor condition as the merge step — majors are
+      # never approved automatically.
+      - name: Approve (patch and minor only)
+        if: |
+          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+          steps.meta.outputs.update-type == 'version-update:semver-minor'
+        run: gh pr review --approve "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable auto-merge (patch and minor only)
+        if: |
+          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+          steps.meta.outputs.update-type == 'version-update:semver-minor'
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Flag major updates for manual review
+        if: steps.meta.outputs.update-type == 'version-update:semver-major'
+        run: |
+          gh pr comment "$PR_URL" --body \
+            "🔍 **Major version bump — auto-merge intentionally skipped.**
+
+          \`${{ steps.meta.outputs.dependency-names }}\` ${{ steps.meta.outputs.previous-version }} → ${{ steps.meta.outputs.new-version }}
+
+          Majors can change behaviour or pull in a different supply chain, so this needs a human review and merge."
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
