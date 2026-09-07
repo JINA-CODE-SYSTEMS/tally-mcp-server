@@ -127,6 +127,12 @@ jobs:
             echo "::error::Sensitive file types detected in PR. Remove them before merging."
             BLOCKED=1
           fi
+          # The Claude plugin is built from plugin/ during the Pages deploy. A committed archive
+          # is unreviewable — diffs are meaningless and its contents cannot be code-reviewed.
+          if git diff --name-only --diff-filter=A origin/main...HEAD | grep -iE '\.(plugin|zip)$'; then
+            echo "::error::Committed archive detected. Build it from source instead — see plugin/ and pages.yml."
+            BLOCKED=1
+          fi
           # Check for common secret patterns in added lines
           if git diff origin/main...HEAD | grep -iE '^\+.*(password|secret|token|api_key)\s*[:=]\s*.{8,}'; then
             echo "::warning::Possible hardcoded secret detected. Please review."

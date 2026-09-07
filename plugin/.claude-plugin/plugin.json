@@ -1,0 +1,8 @@
+{
+  "name": "tally-feeding",
+  "version": "0.2.0",
+  "description": "Client-consistent data entry into Tally Prime — profile how a firm actually posts, confirm it, then feed ledgers, stock items, and vouchers (GST and non-GST) that match, through the Tally Prime MCP. Requires the open-source Tally Prime MCP server connected as a connector.",
+  "author": { "name": "Tapan Jain", "email": "tapan@jinacode.systems" },
+  "homepage": "https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server",
+  "keywords": ["tally", "accounting", "bookkeeping", "gst", "vouchers", "india"]
+}
