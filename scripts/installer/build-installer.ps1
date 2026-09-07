@@ -60,6 +60,12 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 Set-Location $repoRoot
 
+# Echo how we were actually invoked. A caller that fails to bind -DownloadDeps (PowerShell array
+# splatting passes elements positionally and will NOT set a switch) otherwise skips dependency
+# staging in silence and dies later on a "node.exe not found ... re-run with -DownloadDeps"
+# message, which points at the one thing the caller believed it had already done.
+Write-Host "==> build-installer: Version='$Version' DownloadDeps=$DownloadDeps SkipBuild=$SkipBuild" -ForegroundColor DarkGray
+
 $staging = Join-Path $repoRoot 'installer-staging'
 $nodeStaging = Join-Path $staging 'node-portable'
 New-Item -ItemType Directory -Force -Path $staging, $nodeStaging | Out-Null

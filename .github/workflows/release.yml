@@ -143,9 +143,16 @@ jobs:
           # is absent rather than silently trusting the download.
           NSSM_SHA256: ${{ vars.NSSM_SHA256 }}
         run: |
-          # Not $args — that is a PowerShell automatic variable.
-          $buildArgs = @('-DownloadDeps', '-Version', '${{ steps.ver.outputs.version }}')
-          if ($env:NSSM_SHA256) { $buildArgs += @('-NssmSha256', $env:NSSM_SHA256) }
+          # HASHTABLE splatting, not array splatting. An array splat passes its elements
+          # POSITIONALLY, so '-DownloadDeps' did not bind the switch — the script silently skipped
+          # staging Node and then failed on the "node.exe not found" check. A hashtable binds by
+          # name and is the only correct way to pass a switch this way.
+          # Not named $args: that is a PowerShell automatic variable.
+          $buildArgs = @{
+            DownloadDeps = $true
+            Version      = '${{ steps.ver.outputs.version }}'
+          }
+          if ($env:NSSM_SHA256) { $buildArgs.NssmSha256 = $env:NSSM_SHA256 }
           & .\scripts\installer\build-installer.ps1 @buildArgs
 
       - name: Hash the installer
