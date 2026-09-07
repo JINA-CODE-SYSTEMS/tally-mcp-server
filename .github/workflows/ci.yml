@@ -132,3 +132,56 @@ jobs:
             echo "::warning::Possible hardcoded secret detected. Please review."
           fi
           if [ "$BLOCKED" -eq 1 ]; then exit 1; fi
+
+  # ──────────────────────────────────────────────
+  # Windows Sources
+  # ──────────────────────────────────────────────
+  # The Windows half of this project had no CI at all: the installer, the PowerShell agent and
+  # TallyUI.cs were only ever built on a maintainer's desktop. This job keeps the Windows sources
+  # honest on every PR. It deliberately does NOT build the full installer — that downloads a
+  # portable Node, NSSM and cloudflared and runs Inno Setup, which is far too slow per-PR. The
+  # complete installer build runs on tag push in release.yml.
+  windows-sources:
+    name: Windows Sources
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compile TallyUI.dll
+        shell: pwsh
+        run: |
+          $csc = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (-not (Test-Path $csc)) { throw "csc.exe not found at $csc" }
+          & $csc /nologo /target:library /reference:System.Drawing.dll `
+                 /out:scripts\TallyUI.dll scripts\TallyUI.cs
+          if ($LASTEXITCODE -ne 0) { throw 'TallyUI.dll compile failed' }
+          Write-Host "TallyUI.dll built: $((Get-Item scripts\TallyUI.dll).Length) bytes"
+
+      - name: PowerShell syntax check
+        shell: pwsh
+        run: |
+          $bad = @()
+          Get-ChildItem -Path scripts -Recurse -Filter *.ps1 | ForEach-Object {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors) | Out-Null
+            if ($errors) {
+              $bad += $_.FullName
+              Write-Host "::error file=$($_.FullName)::$($errors[0].Message)"
+            }
+          }
+          if ($bad.Count) { throw "$($bad.Count) PowerShell file(s) failed to parse" }
+          Write-Host 'All PowerShell scripts parse cleanly'
+
+      - name: PSScriptAnalyzer (errors only)
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
+          # Errors fail the build; warnings are surfaced but tolerated for now, so this can be
+          # adopted without a large up-front cleanup. Tighten to Warning once the backlog is clear.
+          $issues = Invoke-ScriptAnalyzer -Path scripts -Recurse -Severity Error
+          if ($issues) {
+            $issues | Format-Table -AutoSize | Out-String | Write-Host
+            throw "PSScriptAnalyzer reported $($issues.Count) error(s)"
+          }
+          Write-Host 'No PSScriptAnalyzer errors'
+

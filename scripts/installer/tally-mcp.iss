@@ -21,7 +21,12 @@
 ; MyAgentTaskName, MyTrayTaskName) and the install directory stay "TallyMCP" on purpose so existing
 ; installs upgrade in place — only the user-facing brand changes. AppId is unchanged for the same reason.
 #define MyAppName        "Claudally"
-#define MyAppVersion     "1.1.0"
+; Version is supplied by the build (ISCC /DMyAppVersion=...), which takes it from the git tag so
+; the release, the installer filename and package.json cannot drift apart. The fallback below is
+; used only for an ad-hoc local compile and is deliberately obviously-not-a-release.
+#ifndef MyAppVersion
+  #define MyAppVersion   "0.0.0-dev"
+#endif
 #define MyAppPublisher   "JINA CODE SYSTEMS LLP"
 #define MyAppURL         "https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server"
 #define MyServiceName    "TallyMCP"

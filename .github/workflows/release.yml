@@ -1,0 +1,159 @@
+# Builds Claudally-Setup-<version>.exe on a Windows runner and publishes it as a GitHub Release.
+#
+# ─── Why this exists ─────────────────────────────────────────────────────────
+#
+# Until now the installer was built only on a maintainer's desktop, so the Windows
+# half of this project — the installer, the PowerShell GUI agent, TallyUI.cs — was
+# never compiled by automation. A CI-built release from public source is also a
+# hard prerequisite for every code-signing route available to us.
+#
+# ─── Security notes — read before editing ────────────────────────────────────
+#
+# 1. Triggers on TAG PUSH and manual dispatch only. NEVER on pull_request.
+#    Signing credentials will live in repository secrets. This is a public repo,
+#    so anyone can open a PR; a workflow that both builds releases and runs on
+#    untrusted PR content is how signing material leaks. Keep it tag-only.
+#
+# 2. Workflow logs on a public repo are world-readable. Nothing secret may be
+#    echoed here, and that constraint tightens once signing is wired in (#175).
+#
+# 3. Bundled dependencies are integrity-checked by build-installer.ps1: Node.js
+#    against its official SHASUMS256.txt, and NSSM against -NssmSha256 when a
+#    pinned hash is supplied. nssm.cc publishes no signed checksums, so that
+#    hash must come from a trusted source — see NSSM_SHA256 below.
+#
+# 4. Artifacts are NOT yet code-signed (#175). Until they are, the published
+#    SHA-256 is the only way a customer can verify a download, so the release
+#    notes must always carry it.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build, without the leading v (e.g. 0.1.0). Produces a draft release.'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Windows installer
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+          cache: npm
+
+      # The tag is the single source of truth for the version. package.json must agree, or the
+      # release, the installer filename and the runtime would drift apart the way they already had
+      # (package.json said 1.0.0 while the .iss hardcoded 1.1.0).
+      - name: Resolve and verify version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            '${{ inputs.version }}'
+          } else {
+            '${{ github.ref_name }}' -replace '^v', ''
+          }
+          if ($v -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') {
+            throw "Version '$v' is not semver. Tag releases as vMAJOR.MINOR.PATCH."
+          }
+          $pkg = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($pkg -ne $v) {
+            throw "Version mismatch: tag says '$v' but package.json says '$pkg'. Update package.json and re-tag."
+          }
+          Write-Host "Building version $v"
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck and test
+        run: |
+          npx tsc --noEmit
+          npm test
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        env:
+          # nssm.cc publishes no signed checksums. Set this repository variable to a SHA-256
+          # obtained from a trusted source to harden the build; the script warns loudly when it
+          # is absent rather than silently trusting the download.
+          NSSM_SHA256: ${{ vars.NSSM_SHA256 }}
+        run: |
+          # Not $args — that is a PowerShell automatic variable.
+          $buildArgs = @('-DownloadDeps', '-Version', '${{ steps.ver.outputs.version }}')
+          if ($env:NSSM_SHA256) { $buildArgs += @('-NssmSha256', $env:NSSM_SHA256) }
+          & .\scripts\installer\build-installer.ps1 @buildArgs
+
+      - name: Hash the installer
+        id: hash
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem dist-installer\Claudally-Setup-*.exe | Select-Object -First 1
+          if (-not $exe) { throw "No installer produced in dist-installer/" }
+          $sha = (Get-FileHash -Path $exe.FullName -Algorithm SHA256).Hash.ToLower()
+          "$sha  $($exe.Name)" | Out-File -FilePath "$($exe.FullName).sha256" -Encoding ascii
+          Write-Host "$($exe.Name)  $([math]::Round($exe.Length/1MB,1)) MB  sha256=$sha"
+          "path=$($exe.FullName)"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "name=$($exe.Name)"      | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sha=$sha"               | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Claudally-Setup-${{ steps.ver.outputs.version }}
+          path: |
+            dist-installer/Claudally-Setup-*.exe
+            dist-installer/Claudally-Setup-*.exe.sha256
+          retention-days: 14
+
+      # Notes come from .github/release-notes.md.tmpl so they can be edited without touching this
+      # workflow. A manual dispatch produces a DRAFT, so a build can be exercised end to end
+      # without publishing something a customer might install. Tag pushes publish for real.
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = '${{ steps.ver.outputs.version }}'
+          if (gh release view "v$v" 2>$null) {
+            throw "Release v$v already exists. Bump the version rather than overwriting a published artifact."
+          }
+
+          $notes = Get-Content .github/release-notes.md.tmpl -Raw
+          $notes = $notes.Replace('{{VERSION}}', $v)
+          $notes = $notes.Replace('{{FILE}}', '${{ steps.hash.outputs.name }}')
+          $notes = $notes.Replace('{{SHA}}', '${{ steps.hash.outputs.sha }}')
+          $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          $notes | Out-File -FilePath $notesFile -Encoding utf8
+
+          $createArgs = @(
+            "v$v",
+            '${{ steps.hash.outputs.path }}',
+            '${{ steps.hash.outputs.path }}.sha256',
+            '--title', "Claudally $v",
+            '--notes-file', $notesFile
+          )
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch') { $createArgs += '--draft' }
+
+          gh release create @createArgs
+          if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }

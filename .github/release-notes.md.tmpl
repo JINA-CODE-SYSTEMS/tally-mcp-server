@@ -1,0 +1,29 @@
+**Claudally {{VERSION}}** — Tally Prime ERP for Claude, and any MCP client.
+
+### Install
+
+Download `{{FILE}}` and run it. The wizard takes a Windows box from nothing installed to a running service; most values auto-detect. Node.js is bundled.
+
+Requires Tally Prime (Silver or Gold) with the XML server enabled on port 9000: **F1 → Settings → Connectivity → Client/Server Configuration**.
+
+### Verify your download
+
+This installer is **not yet code-signed**, so Windows will warn about an unrecognised publisher. Until signing is in place the SHA-256 below is the only way to confirm you have the file we built — check it before running:
+
+```powershell
+Get-FileHash -Algorithm SHA256 .\{{FILE}}
+```
+
+Expected:
+
+```
+{{SHA}}
+```
+
+If it does not match, do not run the file.
+
+### Documentation
+
+[Setup, configuration and the full tool reference](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/v{{VERSION}}/docs/README.md).
+
+Where your MCP client runs decides which URL to use — for Claude Desktop on the Tally PC itself, nothing needs to be exposed to the network at all.
