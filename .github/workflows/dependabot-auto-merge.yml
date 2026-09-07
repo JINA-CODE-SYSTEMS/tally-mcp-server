@@ -35,8 +35,17 @@
 #     b) A ruleset / branch protection on `main` requiring these checks:
 #          Build & Type Check, Tests (Node 20), Tests (Node 22),
 #          Security Scan, Secret Leak Detection, File Safety Checks
+#     c) Settings -> Actions -> General ->
+#          "Allow GitHub Actions to create and approve pull requests" = enabled
 #
-#   Without (b) this workflow is a liability rather than a safeguard.
+#   (c) is required because `main` requires one approving review. Without it,
+#   auto-merge is set but the PR waits indefinitely for an approval that never
+#   arrives — the workflow appears to work while doing nothing.
+#
+#   Without (b) this workflow is a liability rather than a safeguard. The
+#   approval in the step below is granted WITHOUT human review, so required
+#   status checks are the only thing standing between a bad dependency update
+#   and `main`. Do not enable this workflow until (b) is in place.
 
 name: Dependabot auto-merge
 
@@ -60,6 +69,19 @@ jobs:
         uses: dependabot/fetch-metadata@21025c705c08248db411dc16f3619e6b5f9ea21a
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # `main` requires one approving review. Dependabot cannot approve its own
+      # PR, so without this the auto-merge below is queued and never satisfied.
+      # Scoped to the same patch/minor condition as the merge step — majors are
+      # never approved automatically.
+      - name: Approve (patch and minor only)
+        if: |
+          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+          steps.meta.outputs.update-type == 'version-update:semver-minor'
+        run: gh pr review --approve "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Enable auto-merge (patch and minor only)
         if: |
