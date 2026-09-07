@@ -2659,8 +2659,6 @@ export async function registerMcpServer(): Promise<McpServer> {
           const guiTimeoutSeconds = getOpenCompanyGuiTimeoutSeconds();
           const guiMaxSteps = getOpenCompanyGuiMaxSteps();
           const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
-          const commandFile = path.join(tallyDataPath, '_mcp_gui_command.json');
-          const resultFile = path.join(tallyDataPath, '_mcp_gui_result.json');
 
           // Check if Tally is running at all
           let tallyRunning = true;
@@ -2683,74 +2681,31 @@ export async function registerMcpServer(): Promise<McpServer> {
             }
           }
 
-          // --- First, ping the agent to check if it's alive ---
-          const pingCommandId = createGuiAgentCommandId('ping');
-          try { fs.unlinkSync(resultFile); } catch {}
-          atomicWriteFile(commandFile, JSON.stringify({ action: 'ping', commandId: pingCommandId, timestamp: new Date().toISOString() }));
-          let agentAlive = false;
-          for (let i = 0; i < 5; i++) {
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            if (fs.existsSync(resultFile)) {
-              try {
-                const pingResult = JSON.parse(fs.readFileSync(resultFile, 'utf-8').replace(/^﻿/, ''));
-                if (isMatchingGuiAgentCommand(pingResult, pingCommandId)) {
-                  agentAlive = true;
-                  try { fs.unlinkSync(resultFile); } catch {}
-                  break;
-                }
-                logs.push(`  Ignoring stale ping response for commandId ${pingResult?.commandId || 'unknown'}.`);
-                try { fs.unlinkSync(resultFile); } catch {}
-              } catch {
-                try { fs.unlinkSync(resultFile); } catch {}
-              }
-            }
-          }
-
-          if (!agentAlive) {
-            logs.push('  GUI agent not running. Please start scripts/tally-gui-agent-v2.ps1 in the interactive desktop session.');
+          // Route through the transport seam rather than hand-rolling IPC here. This block used to
+          // write _mcp_gui_command.json and poll for the result itself, which meant it bypassed
+          // callGuiAgent() entirely — and would therefore have kept writing files nobody reads once
+          // the in-session transport is active. Same behaviour, one code path, both transports.
+          const agentPing = await pingGuiAgent(tallyDataPath, 5, logs);
+          if (!agentPing.alive) {
+            logs.push(guiTransportNeedsVersionHandshake()
+              ? '  GUI agent not running. Please start scripts/tally-gui-agent-v2.ps1 in the interactive desktop session.'
+              : '  Could not run the GUI agent script in this session. Check that PowerShell can execute scripts/tally-gui-agent-v2.ps1.');
             return false;
           }
           logs.push('  GUI agent is alive.');
 
-          // --- Send the actual command ---
-          const commandId = createGuiAgentCommandId('open-company');
-          try { fs.unlinkSync(resultFile); } catch {}
-          const command = JSON.stringify({
-            action: action,
-            companyName: companyName,
-            commandId: commandId,
-            maxSteps: guiMaxSteps,
-            timestamp: new Date().toISOString()
-          });
-          atomicWriteFile(commandFile, command);
-          logs.push(`  Command sent (commandId=${commandId}, maxSteps=${guiMaxSteps}), waiting for GUI agent (up to ${guiTimeoutSeconds} seconds for LLM-guided actions)...`);
-
-          // Poll for result — timeout is configurable because LLM-guided actions can take longer.
-          let agentResponded = false;
-          for (let i = 0; i < guiTimeoutSeconds; i++) {
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            if (fs.existsSync(resultFile)) {
-              try {
-                const resultText = fs.readFileSync(resultFile, 'utf-8').replace(/^﻿/, '');
-                const result = JSON.parse(resultText);
-                if (!isMatchingGuiAgentCommand(result, commandId)) {
-                  logs.push(`  Ignoring stale response for commandId ${result?.commandId || 'unknown'}.`);
-                  try { fs.unlinkSync(resultFile); } catch {}
-                  continue;
-                }
-                logs.push(`  Agent response: ${result.status} - ${result.message}`);
-                agentResponded = true;
-                try { fs.unlinkSync(resultFile); } catch {}
-                if (result.status !== 'success') return false;
-                break;
-              } catch {}
-            }
-          }
-
-          if (!agentResponded) {
+          const agentResp = await callGuiAgent(
+            action,
+            { companyName, maxSteps: guiMaxSteps },
+            guiTimeoutSeconds,
+            tallyDataPath,
+            logs
+          );
+          if (!agentResp) {
             logs.push(`  Agent did not respond within ${guiTimeoutSeconds} seconds.`);
             return false;
           }
+          if (agentResp.status !== 'success') return false;
 
           // Wait for Tally to process the company load
           await new Promise(resolve => setTimeout(resolve, 5000));
