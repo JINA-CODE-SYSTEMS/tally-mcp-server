@@ -22,6 +22,17 @@ Expected:
 
 If it does not match, do not run the file.
 
+### Verify it was built from this source
+
+Every release carries signed build provenance, so you can confirm the binary was produced by our
+release workflow from a specific commit — not just that it matches a hash we published:
+
+```
+gh attestation verify .\{{FILE}} -R JINA-CODE-SYSTEMS/tally-mcp-server
+```
+
+That is a stronger guarantee than a checksum alone, and it holds even before code signing lands.
+
 ### Documentation
 
 [Setup, configuration and the full tool reference](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/v{{VERSION}}/docs/README.md).
