@@ -1040,10 +1040,157 @@ export type GuiAgentResponse = {
   raw: Record<string, any>;
 };
 
+// How GUI actions reach a desktop session.
+//
+//   'ipc'        The MCP server runs as a Windows service in Session 0, which has no desktop, so it
+//                cannot spawn tally.exe or inject keystrokes. Commands are handed to a long-running
+//                companion agent through JSON files in TALLY_DATA_PATH.
+//
+//   'in-session' The MCP server was spawned by the MCP client and is already running in the user's
+//                interactive session, where Tally is visible. Session 0 isolation does not apply, so
+//                the agent script is invoked directly as a short-lived child process. No watcher, no
+//                scheduled task, and — the reason this matters — no credential written to disk.
+export type GuiTransportMode = 'ipc' | 'in-session';
+
+// Pure so the precedence can be unit-tested. An explicit GUI_TRANSPORT wins; otherwise the
+// entrypoint's default stands. Unrecognised values fall back rather than throwing, because a typo in
+// a config file should not take the whole server down.
+export function resolveGuiTransportMode(
+  rawValue: string | undefined,
+  entrypointDefault: GuiTransportMode
+): GuiTransportMode {
+  const normalized = (rawValue ?? '').trim().toLowerCase();
+  if (normalized === 'ipc' || normalized === 'in-session') return normalized;
+  return entrypointDefault;
+}
+
+// Defaults to 'ipc' so the existing service deployment behaves exactly as before. index.mts (stdio)
+// switches to 'in-session' at startup; server.mts leaves it alone.
+let guiTransportMode: GuiTransportMode = resolveGuiTransportMode(process.env.GUI_TRANSPORT, 'ipc');
+
+export function setGuiTransportMode(mode: GuiTransportMode): void {
+  guiTransportMode = resolveGuiTransportMode(process.env.GUI_TRANSPORT, mode);
+}
+
+export function getGuiTransportMode(): GuiTransportMode {
+  return guiTransportMode;
+}
+
+// Only the IPC transport talks to a separately-launched, independently-updated agent, so only it can
+// find itself paired with a stale one. In-session runs the script from this install, so the version
+// is whatever we shipped.
+export function guiTransportNeedsVersionHandshake(mode: GuiTransportMode = guiTransportMode): boolean {
+  return mode === 'ipc';
+}
+
+// Sends a command to the GUI agent and waits for its response, via whichever transport is active.
+// Returns the response, or null on timeout. Every GUI call site goes through here.
+async function callGuiAgent(
+  action: string,
+  payload: Record<string, any>,
+  timeoutSec: number,
+  dataPath: string,
+  logs: string[]
+): Promise<GuiAgentResponse | null> {
+  if (guiTransportMode === 'in-session') {
+    return callGuiAgentInSession(action, payload, timeoutSec, dataPath, logs);
+  }
+  return callGuiAgentViaIpc(action, payload, timeoutSec, dataPath, logs);
+}
+
+// Runs the agent script as a short-lived child in this process's own session.
+//
+// SECURITY: the command travels on stdin, never as a command-line argument and never through a file.
+// select-and-unlock-company carries a decrypted company password; argv is readable by any local
+// process listing, and the IPC transport has to write that password to _mcp_gui_command.json and
+// delete it afterwards. Here it exists only in a pipe.
+async function callGuiAgentInSession(
+  action: string,
+  payload: Record<string, any>,
+  timeoutSec: number,
+  dataPath: string,
+  logs: string[]
+): Promise<GuiAgentResponse | null> {
+  const commandId = createGuiAgentCommandId(action);
+  const command = JSON.stringify({ action, ...payload, commandId, timestamp: new Date().toISOString() });
+  const scriptPath = resolveScriptPath('tally-gui-agent-v2.ps1');
+  logs.push(`  [gui-agent] in-session action=${action} commandId=${commandId}, waiting up to ${timeoutSec}s`);
+
+  return new Promise<GuiAgentResponse | null>((resolve) => {
+    const child = spawn(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath,
+       '-Once', '-WatchDir', dataPath],
+      { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
+    );
+
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+
+    const finish = (value: GuiAgentResponse | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { child.kill(); } catch { /* already exited */ }
+      resolve(value);
+    };
+
+    const timer = setTimeout(() => {
+      logs.push(`  [gui-agent] no response within ${timeoutSec}s`);
+      finish(null);
+    }, timeoutSec * 1000);
+
+    child.stdout.on('data', d => { stdout += d.toString('utf-8'); });
+    child.stderr.on('data', d => { stderr += d.toString('utf-8'); });
+    child.on('error', err => {
+      logs.push(`  [gui-agent] could not start the agent script: ${err.message}`);
+      finish(null);
+    });
+
+    child.on('close', code => {
+      const parsed = parseGuiAgentStdout(stdout);
+      if (!parsed) {
+        logs.push(`  [gui-agent] exited ${code} without a parseable result${stderr.trim() ? `: ${stderr.trim().slice(0, 300)}` : ''}`);
+        finish(null);
+        return;
+      }
+      logs.push(`  [gui-agent] response: status=${parsed.status} message=${parsed.message}${parsed.agentVersion ? ` agentVersion=${parsed.agentVersion}` : ''}`);
+      finish(parsed);
+    });
+
+    child.stdin.write(command);
+    child.stdin.end();
+  });
+}
+
+// The script prints its JSON result on stdout, but PowerShell hosts are free to emit banners or
+// progress lines around it. Take the last complete JSON object rather than assuming clean output.
+export function parseGuiAgentStdout(stdout: string): GuiAgentResponse | null {
+  const candidates = stdout
+    .split('\n')
+    .map(line => line.replace(/^\uFEFF/, '').trim())
+    .filter(line => line.startsWith('{') && line.endsWith('}'));
+
+  for (const candidate of candidates.reverse()) {
+    try {
+      const result = JSON.parse(candidate);
+      if (typeof result?.status !== 'string') continue;
+      return {
+        status: String(result.status || ''),
+        message: String(result.message || ''),
+        agentVersion: typeof result.agentVersion === 'string' ? result.agentVersion : null,
+        raw: result
+      };
+    } catch { /* not the result line */ }
+  }
+  return null;
+}
+
 // Sends a command to the GUI agent (running in the user's desktop session) via the JSON file IPC pattern,
 // and waits for a matching response. Returns the agent's response or null on timeout.
 // Used to bridge Session 0 isolation — the MCP service can't spawn GUI apps directly when running as a service.
-async function callGuiAgent(
+async function callGuiAgentViaIpc(
   action: string,
   payload: Record<string, any>,
   timeoutSec: number,
@@ -1111,7 +1258,13 @@ async function pingGuiAgent(dataPath: string, timeoutSec = 4, logs: string[] = [
   if (!resp || resp.status !== 'success') {
     return { alive: false, agentVersion: null, versionOk: false };
   }
-  const versionOk = isAgentVersionAtLeast(resp.agentVersion, REQUIRED_AGENT_VERSION);
+  // Only the IPC transport can be paired with a stale agent — that one is launched separately, by a
+  // scheduled task, and updated on its own schedule. In-session runs the script from this very
+  // install, so a version check there could only ever fail on a broken install, and reporting "your
+  // agent is too old" would point the user at a component that no longer exists in this mode.
+  const versionOk = guiTransportNeedsVersionHandshake()
+    ? isAgentVersionAtLeast(resp.agentVersion, REQUIRED_AGENT_VERSION)
+    : true;
   return { alive: true, agentVersion: resp.agentVersion, versionOk };
 }
 
