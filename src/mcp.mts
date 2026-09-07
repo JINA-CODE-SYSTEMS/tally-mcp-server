@@ -11,7 +11,13 @@ import { MASTER_TAGS, MASTER_COLLECTION_TYPES, planMasterNameRepairs, buildRenam
 import type { ModelPushResponse } from './models.mjs';
 import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
 
-dotenv.config({ override: true, quiet: true });
+// Load .env from the install directory by ABSOLUTE path (next to dist/), never relative to the
+// process working directory. Under NSSM the service cwd happens to equal the install directory, so
+// a bare dotenv.config() worked by accident. Under a stdio deployment the MCP client spawns this
+// process and chooses its own cwd — typically not ours — so a cwd-relative load silently misses
+// every Tally setting and the server falls back to defaults with no error. server.mts already
+// anchors its own load for the same reason (issue #23); this makes both entrypoints agree.
+dotenv.config({ path: path.join(import.meta.dirname, '../.env'), override: true, quiet: true });
 
 // Audit logging — logs every tool invocation
 function auditLog(toolName: string, args: Record<string, any>, status: 'success' | 'error' | 'denied' | 'dryrun', durationMs?: number): void {
@@ -24,7 +30,10 @@ function auditLog(toolName: string, args: Record<string, any>, status: 'success'
     status,
     durationMs
   };
-  console.log(`[audit] ${JSON.stringify(entry)}`);
+  // stderr, NEVER stdout. Under the stdio transport stdout IS the JSON-RPC channel, so an audit
+  // line written there is injected straight into the stream the client is parsing. The HTTP
+  // deployment is unaffected: NSSM redirects AppStdout and AppStderr to the same service.log.
+  console.error(`[audit] ${JSON.stringify(entry)}`);
 }
 
 export function getOpenCompanyGuiTimeoutSeconds(rawValue: string | undefined = process.env.OPEN_COMPANY_GUI_TIMEOUT_SEC): number {
@@ -672,10 +681,16 @@ export function listConfiguredAliases(registry: CompanyRegistry): string[] {
   return out;
 }
 
+// Absolute path to a script shipped in scripts/, resolved from THIS module's location rather than
+// the process working directory. Compiled output lives in dist/, so scripts/ is one level up.
+// Anything cwd-relative breaks under a stdio deployment, where the MCP client picks the cwd.
+export function resolveScriptPath(...segments: string[]): string {
+  return path.resolve(import.meta.dirname, '..', 'scripts', ...segments);
+}
+
 // Path to the PowerShell helper that performs the actual DPAPI Protect/Unprotect.
-// Compiled output lives in dist/, so the helper resolves to ../scripts/dpapi-helper.ps1.
 function dpapiHelperPath(): string {
-  return path.resolve(import.meta.dirname, '..', 'scripts', 'dpapi-helper.ps1');
+  return resolveScriptPath('dpapi-helper.ps1');
 }
 
 // Spawns the DPAPI helper with input on stdin (never command-line args, so secrets don't
@@ -2665,8 +2680,8 @@ export async function registerMcpServer(): Promise<McpServer> {
         const tallyExePath = process.env.TALLY_EXE_PATH || 'C:\\Program Files\\TallyPrimeEditLog\\tally.exe';
         const commandFile = path.join(tallyDataPath, '_mcp_gui_command.json');
         const resultFile = path.join(tallyDataPath, '_mcp_gui_result.json');
-        const guiScriptPath = path.join(process.cwd(), 'scripts', 'tally-gui-agent-v2.ps1');
-        const guiDllPath = path.join(process.cwd(), 'scripts', 'TallyUI.dll');
+        const guiScriptPath = resolveScriptPath('tally-gui-agent-v2.ps1');
+        const guiDllPath = resolveScriptPath('TallyUI.dll');
 
         const report: Record<string, any> = {
           timestamp: new Date().toISOString(),
