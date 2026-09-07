@@ -15,13 +15,19 @@ deploy-diagnostics.txt
 installer-staging/
 dist-installer/
 
-# Local-only Claude Code state (per-developer tooling config)
-.claude/
-.mcp.json
+# Local-only Claude Code state (per-developer tooling config).
+# Anchored to the repo root: unanchored patterns match at any depth, and an
+# unanchored `.mcp.json` silently swallowed plugin/.mcp.json, which is shipped source.
+/.claude/
+/.mcp.json
 
 # Transient PID file written by scripts/dev-run-local.ps1
 scripts/.dev-pids
 
-# Pages build copies these in from their canonical source at deploy time (see pages.yml)
+# Pages build stages these from their canonical source at deploy time (see pages.yml):
+# the logo is copied, the plugin archive is built from plugin/.
 site/claudally-logo.png
 site/tally-feeding.plugin
+
+# The Claude plugin archive is a BUILD ARTIFACT, built from plugin/. Never commit it.
+/tally-feeding.plugin
