@@ -10,6 +10,11 @@ on:
       - 'plugin/**'
       - 'scripts/tray/assets/claudally-logo.png'
       - '.github/workflows/pages.yml'
+  # Republish when a release is published, so the download button and the verification hash on the
+  # site always describe the release that actually exists. Nothing about the version is committed
+  # into the HTML; it is read from the release at deploy time.
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -44,6 +49,65 @@ jobs:
           cp scripts/tray/assets/claudally-logo.png site/claudally-logo.png
           (cd plugin && zip -r -q -X ../site/tally-feeding.plugin .)
           unzip -l site/tally-feeding.plugin
+
+      # site/index.html ships {{RELEASE_*}} placeholders rather than hardcoded version numbers,
+      # so the published page cannot drift from the actual latest release. If no release exists
+      # yet, the buttons degrade to the releases listing instead of rendering broken placeholders.
+      - name: Inject current release details
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          REPO="$GITHUB_REPOSITORY"
+          RELEASES_URL="https://github.com/$REPO/releases"
+
+          if gh release view --repo "$REPO" --json tagName,assets > /tmp/rel.json 2>/dev/null; then
+            TAG=$(jq -r '.tagName' /tmp/rel.json)
+            VERSION="${TAG#v}"
+            FILE=$(jq -r '[.assets[] | select(.name | endswith(".exe"))][0].name // ""' /tmp/rel.json)
+            BYTES=$(jq -r '[.assets[] | select(.name | endswith(".exe"))][0].size // 0' /tmp/rel.json)
+            SHA_URL=$(jq -r '[.assets[] | select(.name | endswith(".sha256"))][0].url // ""' /tmp/rel.json)
+
+            if [ -n "$FILE" ]; then
+              DOWNLOAD="$RELEASES_URL/download/$TAG/$FILE"
+              # Trailing separator lives with the value, so the line reads correctly whether or
+              # not a size is available.
+              SIZE="$(awk -v b="$BYTES" 'BEGIN{printf "%.0f MB", b/1048576}') · "
+            else
+              DOWNLOAD="$RELEASES_URL"; SIZE=""
+            fi
+
+            SHA="(published on the release page)"
+            if [ -n "$SHA_URL" ]; then
+              SHA=$(curl -sSL "$SHA_URL" | awk '{print $1}' | head -1)
+            fi
+            echo "Injecting $TAG ($FILE, $BYTES bytes)"
+          else
+            echo "No published release found — pointing the buttons at the releases listing."
+            VERSION="latest"; FILE="Claudally-Setup.exe"; DOWNLOAD="$RELEASES_URL"
+            SIZE=""; SHA="(published on the release page)"
+          fi
+
+          python3 - "$VERSION" "$FILE" "$DOWNLOAD" "$SIZE" "$SHA" <<'PYEOF'
+          import sys, pathlib
+          version, file, download, size, sha = sys.argv[1:6]
+          p = pathlib.Path('site/index.html')
+          html = p.read_text(encoding='utf-8')
+          for key, value in {
+              'RELEASE_VERSION': version,
+              'RELEASE_FILE': file,
+              'RELEASE_DOWNLOAD': download,
+              'RELEASE_SIZE': size,
+              'RELEASE_SHA': sha,
+          }.items():
+              html = html.replace('{{' + key + '}}', value)
+          p.write_text(html, encoding='utf-8')
+          leftover = [k for k in ('RELEASE_VERSION','RELEASE_FILE','RELEASE_DOWNLOAD','RELEASE_SIZE','RELEASE_SHA')
+                      if '{{' + k + '}}' in html]
+          if leftover:
+              raise SystemExit(f'Unsubstituted placeholders remain: {leftover}')
+          print('Placeholders substituted.')
+          PYEOF
 
       - name: Upload site artifact
         uses: actions/upload-pages-artifact@v5

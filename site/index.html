@@ -421,6 +421,48 @@
       .mq-track, .scroll-hint .rail::after, .plugin-badge, #preloader svg, .caret { animation: none; }
       .btn, .card, .term { transition: none; }
     }
+
+    /* --- Release download card (values injected at deploy time by pages.yml) --- */
+    .dl {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--card);
+      padding: 26px 28px;
+      margin-bottom: 34px;
+    }
+    .dl-head {
+      display: flex; flex-wrap: wrap; gap: 20px;
+      align-items: center; justify-content: space-between;
+    }
+    .dl-name { font-family: var(--font-d); font-size: 19px; font-weight: 600; margin: 0 0 6px; }
+    .dl-meta { color: var(--muted); font-size: 14px; margin: 0; }
+    .dl-ver {
+      font-family: var(--font-m); font-size: 13px; color: var(--o1);
+      border: 1px solid rgba(255,154,46,.32); border-radius: 5px;
+      padding: 1px 7px; margin-right: 4px;
+    }
+    .dl-verify { margin-top: 24px; border-top: 1px solid var(--line); padding-top: 20px; }
+    .dl-verify summary {
+      cursor: pointer; font-size: 14.5px; color: var(--ink);
+      font-weight: 500; list-style: none;
+    }
+    .dl-verify summary::-webkit-details-marker { display: none; }
+    .dl-verify summary::before { content: "+ "; color: var(--o1); font-family: var(--font-m); }
+    .dl-verify[open] summary::before { content: "− "; }
+    .dl-verify summary:hover { color: var(--o1); }
+    .dl-verify p { color: var(--muted); font-size: 14px; margin: 14px 0; max-width: 62ch; }
+    .dl-code {
+      font-family: var(--font-m); font-size: 12.5px;
+      background: rgba(0,0,0,.34); border: 1px solid var(--line); border-radius: 8px;
+      padding: 11px 14px; margin: 10px 0; overflow-x: auto; white-space: nowrap;
+    }
+    .dl-sha {
+      font-family: var(--font-m); font-size: 11.5px; color: var(--num);
+      word-break: break-all; margin: 10px 0 16px; line-height: 1.7;
+    }
+    @media (max-width: 620px) {
+      .dl-head { flex-direction: column; align-items: flex-start; }
+    }
   </style>
 </head>
 <body>
@@ -480,7 +522,10 @@
         language, from Claude, ChatGPT, Copilot, or any MCP client. Open source, local-first.
       </p>
       <div class="cta stage stage-3">
-        <a class="btn btn-primary brand-grad magnetic" href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/installer.md">Get started</a>
+        <a class="btn btn-primary brand-grad magnetic" href="{{RELEASE_DOWNLOAD}}">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>
+          Download for Windows
+        </a>
         <a class="btn btn-ghost magnetic" href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server">
           <svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
           Star on GitHub
@@ -489,7 +534,7 @@
       <div class="badges stage stage-4">
         <span class="pill">🔒 local-first &amp; self-hosted</span>
         <span class="pill">⚖️ AGPL-3.0 open source</span>
-        <span class="pill">🪟 5-minute Windows installer</span>
+        <span class="pill">🪟 {{RELEASE_VERSION}} — 5-minute Windows installer</span>
       </div>
       <p class="tested stage stage-5">✓ Tested with Claude <strong>Opus&nbsp;4+</strong> and <strong>Sonnet&nbsp;5&nbsp;(beta)</strong></p>
       <p class="byline stage stage-5">by <strong>JINA CODE SYSTEMS LLP</strong></p>
@@ -674,10 +719,39 @@
     <section class="block wrap" id="install">
       <div class="sec-head" data-reveal>
         <p class="eyebrow"><span class="o">04</span> — Quick start</p>
-        <h2 class="sec">Prefer the <span class="grad-text">source?</span></h2>
-        <p class="sub">Clone and build in a few commands — or grab the one-click Windows installer for production.</p>
+        <h2 class="sec">Install in <span class="grad-text">one click.</span></h2>
+        <p class="sub">Download the Windows installer, or clone and build from source.</p>
       </div>
       <div class="install" data-reveal>
+        <div class="dl">
+          <div class="dl-head">
+            <div>
+              <p class="dl-name">Claudally for Windows</p>
+              <p class="dl-meta"><span class="dl-ver">{{RELEASE_VERSION}}</span> {{RELEASE_SIZE}}bundles Node.js, NSSM and cloudflared</p>
+            </div>
+            <a class="btn btn-primary brand-grad magnetic" href="{{RELEASE_DOWNLOAD}}">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>
+              Download installer
+            </a>
+          </div>
+          <details class="dl-verify">
+            <summary>Check this download before you run it</summary>
+            <p>
+              This installer is not code-signed yet, so Windows will warn about an unrecognised
+              publisher. Two checks confirm you have exactly the file we built — run them in
+              PowerShell from your downloads folder.
+            </p>
+            <div class="dl-code">Get-FileHash -Algorithm SHA256 .\{{RELEASE_FILE}}</div>
+            <p style="margin-bottom:6px;">Should print:</p>
+            <div class="dl-sha">{{RELEASE_SHA}}</div>
+            <div class="dl-code">gh attestation verify .\{{RELEASE_FILE}} -R JINA-CODE-SYSTEMS/tally-mcp-server</div>
+            <p>
+              The second is the stronger one: it proves this binary was produced by our public
+              release pipeline from a specific commit, not merely that it matches a number we
+              published. If either check fails, don't run the file.
+            </p>
+          </details>
+        </div>
         <div class="term">
           <div class="term-bar">
             <span class="dot" style="background:#ff5f57"></span>
@@ -707,7 +781,7 @@ npm install <span class="p">&amp;&amp;</span> npx tsc
       <h2 data-reveal>Talk to <span class="grad-text">your books.</span></h2>
       <p data-reveal style="--d:80">Free, open source, and running in minutes.</p>
       <div class="cta" data-reveal style="--d:160">
-        <a class="btn btn-primary brand-grad magnetic" href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/installer.md">Get started</a>
+        <a class="btn btn-primary brand-grad magnetic" href="{{RELEASE_DOWNLOAD}}">Download {{RELEASE_VERSION}}</a>
         <a class="btn btn-ghost magnetic" href="https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/README.md">Read the docs</a>
       </div>
     </section>
