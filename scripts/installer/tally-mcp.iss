@@ -277,8 +277,12 @@ begin
   GuiControlOptIn.Top := EditionPage.Surface.Height - ScaleY(38);
   GuiControlOptIn.Width := EditionPage.SurfaceWidth;
   GuiControlOptIn.Height := ScaleY(32);
-  GuiControlOptIn.Caption := 'Let Claude control Tally directly (screenshots + keystrokes) — recommended. Uncheck to disable.';
-  GuiControlOptIn.Checked := True;
+  GuiControlOptIn.Caption := 'Let Claude see and drive the Tally window (screenshots + keystrokes). Off by default — you can turn it on later from the tray icon.';
+  // Default OFF. Screenshots plus synthetic keystrokes against live books is not a default a
+  // customer should acquire by clicking Next. firstrun-config.ps1 already coalesces this key
+  // to false; until now the wizard was the only thing asserting otherwise. Restored from the
+  // previous install below, so an upgrade never silently removes a capability in use.
+  GuiControlOptIn.Checked := GetPreviousData('EnableGuiControl', 'false') = 'true';
 
   // Persistent publisher credit, bottom-left of the wizard chrome (shows on every page, alongside the
   // JINA logo carried by the sidebar image). Keeps "by JINA CODE SYSTEMS LLP" visible after the rebrand
@@ -479,6 +483,16 @@ begin
   Result := ConfigPage.Values[4];
 end;
 
+// Persist the GUI-control choice into the install's own record so the next upgrade restores it
+// rather than re-applying the (now off) default. Without this, flipping the default silently
+// removes the capability from every install that had deliberately enabled it.
+procedure RegisterPreviousData(PreviousDataKey: Integer);
+begin
+  if GuiControlOptIn.Checked then
+    SetPreviousData(PreviousDataKey, 'EnableGuiControl', 'true')
+  else
+    SetPreviousData(PreviousDataKey, 'EnableGuiControl', 'false');
+end;
 function GetWizardGuiControl(Param: string): string;
 begin
   if GuiControlOptIn.Checked then
