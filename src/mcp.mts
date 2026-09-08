@@ -17,6 +17,23 @@ import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
 // process and chooses its own cwd — typically not ours — so a cwd-relative load silently misses
 // every Tally setting and the server falls back to defaults with no error. server.mts already
 // anchors its own load for the same reason (issue #23); this makes both entrypoints agree.
+// Captured BEFORE the .env load below, deliberately, and never re-read from process.env.
+//
+// This is the allowlist that constrains which executable resolveTallyExePath() will launch. It
+// must not be settable from .env, because .env is precisely what the allowlist defends against:
+// firstrun-config.ps1 grants the agent user Full Control over that file, so an allowlist read
+// after the load would let an attacker widen their own trust boundary in the same write that
+// poisons TALLY_EXE_PATH — the guard would then be checking a value against a rule the attacker
+// just supplied. Setting this therefore requires the real process environment (a machine-level
+// variable, or the service definition), which needs administrator rights to change.
+const TRUSTED_EXE_ROOTS_AT_STARTUP = process.env.TALLY_ALLOWED_EXE_ROOTS;
+
+// Our own install directory is inside %ProgramFiles%, but it is NOT a trusted place to launch
+// from: tally-mcp.iss:144-145 grants Users modify rights on {app}logs and {app}data, so a
+// non-admin can drop a payload there. Nothing legitimately launches Tally out of our install
+// tree, so the whole subtree is excluded from the allowlist.
+const MCP_INSTALL_ROOT = path.resolve(import.meta.dirname, '..');
+
 dotenv.config({ path: path.join(import.meta.dirname, '../.env'), override: true, quiet: true });
 
 // Audit logging — logs every tool invocation
@@ -414,6 +431,86 @@ export function isPathWithinRoots(candidate: string, roots: string[], p: PathLik
     if (resolved === r || resolved.startsWith(rWithSep)) return { ok: true, resolved };
   }
   return { ok: false, resolved };
+}
+
+// Resolves the Tally executable to launch, refusing anything we cannot vouch for.
+//
+// TALLY_EXE_PATH arrives from .env, which the tray rewrites unelevated and over which the agent
+// user holds Full Control (firstrun-config.ps1), while the service runs as LocalSystem. Passing
+// that value to a shell was a straightforward path to SYSTEM; this narrows it to executables
+// sitting under a trusted root.
+//
+// TWO LIMITS, STATED PLAINLY, because a security control that overstates itself is worse than none:
+//
+//  1. The allowlist comes from TRUSTED_EXE_ROOTS_AT_STARTUP — captured from the real process
+//     environment BEFORE .env is loaded — never from .env itself. Otherwise an attacker widens the
+//     allowlist in the same write that poisons the path.
+//  2. Containment is a prefix test, not a permission test. %ProgramFiles% is only a boundary while
+//     nothing user-writable sits inside it, and our own installer breaks that: tally-mcp.iss:144-145
+//     grants Users modify on {app}\\logs and {app}\\data. Those subtrees are excluded below, but the
+//     general property ("nothing under a trusted root is attacker-writable") is the installer's to
+//     guarantee, not this function's. Moving logs/ and data/ out of Program Files is tracked as part
+//     of #172's installer workstream; until then, treat this as narrowing the hole, not closing it.
+export function resolveTallyExePath(opts: {
+  env?: Record<string, string | undefined>;
+  p?: PathLike;
+  rootsOverride?: string;
+  excludeRoots?: string[];
+} = {}): { ok: boolean; exe: string; roots: string[]; reason?: string } {
+  const env = opts.env ?? process.env;
+  const p = opts.p ?? path;
+  const rootsOverride = opts.rootsOverride !== undefined ? opts.rootsOverride : TRUSTED_EXE_ROOTS_AT_STARTUP;
+  const excludeRoots = opts.excludeRoots ?? [MCP_INSTALL_ROOT];
+
+  // Windows environment variable names are case-insensitive, and process.env is a proxy that
+  // honours that — but a plain object (a test fixture, or an env captured through a shell that
+  // upper-cases names) is not. Look up case-insensitively so the guard behaves the same however
+  // the environment reaches it; getting this wrong makes it fall back to fewer roots and refuse
+  // the real Tally binary, which reads to the user as "Tally will not start".
+  const getEnv = (name: string): string | undefined => {
+    const direct = env[name];
+    if (direct !== undefined) return direct;
+    const lower = name.toLowerCase();
+    for (const key of Object.keys(env)) {
+      if (key.toLowerCase() === lower) return env[key];
+    }
+    return undefined;
+  };
+
+  // Strip surrounding quotes as well as whitespace: operators paste quoted paths into .env, and a
+  // quoted value would otherwise fail containment for a reason nobody could diagnose.
+  const exe = (getEnv('TALLY_EXE_PATH') || 'C:\\Program Files\\TallyPrimeEditLog\\tally.exe')
+    .trim()
+    .replace(/^"+|"+$/g, '')
+    .trim();
+
+  const explicit = (rootsOverride || '').split(';').map(r => r.trim()).filter(Boolean);
+  const roots = explicit.length
+    ? explicit
+    : [getEnv('ProgramFiles'), getEnv('ProgramFiles(x86)')].filter((r): r is string => Boolean(r));
+
+  if (!roots.length) {
+    return { ok: false, exe, roots, reason: 'no trusted root is known — set TALLY_ALLOWED_EXE_ROOTS in the machine environment' };
+  }
+  if (!/\.exe$/i.test(exe)) {
+    return { ok: false, exe, roots, reason: 'TALLY_EXE_PATH does not name an .exe' };
+  }
+
+  // Windows paths are case-insensitive, so compare folded — otherwise a correctly-spelled path in
+  // the wrong case is refused with a message that makes no sense to the person reading it.
+  const fold = (v: string) => (p.sep === '\\' ? v.toLowerCase() : v);
+  const resolved = p.resolve(exe);
+  const within = isPathWithinRoots(fold(resolved), roots.map(fold), p);
+  if (!within.ok) {
+    return { ok: false, exe: resolved, roots, reason: `TALLY_EXE_PATH resolves outside the trusted roots (${roots.join(', ')})` };
+  }
+
+  const excluded = isPathWithinRoots(fold(resolved), excludeRoots.map(fold), p);
+  if (excluded.ok) {
+    return { ok: false, exe: resolved, roots, reason: 'TALLY_EXE_PATH resolves inside the MCP install tree, which contains user-writable directories' };
+  }
+
+  return { ok: true, exe: resolved, roots };
 }
 
 // Parses tally.ini content and returns the list of company IDs in `Load=` directives under [TALLY].
@@ -2673,10 +2770,27 @@ export async function registerMcpServer(): Promise<McpServer> {
 
           // If Tally isn't running, try to start it first
           if (!tallyRunning) {
-            const tallyExe = process.env.TALLY_EXE_PATH || 'C:\\Program Files\\TallyPrimeEditLog\\tally.exe';
-            if (fs.existsSync(tallyExe)) {
+            // Never pass an env-supplied path through a shell, and never launch one we cannot
+            // vouch for — .env is writable by the agent user while the service runs as LocalSystem.
+            const exeCheck = resolveTallyExePath();
+            if (!exeCheck.ok) {
+              logs.push(`  Not starting Tally: ${exeCheck.reason}`);
+            } else if (fs.existsSync(exeCheck.exe)) {
               logs.push('  Starting Tally...');
-              try { execSync(`start "" "${tallyExe}"`, { timeout: 5000, shell: 'cmd' }); } catch {}
+              try {
+                const child = spawn(exeCheck.exe, [], { shell: false, detached: true, stdio: 'ignore' });
+                // spawn reports ENOENT/EACCES/EAGAIN/EMFILE/ENFILE ASYNCHRONOUSLY, so the try/catch
+                // around it cannot see them. Without this listener the 'error' event reaches an
+                // EventEmitter with no handler, which is an uncaughtException — and index.mts now
+                // exits the process on those. An AV lock on tally.exe, AppLocker, or the file
+                // vanishing after the existsSync check would then kill the whole MCP session rather
+                // than falling through to the GUI-agent strategy below. Log and carry on.
+                child.on('error', err => logs.push(`  Could not start Tally: ${err.message}`));
+                child.unref();
+              } catch (err) {
+                // Synchronous failures only (bad arguments, a non-executable image).
+                logs.push(`  Could not start Tally: ${err instanceof Error ? err.message : String(err)}`);
+              }
               await new Promise(resolve => setTimeout(resolve, 10000));
             }
           }
