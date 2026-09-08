@@ -277,12 +277,16 @@ begin
   GuiControlOptIn.Top := EditionPage.Surface.Height - ScaleY(38);
   GuiControlOptIn.Width := EditionPage.SurfaceWidth;
   GuiControlOptIn.Height := ScaleY(32);
-  GuiControlOptIn.Caption := 'Let Claude see and drive the Tally window (screenshots + keystrokes). Off by default — you can turn it on later from the tray icon.';
-  // Default OFF. Screenshots plus synthetic keystrokes against live books is not a default a
-  // customer should acquire by clicking Next. firstrun-config.ps1 already coalesces this key
-  // to false; until now the wizard was the only thing asserting otherwise. Restored from the
-  // previous install below, so an upgrade never silently removes a capability in use.
-  GuiControlOptIn.Checked := GetPreviousData('EnableGuiControl', 'false') = 'true';
+  GuiControlOptIn.Caption := 'Let Claude see and drive the Tally window (screenshots + keystrokes). On by default — untick to disable, or change it any time from the tray icon.';
+  // ON by default: driving the Tally GUI is the product’s core capability, and every
+  // company-loading tool already works without this flag, so the practical cost of shipping it
+  // off is that Tally’s GUI state becomes unrecoverable from the server — an ungated tool can
+  // still leave a modal dialog on screen that nothing is then able to see or clear.
+  //
+  // The value is restored from the previous install, so the choice is preserved in BOTH
+  // directions: an upgrade neither removes it from someone who wants it nor re-enables it for
+  // someone who deliberately turned it off.
+  GuiControlOptIn.Checked := GetPreviousData('EnableGuiControl', 'true') = 'true';
 
   // Persistent publisher credit, bottom-left of the wizard chrome (shows on every page, alongside the
   // JINA logo carried by the sidebar image). Keeps "by JINA CODE SYSTEMS LLP" visible after the rebrand
