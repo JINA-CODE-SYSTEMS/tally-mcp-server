@@ -67,6 +67,17 @@ param(
     # Opt-in for Claude-driven GUI control (gui-screenshot / gui-send-keys). Wizard passes
     # 'true'/'false'; a bare Reconfigure omits it, so we preserve the existing .env value below.
     [string]$EnableGuiControl,
+    # --- Deployment mode: three orthogonal axes, not one key (#172, #177, #178) ---
+    # No defaults here, per the fallback-chain convention above; they are resolved after .env is read.
+    #   DEPLOYMENT_MODE  local|remote            is there a service and a listening port?      (#172)
+    #   REMOTE_AUTH      oauth-password|paired   how do remote callers authenticate?           (#178)
+    #   REMOTE_TRANSPORT tunnel|lan              how do they reach us?                         (#178)
+    # These are deliberately separate. A paired remote install is remote + paired + tunnel, so
+    # collapsing the first two onto one key leaves that configuration unexpressible - which is the
+    # bug the three planning streams each hit independently.
+    [string]$DeploymentMode,
+    [string]$RemoteAuth,
+    [string]$RemoteTransport,
     # Cloudflare Tunnel. When -TunnelToken is non-empty, a second NSSM service ($TunnelServiceName)
     # runs cloudflared so a NAT'd box gets a stable public HTTPS URL with no router config. Blank on a
     # bare Reconfigure -> preserved from .env below (like McpDomain), so a reconfigure doesn't drop it.
@@ -121,6 +132,36 @@ if ($EnableGuiControl -ne 'true') { $EnableGuiControl = 'false' }
 # Cloudflare Tunnel token: preserve across a bare Reconfigure (like MCP_DOMAIN). Blank = no tunnel,
 # and a previously-configured tunnel is torn down below. Trim so a stray-space value counts as blank.
 $TunnelToken = ("$(_Coalesce $TunnelToken $_existingEnv['TUNNEL_TOKEN'] '')").Trim()
+
+# --- Deployment mode ------------------------------------------------------------------------------
+# UPGRADE SAFETY IS THE WHOLE POINT OF THIS BLOCK. An install created before these keys existed has
+# no DEPLOYMENT_MODE in .env, and must keep behaving exactly as it does today: service, listener,
+# OAuth password. So an EXISTING install falls back to 'remote' while a FRESH one defaults to
+# 'local'. Backwards, this silently tears the service out of every deployed instance on upgrade.
+$_isExistingInstall = $_existingEnv.Count -gt 0
+
+$DeploymentMode  = _Coalesce $DeploymentMode  $_existingEnv['DEPLOYMENT_MODE']  $(if ($_isExistingInstall) { 'remote' } else { 'local' })
+$RemoteAuth      = _Coalesce $RemoteAuth      $_existingEnv['REMOTE_AUTH']      'oauth-password'
+$RemoteTransport = _Coalesce $RemoteTransport $_existingEnv['REMOTE_TRANSPORT'] 'tunnel'
+
+# Validate terminally, and never coalesce an unrecognised value to a default - a typo in .env must
+# stop the run, not quietly pick a deployment mode for the operator.
+#
+# A [ValidateSet] on the parameter DOES re-validate on assignment (verified: assigning an
+# out-of-set value throws ValidationMetadataException, it does not silently keep the old one), so
+# the attribute alone would fail closed. It is not used here because the exception it raises names
+# a PowerShell internal and says nothing about which file to edit - useless to whoever is watching
+# an installer. Check explicitly and say what to do instead.
+function _AssertOneOf {
+    param([string]$Name, [string]$Value, [string[]]$Allowed)
+    if ($Allowed -notcontains $Value) {
+        throw ("$Name is '$Value', which is not one of: " + ($Allowed -join ', ') +
+               ". Fix it in " + (Join-Path $InstallDir '.env') + " and re-run, or pass -$Name explicitly.")
+    }
+}
+_AssertOneOf 'DEPLOYMENT_MODE'  $DeploymentMode  @('local','remote')
+_AssertOneOf 'REMOTE_AUTH'      $RemoteAuth      @('oauth-password','paired')
+_AssertOneOf 'REMOTE_TRANSPORT' $RemoteTransport @('tunnel','lan')
 
 # --- Resolve OAuth password ---
 # Two entry paths:
@@ -307,6 +348,13 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         "AGENT_TASK_USER=$(_envQuote $AgentTaskUser)"
         # Claude-driven GUI control (gui-screenshot / gui-send-keys). Off unless the operator opted in.
         "ENABLE_GUI_CONTROL=$EnableGuiControl"
+        # Deployment mode (#172). 'local' means no service, no listening port and no OAuth password;
+        # 'remote' is the pre-existing behaviour and stays the fallback for any install that predates
+        # this key. REMOTE_AUTH and REMOTE_TRANSPORT are consumed by #178 and are written now so the
+        # three epics cannot collide over one key's vocabulary.
+        "DEPLOYMENT_MODE=$DeploymentMode"
+        "REMOTE_AUTH=$RemoteAuth"
+        "REMOTE_TRANSPORT=$RemoteTransport"
     )
     # Bind address (security): only listen on all interfaces when a public domain / reverse proxy
     # is explicitly configured. When MCP_DOMAIN is blank ("localhost-only mode") bind to loopback
