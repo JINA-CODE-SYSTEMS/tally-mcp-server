@@ -1,4 +1,3 @@
-import dotenv from 'dotenv';
 import { XMLParser } from 'fast-xml-parser';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -7,20 +6,33 @@ import nunjucks from 'nunjucks';
 import * as m from './models.mjs';
 import { utility, parseIntEnv } from './utility.mjs';
 
-dotenv.config({ override: true, quiet: true });
-
-const tally_host = process.env.TALLY_HOST || 'localhost'; // default to localhost
-const tally_port = parseIntEnv(process.env.TALLY_PORT, 9000); // default to 9000 XML port of Tally
+// Tally connection settings are read at CALL time, never frozen at module load.
+//
+// This module deliberately loads no .env of its own. src/mcp.mts is the single
+// loader and resolves .env by ABSOLUTE path against the install directory. But under
+// ESM every import is evaluated before the importing module's body, and both
+// entrypoints reach this file through mcp.mjs (directly at mcp.mts:8, and again via
+// database.mts:4) — so this module's top level runs BEFORE that dotenv.config() call.
+// A `const` here would capture the default and then silently ignore .env entirely,
+// including the request cap below.
+//
+// Until now this file ran its own bare `dotenv.config({ override: true })` with no
+// path, which masked that ordering — and resolved .env against the process CWD. Under
+// stdio the MCP client chooses the cwd, so a .env sitting in whatever project the user
+// had open could redirect TALLY_HOST off-box and override TALLY_ALLOWED_DATA_ROOTS and
+// the company-registry path. That is why this is a security fix, not config tidying.
+const tallyHost = () => process.env.TALLY_HOST || 'localhost'; // default to localhost
+const tallyPort = () => parseIntEnv(process.env.TALLY_PORT, 9000); // default to 9000 XML port of Tally
 // Hard cap on a single Tally HTTP round trip. Tally's XML server is single-threaded
 // and stops processing any request while a modal dialog (license expiry, "Bad formula",
 // split-period prompts, etc.) is on screen. Without this cap, requests hang
 // indefinitely and pile up. Default 30s — long enough for big balance-sheet pulls,
 // short enough that the MCP client doesn't sit forever on a dead Tally.
-const tally_request_timeout_ms = parseIntEnv(process.env.TALLY_REQUEST_TIMEOUT_MS, 30000);
+const tallyRequestTimeoutMs = () => parseIntEnv(process.env.TALLY_REQUEST_TIMEOUT_MS, 30000);
 // Pre-flight ping timeout. Short — a healthy Tally answers a Collection query in
 // <100ms. If the ping doesn't come back in 3s we treat Tally as wedged and abort
 // the heavy call immediately with a clear error instead of waiting the full 30s.
-const tally_ping_timeout_ms = parseIntEnv(process.env.TALLY_PING_TIMEOUT_MS, 3000);
+const tallyPingTimeoutMs = () => parseIntEnv(process.env.TALLY_PING_TIMEOUT_MS, 3000);
 const __dirname = import.meta.dirname;
 const lstPullReport: m.ModelPullReportInfo[] = JSON.parse(fs.readFileSync(path.join(__dirname, '../pull/config.json'), 'utf-8'))['reports'];
 const lstPushTemplate: m.ModelPushTemplateInfo[] = JSON.parse(fs.readFileSync(path.join(__dirname, '../push/config.json'), 'utf-8'))['templates'];
@@ -185,7 +197,7 @@ function sendTally(xml: string, lstVariables: Map<string, any>): Promise<string>
 }
 
 export function postTallyXML(xml: string, opts?: { timeoutMs?: number }): Promise<string> {
-    const timeoutMs = opts?.timeoutMs ?? tally_request_timeout_ms;
+    const timeoutMs = opts?.timeoutMs ?? tallyRequestTimeoutMs();
     return new Promise<string>((resolve, reject) => {
         try {
 
@@ -193,8 +205,8 @@ export function postTallyXML(xml: string, opts?: { timeoutMs?: number }): Promis
             const settle = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
 
             let req = http.request({
-                hostname: tally_host,
-                port: tally_port,
+                hostname: tallyHost(),
+                port: tallyPort(),
                 path: '',
                 method: 'POST',
                 headers: {
@@ -247,7 +259,7 @@ export function postTallyXML(xml: string, opts?: { timeoutMs?: number }): Promis
 // within the configured ping timeout. Heavy tools call this first so they can
 // fail fast (~3s) with a clear "Tally not responding" message instead of
 // waiting the full request timeout against a wedged Tally.
-export async function pingTally(timeoutMs: number = tally_ping_timeout_ms): Promise<boolean> {
+export async function pingTally(timeoutMs: number = tallyPingTimeoutMs()): Promise<boolean> {
     const xml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>MCPPingCollection</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME="MCPPingCollection"><TYPE>Company</TYPE></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
     try {
         await postTallyXML(xml, { timeoutMs });

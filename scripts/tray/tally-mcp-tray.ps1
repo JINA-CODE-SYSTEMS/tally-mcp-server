@@ -106,6 +106,8 @@ $State = [hashtable]::Synchronized(@{
     PreviousStatus   = $null   # for toast on degradation: 'green'/'yellow'/'red'/'gray'
     AgentWasRunning  = $false  # for toast on agent crash
     ServiceWasRunning = $false # for toast on service stop
+    DeploymentMode   = 'remote' # local | remote, from .env. Decides which rows MEAN anything.
+    ClientConfigured = $null   # $true / $false / $null (not checked yet) - local mode only
 })
 
 # ---------------------------------------------------------------------------
@@ -137,6 +139,24 @@ function Read-EnvValue {
         return $v
     }
     return ''
+}
+
+# In local mode there is no service to interrogate, so "is it working?" becomes "is this user's
+# Claude pointed at this install?". The tray runs as that user, so it can just read the file -
+# no elevation, no IPC. Returns $true / $false, or $null when we cannot tell.
+function Test-ClientConfigured {
+    param([string]$InstallRoot)
+    try {
+        $cfg = Join-Path (Join-Path $env:APPDATA 'Claude') 'claude_desktop_config.json'
+        if (-not (Test-Path -LiteralPath $cfg)) { return $false }
+        $raw = Get-Content -LiteralPath $cfg -Raw -ErrorAction Stop
+        if (-not $raw) { return $false }
+        # Match on the install path rather than the entry name: the name is cosmetic and a user
+        # may rename it, but an entry that does not point HERE is not this install being wired up.
+        return ($raw.IndexOf($InstallRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+    } catch {
+        return $null
+    }
 }
 
 # Write (replace or append) a single KEY=VALUE in .env, preserving all other lines. Writes in place
@@ -216,6 +236,18 @@ function Invoke-StatusPoll {
         $State.Service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     } catch { $State.Service = $null; $State.LastError = "service: $_" }
 
+    # Mode first: every judgement below depends on it. An install predating the key reads as
+    # 'remote', which is what it is.
+    try {
+        $mode = Read-EnvValue (Join-Path $InstallDir '.env') 'DEPLOYMENT_MODE'
+        if ($mode -eq 'local') { $State.DeploymentMode = 'local' } else { $State.DeploymentMode = 'remote' }
+    } catch { $State.DeploymentMode = 'remote' }
+    if ($State.DeploymentMode -eq 'local') {
+        $State.ClientConfigured = Test-ClientConfigured $InstallDir
+    } else {
+        $State.ClientConfigured = $null
+    }
+
     try {
         # Get-ScheduledTask returns CIM instance objects; .State is 'Running' / 'Ready' / 'Disabled' / etc.
         $State.AgentTask = Get-ScheduledTask -TaskName $AgentTaskName -ErrorAction SilentlyContinue
@@ -268,7 +300,7 @@ function Invoke-StatusPoll {
         if (-not $dataPath) { $dataPath = 'C:\Users\Public\TallyPrimeEditLog\data' }
         $regPath = Join-Path $dataPath '.tally-mcp-companies.json'
         if (Test-Path -LiteralPath $regPath) {
-            $raw = (Get-Content -LiteralPath $regPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue) -replace '^﻿', ''
+            $raw = (Get-Content -LiteralPath $regPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue) -replace '^\uFEFF', ''
             if ($raw) {
                 $parsed = $raw | ConvertFrom-Json -ErrorAction Stop
                 $latest = $parsed.companies | Where-Object { $_.lastLoadedAt } |
@@ -317,6 +349,17 @@ function Get-OverallStatus {
     $agentOk   = ($State.AgentTask -and $State.AgentTask.State -in @('Running', 'Ready')) -and $State.AgentProcess
     $urlOk     = $State.PublicUrlOk -eq $true
 
+    # LOCAL MODE (#172 D1). There is no service and no public URL by design, so judging health on
+    # either would paint the tray permanently red on a correctly working install - the exact
+    # failure #172 rules out ("must not show red for the absence of things that correctly do not
+    # exist in this mode"). What matters locally is whether Claude is pointed at us; the server
+    # itself is started on demand by the client and is SUPPOSED to be absent the rest of the time.
+    if ($State.DeploymentMode -eq 'local') {
+        if ($State.ClientConfigured -eq $false) { return 'yellow' }
+        if ($agentOk) { return 'green' }
+        return 'yellow'
+    }
+
     if (-not $serviceOk) { return 'red' }
     if ($agentOk -and $urlOk) { return 'green' }
     # Service running but something downstream is degraded - yellow rather than red. The MCP
@@ -330,7 +373,11 @@ function Format-Tooltip {
         $lines += '  (initializing...)'
         return ($lines -join "`r`n")
     }
-    if ($State.Service) {
+    if ($State.DeploymentMode -eq 'local') {
+        $lines += "  Mode:     on this computer (no service, no open port)"
+        if ($State.ClientConfigured -eq $true) { $lines += "  Claude:   connected" }
+        elseif ($State.ClientConfigured -eq $false) { $lines += "  Claude:   not connected yet" }
+    } elseif ($State.Service) {
         $lines += "  Service:  $($State.Service.Status)"
     } else {
         $lines += "  Service:  not installed"
@@ -440,7 +487,7 @@ $miStopService.Add_Click({
             "Stop the TallyMCP service?`n`nAll MCP tools become unavailable (any Claude session using them will fail) until you start it again with `"Restart service`".",
             'TallyMCP', 'OKCancel', 'Warning')
         if ($confirm -ne 'OK') { return }
-        # Elevated, like Restart. Use `sc.exe stop` (non-blocking — it sends the STOP control and
+        # Elevated, like Restart. Use `sc.exe stop` (non-blocking - it sends the STOP control and
         # returns immediately, so this can't hang the hidden window in StopPending), which puts NSSM
         # into stopping mode, then taskkill node as a fallback: on a pre-#23 install whose graceful
         # stop stalls, killing node lets NSSM finish reaching Stopped. Because the service is already
@@ -836,8 +883,20 @@ function Show-Dashboard {
     $lblPublisher.Location  = New-Object System.Drawing.Point 102, 52
     $header.Controls.Add($lblPublisher)
 
+    # Read the real version rather than asserting one. This said 'v1.1.0' while package.json said
+    # 0.1.0 - a version that has never existed - so the one place a customer looks to answer "what
+    # am I running?" was wrong, and any support conversation starting from it started from a lie.
+    $displayVersion = 'unknown'
+    try {
+        $pkgPath = Join-Path $InstallDir 'package.json'
+        if (Test-Path -LiteralPath $pkgPath) {
+            $pkgVersion = (Get-Content -LiteralPath $pkgPath -Raw | ConvertFrom-Json).version
+            if ($pkgVersion) { $displayVersion = "v$pkgVersion" }
+        }
+    } catch { }
+
     $lblVersion = New-Object System.Windows.Forms.Label
-    $lblVersion.Text      = 'v1.1.0'
+    $lblVersion.Text      = $displayVersion
     $lblVersion.Font      = New-Object System.Drawing.Font 'Segoe UI', 9
     $lblVersion.ForeColor = [System.Drawing.Color]::FromArgb(156, 163, 175)
     $lblVersion.BackColor = [System.Drawing.Color]::Transparent
@@ -855,10 +914,10 @@ function Show-Dashboard {
     foreach ($name in @('Service','Agent','Tally','PublicUrl')) {
         $caption = New-Object System.Windows.Forms.Label
         $caption.Text      = switch ($name) {
-            'Service'   { 'Service' }
+            'Service'   { if ($State.DeploymentMode -eq 'local') { 'Mode' } else { 'Service' } }
             'Agent'     { 'GUI agent' }
             'Tally'     { 'Tally' }
-            'PublicUrl' { 'Public URL' }
+            'PublicUrl' { if ($State.DeploymentMode -eq 'local') { 'Claude' } else { 'Public URL' } }
         }
         $caption.Location  = New-Object System.Drawing.Point 16, ($rowY + 2)
         $caption.Size      = New-Object System.Drawing.Size 84, 18
@@ -992,8 +1051,12 @@ function Show-Dashboard {
 function Update-DashboardUi {
     if (-not $script:Dashboard -or $script:Dashboard.IsDisposed -or -not $script:DashboardLabels) { return }
 
-    # Service
-    if ($State.Service) {
+    # Service row. In local mode there is no service and never will be, so reporting "Not
+    # installed" describes a fault that does not exist; report the MODE instead, which is the
+    # thing the user actually wants confirmed.
+    if ($State.DeploymentMode -eq 'local') {
+        Set-StatusRow $script:DashboardLabels['Service'] 'On this computer' 'no service, no open port' 'green'
+    } elseif ($State.Service) {
         $s = "$($State.Service.Status)"
         $sh = switch ($s) { 'Running' { 'green' } 'Stopped' { 'red' } default { 'amber' } }
         Set-StatusRow $script:DashboardLabels['Service'] $s '' $sh
@@ -1021,8 +1084,17 @@ function Update-DashboardUi {
         Set-StatusRow $script:DashboardLabels['Tally'] 'Not running' '' 'gray'
     }
 
-    # Public URL
-    if ($null -eq $State.PublicUrlOk) {
+    # Public URL row. Local mode has no public URL by design, so the row is repurposed to the
+    # question that actually decides whether the product works there: is Claude pointed at us?
+    if ($State.DeploymentMode -eq 'local') {
+        if ($State.ClientConfigured -eq $true) {
+            Set-StatusRow $script:DashboardLabels['PublicUrl'] 'Connected' 'quit and reopen Claude if tools are missing' 'green'
+        } elseif ($State.ClientConfigured -eq $false) {
+            Set-StatusRow $script:DashboardLabels['PublicUrl'] 'Not connected' 'use Connect Claude to Tally' 'amber'
+        } else {
+            Set-StatusRow $script:DashboardLabels['PublicUrl'] 'Unknown' 'could not read the Claude config' 'gray'
+        }
+    } elseif ($null -eq $State.PublicUrlOk) {
         Set-StatusRow $script:DashboardLabels['PublicUrl'] 'Not configured' '' 'gray'
     } elseif ($State.PublicUrlOk) {
         Set-StatusRow $script:DashboardLabels['PublicUrl'] 'OK' "$($State.PublicUrl)" 'green'

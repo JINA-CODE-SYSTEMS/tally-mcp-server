@@ -78,11 +78,38 @@ matches a number we published. **If either check fails, do not run the file.**
 
 **The setup wizard collects (most values auto-detect — usually just click Next):**
 
-- **Page 1 — Tally MCP Configuration:** OAuth password (min 12 chars — this gates every tool), Tally exe / data / `tally.ini` paths, and the Windows user the GUI agent runs as.
-- **Page 2 — Remote Access (optional):** a public domain / Cloudflare Tunnel hostname and a Cloudflare Tunnel token. **Leave both blank for localhost-only** (Claude Desktop on the same PC needs nothing here) — see [Connecting — which URL?](#connecting--which-url) below.
-- **Page 3 — Tally Edition:** Silver / Gold, plus a checkbox to let **Claude control Tally directly** (screenshots + keystrokes for login / company switching) — on by default.
+- **Page 1 — Tally MCP Configuration:** Tally exe / data / `tally.ini` paths, and the Windows user the GUI agent runs as.
+- **Page 2 — Tally Edition:** Silver / Gold, plus a checkbox to let **Claude control Tally directly** (screenshots + keystrokes for login / company switching) — on by default.
+
+There is no password page, because there is no password. The installer sets up a **local** deployment: the server runs on this PC, started by Claude when you use it. Nothing listens on the network, so there is no login to gate — see [What a local install does and does not create](#what-a-local-install-does-and-does-not-create).
+
+**Remote access is not offered by the installer at present** ([#192](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/192)). Existing remote installs keep working and are preserved across upgrades untouched; only new installs are local-only.
 
 Change any of these later via the **Reconfigure** Start-Menu shortcut, or manage saved companies from the tray icon → **Manage Companies**.
+
+### What a local install does and does not create
+
+These are the properties a local install is built around. They are stated here because they are the reason to prefer it — and because you can check every one of them yourself rather than taking our word for it.
+
+**Does not create:**
+
+- **No Windows service.** The server is started by Claude when you use it and exits with it. Nothing runs while you are not working.
+- **No listening socket of ours.** Nothing of Claudally binds a port, so there is nothing on your machine or your LAN to connect to, and nothing to forward in a router.
+- **No password.** The OAuth password exists only to gate a listener. With no listener, it is never asked for, never written to `.env`, and never created.
+- **No token stores.** `.oauth-clients.json` and `.oauth-tokens.json` are never written. If you switch an existing remote install to local, they are shredded and removed.
+- **No outbound tunnel.** No third party sits between Claude and your books.
+
+**One honest correction to the obvious version of this claim:** your machine *does* still have a listening socket, because Tally Prime itself needs one — its XML server listens on port 9000, and Claudally could not read a single ledger without it. The claim is that **no Claudally process listens**, not that nothing on the PC does. Anyone telling you to check `netstat` for silence is describing something that was never true of a working Tally install.
+
+**Check it yourself**, rather than believing the list above:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "C:\Program Files\TallyMCP\scripts\verify-deployment.ps1"
+```
+
+It reports each claim as PASS / FAIL / NA with the evidence it used, interpreted against the mode you are actually running — a remote install is *supposed* to have a service and a port, so it says so rather than painting them red. Add `-Json` to attach the result to a support ticket. Run it from an elevated prompt for the most complete answer: without administrator rights it cannot read the command line of processes owned by other accounts, and it will say so rather than guess.
+
+**What a local install still trusts.** Stored Tally company passwords are protected by Windows DPAPI at machine scope, which means the file's NTFS permissions are what actually keep other accounts on the same PC out of them. The installer locks that file down to SYSTEM, Administrators and the agent user, and `verify-deployment.ps1` checks it. If several people share a Windows login on the Tally PC, they share that protection.
 
 ### Option B — From source (development / custom deployments)
 
@@ -100,7 +127,7 @@ Copy `.env.example` to `.env` and configure:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | **Core** | | |
-| `PASSWORD` | *(required for remote)* | OAuth authentication password |
+| `PASSWORD` | *(remote only)* | OAuth authentication password. **Not created in a local install** — there is no listener to gate, so the wizard never asks for one and never writes the key. |
 | `TALLY_HOST` | `localhost` | Tally Prime XML server hostname |
 | `TALLY_PORT` | `9000` | Tally Prime XML server port |
 | `TALLY_DATA_PATH` | `C:\Users\Public\TallyPrime\data` | Tally data directory (for `list-companies`) |
@@ -170,6 +197,8 @@ Because the MCP server typically runs as a Windows service in **Session 0** (no 
 
 ### Connecting — which URL?
 
+> **This section applies to remote deployments, which the installer does not currently set up** ([#192](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/192)). It is kept for existing remote installs and for anyone configuring one by hand.
+
 Where your Claude client runs decides what URL to point it at. **Rule of thumb: you only need a public URL when the client is *not* on the Tally PC.**
 
 | Your Claude client | URL to use | Wizard "Remote Access" page |
@@ -187,7 +216,13 @@ Either way, add the URL (with `/mcp`) as a custom connector in your client and s
 
 ### Local (Claude Desktop)
 
-Add to your `claude_desktop_config.json` (File → Settings → Developer):
+**The installer does this for you.** It writes the entry into `claude_desktop_config.json` as the user who runs Claude, merging into that file rather than replacing it — any other MCP servers you have configured are left alone, and the file is backed up first.
+
+Then **quit Claude Desktop completely and reopen it**. Closing the window is not enough (use File → Exit, or the tray icon): Claude reads this file only at startup, so until it restarts you will see no Tally tools.
+
+If Claude Desktop was installed *after* Claudally, or you want to connect a second Windows user, run **Connect Claude to Tally** from the Start Menu — it is safe to run repeatedly and does nothing if the entry is already correct.
+
+To add the entry by hand instead (File → Settings → Developer):
 
 ```json
 {
@@ -387,13 +422,20 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:library /referen
 
 Compiled C# library wrapping Windows APIs for window management, keystroke injection, and screenshot capture. Required by GUI Agent v2. The `setup-windows.ps1` script compiles this automatically.
 
-### Windows Service Setup
+### Windows Setup (from source)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1 [-InstallDir C:\tally-mcp-server] [-NodePath "..."] [-ServiceName TallyMCP]
+powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1 [-DeploymentMode local|remote] [-InstallDir C:\tally-mcp-server] [-NodePath "..."]
 ```
 
-One-time setup to register the MCP server as a Windows service via [NSSM](https://nssm.cc/). Configures auto-start, log rotation, loads `.env` variables, and registers two at-logon scheduled tasks: `TallyMCPAgent` (the GUI agent) and `TallyMCPTray` (the status tray icon). See [Windows Server Setup](server-setup-windows.md) for the full guide.
+One-time setup for a from-source install. It registers two at-logon scheduled tasks — `TallyMCPAgent` (the GUI agent) and `TallyMCPTray` (the status tray icon) — compiles `TallyUI.dll`, and writes `DEPLOYMENT_MODE` into `.env` so the tray and `verify-deployment.ps1` judge the box against what it actually is. What else it does depends on the mode:
+
+- **local** (the default for a fresh install) — no service, no listening port, no OAuth password. Claude starts `dist\index.mjs` over stdio on demand, and the script points your Claude Desktop config at this install. If an old `TallyMCP` service is present it is removed, because a local install must not leave a listener behind.
+- **remote** — registers the `TallyMCP` service via [NSSM](https://nssm.cc/) running `dist\server.mjs`, with auto-start and log rotation. See [Windows Server Setup](server-setup-windows.md).
+
+Re-running the script never silently changes what a box is: the mode comes from `-DeploymentMode`, else `DEPLOYMENT_MODE` in the existing `.env`, else `remote` if a `TallyMCP` service already exists (a pre-#172 install), else `local`.
+
+> `.env` is no longer copied into the service environment via NSSM `AppEnvironmentExtra`. That put every value — `PASSWORD` included — into a services registry key readable by `BUILTIN\Users`, and it was redundant, because `server.mts` loads `.env` itself by absolute path.
 
 ### Status Tray Icon (issue #20)
 
