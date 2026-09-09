@@ -18,7 +18,7 @@ function Read-CompanyRegistry {
     try {
         $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
         if (-not $raw) { return $empty }
-        $raw = $raw -replace '^﻿', ''
+        $raw = $raw -replace '^\uFEFF', ''
         $parsed = $raw | ConvertFrom-Json -ErrorAction Stop
     } catch { return $empty }
     if (-not $parsed) { return $empty }
@@ -148,7 +148,7 @@ function Invoke-LoadCompanyViaAgent {
             Start-Sleep -Milliseconds 500
             if (-not (Test-Path $resFile)) { continue }
             try {
-                $raw = (Get-Content -LiteralPath $resFile -Raw -Encoding UTF8) -replace '^﻿', ''
+                $raw = (Get-Content -LiteralPath $resFile -Raw -Encoding UTF8) -replace '^\uFEFF', ''
                 $resp = $raw | ConvertFrom-Json -ErrorAction Stop
                 if ($resp.commandId -ne $commandId) { continue }
                 Remove-Item $resFile -Force -ErrorAction SilentlyContinue
@@ -565,7 +565,7 @@ function Show-CompanyEditDialog {
             displayName  = $tbDisplayName.Text.Trim()
             username     = $tbUsername.Text.Trim()
             notes        = $tbNotes.Text.Trim()
-            # Password handling — three states:
+            # Password handling - three states:
             #   1. checkbox unchecked    -> preserve existing passwordEnc (Edit) or no password (Add)
             #   2. checkbox checked + empty field -> clear password (passwordEnc = $null)
             #   3. checkbox checked + non-empty   -> save loop encrypts via DPAPI helper
@@ -802,7 +802,7 @@ function Show-ManageCompaniesDialog {
     # Buttons. Row ops grouped left (Add/Edit/Delete/Test), bulk ops in the
     # middle (Import/Sample), Close right-anchored.
     $btnY = 535
-    # Flat buttons with a brand-orange accent + hover — Kind = 'primary' (orange) | 'danger' (red) |
+    # Flat buttons with a brand-orange accent + hover - Kind = 'primary' (orange) | 'danger' (red) |
     # 'secondary'. Matches the tray dashboard reskin.
     function _MakeButton {
         param([string]$Text, [int]$X, [int]$W = 95, [string]$Anchor = 'Bottom,Left', [string]$Kind = 'secondary')

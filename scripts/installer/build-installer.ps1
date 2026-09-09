@@ -182,7 +182,7 @@ $nssmTarget = Join-Path $staging 'nssm.exe'
 if ($DownloadDeps) {
     $nssmZip = Join-Path $staging "nssm-$NssmVersion.zip"
     # Security: only the canonical HTTPS origin. The former web.archive.org fallback served an
-    # unauthenticated, mutable snapshot with no integrity guarantee — a supply-chain risk for a
+    # unauthenticated, mutable snapshot with no integrity guarantee - a supply-chain risk for a
     # binary that gets installed as a SYSTEM service host.
     $nssmUrls = @(
         "https://nssm.cc/release/nssm-$NssmVersion.zip"

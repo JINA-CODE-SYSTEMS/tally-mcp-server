@@ -39,8 +39,16 @@
 
 ; Source root: the installer is built from <repo>/scripts/installer/, so SourceDir
 ; climbs two levels to reach the repo root. SourcePath itself is provided by Inno.
-#define RepoRoot         "..\\.."
-#define StagingRoot      "..\\..\\installer-staging"
+; Both roots are overridable from the command line (ISCC /DRepoRoot=...). The release build
+; leaves them alone; CI points them at a tree of stub files so the Pascal Script and the
+; [Setup]/[Files]/[Run] sections are compiled on every PR without first downloading a
+; portable Node, NSSM and cloudflared. See scripts/installer/check-iss.ps1.
+#ifndef RepoRoot
+  #define RepoRoot       "..\\.."
+#endif
+#ifndef StagingRoot
+  #define StagingRoot    "..\\..\\installer-staging"
+#endif
 
 [Setup]
 AppId={{F8E2A7C9-3B4D-4A6E-9F0E-2C5D1E7B8A4F}
@@ -198,7 +206,6 @@ Type: filesandordirs; Name: "{app}\bin"
 ; ===========================================================================
 [Code]
 var
-  ModePage: TInputOptionWizardPage;
   ConfigPage: TInputQueryWizardPage;
   RemotePage: TInputQueryWizardPage;
   EditionPage: TInputOptionWizardPage;
@@ -221,7 +228,7 @@ begin
   ConfigPage := CreateInputQueryPage(wpSelectDir,
     'Tally MCP Configuration',
     'Tell us where Tally Prime lives and how to talk to it.',
-    'These values become the .env file. You can edit them later via the "Reconfigure" Start Menu shortcut. The OAuth password below is required and protects access to all MCP tools.');
+    'These values become the .env file. You can change any of them later from the "Reconfigure" Start Menu shortcut.');
 
   ConfigPage.Add('Tally executable path:', False);
   ConfigPage.Add('Tally data folder:', False);

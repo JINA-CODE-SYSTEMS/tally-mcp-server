@@ -300,7 +300,7 @@ function Invoke-StatusPoll {
         if (-not $dataPath) { $dataPath = 'C:\Users\Public\TallyPrimeEditLog\data' }
         $regPath = Join-Path $dataPath '.tally-mcp-companies.json'
         if (Test-Path -LiteralPath $regPath) {
-            $raw = (Get-Content -LiteralPath $regPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue) -replace '^﻿', ''
+            $raw = (Get-Content -LiteralPath $regPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue) -replace '^\uFEFF', ''
             if ($raw) {
                 $parsed = $raw | ConvertFrom-Json -ErrorAction Stop
                 $latest = $parsed.companies | Where-Object { $_.lastLoadedAt } |
@@ -487,7 +487,7 @@ $miStopService.Add_Click({
             "Stop the TallyMCP service?`n`nAll MCP tools become unavailable (any Claude session using them will fail) until you start it again with `"Restart service`".",
             'TallyMCP', 'OKCancel', 'Warning')
         if ($confirm -ne 'OK') { return }
-        # Elevated, like Restart. Use `sc.exe stop` (non-blocking — it sends the STOP control and
+        # Elevated, like Restart. Use `sc.exe stop` (non-blocking - it sends the STOP control and
         # returns immediately, so this can't hang the hidden window in StopPending), which puts NSSM
         # into stopping mode, then taskkill node as a fallback: on a pre-#23 install whose graceful
         # stop stalls, killing node lets NSSM finish reaching Stopped. Because the service is already

@@ -167,7 +167,7 @@ $TallyEdition   = _Coalesce $TallyEdition   $_existingEnv['TALLY_EDITION']   'si
 $TallyExePath   = _Coalesce $TallyExePath   $_existingEnv['TALLY_EXE_PATH']   'C:\Program Files\TallyPrimeEditLog\tally.exe'
 $TallyDataPath  = _Coalesce $TallyDataPath  $_existingEnv['TALLY_DATA_PATH']  'C:\Users\Public\TallyPrimeEditLog\data'
 $TallyIniPath   = _Coalesce $TallyIniPath   $_existingEnv['TALLY_INI_PATH']   'C:\Program Files\TallyPrimeEditLog\tally.ini'
-# MCP_DOMAIN has no hardcoded default — blank means "localhost-only mode".
+# MCP_DOMAIN has no hardcoded default - blank means "localhost-only mode".
 $McpDomain      = _Coalesce $McpDomain      $_existingEnv['MCP_DOMAIN']       ''
 # AGENT_TASK_USER is persisted in .env (below) and preferred over $env:USERNAME so a Reconfigure run
 # by a DIFFERENT admin (the bare-InstallDir path omits -AgentTaskUser) does not silently re-point the
@@ -304,7 +304,7 @@ Start-Transcript -Path $transcript -Append | Out-Null
 # Distinguish silent installer-driven runs (Inno passes -CredentialsFile and the
 # window is auto-closed by the installer) from interactive reconfigure runs
 # launched via the Start Menu shortcut. On the interactive path, the PowerShell
-# host closes the window the moment the script returns — success or failure —
+# host closes the window the moment the script returns - success or failure -
 # which is why operators reported "nothing happens, window flashes shut" on the
 # RDC: the script completed, they just couldn't see the output. Pause at the
 # end so they can read it.
@@ -471,7 +471,7 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         # Nothing to add - the comment line above records why.
     } elseif ($TunnelToken) {
         # Cloudflare Tunnel: cloudflared makes an OUTBOUND connection to Cloudflare's edge and reaches
-        # the MCP server on loopback, so the server never needs to listen beyond 127.0.0.1 — strictly
+        # the MCP server on loopback, so the server never needs to listen beyond 127.0.0.1 - strictly
         # more secure than the bring-your-own reverse-proxy path below (which must bind 0.0.0.0).
         # MCP_DOMAIN stays the public hostname so OAuth discovery advertises the right URL.
         $envLines += "BIND_HOST=127.0.0.1"
@@ -526,7 +526,7 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     # IMPORTANT: also grant the agent task user explicit Full Control. The tray scheduled task
     # runs with -RunLevel Limited (non-elevated), which filters the Administrators group from
     # the process token even when the user IS in Administrators. Without an explicit user grant,
-    # the Manage Companies dialog's Move-Item -Force silently fails on overwrite — the .tmp file
+    # the Manage Companies dialog's Move-Item -Force silently fails on overwrite - the .tmp file
     # gets written but never gets renamed to the real .json, so Save reports success and
     # nothing actually persists.
     & icacls $registryFile /inheritance:r /grant:r 'SYSTEM:F' 'Administrators:F' "${AgentTaskUser}:F" 2>$null | Out-Null
@@ -652,7 +652,7 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         & $bundledNssm set $ServiceName AppStopMethodThreads 1500  | Out-Null
         # On an unexpected exit, restart with a sane delay rather than hammering. Throttle detection
         # (AppThrottle) means a process that keeps dying fast is left stopped instead of respawned into
-        # the "Running but nothing listening" limbo we saw on cold installs — the real error then shows
+        # the "Running but nothing listening" limbo we saw on cold installs - the real error then shows
         # up in logs/service.log (e.g. the PASSWORD FATAL line) instead of a silent crash-loop.
         & $bundledNssm set $ServiceName AppExit Default Restart    | Out-Null
         & $bundledNssm set $ServiceName AppRestartDelay 2000       | Out-Null
@@ -754,7 +754,7 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     # When a tunnel token is configured, register cloudflared as a second NSSM service so a NAT'd box
     # gets a stable public HTTPS URL with no router/domain config. Idempotent: ALWAYS stop/remove any
     # prior instance first (mirrors the main-service teardown above), then re-register ONLY if a token
-    # is present — so blanking the token on a Reconfigure tears the tunnel down cleanly. The token is
+    # is present - so blanking the token on a Reconfigure tears the tunnel down cleanly. The token is
     # passed via the service ENV (TUNNEL_TOKEN), never on the command line where a local user could read it.
     $cloudflaredExe = Join-Path $InstallDir 'bin\cloudflared.exe'
     $existingTunnel = Get-Service -Name $TunnelServiceName -ErrorAction SilentlyContinue
@@ -828,7 +828,7 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
             -Execute 'powershell.exe' `
             -Argument "-ExecutionPolicy Bypass -NoProfile -WindowStyle Minimized -File `"$agentScript`""
         # At-logon trigger is the reliable baseline. Crash-supervision (#88 H-2) is added on top via
-        # RestartCount/Interval + an optional 1-min heartbeat — but BOTH are built best-effort so a
+        # RestartCount/Interval + an optional 1-min heartbeat - but BOTH are built best-effort so a
         # picky Windows build can never abort registration (which previously left the task unregistered).
         $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $AgentTaskUser
         $taskPrincipal = New-ScheduledTaskPrincipal -UserId $AgentTaskUser -LogonType Interactive -RunLevel Limited
@@ -843,7 +843,7 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
             $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
         }
 
-        # Optional heartbeat trigger — re-fires the task every minute as a belt for the "process gone
+        # Optional heartbeat trigger - re-fires the task every minute as a belt for the "process gone
         # but the engine thinks it completed" case. Some Windows builds reject the repetition params,
         # so build it in a try/catch and register logon-only if it fails (RestartCount still covers crashes).
         # NOTE: use a finite 10-year duration, NOT [TimeSpan]::MaxValue, which overflows and threw here.

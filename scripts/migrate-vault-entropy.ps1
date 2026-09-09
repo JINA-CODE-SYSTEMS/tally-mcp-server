@@ -5,7 +5,7 @@
 .DESCRIPTION
     Issue #50 introduced a DPAPI entropy value but only applied it to passwords set AFTER that
     change. dpapi-helper.ps1's comment claims legacy blobs "get re-encrypted with entropy on the
-    next save"; they are not — manage-companies-dialog.ps1 preserves passwordEnc verbatim unless
+    next save"; they are not - manage-companies-dialog.ps1 preserves passwordEnc verbatim unless
     the operator ticks "Change password". So installs predating #50 still hold blobs any local
     process can Unprotect with null entropy.
 

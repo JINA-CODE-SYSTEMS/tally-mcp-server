@@ -68,6 +68,19 @@ To iterate just on the wizard without rebuilding the project:
 .\scripts\installer\build-installer.ps1 -SkipBuild
 ```
 
+### Checking the script without building
+
+CI compiles the `.iss` on every PR against a tree of stub files, so the Pascal Script and every
+section are checked in seconds without downloading a portable Node. Run the same check locally:
+
+```powershell
+.\scripts\installer\check-iss.ps1
+```
+
+It fails on ISCC warnings as well as errors. What no compiler can check - wizard page `Values[]`
+indices, interactivity, privilege boundaries, upgrade paths - is in
+[installer-manual-test.md](installer-manual-test.md).
+
 ## Files
 
 | Path | Purpose |

@@ -163,20 +163,19 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'TallyUI.dll compile failed' }
           Write-Host "TallyUI.dll built: $((Get-Item scripts\TallyUI.dll).Length) bytes"
 
-      - name: PowerShell syntax check
+      # Customers run Windows PowerShell 5.1 - it is what the service, the scheduled tasks and the
+      # installer shell out to. CI used to parse these scripts only with pwsh 7, which reads files
+      # as UTF-8 and accepts syntax 5.1 rejects; that is how an em dash in a BOM-less deploy.ps1
+      # sat unparseable on main while every check stayed green. 5.1 is the gate that matters, so it
+      # runs first, and it checks encoding as well as syntax.
+      - name: PowerShell 5.1 compatibility (syntax + encoding)
+        shell: powershell
+        run: .\scripts\check-powershell-compat.ps1
+
+      # The scripts also have to keep working under pwsh 7, which maintainers and the tray use.
+      - name: PowerShell 7 syntax check
         shell: pwsh
-        run: |
-          $bad = @()
-          Get-ChildItem -Path scripts -Recurse -Filter *.ps1 | ForEach-Object {
-            $errors = $null
-            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors) | Out-Null
-            if ($errors) {
-              $bad += $_.FullName
-              Write-Host "::error file=$($_.FullName)::$($errors[0].Message)"
-            }
-          }
-          if ($bad.Count) { throw "$($bad.Count) PowerShell file(s) failed to parse" }
-          Write-Host 'All PowerShell scripts parse cleanly'
+        run: .\scripts\check-powershell-compat.ps1 -ParseOnly
 
       - name: PSScriptAnalyzer (errors only)
         shell: pwsh
@@ -190,6 +189,18 @@ jobs:
             throw "PSScriptAnalyzer reported $($issues.Count) error(s)"
           }
           Write-Host 'No PSScriptAnalyzer errors'
+
+      # The installer's [Code] section is Pascal Script and nothing in CI ever compiled it, so a
+      # broken wizard function or a dangling {code:...} reference could only be caught by cutting a
+      # release. This compiles the real .iss against a tree of stub files - seconds, no downloads.
+      # It does not check that the declared source files exist; the release build does that.
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Inno Setup script compiles
+        shell: pwsh
+        run: .\scripts\installer\check-iss.ps1
 
 
       # Regression test for the transport seam (PR #190). The one-shot (-Once) path is how the MCP

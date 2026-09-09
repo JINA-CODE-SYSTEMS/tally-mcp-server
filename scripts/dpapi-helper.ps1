@@ -1,6 +1,6 @@
 # DPAPI encrypt/decrypt helper for TallyMCP company-registry passwords.
 #
-# Reads plaintext (encrypt) or base64 blob (decrypt) from STDIN — never from command-line args,
+# Reads plaintext (encrypt) or base64 blob (decrypt) from STDIN - never from command-line args,
 # so secrets don't show up in process listings (Task Manager, Get-WmiObject Win32_Process, etc.).
 #
 # RUN (from Node):
@@ -30,8 +30,8 @@ $scope = [System.Security.Cryptography.DataProtectionScope]::LocalMachine
 
 # Application-specific entropy namespaces the protection: an arbitrary unrelated
 # process on the box can no longer ProtectedData.Unprotect a stolen blob without
-# also supplying this value. It is NOT a secret key — it only has to match between
-# Protect and Unprotect — but it removes the "any process can decrypt" weakness of
+# also supplying this value. It is NOT a secret key - it only has to match between
+# Protect and Unprotect - but it removes the "any process can decrypt" weakness of
 # a null entropy under LocalMachine scope. NTFS ACLs remain the primary boundary.
 $entropy = [System.Text.Encoding]::UTF8.GetBytes('TallyMCP.CompanyRegistry.DPAPI.v1')
 
