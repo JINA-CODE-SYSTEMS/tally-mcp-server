@@ -664,6 +664,21 @@ $miManageCompanies.Add_Click({
     }
 })
 
+# Points Claude Desktop at this install by merging an entry into claude_desktop_config.json.
+# NOT elevated, deliberately: that file lives in %APPDATA%, which is per-user. Running it as an
+# admin who never opens Claude writes the wrong profile, and the user then sees no Tally tools with
+# nothing anywhere explaining why. connect-client.ps1 documents the same rule.
+$miConnectClaude = $menu.Items.Add('Connect Claude to Tally')
+$miConnectClaude.Add_Click({
+    $script = Join-Path $InstallDir 'scripts\installer\connect-client.ps1'
+    if (-not (Test-Path -LiteralPath $script)) {
+        [System.Windows.Forms.MessageBox]::Show("Connect script not found at: $script", 'Claudally', 'OK', 'Warning') | Out-Null
+        return
+    }
+    $connectArgs = "-ExecutionPolicy Bypass -NoProfile -NoExit -File `"$script`" -InstallDir `"$InstallDir`""
+    Start-Process -FilePath 'powershell.exe' -ArgumentList $connectArgs
+})
+
 $miReconfigure = $menu.Items.Add('Reconfigure...')
 $miReconfigure.Add_Click({
     $script = Join-Path $InstallDir 'scripts\installer\firstrun-config.ps1'
@@ -969,37 +984,68 @@ function Show-Dashboard {
 
     # --- Actions card: 3x3 grid of flat buttons. Each .PerformClick()s the corresponding
     # right-click ToolStripMenuItem so the implementation stays in one place. ---
-    $actions = New-DashCard 16 266 600 174 ([System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right) 'Actions'
-    $form.Controls.Add($actions)
+    # Which actions exist depends on the deployment mode. In local mode there is no service to
+    # restart or stop and no public URL to copy, so offering those buttons describes a system the
+    # user does not have — and 'Restart service' sitting there as the PRIMARY action is actively
+    # misleading. Connecting Claude is the primary thing to do locally, so it takes that slot.
+    $isLocal = ($State.DeploymentMode -eq 'local')
 
-    $btnSpecs = @(
-        @{ Text = 'Restart service';      X =  14; Y = 42;  Kind = 'primary';   Click = { $miRestartService.PerformClick() } },
-        @{ Text = 'Restart GUI agent';    X = 202; Y = 42;  Kind = 'secondary'; Click = { $miRestartAgent.PerformClick() } },
-        @{ Text = 'Reconfigure...';       X = 390; Y = 42;  Kind = 'secondary'; Click = { $miReconfigure.PerformClick() } },
-        @{ Text = 'Launch Tally';         X =  14; Y = 84;  Kind = 'secondary'; Click = { $miLaunchTally.PerformClick() } },
-        @{ Text = 'Open logs';            X = 202; Y = 84;  Kind = 'secondary'; Click = { $miOpenLogs.PerformClick() } },
-        @{ Text = 'Copy public URL';      X = 390; Y = 84;  Kind = 'secondary'; Click = {
+    $btnSpecs = @()
+    if (-not $isLocal) {
+        $btnSpecs += @{ Text = 'Restart service'; Kind = 'primary'; Click = { $miRestartService.PerformClick() } }
+    }
+    $btnSpecs += @{ Text = 'Connect Claude to Tally'; Kind = $(if ($isLocal) { 'primary' } else { 'secondary' }); Click = { $miConnectClaude.PerformClick() } }
+    $btnSpecs += @{ Text = 'Restart GUI agent';   Kind = 'secondary'; Click = { $miRestartAgent.PerformClick() } }
+    $btnSpecs += @{ Text = 'Launch Tally';        Kind = 'secondary'; Click = { $miLaunchTally.PerformClick() } }
+    $btnSpecs += @{ Text = 'Manage Companies...'; Kind = 'secondary'; Click = { $miManageCompanies.PerformClick() } }
+    $btnSpecs += @{ Text = 'Open logs';           Kind = 'secondary'; Click = { $miOpenLogs.PerformClick() } }
+    $btnSpecs += @{ Text = 'Reconfigure...';      Kind = 'secondary'; Click = { $miReconfigure.PerformClick() } }
+    $btnSpecs += @{ Text = 'Claude GUI control...'; Kind = 'secondary'; Click = { $miGuiControl.PerformClick() } }
+    if (-not $isLocal) {
+        $btnSpecs += @{ Text = 'Copy public URL'; Kind = 'secondary'; Click = {
             if ($State.PublicUrl) {
                 try { [System.Windows.Forms.Clipboard]::SetText($State.PublicUrl) } catch {}
             }
-        } },
-        @{ Text = 'Manage Companies...';  X =  14; Y = 126; Kind = 'secondary'; Click = { $miManageCompanies.PerformClick() } },
-        @{ Text = 'Stop service';         X = 202; Y = 126; Kind = 'danger';    Click = { $miStopService.PerformClick() } },
-        @{ Text = 'Claude GUI control...';X = 390; Y = 126; Kind = 'secondary'; Click = { $miGuiControl.PerformClick() } }
-    )
+        } }
+        $btnSpecs += @{ Text = 'Stop service';    Kind = 'danger';    Click = { $miStopService.PerformClick() } }
+    }
+
+    # Size the card to the rows the buttons actually need. Remote mode has ten actions (four rows)
+    # and local seven (three), so a fixed height would clip the last row in one mode or leave a band
+    # of dead white in the other.
+    $btnRows      = [math]::Ceiling($btnSpecs.Count / 3)
+    $actionsH     = 42 + ($btnRows * 42) + 6
+    $actionsGrew  = $actionsH - 174
+
+    $actions = New-DashCard 16 266 600 $actionsH ([System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right) 'Actions'
+    $form.Controls.Add($actions)
+
+    # Positions are computed, not hardcoded: the button list now varies with mode, and fixed X/Y
+    # would leave holes in the grid the moment an entry is dropped.
+    $btnIndex = 0
     foreach ($spec in $btnSpecs) {
+        $col = $btnIndex % 3
+        $row = [math]::Floor($btnIndex / 3)
         $btn = New-Object System.Windows.Forms.Button
         $btn.Text     = $spec.Text
-        $btn.Location = New-Object System.Drawing.Point $spec.X, $spec.Y
+        $btn.Location = New-Object System.Drawing.Point (14 + 188 * $col), (42 + 42 * $row)
         $btn.Size     = New-Object System.Drawing.Size 182, 34
         Set-FlatButton $btn $spec.Kind
         $btn.Add_Click($spec.Click)
         $actions.Controls.Add($btn)
+        $btnIndex++
+    }
+
+    # Give the window back the height the extra button row took, so the License card keeps its size
+    # instead of quietly shrinking in remote mode.
+    if ($actionsGrew -gt 0) {
+        $form.Height      = $form.Height + $actionsGrew
+        $form.MinimumSize = New-Object System.Drawing.Size $form.MinimumSize.Width, ($form.MinimumSize.Height + $actionsGrew)
     }
 
     # --- License card: read-only viewer of the bundled LICENSE file. Anchored to all four sides
     # so the user can resize the window to read more without horizontal scroll. ---
-    $licenseGroup = New-DashCard 16 452 600 210 ([System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right) 'License'
+    $licenseGroup = New-DashCard 16 (452 + $actionsGrew) 600 210 ([System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right) 'License'
     $form.Controls.Add($licenseGroup)
 
     $licenseBox = New-Object System.Windows.Forms.TextBox
