@@ -209,19 +209,16 @@ procedure InitializeWizard;
 var
   DefaultExePath, DefaultDataPath, DefaultIniPath, DefaultDomain, DefaultUser: string;
 begin
-  // Deployment mode is the FIRST question (#172 C5). Everything after it is conditional on the
-  // answer, so asking it last - or inferring it from whether a domain was typed - would mean
-  // collecting an OAuth password from someone who will never have a listener to gate.
-  ModePage := CreateInputOptionPage(wpSelectDir,
-    'How will Claude reach Tally?',
-    'Choose where Claude runs. You can change this later with Reconfigure.',
-    'Most people want the first option. It is also the safer one: nothing listens on the network, no password is created, and the server only runs while you are using Claude.',
-    True, False);
-  ModePage.Add('On this computer (recommended) - Claude Desktop runs here, alongside Tally');
-  ModePage.Add('From another computer - needs a public address and a password');
-  ModePage.SelectedValueIndex := 0;
-
-  ConfigPage := CreateInputQueryPage(ModePage.ID,
+  // REMOTE ACCESS IS HIDDEN FOR NOW (see the remote-access issue). The mode page and the remote
+  // page are both suppressed rather than deleted: the machinery underneath them is finished and
+  // tested, and the remote path still WORKS - it is the provisioning story around it (no
+  // Cloudflare zone, manual per-client setup, a trust claim that does not survive scrutiny) that
+  // is not ready to put in front of customers. Offering a choice we cannot yet support well is
+  // worse than offering one good option.
+  //
+  // Restoring it is deliberately small: re-create ModePage here, re-parent ConfigPage to it, and
+  // make IsLocalMode() read the page again instead of returning True.
+  ConfigPage := CreateInputQueryPage(wpSelectDir,
     'Tally MCP Configuration',
     'Tell us where Tally Prime lives and how to talk to it.',
     'These values become the .env file. You can edit them later via the "Reconfigure" Start Menu shortcut. The OAuth password below is required and protects access to all MCP tools.');
@@ -396,14 +393,26 @@ end;
 // The single source of truth for which mode was chosen. Everything else - the skipped page, the
 // credentials file, the value handed to firstrun-config.ps1 - reads this rather than re-deriving
 // it, so there is no way for the wizard to act on one answer and record another.
+// While remote is hidden, every install this wizard performs is a local one. Kept as a function
+// rather than inlined so restoring the mode page is a one-line change here.
 function IsLocalMode(): Boolean;
 begin
-  Result := (ModePage.SelectedValueIndex = 0);
+  Result := True;
 end;
 
+// DELIBERATELY EMPTY, and this is the load-bearing part of hiding remote.
+//
+// Passing "local" here would CONVERT every existing remote install to local on upgrade - tearing
+// out the service and the listener of a working deployment because we changed our installer's
+// UI. Passing nothing lets firstrun-config.ps1 apply its own precedence, which already answers
+// correctly for all three cases: a fresh install has no .env and defaults to local; an install
+// carrying DEPLOYMENT_MODE keeps whatever it says; and an install predating the key falls back to
+// remote, so it is a strict no-op. The same reasoning is why the hidden RemotePage no longer
+// supplies MCP_DOMAIN or TUNNEL_TOKEN - blank preserves the existing values rather than clearing
+// them.
 function GetWizardMode(Param: string): string;
 begin
-  if IsLocalMode() then Result := 'local' else Result := 'remote';
+  Result := '';
 end;
 
 // Local mode has no listener, so the whole remote page is meaningless there. Skipping it is not
