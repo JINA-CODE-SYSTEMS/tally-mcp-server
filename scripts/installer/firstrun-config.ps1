@@ -67,6 +67,22 @@ param(
     # Opt-in for Claude-driven GUI control (gui-screenshot / gui-send-keys). Wizard passes
     # 'true'/'false'; a bare Reconfigure omits it, so we preserve the existing .env value below.
     [string]$EnableGuiControl,
+    # Set by the installer, which knows it is running us in a hidden window with no keyboard.
+    # NOT inferred from -CredentialsFile any more: local mode deliberately passes no credentials
+    # file, so that inference made every local install hang on the "Press Enter" pause below,
+    # waiting for a keypress the window could never receive.
+    [switch]$Unattended,
+    # --- Deployment mode: three orthogonal axes, not one key (#172, #177, #178) ---
+    # No defaults here, per the fallback-chain convention above; they are resolved after .env is read.
+    #   DEPLOYMENT_MODE  local|remote            is there a service and a listening port?      (#172)
+    #   REMOTE_AUTH      oauth-password|paired   how do remote callers authenticate?           (#178)
+    #   REMOTE_TRANSPORT tunnel|lan              how do they reach us?                         (#178)
+    # These are deliberately separate. A paired remote install is remote + paired + tunnel, so
+    # collapsing the first two onto one key leaves that configuration unexpressible - which is the
+    # bug the three planning streams each hit independently.
+    [string]$DeploymentMode,
+    [string]$RemoteAuth,
+    [string]$RemoteTransport,
     # Cloudflare Tunnel. When -TunnelToken is non-empty, a second NSSM service ($TunnelServiceName)
     # runs cloudflared so a NAT'd box gets a stable public HTTPS URL with no router config. Blank on a
     # bare Reconfigure -> preserved from .env below (like McpDomain), so a reconfigure doesn't drop it.
@@ -74,6 +90,49 @@ param(
     [string]$TunnelToken,
     [switch]$SkipTrayTask
 )
+
+# --- Elevate, or say why we cannot (#172 C2) -----------------------------------------------------
+# Almost everything below needs administrator rights: icacls on .env and the company vault, nssm,
+# Register-ScheduledTask for another user. The installer always runs us elevated, but the
+# "Reconfigure" Start Menu shortcut launches powershell.exe with no runas verb - so that path ran
+# unelevated and every privileged call failed. Most are wrapped in `2>$null | Out-Null` to swallow
+# benign stderr, which meant they failed SILENTLY: the operator saw a script that appeared to
+# succeed while changing nothing.
+#
+# That is worse than an error. A "reconfigure" that silently skips the icacls calls can leave the
+# .env and the company vault LESS protected than before, on a machine whose owner has just been told
+# everything is fine.
+#
+# Relaunch ourselves elevated rather than merely warning, because a warning on a path people use to
+# fix things is a warning nobody reads. Forward every bound parameter so the relaunched run behaves
+# identically. If elevation is declined or unavailable, stop with a clear reason instead of doing
+# half the work.
+$_principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $_principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "[*] Administrator rights are required; requesting elevation..." -ForegroundColor Yellow
+
+    $_fwd = @('-ExecutionPolicy', 'Bypass', '-NoProfile', '-File', "`"$PSCommandPath`"")
+    foreach ($kv in $PSBoundParameters.GetEnumerator()) {
+        if ($kv.Value -is [switch]) {
+            if ($kv.Value.IsPresent) { $_fwd += "-$($kv.Key)" }
+        } else {
+            $_fwd += @("-$($kv.Key)", "`"$($kv.Value)`"")
+        }
+    }
+
+    try {
+        $_child = Start-Process -FilePath 'powershell.exe' -ArgumentList $_fwd -Verb RunAs -PassThru -Wait -ErrorAction Stop
+        exit $_child.ExitCode
+    } catch {
+        Write-Host ""
+        Write-Host "[ERROR] This script needs to run as Administrator and elevation was declined or unavailable." -ForegroundColor Red
+        Write-Host "        Without it the service, the scheduled tasks and the NTFS lockdown on .env and the" -ForegroundColor Red
+        Write-Host "        company password vault cannot be changed - and those failures would be silent." -ForegroundColor Red
+        Write-Host "        Right-click 'Reconfigure Claudally' and choose 'Run as administrator'." -ForegroundColor Red
+        Write-Host ""
+        exit 1
+    }
+}
 
 # --- Preserve-on-reconfigure: read existing .env to fill in any blank params ---
 function _ReadEnvHashtable {
@@ -108,7 +167,7 @@ $TallyEdition   = _Coalesce $TallyEdition   $_existingEnv['TALLY_EDITION']   'si
 $TallyExePath   = _Coalesce $TallyExePath   $_existingEnv['TALLY_EXE_PATH']   'C:\Program Files\TallyPrimeEditLog\tally.exe'
 $TallyDataPath  = _Coalesce $TallyDataPath  $_existingEnv['TALLY_DATA_PATH']  'C:\Users\Public\TallyPrimeEditLog\data'
 $TallyIniPath   = _Coalesce $TallyIniPath   $_existingEnv['TALLY_INI_PATH']   'C:\Program Files\TallyPrimeEditLog\tally.ini'
-# MCP_DOMAIN has no hardcoded default — blank means "localhost-only mode".
+# MCP_DOMAIN has no hardcoded default - blank means "localhost-only mode".
 $McpDomain      = _Coalesce $McpDomain      $_existingEnv['MCP_DOMAIN']       ''
 # AGENT_TASK_USER is persisted in .env (below) and preferred over $env:USERNAME so a Reconfigure run
 # by a DIFFERENT admin (the bare-InstallDir path omits -AgentTaskUser) does not silently re-point the
@@ -122,6 +181,36 @@ if ($EnableGuiControl -ne 'true') { $EnableGuiControl = 'false' }
 # and a previously-configured tunnel is torn down below. Trim so a stray-space value counts as blank.
 $TunnelToken = ("$(_Coalesce $TunnelToken $_existingEnv['TUNNEL_TOKEN'] '')").Trim()
 
+# --- Deployment mode ------------------------------------------------------------------------------
+# UPGRADE SAFETY IS THE WHOLE POINT OF THIS BLOCK. An install created before these keys existed has
+# no DEPLOYMENT_MODE in .env, and must keep behaving exactly as it does today: service, listener,
+# OAuth password. So an EXISTING install falls back to 'remote' while a FRESH one defaults to
+# 'local'. Backwards, this silently tears the service out of every deployed instance on upgrade.
+$_isExistingInstall = $_existingEnv.Count -gt 0
+
+$DeploymentMode  = _Coalesce $DeploymentMode  $_existingEnv['DEPLOYMENT_MODE']  $(if ($_isExistingInstall) { 'remote' } else { 'local' })
+$RemoteAuth      = _Coalesce $RemoteAuth      $_existingEnv['REMOTE_AUTH']      'oauth-password'
+$RemoteTransport = _Coalesce $RemoteTransport $_existingEnv['REMOTE_TRANSPORT'] 'tunnel'
+
+# Validate terminally, and never coalesce an unrecognised value to a default - a typo in .env must
+# stop the run, not quietly pick a deployment mode for the operator.
+#
+# A [ValidateSet] on the parameter DOES re-validate on assignment (verified: assigning an
+# out-of-set value throws ValidationMetadataException, it does not silently keep the old one), so
+# the attribute alone would fail closed. It is not used here because the exception it raises names
+# a PowerShell internal and says nothing about which file to edit - useless to whoever is watching
+# an installer. Check explicitly and say what to do instead.
+function _AssertOneOf {
+    param([string]$Name, [string]$Value, [string[]]$Allowed)
+    if ($Allowed -notcontains $Value) {
+        throw ("$Name is '$Value', which is not one of: " + ($Allowed -join ', ') +
+               ". Fix it in " + (Join-Path $InstallDir '.env') + " and re-run, or pass -$Name explicitly.")
+    }
+}
+_AssertOneOf 'DEPLOYMENT_MODE'  $DeploymentMode  @('local','remote')
+_AssertOneOf 'REMOTE_AUTH'      $RemoteAuth      @('oauth-password','paired')
+_AssertOneOf 'REMOTE_TRANSPORT' $RemoteTransport @('tunnel','lan')
+
 # --- Resolve OAuth password ---
 # Two entry paths:
 #   1. Inno Setup wizard: passes -CredentialsFile pointing at a JSON in the installer's user-only
@@ -129,8 +218,26 @@ $TunnelToken = ("$(_Coalesce $TunnelToken $_existingEnv['TUNNEL_TOKEN'] '')").Tr
 #      line where Get-CimInstance Win32_Process could observe it.
 #   2. Interactive "Reconfigure" Start Menu shortcut: re-runs this script with only -InstallDir.
 #      We prompt the operator securely via Read-Host -AsSecureString.
+#
+# LOCAL MODE HAS NO PASSWORD AT ALL (#172). The OAuth password exists to gate an HTTP listener;
+# local mode has no listener, so the credential that currently gates read AND write on live books
+# simply does not exist. That is the single strongest security property #172 claims, and it is only
+# true if we never create it - not if we create one and leave it unused. So the whole block below
+# is skipped, and any credentials file the installer wrote is still shredded rather than left on
+# disk for the next process to find.
 $Password = $null
-if ($CredentialsFile -and $CredentialsFile.Trim().Length -gt 0) {
+if ($DeploymentMode -eq 'local') {
+    if ($CredentialsFile -and (Test-Path -LiteralPath $CredentialsFile)) {
+        try {
+            $size = (Get-Item -LiteralPath $CredentialsFile -ErrorAction SilentlyContinue).Length
+            if ($size -gt 0) { [System.IO.File]::WriteAllBytes($CredentialsFile, (New-Object byte[] $size)) }
+        } catch { }
+        Remove-Item -LiteralPath $CredentialsFile -Force -ErrorAction SilentlyContinue
+        Write-Host "[OK] Local mode: no OAuth password is created; the installer's credentials file was shredded"
+    } else {
+        Write-Host "[OK] Local mode: no OAuth password is created"
+    }
+} elseif ($CredentialsFile -and $CredentialsFile.Trim().Length -gt 0) {
     if (-not (Test-Path -LiteralPath $CredentialsFile)) {
         throw "Credentials file not found at '$CredentialsFile'. Inno Setup should have written it before invoking this script."
     }
@@ -197,11 +304,14 @@ Start-Transcript -Path $transcript -Append | Out-Null
 # Distinguish silent installer-driven runs (Inno passes -CredentialsFile and the
 # window is auto-closed by the installer) from interactive reconfigure runs
 # launched via the Start Menu shortcut. On the interactive path, the PowerShell
-# host closes the window the moment the script returns — success or failure —
+# host closes the window the moment the script returns - success or failure -
 # which is why operators reported "nothing happens, window flashes shut" on the
 # RDC: the script completed, they just couldn't see the output. Pause at the
 # end so they can read it.
-$Script:IsInteractiveRun = [string]::IsNullOrWhiteSpace($CredentialsFile)
+# -Unattended is authoritative. The CredentialsFile heuristic is kept only as a fallback for a
+# caller that predates the switch: it is right for remote installs (which always pass one) and
+# wrong for local ones, which is exactly the bug the switch exists to close.
+$Script:IsInteractiveRun = (-not $Unattended) -and [string]::IsNullOrWhiteSpace($CredentialsFile)
 function _PauseIfInteractive {
     if ($Script:IsInteractiveRun) {
         Write-Host ""
@@ -222,7 +332,20 @@ try {
     $envFile     = Join-Path $InstallDir '.env'
     $agentScript = Join-Path $InstallDir 'scripts\tally-gui-agent-v2.ps1'
 
-    foreach ($p in @($bundledNode, $bundledNssm, $serverEntry, $agentScript)) {
+    # The prerequisite list is mode-dependent, and was not (#172 C3/C5). Local mode registers no
+    # service, so it never invokes nssm.exe, and it runs dist\index.mjs rather than dist\server.mjs -
+    # yet a local install refused to proceed without both. That is not merely pedantic: it blocks a
+    # local-only installer from dropping the service tooling it will never call, and an install that
+    # demands files it does not use is telling the operator something untrue about what it needs.
+    $required = @($bundledNode, $agentScript)
+    if ($DeploymentMode -eq 'remote') {
+        $required += $bundledNssm    # only the service path shells out to nssm
+        $required += $serverEntry    # dist\server.mjs is the HTTP entrypoint
+    } else {
+        $required += (Join-Path $InstallDir 'dist\index.mjs')   # the stdio entrypoint local mode uses
+    }
+
+    foreach ($p in $required) {
         if (-not (Test-Path -LiteralPath $p)) {
             throw @"
 Required file missing: $p
@@ -295,7 +418,6 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     $envLines = @(
         "# Generated by Tally MCP first-run wizard at $(Get-Date -Format 'o')"
         "# Edit by hand or re-run scripts\installer\firstrun-config.ps1 to regenerate."
-        "PASSWORD=$(_envQuote $Password)"
         "TALLY_EDITION=$TallyEdition"
         "TALLY_HOST=127.0.0.1"
         "TALLY_PORT=9000"
@@ -307,19 +429,49 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         "AGENT_TASK_USER=$(_envQuote $AgentTaskUser)"
         # Claude-driven GUI control (gui-screenshot / gui-send-keys). Off unless the operator opted in.
         "ENABLE_GUI_CONTROL=$EnableGuiControl"
+        # Deployment mode (#172). 'local' means no service, no listening port and no OAuth password;
+        # 'remote' is the pre-existing behaviour and stays the fallback for any install that predates
+        # this key. REMOTE_AUTH and REMOTE_TRANSPORT are consumed by #178 and are written now so the
+        # three epics cannot collide over one key's vocabulary.
+        "DEPLOYMENT_MODE=$DeploymentMode"
+        "REMOTE_AUTH=$RemoteAuth"
+        "REMOTE_TRANSPORT=$RemoteTransport"
     )
+
+    # PASSWORD is written ONLY in remote mode. It gates the HTTP listener; local mode has no
+    # listener, so writing an unused credential would falsify the claim #172 is built on ("the
+    # credential that currently gates read and write on live books does not exist in this mode")
+    # while still leaving a secret on disk for anyone who later reads .env. Absence is the feature.
+    if ($DeploymentMode -eq 'remote') {
+        $envLines += "PASSWORD=$(_envQuote $Password)"
+    }
     # Bind address (security): only listen on all interfaces when a public domain / reverse proxy
     # is explicitly configured. When MCP_DOMAIN is blank ("localhost-only mode") bind to loopback
     # so the OAuth-gated server is NOT reachable from the LAN. Older versions always wrote
     # BIND_HOST=0.0.0.0 even in the localhost-only path, silently exposing the server network-wide
     # (and the adjacent "binds to localhost only" comment was false).
-    if ($TunnelToken -and -not $McpDomain) {
+    # None of the network keys are written in local mode. There is no listener to bind, no public
+    # hostname to advertise, and no tunnel to run, so BIND_HOST / MCP_DOMAIN / TUNNEL_TOKEN would
+    # all be inert - and TUNNEL_TOKEN in particular is a live bearer credential that must not sit in
+    # a file it can never be used from. A token supplied to a local-mode run is a contradiction
+    # rather than an oversight, so say so instead of silently dropping it.
+    if ($DeploymentMode -eq 'local') {
+        $envLines += "# Local mode: no listener, so BIND_HOST / MCP_DOMAIN / CORS_ORIGINS are not written."
+        if ($TunnelToken) {
+            Write-Host "[WARN] A Cloudflare Tunnel token was supplied but DEPLOYMENT_MODE is 'local'." -ForegroundColor Yellow
+            Write-Host "       Local mode runs no listener for a tunnel to reach, so the token is NOT being written" -ForegroundColor Yellow
+            Write-Host "       to .env and no tunnel service will be registered. Re-run with -DeploymentMode remote" -ForegroundColor Yellow
+            Write-Host "       if a tunnel is what you wanted." -ForegroundColor Yellow
+        }
+    } elseif ($TunnelToken -and -not $McpDomain) {
         Write-Host "[WARN] A Cloudflare Tunnel token was supplied but MCP_DOMAIN (the public hostname) is blank." -ForegroundColor Yellow
         Write-Host "       The tunnel will run, but the OAuth metadata URL will be wrong until you set the hostname (Reconfigure)." -ForegroundColor Yellow
     }
-    if ($TunnelToken) {
+    if ($DeploymentMode -eq 'local') {
+        # Nothing to add - the comment line above records why.
+    } elseif ($TunnelToken) {
         # Cloudflare Tunnel: cloudflared makes an OUTBOUND connection to Cloudflare's edge and reaches
-        # the MCP server on loopback, so the server never needs to listen beyond 127.0.0.1 — strictly
+        # the MCP server on loopback, so the server never needs to listen beyond 127.0.0.1 - strictly
         # more secure than the bring-your-own reverse-proxy path below (which must bind 0.0.0.0).
         # MCP_DOMAIN stays the public hostname so OAuth discovery advertises the right URL.
         $envLines += "BIND_HOST=127.0.0.1"
@@ -374,7 +526,7 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     # IMPORTANT: also grant the agent task user explicit Full Control. The tray scheduled task
     # runs with -RunLevel Limited (non-elevated), which filters the Administrators group from
     # the process token even when the user IS in Administrators. Without an explicit user grant,
-    # the Manage Companies dialog's Move-Item -Force silently fails on overwrite — the .tmp file
+    # the Manage Companies dialog's Move-Item -Force silently fails on overwrite - the .tmp file
     # gets written but never gets renamed to the real .json, so Save reports success and
     # nothing actually persists.
     & icacls $registryFile /inheritance:r /grant:r 'SYSTEM:F' 'Administrators:F' "${AgentTaskUser}:F" 2>$null | Out-Null
@@ -454,58 +606,155 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         }
     }
 
-    # --- 3. Register NSSM service pointing at bundled node + dist/server.mjs --
-    # IMPORTANT: pass the script as a RELATIVE path ('dist\server.mjs') against AppDirectory rather
-    # than the absolute path 'C:\Program Files\TallyMCP\dist\server.mjs'. NSSM's storage of the
-    # AppParameters value via the install command's third positional arg loses the quoting around
-    # spaces somewhere in the PowerShell -> nssm.exe -> Windows registry chain, so the resulting
-    # service launches as `node.exe C:\Program Files\TallyMCP\dist\server.mjs` (unquoted), which
-    # Node tokenizes at the first space and tries to load `C:\Program` as a module. Relative paths
-    # with no spaces sidestep the whole quoting fragility. AppDirectory is set on the next line.
-    $serverEntryRelative = 'dist\server.mjs'
-    & $bundledNssm install $ServiceName $bundledNode $serverEntryRelative | Out-Null
-    & $bundledNssm set $ServiceName AppDirectory $InstallDir                            | Out-Null
-    & $bundledNssm set $ServiceName Description  'Tally Prime MCP Server'               | Out-Null
-    & $bundledNssm set $ServiceName Start        SERVICE_AUTO_START                     | Out-Null
-    & $bundledNssm set $ServiceName AppStdout    (Join-Path $InstallDir 'logs\service.log') | Out-Null
-    & $bundledNssm set $ServiceName AppStderr    (Join-Path $InstallDir 'logs\service.log') | Out-Null
-    & $bundledNssm set $ServiceName AppRotateFiles 1                                    | Out-Null
-    & $bundledNssm set $ServiceName AppRotateOnline 1                                   | Out-Null
-    & $bundledNssm set $ServiceName AppRotateSeconds 86400                              | Out-Null
-    & $bundledNssm set $ServiceName AppRotateBytes 5242880                              | Out-Null
-    & $bundledNssm set $ServiceName AppStdoutCreationDisposition 4                      | Out-Null
-    & $bundledNssm set $ServiceName AppStderrCreationDisposition 4                      | Out-Null
+    # --- 3. Register NSSM service (REMOTE MODE ONLY) -----------------------
+    # The teardown above is deliberately unconditional while only this registration is gated, so
+    # "switch to local" is expressed as a property of the control flow rather than of a marker we
+    # have to trust: whatever the mode, any existing service is stopped and removed first, and a
+    # local-mode run simply never re-creates it. There is no path that leaves a listener behind.
+    #
+    # The service also no longer receives .env through NSSM AppEnvironmentExtra. That handed every
+    # value INCLUDING PASSWORD to a services registry key BUILTINUsers can read, which defeated
+    # the icacls lockdown ~150 lines above whose own comment claims the password is not readable by
+    # other local users. Removing it costs nothing: both entrypoints already load .env themselves by
+    # absolute path with override:true (src/mcp.mts, src/server.mts), so the registry copy was
+    # redundant as well as leaky.
+    if ($DeploymentMode -eq 'remote') {
+        # IMPORTANT: pass the script as a RELATIVE path ('dist\server.mjs') against AppDirectory rather
+        # than the absolute path 'C:\Program Files\TallyMCP\dist\server.mjs'. NSSM's storage of the
+        # AppParameters value via the install command's third positional arg loses the quoting around
+        # spaces somewhere in the PowerShell -> nssm.exe -> Windows registry chain, so the resulting
+        # service launches as `node.exe C:\Program Files\TallyMCP\dist\server.mjs` (unquoted), which
+        # Node tokenizes at the first space and tries to load `C:\Program` as a module. Relative paths
+        # with no spaces sidestep the whole quoting fragility. AppDirectory is set on the next line.
+        $serverEntryRelative = 'dist\server.mjs'
+        & $bundledNssm install $ServiceName $bundledNode $serverEntryRelative | Out-Null
+        & $bundledNssm set $ServiceName AppDirectory $InstallDir                            | Out-Null
+        & $bundledNssm set $ServiceName Description  'Tally Prime MCP Server'               | Out-Null
+        & $bundledNssm set $ServiceName Start        SERVICE_AUTO_START                     | Out-Null
+        & $bundledNssm set $ServiceName AppStdout    (Join-Path $InstallDir 'logs\service.log') | Out-Null
+        & $bundledNssm set $ServiceName AppStderr    (Join-Path $InstallDir 'logs\service.log') | Out-Null
+        & $bundledNssm set $ServiceName AppRotateFiles 1                                    | Out-Null
+        & $bundledNssm set $ServiceName AppRotateOnline 1                                   | Out-Null
+        & $bundledNssm set $ServiceName AppRotateSeconds 86400                              | Out-Null
+        & $bundledNssm set $ServiceName AppRotateBytes 5242880                              | Out-Null
+        & $bundledNssm set $ServiceName AppStdoutCreationDisposition 4                      | Out-Null
+        & $bundledNssm set $ServiceName AppStderrCreationDisposition 4                      | Out-Null
 
-    # --- Shutdown + restart behaviour (issue #23) --------------------------
-    # Stop the service by sending a console Ctrl-C FIRST: Node receives it as SIGINT and runs the
-    # graceful-shutdown path in server.mts (which drops MCP connections and exits in <1s). Only if
-    # that stalls does NSSM escalate to WM_CLOSE -> thread messages -> TerminateProcess. Bounding the
-    # console wait to 6s (and the next two stages to 1.5s each) keeps Stop-Service returning inside
-    # ~10s even in the worst case, instead of hanging in StopPending until a manual taskkill.
-    & $bundledNssm set $ServiceName AppStopMethodSkip    0     | Out-Null   # 0 = try every stop method
-    & $bundledNssm set $ServiceName AppStopMethodConsole 6000  | Out-Null   # graceful Ctrl-C window
-    & $bundledNssm set $ServiceName AppStopMethodWindow  1500  | Out-Null
-    & $bundledNssm set $ServiceName AppStopMethodThreads 1500  | Out-Null
-    # On an unexpected exit, restart with a sane delay rather than hammering. Throttle detection
-    # (AppThrottle) means a process that keeps dying fast is left stopped instead of respawned into
-    # the "Running but nothing listening" limbo we saw on cold installs — the real error then shows
-    # up in logs/service.log (e.g. the PASSWORD FATAL line) instead of a silent crash-loop.
-    & $bundledNssm set $ServiceName AppExit Default Restart    | Out-Null
-    & $bundledNssm set $ServiceName AppRestartDelay 2000       | Out-Null
-    & $bundledNssm set $ServiceName AppThrottle 5000           | Out-Null
+        # --- Shutdown + restart behaviour (issue #23) --------------------------
+        # Stop the service by sending a console Ctrl-C FIRST: Node receives it as SIGINT and runs the
+        # graceful-shutdown path in server.mts (which drops MCP connections and exits in <1s). Only if
+        # that stalls does NSSM escalate to WM_CLOSE -> thread messages -> TerminateProcess. Bounding the
+        # console wait to 6s (and the next two stages to 1.5s each) keeps Stop-Service returning inside
+        # ~10s even in the worst case, instead of hanging in StopPending until a manual taskkill.
+        & $bundledNssm set $ServiceName AppStopMethodSkip    0     | Out-Null   # 0 = try every stop method
+        & $bundledNssm set $ServiceName AppStopMethodConsole 6000  | Out-Null   # graceful Ctrl-C window
+        & $bundledNssm set $ServiceName AppStopMethodWindow  1500  | Out-Null
+        & $bundledNssm set $ServiceName AppStopMethodThreads 1500  | Out-Null
+        # On an unexpected exit, restart with a sane delay rather than hammering. Throttle detection
+        # (AppThrottle) means a process that keeps dying fast is left stopped instead of respawned into
+        # the "Running but nothing listening" limbo we saw on cold installs - the real error then shows
+        # up in logs/service.log (e.g. the PASSWORD FATAL line) instead of a silent crash-loop.
+        & $bundledNssm set $ServiceName AppExit Default Restart    | Out-Null
+        & $bundledNssm set $ServiceName AppRestartDelay 2000       | Out-Null
+        & $bundledNssm set $ServiceName AppThrottle 5000           | Out-Null
 
-    # Hand .env values to the service through NSSM's AppEnvironmentExtra. NSSM expects a
-    # newline-separated list of KEY=VALUE pairs.
-    $nssmEnv = ($envLines | Where-Object { $_ -and -not $_.StartsWith('#') }) -join "`n"
-    & $bundledNssm set $ServiceName AppEnvironmentExtra $nssmEnv | Out-Null
 
-    Write-Host "[OK] Service '$ServiceName' registered with bundled node + nssm"
+        Write-Host "[OK] Service '$ServiceName' registered with bundled node + nssm"
+    } else {
+        # Local mode: the MCP client spawns dist\index.mjs over stdio for the duration of a
+        # session. Nothing to register, nothing listening, nothing running while the user is not
+        # working - which is the property #172 is sold on.
+        Write-Host "[OK] Local mode: no Windows service registered (the MCP client starts the server on demand)"
+
+        # --- Point the user's Claude at this install, AS THAT USER (#172 C4) ------------------
+        # claude_desktop_config.json lives in %APPDATA%, which is per-user, and this script is
+        # running elevated. On the ordinary over-the-shoulder UAC path the elevated account is an
+        # admin who will never open Claude, so writing from here would configure the wrong profile
+        # and the accountant would see no Tally tools with nothing explaining why.
+        #
+        # So drop to AGENT_TASK_USER through a one-shot scheduled task - the same mechanism the
+        # agent and tray tasks already use, and the only way to reach that user's profile from an
+        # elevated session without their password.
+        #
+        # Failure here is NOT fatal. connect-client.ps1 is idempotent and is also on the Start Menu,
+        # which is the route for the very common case of Claude Desktop being installed afterwards.
+        # A missed auto-connect costs one click; a failed install costs the whole session.
+        $connectScript = Join-Path $InstallDir 'scripts\installer\connect-client.ps1'
+        if (-not (Test-Path -LiteralPath $connectScript)) {
+            Write-Host "[WARN] $connectScript not found - skipping auto-connect. Use the 'Connect Claude to Tally' Start Menu item." -ForegroundColor Yellow
+        } else {
+            $connectTask = 'TallyMCPConnectOnce'
+            # schtasks writes "cannot find the file specified" to stderr when the task does not
+            # exist - which is the NORMAL case on a first install - and under
+            # ErrorActionPreference='Stop' PowerShell 5.1 promotes a native command's stderr to a
+            # terminating error. That killed the whole auto-connect step (and then the script) on
+            # exactly the path it was written for. The nssm calls in this file already relax the
+            # preference for the same reason; this block has to as well.
+            $savedPrefC = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                schtasks /Delete /TN $connectTask /F 2>$null | Out-Null
+
+                $connectAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                    -Argument ('-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File "' + $connectScript + '" -InstallDir "' + $InstallDir + '"')
+                # Interactive + Limited: this must land in the user's own profile with their normal
+                # token, not an elevated one, or %APPDATA% resolves somewhere they will never read.
+                $connectPrincipal = New-ScheduledTaskPrincipal -UserId $AgentTaskUser -LogonType Interactive -RunLevel Limited
+                $connectSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+                Register-ScheduledTask -TaskName $connectTask -Action $connectAction -Principal $connectPrincipal -Settings $connectSettings -Force | Out-Null
+                Start-ScheduledTask -TaskName $connectTask
+
+                # Bounded wait: the task only runs if that user has an active session. If they are not
+                # logged on it stays queued, which is fine - the Start Menu item covers it.
+                $deadlineC = (Get-Date).AddSeconds(30)
+                do {
+                    Start-Sleep -Milliseconds 500
+                    $info = Get-ScheduledTaskInfo -TaskName $connectTask -ErrorAction SilentlyContinue
+                } while ($info -and $info.LastTaskResult -eq 267009 -and (Get-Date) -lt $deadlineC)  # 267009 = still running
+
+                $resultFile = Join-Path (Split-Path (Split-Path $env:APPDATA -Parent) -Parent) "$AgentTaskUser\AppData\Local\Claudally\last-connect-result.json"
+                if ($info -and $info.LastTaskResult -eq 0) {
+                    Write-Host "[OK] Claude Desktop configuration written for '$AgentTaskUser'"
+                } elseif ($info -and $info.LastTaskResult -eq 267011) {
+                    Write-Host "[*]  Auto-connect queued: '$AgentTaskUser' is not logged on right now." -ForegroundColor Yellow
+                    Write-Host "     They should run 'Connect Claude to Tally' from the Start Menu after signing in." -ForegroundColor Yellow
+                } else {
+                    $code = 'unknown'
+                    if ($info) { $code = $info.LastTaskResult }
+                    Write-Host "[WARN] Auto-connect finished with result $code. Run 'Connect Claude to Tally' from the Start Menu as $AgentTaskUser." -ForegroundColor Yellow
+                }
+            } catch {
+                Write-Host "[WARN] Could not run auto-connect: $_" -ForegroundColor Yellow
+                Write-Host "       Use the 'Connect Claude to Tally' Start Menu item instead." -ForegroundColor Yellow
+            } finally {
+                schtasks /Delete /TN $connectTask /F 2>$null | Out-Null
+                $ErrorActionPreference = $savedPrefC
+            }
+        }
+
+        # Revoke rather than abandon. Switching remote -> local must not leave the artefacts of the
+        # old mode lying around: a stale token store is a credential, and a stale OAuth client list
+        # tells an attacker what used to be trusted. verify-deployment.ps1 checks for exactly these.
+        foreach ($leftover in @('.oauth-clients.json', '.oauth-tokens.json')) {
+            $lp = Join-Path $InstallDir $leftover
+            if (Test-Path -LiteralPath $lp) {
+                try {
+                    $len = (Get-Item -LiteralPath $lp).Length
+                    if ($len -gt 0) { [System.IO.File]::WriteAllBytes($lp, (New-Object byte[] $len)) }
+                    Remove-Item -LiteralPath $lp -Force
+                    Write-Host "[OK] Removed $leftover (not used in local mode)"
+                } catch {
+                    Write-Host "[WARN] Could not remove ${leftover}: $_" -ForegroundColor Yellow
+                }
+            }
+        }
+    }
 
     # --- 3b. Cloudflare Tunnel service (optional) --------------------------
     # When a tunnel token is configured, register cloudflared as a second NSSM service so a NAT'd box
     # gets a stable public HTTPS URL with no router/domain config. Idempotent: ALWAYS stop/remove any
     # prior instance first (mirrors the main-service teardown above), then re-register ONLY if a token
-    # is present — so blanking the token on a Reconfigure tears the tunnel down cleanly. The token is
+    # is present - so blanking the token on a Reconfigure tears the tunnel down cleanly. The token is
     # passed via the service ENV (TUNNEL_TOKEN), never on the command line where a local user could read it.
     $cloudflaredExe = Join-Path $InstallDir 'bin\cloudflared.exe'
     $existingTunnel = Get-Service -Name $TunnelServiceName -ErrorAction SilentlyContinue
@@ -527,7 +776,12 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
             Start-Sleep -Milliseconds 500
         }
     }
-    if ($TunnelToken) {
+    # Same shape as the main service: teardown above is unconditional, registration below is gated.
+    # The mode test is NOT redundant with the token test. $TunnelToken is a parameter, so a local-mode
+    # run can still be handed one - the .env write above refuses to persist it, and without this guard
+    # the tunnel service would be registered anyway, leaving an outbound connection and a public
+    # hostname pointing at a machine that #172 promises has neither.
+    if ($DeploymentMode -eq 'remote' -and $TunnelToken) {
         if (-not (Test-Path -LiteralPath $cloudflaredExe)) {
             Write-Host "[WARN] Tunnel token set but cloudflared.exe not found at $cloudflaredExe - skipping tunnel service. Re-run the installer to bundle it." -ForegroundColor Yellow
         } else {
@@ -574,7 +828,7 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
             -Execute 'powershell.exe' `
             -Argument "-ExecutionPolicy Bypass -NoProfile -WindowStyle Minimized -File `"$agentScript`""
         # At-logon trigger is the reliable baseline. Crash-supervision (#88 H-2) is added on top via
-        # RestartCount/Interval + an optional 1-min heartbeat — but BOTH are built best-effort so a
+        # RestartCount/Interval + an optional 1-min heartbeat - but BOTH are built best-effort so a
         # picky Windows build can never abort registration (which previously left the task unregistered).
         $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $AgentTaskUser
         $taskPrincipal = New-ScheduledTaskPrincipal -UserId $AgentTaskUser -LogonType Interactive -RunLevel Limited
@@ -589,7 +843,7 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
             $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
         }
 
-        # Optional heartbeat trigger — re-fires the task every minute as a belt for the "process gone
+        # Optional heartbeat trigger - re-fires the task every minute as a belt for the "process gone
         # but the engine thinks it completed" case. Some Windows builds reject the repetition params,
         # so build it in a try/catch and register logon-only if it fails (RestartCount still covers crashes).
         # NOTE: use a finite 10-year duration, NOT [TimeSpan]::MaxValue, which overflows and threw here.
@@ -662,19 +916,25 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         }
     }
 
-    # --- 5. Start the service ----------------------------------------------
-    # Same defensive pattern: nssm start can write to stderr in benign cases (e.g. service
-    # already running because Windows auto-started it on registration with SERVICE_AUTO_START).
-    $savedPref3 = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        & $bundledNssm start $ServiceName 2>$null | Out-Null
-    } finally {
-        $ErrorActionPreference = $savedPref3
+    # --- 5. Start the service (remote mode only) ----------------------------
+    # Local mode registered no service, so there is nothing to start - and nssm.exe may not even be
+    # present, since it is no longer a prerequisite on that path. Reaching here unguarded threw
+    # "nssm.exe is not recognized" AFTER everything else had succeeded, which is the worst place to
+    # fail: the install was complete and correct, and the operator was told it had errored.
+    if ($DeploymentMode -eq 'remote') {
+        # Same defensive pattern: nssm start can write to stderr in benign cases (e.g. service
+        # already running because Windows auto-started it on registration with SERVICE_AUTO_START).
+        $savedPref3 = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $bundledNssm start $ServiceName 2>$null | Out-Null
+        } finally {
+            $ErrorActionPreference = $savedPref3
+        }
+        Start-Sleep -Seconds 3
+        $svc = Get-Service -Name $ServiceName
+        Write-Host "[OK] Service status after start: $($svc.Status)"
     }
-    Start-Sleep -Seconds 3
-    $svc = Get-Service -Name $ServiceName
-    Write-Host "[OK] Service status after start: $($svc.Status)"
 
     # --- 6. Tell the operator what's next ----------------------------------
     Write-Host ""

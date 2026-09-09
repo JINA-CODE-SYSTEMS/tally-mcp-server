@@ -22,7 +22,7 @@ param(
 
 # --- Hide our own console window --------------------------------------------------------------
 # The agent MUST run in the interactive desktop session (it drives the Tally GUI and takes
-# screenshots — a Session-0 service can't). But its console window is just noise a user can
+# screenshots - a Session-0 service can't). But its console window is just noise a user can
 # accidentally close, which kills GUI control until the crash-respawn heartbeat brings it back.
 # Hide the window so it isn't visible or closeable; the tray dashboard shows the agent's real
 # status (Running + PID). Runs first so the window is gone almost immediately. Pass -ShowConsole
@@ -311,7 +311,7 @@ function Execute-Action {
                 "f12" = [TallyUI2]::VK_F12
             }
             # Letters a-z (VK 0x41..0x5A) and digits 0-9 (VK 0x30..0x39) as single key
-            # presses — needed for Tally menu hotkeys (e.g. "k" = Day Book) and Yes/No
+            # presses - needed for Tally menu hotkeys (e.g. "k" = Day Book) and Yes/No
             # confirmations ("y"/"n"), which the clipboard-paste "type" action cannot fire.
             foreach ($c in 97..122) { $keyMap["$([char]$c)"] = $c - 32 }
             foreach ($d in 48..57)  { $keyMap["$([char]$d)"] = $d }
@@ -330,7 +330,7 @@ function Execute-Action {
                 "f1" = [TallyUI2]::VK_F1; "f2" = [TallyUI2]::VK_F2; "f3" = [TallyUI2]::VK_F3
                 "f4" = [TallyUI2]::VK_F4; "f5" = [TallyUI2]::VK_F5; "f10" = [TallyUI2]::VK_F10
             }
-            # All letters a-z (VK 0x41..0x5A) and digits 0-9 so any modifier chord works —
+            # All letters a-z (VK 0x41..0x5A) and digits 0-9 so any modifier chord works -
             # notably Alt+D (delete voucher), Alt+X (cancel voucher), Alt+2 (delete line),
             # Alt+R, Ctrl+Enter, etc. Previously only a/c/v/x were mapped, so Alt+D was
             # silently dropped ("unmapped combo ... ignored").
@@ -354,7 +354,7 @@ function Execute-Action {
             # PREFER clipboard paste: char-by-char keybd_event double-registers/drops on Tally's UI
             # ("JJINAA CODE..."), which is unacceptable for masked fields (a mistyped password = lockout).
             # Paste sets the field atomically. Fall back to (scan-code) char typing only if the clipboard
-            # is unavailable. NOTE: a few Tally fields (e.g. TallyVault) may block paste — the caller must
+            # is unavailable. NOTE: a few Tally fields (e.g. TallyVault) may block paste - the caller must
             # screenshot-verify the field after a masked entry.
             $text = $Action.value
             $pasted = $false
@@ -640,7 +640,7 @@ function Invoke-LLMGuidedAction {
 
 # --- Main watch loop ---
 # The startup banner is for the watch-mode console. In one-shot mode the caller parses our stdout,
-# so keep it quiet — and skip the overlay runspace below, which costs an STA thread and a WinForms
+# so keep it quiet - and skip the overlay runspace below, which costs an STA thread and a WinForms
 # load that a single short-lived command has no use for.
 if (-not $Once) {
     Write-Host "=== MCP Tally GUI Agent v2 (LLM-Guided) ==="
@@ -685,7 +685,7 @@ public class ClaudeOverlayNative {
             $form = New-Object System.Windows.Forms.Form
             $form.FormBorderStyle = 'None'; $form.ShowInTaskbar = $false; $form.TopMost = $true
             $form.StartPosition = 'Manual'; $form.BackColor = $orange; $form.Visible = $false
-            # Opacity < 1 makes WinForms apply the LAYERED alpha — WITHOUT this the manual WS_EX_LAYERED
+            # Opacity < 1 makes WinForms apply the LAYERED alpha - WITHOUT this the manual WS_EX_LAYERED
             # composites the window fully transparent (invisible), which is why the frame never showed.
             $form.Opacity = 0.9
             # Suppress the brief startup flash from Application.Run showing the form before the timer.
@@ -728,7 +728,7 @@ public class ClaudeOverlayNative {
 
                     # Clamp to the target monitor's visible work area so the frame is ALWAYS on-screen. A
                     # maximized Tally overhangs the monitor by a few px, which used to push the top banner
-                    # (and the outside borders) off-screen — the reason it wasn't visible in full screen.
+                    # (and the outside borders) off-screen - the reason it wasn't visible in full screen.
                     $rect = New-Object System.Drawing.Rectangle ([int]$r.Left), ([int]$r.Top), ([int]$r.Width), ([int]$r.Height)
                     $wa = ([System.Windows.Forms.Screen]::FromRectangle($rect)).WorkingArea
                     $left   = [Math]::Max([int]$r.Left, $wa.Left)
@@ -758,7 +758,7 @@ public class ClaudeOverlayNative {
                     $glow.n = ($glow.n + 1) % 100000
                     $phase = ([Math]::Sin($glow.n * 0.22) + 1) / 2       # 0..1, ~2.9s cycle at 100ms
                     $form.Opacity = 0.70 + 0.25 * $phase                  # 0.70 .. 0.95
-                    $gc = [int](120 + 70 * $phase)                        # green channel 120..190 (orange→amber)
+                    $gc = [int](120 + 70 * $phase)                        # green channel 120..190 (orange->amber)
                     $col = [System.Drawing.Color]::FromArgb(255, $gc, 0)
                     $form.BackColor = $col; $label.BackColor = $col
 
@@ -799,7 +799,7 @@ function Hide-ClaudeOverlay { if ($Script:OverlayState) { try { $Script:OverlayS
 #   runs as a service and therefore has no desktop of its own.
 #
 #   one-shot mode (-Once) reads a single command from stdin and prints the result to stdout. Used
-#   when the MCP server already runs in the interactive session, so nothing has to be bridged —
+#   when the MCP server already runs in the interactive session, so nothing has to be bridged -
 #   and, importantly, no credential is written to disk on the way.
 #
 # Identical dispatch either way: the transport changes, the behaviour does not.
@@ -814,7 +814,7 @@ function Invoke-AgentCommand {
         Write-Host "`n=== Received command: $($cmd.action) ==="
 
         # Show the "Claude is controlling Tally" frame for GUI-driving commands (screenshot/ping
-        # excluded — screenshot must be clean, ping is passive). Auto-hides ~6s after the last action.
+        # excluded - screenshot must be clean, ping is passive). Auto-hides ~6s after the last action.
         if (@('select-company','load-on-startup','sendkeys','select-and-unlock-company','switch-company','start-tally') -contains ([string]$cmd.action)) {
             if (Get-Command Show-ClaudeOverlay -ErrorAction SilentlyContinue) { Show-ClaudeOverlay }
         }
