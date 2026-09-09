@@ -166,7 +166,7 @@ Name: "{group}\Uninstall {#MyAppName}";  Filename: "{uninstallexe}"
 [Run]
 ; --- 1. First-run wizard: writes .env from collected wizard inputs and registers the NSSM service ---
 Filename: "powershell.exe"; \
-  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"" -TunnelServiceName ""{#MyTunnelServiceName}"" -CredentialsFile ""{code:GetCredentialsFilePath}"" -TallyEdition ""{code:GetWizardEdition}"" -TallyExePath ""{code:GetWizardExePath}"" -TallyDataPath ""{code:GetWizardDataPath}"" -TallyIniPath ""{code:GetWizardIniPath}"" -McpDomain ""{code:GetWizardDomain}"" -TunnelToken ""{code:GetWizardTunnelToken}"" -AgentTaskUser ""{code:GetWizardAgentUser}"" -EnableGuiControl ""{code:GetWizardGuiControl}"" -DeploymentMode ""remote"""; \
+  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"" -TunnelServiceName ""{#MyTunnelServiceName}"" -CredentialsFile ""{code:GetCredentialsFilePath}"" -TallyEdition ""{code:GetWizardEdition}"" -TallyExePath ""{code:GetWizardExePath}"" -TallyDataPath ""{code:GetWizardDataPath}"" -TallyIniPath ""{code:GetWizardIniPath}"" -McpDomain ""{code:GetWizardDomain}"" -TunnelToken ""{code:GetWizardTunnelToken}"" -AgentTaskUser ""{code:GetWizardAgentUser}"" -EnableGuiControl ""{code:GetWizardGuiControl}"" -DeploymentMode ""{code:GetWizardMode}"""; \
   WorkingDir: "{app}"; \
   StatusMsg: "Configuring service and writing .env..."; \
   Flags: runhidden waituntilterminated
@@ -198,6 +198,7 @@ Type: filesandordirs; Name: "{app}\bin"
 ; ===========================================================================
 [Code]
 var
+  ModePage: TInputOptionWizardPage;
   ConfigPage: TInputQueryWizardPage;
   RemotePage: TInputQueryWizardPage;
   EditionPage: TInputOptionWizardPage;
@@ -208,12 +209,23 @@ procedure InitializeWizard;
 var
   DefaultExePath, DefaultDataPath, DefaultIniPath, DefaultDomain, DefaultUser: string;
 begin
-  ConfigPage := CreateInputQueryPage(wpSelectDir,
+  // Deployment mode is the FIRST question (#172 C5). Everything after it is conditional on the
+  // answer, so asking it last - or inferring it from whether a domain was typed - would mean
+  // collecting an OAuth password from someone who will never have a listener to gate.
+  ModePage := CreateInputOptionPage(wpSelectDir,
+    'How will Claude reach Tally?',
+    'Choose where Claude runs. You can change this later with Reconfigure.',
+    'Most people want the first option. It is also the safer one: nothing listens on the network, no password is created, and the server only runs while you are using Claude.',
+    True, False);
+  ModePage.Add('On this computer (recommended) - Claude Desktop runs here, alongside Tally');
+  ModePage.Add('From another computer - needs a public address and a password');
+  ModePage.SelectedValueIndex := 0;
+
+  ConfigPage := CreateInputQueryPage(ModePage.ID,
     'Tally MCP Configuration',
     'Tell us where Tally Prime lives and how to talk to it.',
     'These values become the .env file. You can edit them later via the "Reconfigure" Start Menu shortcut. The OAuth password below is required and protects access to all MCP tools.');
 
-  ConfigPage.Add('OAuth password (required, min 12 chars):', True);
   ConfigPage.Add('Tally executable path:', False);
   ConfigPage.Add('Tally data folder:', False);
   ConfigPage.Add('tally.ini path:', False);
@@ -239,11 +251,12 @@ begin
   DefaultDomain := '';
   DefaultUser := GetUserNameString();
 
-  ConfigPage.Values[0] := '';
-  ConfigPage.Values[1] := DefaultExePath;
-  ConfigPage.Values[2] := DefaultDataPath;
-  ConfigPage.Values[3] := DefaultIniPath;
-  ConfigPage.Values[4] := DefaultUser;  // Windows user the GUI agent runs as (current logon, editable)
+  // Reindexed when the password moved to RemotePage. Pascal Script has no bounds checking, so a
+  // half-done reindex writes the wrong value into the wrong key with no error anywhere.
+  ConfigPage.Values[0] := DefaultExePath;
+  ConfigPage.Values[1] := DefaultDataPath;
+  ConfigPage.Values[2] := DefaultIniPath;
+  ConfigPage.Values[3] := DefaultUser;  // Windows user the GUI agent runs as (current logon, editable)
 
   // The agent-user field is pre-filled with the current Windows user and left EDITABLE. (We dropped the
   // earlier lock + "advanced" unlock checkbox from issue #79: the checkbox sat below the last field and
@@ -257,10 +270,15 @@ begin
     'Remote Access (optional)',
     'Only needed for the browser-based claude.ai connector. Leave both blank for localhost-only (Claude Desktop needs nothing here).',
     'No public domain or static IP? Use Cloudflare Tunnel: a Jina admin provisions a token + hostname per client. Paste the hostname and token below and the installer runs cloudflared so this box gets a stable public HTTPS URL with no router config.');
+  // The password lives here, not on the Tally-paths page, because it exists only to gate a
+  // listener. On the local path this page is skipped entirely and no password is ever collected,
+  // created or written - which is the property #172 sells.
+  RemotePage.Add('OAuth password (required, min 12 chars):', True);
   RemotePage.Add('Public domain / Cloudflare Tunnel hostname (e.g. https://client.tally.jinacode.systems):', False);
   RemotePage.Add('Cloudflare Tunnel token (optional; leave blank if you do not use Cloudflare Tunnel):', False);
-  RemotePage.Values[0] := DefaultDomain;
-  RemotePage.Values[1] := '';
+  RemotePage.Values[0] := '';
+  RemotePage.Values[1] := DefaultDomain;
+  RemotePage.Values[2] := '';
 
   EditionPage := CreateInputOptionPage(RemotePage.ID,
     'Tally Edition',
@@ -375,6 +393,28 @@ begin
   end;
 end;
 
+// The single source of truth for which mode was chosen. Everything else - the skipped page, the
+// credentials file, the value handed to firstrun-config.ps1 - reads this rather than re-deriving
+// it, so there is no way for the wizard to act on one answer and record another.
+function IsLocalMode(): Boolean;
+begin
+  Result := (ModePage.SelectedValueIndex = 0);
+end;
+
+function GetWizardMode(Param: string): string;
+begin
+  if IsLocalMode() then Result := 'local' else Result := 'remote';
+end;
+
+// Local mode has no listener, so the whole remote page is meaningless there. Skipping it is not
+// only cosmetic: NextButtonClick never fires for a skipped page, which is what keeps the
+// "password must be 12 chars" validation from blocking a local install that has no password.
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := False;
+  if (PageID = RemotePage.ID) and IsLocalMode() then Result := True;
+end;
+
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
   agentUserValue: string;
@@ -383,24 +423,17 @@ begin
   Result := True;
   if CurPageID = ConfigPage.ID then
   begin
-    if Length(ConfigPage.Values[0]) < 12 then
-    begin
-      MsgBox('OAuth password must be at least 12 characters.', mbError, MB_OK);
-      Result := False;
-      exit;
-    end;
-
     // Validate the GUI agent user actually exists on this box. Catches typos / paste accidents
     // BEFORE the installer tries to register the scheduled task with a bogus account, which fails
     // with "No mapping between account names and security IDs was done."
-    agentUserValue := Trim(ConfigPage.Values[4]);
+    agentUserValue := Trim(ConfigPage.Values[3]);
     if Length(agentUserValue) = 0 then
     begin
       // Blank (e.g. cleared while overriding) — restore the current-user default rather than block.
       // The field is locked to the current user unless the "advanced" checkbox is ticked (issue #79),
       // so an empty value here is a mistake we can safely auto-correct.
-      ConfigPage.Values[4] := GetUserNameString();
-      agentUserValue := Trim(ConfigPage.Values[4]);
+      ConfigPage.Values[3] := GetUserNameString();
+      agentUserValue := Trim(ConfigPage.Values[3]);
     end;
     // ShellExec runs `net user "<name>"` quietly; exit code 0 = user exists.
     if not ShellExec('open', 'cmd.exe', '/c net user "' + agentUserValue + '" >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, errCode) then
@@ -421,10 +454,21 @@ begin
   end
   else if CurPageID = RemotePage.ID then
   begin
+    // Only reachable in remote mode: ShouldSkipPage skips this page on the local path, and
+    // NextButtonClick never fires for a skipped page - which is what stops this password rule
+    // blocking a local install that correctly has no password.
+    if Length(RemotePage.Values[0]) < 12 then
+    begin
+      MsgBox('OAuth password must be at least 12 characters.', mbError, MB_OK);
+      Result := False;
+      exit;
+    end;
+
     // A Cloudflare Tunnel token needs the public hostname (field above it) so the MCP server
     // advertises the correct OAuth URL. Block rather than silently produce a connector that
     // points at localhost.
-    if (Length(Trim(RemotePage.Values[1])) > 0) and (Length(Trim(RemotePage.Values[0])) = 0) then
+    // Indices moved when the password became RemotePage field 0: token is now [2], hostname [1].
+    if (Length(Trim(RemotePage.Values[2])) > 0) and (Length(Trim(RemotePage.Values[1])) = 0) then
     begin
       MsgBox('You entered a Cloudflare Tunnel token but left the "Public domain / Cloudflare Tunnel hostname" field blank.' + #13#10 +
              'Enter the tunnel hostname (e.g. https://client123.tally.jinacode.systems) so the connector URL is correct.', mbError, MB_OK);
@@ -447,14 +491,43 @@ end;
 // JSON just before the [Run] section fires (ssInstall = "files have been copied; now running [Run]
 // entries"). Inno auto-cleans {tmp} at end-of-install, but firstrun-config.ps1 also deletes the
 // file as soon as it has read the password.
+// The Finished page has to say what actually happened, because the two modes end in genuinely
+// different places and the default "Setup has finished installing" is true of both and useful for
+// neither. In local mode the ONLY visible evidence of success is Tally tools appearing in Claude,
+// and that requires a full quit-and-reopen: a user who merely closes the window sees nothing and
+// reasonably concludes the install failed.
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if CurPageID = wpFinished then
+  begin
+    if IsLocalMode() then
+      WizardForm.FinishedLabel.Caption :=
+        'Claudally is installed on this computer.' + #13#10 + #13#10 +
+        'Now QUIT Claude Desktop COMPLETELY and open it again - closing the window is not enough. ' +
+        'Use File > Exit, or right-click its icon near the clock and choose Quit. Tally tools appear ' +
+        'once it restarts.' + #13#10 + #13#10 +
+        'If you have not installed Claude Desktop yet, install it and then run ' +
+        '"Connect Claude to Tally" from the Start Menu.' + #13#10 + #13#10 +
+        'Nothing is listening on the network and no password was created. You can check that ' +
+        'yourself any time by running verify-deployment.ps1 from the install folder.'
+    else
+      WizardForm.FinishedLabel.Caption :=
+        'Claudally is installed and running as a Windows service.' + #13#10 + #13#10 +
+        'Point your MCP client at the public address you entered. The tray icon near the clock ' +
+        'shows whether the service and tunnel are healthy.';
+  end;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   CredsPath, Json, Password, Escaped: string;
 begin
-  if CurStep = ssInstall then
+  // Local mode never writes a credentials file. firstrun-config.ps1 shreds one if it finds it,
+  // but the stronger guarantee is that no password is ever produced to be shredded.
+  if (CurStep = ssInstall) and (not IsLocalMode()) then
   begin
     CredsPath := GetCredentialsFilePath('');
-    Password := ConfigPage.Values[0];
+    Password := RemotePage.Values[0];
     // Minimal JSON-string escaping: backslash and double-quote only.
     // Pascal Script's StringChange is a procedure that mutates a var argument in place
     // (it does NOT return a string), so we copy first and then mutate the copy.
@@ -472,32 +545,32 @@ end;
 
 function GetWizardExePath(Param: string): string;
 begin
-  Result := ConfigPage.Values[1];
+  Result := ConfigPage.Values[0];
 end;
 
 function GetWizardDataPath(Param: string): string;
 begin
-  Result := ConfigPage.Values[2];
+  Result := ConfigPage.Values[1];
 end;
 
 function GetWizardIniPath(Param: string): string;
 begin
-  Result := ConfigPage.Values[3];
+  Result := ConfigPage.Values[2];
 end;
 
 function GetWizardDomain(Param: string): string;
 begin
-  Result := RemotePage.Values[0];
+  Result := RemotePage.Values[1];
 end;
 
 function GetWizardTunnelToken(Param: string): string;
 begin
-  Result := RemotePage.Values[1];
+  Result := RemotePage.Values[2];
 end;
 
 function GetWizardAgentUser(Param: string): string;
 begin
-  Result := ConfigPage.Values[4];
+  Result := ConfigPage.Values[3];
 end;
 
 // Persist the GUI-control choice into the install's own record so the next upgrade restores it
