@@ -62,9 +62,37 @@ Write-Host ("summary: {0} migrated, {1} already protected, {2} failed" -f $migra
 if ($WhatIfOnly) { Write-Host '[what-if] no file written'; exit 0 }
 if ($migrated -eq 0) { Write-Host 'nothing to write'; exit 0 }
 
+# Capture the vault's ACL BEFORE replacing it. firstrun-config.ps1 hardens this file with
+# `icacls /inheritance:r /grant:r SYSTEM:F Administrators:F <agent user>:F`, and a tmp-plus-rename
+# silently discards that: the replacement is a NEW file, so it inherits from the parent directory
+# instead of carrying the file's own explicit, inheritance-blocked ACL.
+#
+# On a correctly installed box the effective principals end up the same, because the parent is
+# itself inheritance-blocked and grants the same three. But this ACL is the ENTIRE boundary for
+# these passwords (DPAPI LocalMachine scope means any local principal who can READ the file can
+# decrypt it), so dropping the file's own protection and depending on the parent is a real loss of
+# defence in depth - and it makes the vault silently follow any later change to the parent.
+# Learned by shipping it: the first run of this script did exactly that, and verify-deployment.ps1
+# caught it.
+$origAcl = Get-Acl -LiteralPath $RegistryPath
+
 $backup = "$RegistryPath.pre-entropy-backup"
 Copy-Item -LiteralPath $RegistryPath -Destination $backup -Force
+# The backup holds the OLD null-entropy blobs - the exact weakness being removed - so it must not be
+# left more readable than the vault it came from.
+Set-Acl -LiteralPath $backup -AclObject $origAcl
+
 $tmp = "$RegistryPath.tmp"
 ($reg | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $tmp -Encoding UTF8
+Set-Acl -LiteralPath $tmp -AclObject $origAcl
 Move-Item -LiteralPath $tmp -Destination $RegistryPath -Force
+
+$newAcl = Get-Acl -LiteralPath $RegistryPath
+if (-not $newAcl.AreAccessRulesProtected -and $origAcl.AreAccessRulesProtected) {
+    Write-Host '[warn] the replaced vault is no longer inheritance-blocked; re-applying'
+    Set-Acl -LiteralPath $RegistryPath -AclObject $origAcl
+}
+
 Write-Host ("written. backup at {0}" -f $backup)
+Write-Host ("vault ACL: inheritance-blocked={0}" -f (Get-Acl -LiteralPath $RegistryPath).AreAccessRulesProtected)
+Write-Host 'Delete the backup once you have confirmed a company still loads - it holds the old blobs.'
