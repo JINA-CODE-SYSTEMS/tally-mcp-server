@@ -619,7 +619,14 @@ test('CLI: apply writes and exits 0; a second apply is a no-op that still exits 
   const ws = workspace();
   assert.equal(cli(['apply', '--workspace', ws]).code, 0);
   const written = fs.readFileSync(mcpJson(ws), 'utf-8');
-  assert.deepEqual(JSON.parse(written).servers['tally-prime'], vscEntry);
+  // Build the expectation with the REAL path module, exactly as runCli does. The shared fixture
+  // above is pinned to path.win32 so the pure-function tests assert Windows semantics on any host -
+  // but the CLI resolves with whatever platform it is running on. Comparing the two passed on
+  // Windows and failed on the Linux CI runner, where path.join yields
+  // 'C:\Program Files\...\dist/index.mjs': a mixed separator that is wrong on both platforms and
+  // only ever appeared because the test asserted a Windows shape from a POSIX run.
+  const cliEntry = VSC.buildEntry(localLaunchSpec(INSTALL, NODE));
+  assert.deepEqual(JSON.parse(written).servers['tally-prime'], cliEntry);
 
   const second = cli(['apply', '--workspace', ws]);
   assert.equal(second.code, 0);
