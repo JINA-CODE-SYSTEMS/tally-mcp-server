@@ -80,6 +80,9 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ; @types and tsc and is brittle on locked-down boxes. ---
 Source: "{#RepoRoot}\dist\*";          DestDir: "{app}\dist";    Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#RepoRoot}\package.json";    DestDir: "{app}";          Flags: ignoreversion
+; Extracted to {tmp} so PrepareToInstall can run it before any file is copied. On a fresh install
+; {app}\scripts does not exist yet, and on an upgrade the on-disk copy is the version being replaced.
+Source: "{#RepoRoot}\scripts\installer\stop-install-processes.ps1"; Flags: dontcopy
 Source: "{#RepoRoot}\package-lock.json"; DestDir: "{app}";        Flags: ignoreversion
 Source: "{#RepoRoot}\node_modules\*";  DestDir: "{app}\node_modules"; Flags: ignoreversion recursesubdirs createallsubdirs
 
@@ -97,6 +100,7 @@ Source: "{#RepoRoot}\scripts\TallyUI.cs";             DestDir: "{app}\scripts"; 
 Source: "{#RepoRoot}\scripts\deploy.ps1";             DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\setup-windows.ps1";      DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\installer\firstrun-config.ps1";    DestDir: "{app}\scripts\installer"; Flags: ignoreversion
+Source: "{#RepoRoot}\scripts\installer\stop-install-processes.ps1"; DestDir: "{app}\scripts\installer"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\installer\uninstall-cleanup.ps1";  DestDir: "{app}\scripts\installer"; Flags: ignoreversion
 
 ; --- Tray status app (issue #20). Polls service/agent/Tally health and surfaces a
@@ -327,15 +331,22 @@ begin
   Exec(ExpandConstant('{cmd}'), '/C schtasks /End /TN TallyMCPAgent /F', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
   Exec(ExpandConstant('{cmd}'), '/C schtasks /End /TN TallyMCPTray /F',  '', SW_HIDE, ewWaitUntilTerminated, resultCode);
 
-  // 3. Kill any orphan node.exe belonging to THIS install (the MCP service child) and any
-  //    powershell.exe whose command line references tally-mcp / TallyMCP (orphan agent / tray
-  //    instances from a crashed earlier run). wmic filters by commandline without nested-quote
-  //    hell. The node.exe filter matches this server's own entrypoint (dist\server.mjs) rather
-  //    than the bare image name, so unrelated node processes on the box (dev servers, Electron
-  //    apps, other services) are NOT terminated — the old `taskkill /IM node.exe /T` killed them all.
-  Exec(ExpandConstant('{cmd}'), '/C wmic process where "name=''node.exe'' and commandline like ''%%server.mjs%%''" delete', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
-  Exec(ExpandConstant('{cmd}'), '/C wmic process where "name=''powershell.exe'' and commandline like ''%%tally-mcp%%''" delete', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
-  Exec(ExpandConstant('{cmd}'), '/C wmic process where "name=''powershell.exe'' and commandline like ''%%TallyMCP%%''" delete', '', SW_HIDE, ewWaitUntilTerminated, resultCode);
+  // 3. Stop processes belonging to THIS install so the copy phase can replace their files.
+  //
+  //    This used three `wmic process where ... delete` calls. wmic is a Feature-on-Demand that is
+  //    ABSENT BY DEFAULT on Windows 11 24H2 and Server 2025, so on a current machine all three
+  //    were silent no-ops and the upgrade failed later with a DeleteFile error naming no process.
+  //    Two of them also matched any powershell.exe whose command line merely contained TallyMCP
+  //    anywhere on the box, while the node.exe filter matched only server.mjs - the REMOTE
+  //    entrypoint - so a local-mode server (dist\index.mjs, #172) survived and held the lock.
+  //
+  //    The helper decides ownership by install path, and deliberately spares anything under
+  //    {app}\update: #177 s updater orchestrator runs from there and must outlive the install
+  //    it is driving, because it is what performs the rollback if the new build fails to start.
+  ExtractTemporaryFile('stop-install-processes.ps1');
+  Exec('powershell.exe',
+       '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}\stop-install-processes.ps1') + '" -InstallDir "' + ExpandConstant('{app}') + '"',
+       '', SW_HIDE, ewWaitUntilTerminated, resultCode);
 
   // 4. Wait for the process tear-down to actually release handles. SCM marks STOPPED before
   //    NSSM's child node.exe exits; duckdb in-memory cleanup adds a couple of seconds.

@@ -74,11 +74,33 @@ try {
     Write-Host "[WARN] cloudflared.exe kill raised: $_"
 }
 
-# 2. Kill any leftover node.exe instances spawned by the service so file deletion succeeds.
-try {
-    Get-Process -Name node -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-} catch {
-    Write-Host "[WARN] node.exe kill raised: $_"
+# 2. Stop leftover processes from THIS install so file deletion succeeds.
+#
+# This was `Get-Process -Name node | Stop-Process -Force`, which killed EVERY node.exe on the
+# machine - the customer's editor, their build, an unrelated Electron app, another product's
+# service. tally-mcp.iss learned that lesson years ago and filtered by command line; the
+# uninstaller never did, and in local mode (#172) it would additionally kill the user's own
+# client-spawned server. Reuse the installer's ownership rules rather than inventing a third
+# answer to the same question (#172 C1).
+$stopHelper = Join-Path $InstallDir 'scripts\installer\stop-install-processes.ps1'
+if (Test-Path -LiteralPath $stopHelper) {
+    try {
+        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $stopHelper -InstallDir $InstallDir
+    } catch {
+        Write-Host "[WARN] stop-install-processes raised: $_"
+    }
+} else {
+    # An install from before this helper shipped, or a partially-deleted tree. Fall back to the
+    # narrow case rather than the old machine-wide kill: only node.exe running from THIS install.
+    Write-Host "[WARN] $stopHelper not found; falling back to a path-scoped node.exe stop"
+    try {
+        $root = $InstallDir.TrimEnd('\') + '\'
+        Get-Process -Name node -ErrorAction SilentlyContinue | Where-Object {
+            $_.Path -and $_.Path.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)
+        } | Stop-Process -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-Host "[WARN] node.exe kill raised: $_"
+    }
 }
 
 # 3. Remove the GUI agent at-logon scheduled task.
