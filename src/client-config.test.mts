@@ -19,7 +19,7 @@ import {
 // idempotency) that decide whether the client can still load its own config afterwards.
 //
 // Windows paths are written with DOUBLED backslashes because these are TS string literals; a single
-// backslash would make 'C:\Program Files' parse as 'C:Program Files' and every assertion below
+// backslash would make 'C:\Program Files' parse as 'C:Program Files' and every assertion below  (collapsed-path-ok: that is the bug being described)
 // would be testing nonsense. path.win32 is injected explicitly so the assertions mean the same
 // thing on a posix CI runner as on the Windows box.
 

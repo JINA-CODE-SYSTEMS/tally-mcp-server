@@ -147,7 +147,7 @@ function Read-EnvValue {
 function Test-ClientConfigured {
     param([string]$InstallRoot)
     try {
-        $cfg = Join-Path $env:APPDATA 'Claudeclaude_desktop_config.json'
+        $cfg = Join-Path (Join-Path $env:APPDATA 'Claude') 'claude_desktop_config.json'
         if (-not (Test-Path -LiteralPath $cfg)) { return $false }
         $raw = Get-Content -LiteralPath $cfg -Raw -ErrorAction Stop
         if (-not $raw) { return $false }

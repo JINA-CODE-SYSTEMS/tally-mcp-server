@@ -661,7 +661,7 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
 
         Write-Host "[OK] Service '$ServiceName' registered with bundled node + nssm"
     } else {
-        # Local mode: the MCP client spawns distindex.mjs over stdio for the duration of a
+        # Local mode: the MCP client spawns dist\index.mjs over stdio for the duration of a
         # session. Nothing to register, nothing listening, nothing running while the user is not
         # working - which is the property #172 is sold on.
         Write-Host "[OK] Local mode: no Windows service registered (the MCP client starts the server on demand)"

@@ -359,7 +359,7 @@ export function entryIdentity(entry: unknown): Identity {
  * entryIdentity() deliberately compares only the script TAIL ("dist/index.mjs"), so an entry
  * survives a legitimate move of the install directory. That tolerance is right when we are
  * managing OUR OWN user's entry - and wrong when deciding whether to delete an entry out of
- * somebody else's profile, because a user running their own fork from D:my-forkdistindex.mjs
+ * somebody else's profile, because a user running their own fork from D:\my-fork\dist\index.mjs
  * has exactly the same tail. Mass removal (#172 E1) needs the stricter question, and this is it.
  */
 export function entryPointsInside(entry: unknown, installRoot: string, p: PathLike = path): boolean {

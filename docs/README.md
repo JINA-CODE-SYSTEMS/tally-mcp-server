@@ -104,7 +104,7 @@ These are the properties a local install is built around. They are stated here b
 **Check it yourself**, rather than believing the list above:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "C:Program FilesTallyMCPscriptserify-deployment.ps1"
+powershell -ExecutionPolicy Bypass -File "C:\Program Files\TallyMCP\scripts\verify-deployment.ps1"
 ```
 
 It reports each claim as PASS / FAIL / NA with the evidence it used, interpreted against the mode you are actually running — a remote install is *supposed* to have a service and a port, so it says so rather than painting them red. Add `-Json` to attach the result to a support ticket. Run it from an elevated prompt for the most complete answer: without administrator rights it cannot read the command line of processes owned by other accounts, and it will say so rather than guess.

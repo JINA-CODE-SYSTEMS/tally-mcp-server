@@ -139,6 +139,15 @@ jobs:
           fi
           if [ "$BLOCKED" -eq 1 ]; then exit 1; fi
 
+      # Windows paths in this repo are routinely written through layers that treat a backslash as
+      # an escape introducer. When one gets eaten the result still looks path-shaped, so review
+      # slides past it: docs/README.md shipped the customer-facing verification command as
+      # "C:Program FilesTallyMCPscripts<VT>erify-deployment.ps1" - the backslash-v became a vertical
+      # tab and took the "v" with it - and the tray looked for Claude's config at a glued-together
+      # path that cannot exist, reporting a working install as "Not connected".
+      - name: No collapsed Windows paths
+        run: node scripts/check-collapsed-paths.mjs
+
   # ──────────────────────────────────────────────
   # Windows Sources
   # ──────────────────────────────────────────────
