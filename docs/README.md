@@ -422,13 +422,20 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:library /referen
 
 Compiled C# library wrapping Windows APIs for window management, keystroke injection, and screenshot capture. Required by GUI Agent v2. The `setup-windows.ps1` script compiles this automatically.
 
-### Windows Service Setup
+### Windows Setup (from source)
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1 [-InstallDir C:\tally-mcp-server] [-NodePath "..."] [-ServiceName TallyMCP]
+powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1 [-DeploymentMode local|remote] [-InstallDir C:\tally-mcp-server] [-NodePath "..."]
 ```
 
-One-time setup to register the MCP server as a Windows service via [NSSM](https://nssm.cc/). Configures auto-start, log rotation, loads `.env` variables, and registers two at-logon scheduled tasks: `TallyMCPAgent` (the GUI agent) and `TallyMCPTray` (the status tray icon). See [Windows Server Setup](server-setup-windows.md) for the full guide.
+One-time setup for a from-source install. It registers two at-logon scheduled tasks — `TallyMCPAgent` (the GUI agent) and `TallyMCPTray` (the status tray icon) — compiles `TallyUI.dll`, and writes `DEPLOYMENT_MODE` into `.env` so the tray and `verify-deployment.ps1` judge the box against what it actually is. What else it does depends on the mode:
+
+- **local** (the default for a fresh install) — no service, no listening port, no OAuth password. Claude starts `dist\index.mjs` over stdio on demand, and the script points your Claude Desktop config at this install. If an old `TallyMCP` service is present it is removed, because a local install must not leave a listener behind.
+- **remote** — registers the `TallyMCP` service via [NSSM](https://nssm.cc/) running `dist\server.mjs`, with auto-start and log rotation. See [Windows Server Setup](server-setup-windows.md).
+
+Re-running the script never silently changes what a box is: the mode comes from `-DeploymentMode`, else `DEPLOYMENT_MODE` in the existing `.env`, else `remote` if a `TallyMCP` service already exists (a pre-#172 install), else `local`.
+
+> `.env` is no longer copied into the service environment via NSSM `AppEnvironmentExtra`. That put every value — `PASSWORD` included — into a services registry key readable by `BUILTIN\Users`, and it was redundant, because `server.mts` loads `.env` itself by absolute path.
 
 ### Status Tray Icon (issue #20)
 

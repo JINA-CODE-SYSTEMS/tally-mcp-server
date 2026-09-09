@@ -6,20 +6,21 @@
  * that still looks path-shaped:
  *
  *   "C:\Program Files\TallyMCP\scripts\verify-deployment.ps1"
- *     -> "C:Program FilesTallyMCPscripts\x0Berify-deployment.ps1"
+ *     -> "C:Program FilesTallyMCPscripts\x0Berify-deployment.ps1"       collapsed-path-ok
  *
  * Note what happened to \v: it became a vertical tab and swallowed the letter after it. That
  * exact string shipped in docs/README.md as the command inviting customers to verify our
- * security claims for themselves. The same class of damage put
- * $env:APPDATA\Claudeclaude_desktop_config.json into the tray, where it made a correctly
- * connected install report "Not connected".
+ * security claims for themselves. The same class of damage put a glued-together
+ * %APPDATA% path into the tray, where it made a correctly connected install report
+ * "Not connected".
  *
  * Three rules, all cheap:
  *   1. control characters other than tab/CR/LF - the \v, \f, \b, \a residue
- *   2. a drive letter with no separator after it  (C:Program)
- *   3. a known path token glued onto a preceding word  (Claudeclaude_desktop_config.json)
+ *   2. a drive letter with no separator after it   (C:Program)                  collapsed-path-ok
+ *   3. a path token glued onto a preceding word    (Claudeclaude_desktop_config.json)  collapsed-path-ok
  *
- * Put `collapsed-path-ok` in a line's own comment to allow a deliberate example.
+ * Put `collapsed-path-ok` in a line's own comment to allow a deliberate example - as the
+ * three lines above do, since this file has to contain the very thing it rejects.
  *
  * Usage: node scripts/check-collapsed-paths.mjs
  */

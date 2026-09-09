@@ -33,17 +33,20 @@ CONNECTION_STRING=
 ```
 
 ### 3. Install NSSM & register as Windows service
-Run the setup script **as Administrator**:
+Run the setup script **as Administrator**. `-DeploymentMode remote` is required on a fresh box: since [#172](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/172) the script defaults to a **local** install, which registers no service at all. On a box that already has a `TallyMCP` service the flag is optional — the existing service is detected and remote is preserved — but passing it is clearer.
+
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\tally-mcp-server\scripts\setup-windows.ps1
+powershell -ExecutionPolicy Bypass -File C:\tally-mcp-server\scripts\setup-windows.ps1 -DeploymentMode remote
 ```
 
 This will:
 - Install NSSM (if not present)
-- Register `TallyMCP` as a Windows service
+- Register `TallyMCP` as a Windows service running `dist\server.mjs`
 - Configure auto-start on boot, log rotation
-- Load environment variables from `.env`
+- Write `DEPLOYMENT_MODE=remote` to `.env`
 - Start the service
+
+Environment variables are **not** copied into the service via NSSM `AppEnvironmentExtra`. That exposed `PASSWORD` in a registry key readable by `BUILTIN\Users`, and was redundant: `server.mts` loads `.env` itself by absolute path.
 
 ### 4. Install GitHub Actions self-hosted runner
 Go to **GitHub repo → Settings → Actions → Runners → New self-hosted runner** and follow the Windows instructions. Summary:
