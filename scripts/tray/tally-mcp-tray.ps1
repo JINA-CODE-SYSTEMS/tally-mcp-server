@@ -986,7 +986,7 @@ function Show-Dashboard {
     # right-click ToolStripMenuItem so the implementation stays in one place. ---
     # Which actions exist depends on the deployment mode. In local mode there is no service to
     # restart or stop and no public URL to copy, so offering those buttons describes a system the
-    # user does not have — and 'Restart service' sitting there as the PRIMARY action is actively
+    # user does not have, and 'Restart service' sitting there as the PRIMARY action is actively
     # misleading. Connecting Claude is the primary thing to do locally, so it takes that slot.
     $isLocal = ($State.DeploymentMode -eq 'local')
 
