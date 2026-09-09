@@ -91,6 +91,49 @@ param(
     [switch]$SkipTrayTask
 )
 
+# --- Elevate, or say why we cannot (#172 C2) -----------------------------------------------------
+# Almost everything below needs administrator rights: icacls on .env and the company vault, nssm,
+# Register-ScheduledTask for another user. The installer always runs us elevated, but the
+# "Reconfigure" Start Menu shortcut launches powershell.exe with no runas verb - so that path ran
+# unelevated and every privileged call failed. Most are wrapped in `2>$null | Out-Null` to swallow
+# benign stderr, which meant they failed SILENTLY: the operator saw a script that appeared to
+# succeed while changing nothing.
+#
+# That is worse than an error. A "reconfigure" that silently skips the icacls calls can leave the
+# .env and the company vault LESS protected than before, on a machine whose owner has just been told
+# everything is fine.
+#
+# Relaunch ourselves elevated rather than merely warning, because a warning on a path people use to
+# fix things is a warning nobody reads. Forward every bound parameter so the relaunched run behaves
+# identically. If elevation is declined or unavailable, stop with a clear reason instead of doing
+# half the work.
+$_principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $_principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "[*] Administrator rights are required; requesting elevation..." -ForegroundColor Yellow
+
+    $_fwd = @('-ExecutionPolicy', 'Bypass', '-NoProfile', '-File', "`"$PSCommandPath`"")
+    foreach ($kv in $PSBoundParameters.GetEnumerator()) {
+        if ($kv.Value -is [switch]) {
+            if ($kv.Value.IsPresent) { $_fwd += "-$($kv.Key)" }
+        } else {
+            $_fwd += @("-$($kv.Key)", "`"$($kv.Value)`"")
+        }
+    }
+
+    try {
+        $_child = Start-Process -FilePath 'powershell.exe' -ArgumentList $_fwd -Verb RunAs -PassThru -Wait -ErrorAction Stop
+        exit $_child.ExitCode
+    } catch {
+        Write-Host ""
+        Write-Host "[ERROR] This script needs to run as Administrator and elevation was declined or unavailable." -ForegroundColor Red
+        Write-Host "        Without it the service, the scheduled tasks and the NTFS lockdown on .env and the" -ForegroundColor Red
+        Write-Host "        company password vault cannot be changed - and those failures would be silent." -ForegroundColor Red
+        Write-Host "        Right-click 'Reconfigure Claudally' and choose 'Run as administrator'." -ForegroundColor Red
+        Write-Host ""
+        exit 1
+    }
+}
+
 # --- Preserve-on-reconfigure: read existing .env to fill in any blank params ---
 function _ReadEnvHashtable {
     param([string]$Path)
