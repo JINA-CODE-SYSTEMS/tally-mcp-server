@@ -217,3 +217,15 @@ jobs:
 
           gh release create @createArgs
           if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
+
+  # Refresh the landing page so its download button and verification hash describe the release we
+  # just published. Invoked as a reusable workflow rather than left to pages.yml's own `release`
+  # trigger, which cannot fire for a release created with GITHUB_TOKEN.
+  publish-site:
+    name: Republish landing page
+    needs: build
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/pages.yml
