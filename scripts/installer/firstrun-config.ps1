@@ -67,6 +67,11 @@ param(
     # Opt-in for Claude-driven GUI control (gui-screenshot / gui-send-keys). Wizard passes
     # 'true'/'false'; a bare Reconfigure omits it, so we preserve the existing .env value below.
     [string]$EnableGuiControl,
+    # Set by the installer, which knows it is running us in a hidden window with no keyboard.
+    # NOT inferred from -CredentialsFile any more: local mode deliberately passes no credentials
+    # file, so that inference made every local install hang on the "Press Enter" pause below,
+    # waiting for a keypress the window could never receive.
+    [switch]$Unattended,
     # --- Deployment mode: three orthogonal axes, not one key (#172, #177, #178) ---
     # No defaults here, per the fallback-chain convention above; they are resolved after .env is read.
     #   DEPLOYMENT_MODE  local|remote            is there a service and a listening port?      (#172)
@@ -260,7 +265,10 @@ Start-Transcript -Path $transcript -Append | Out-Null
 # which is why operators reported "nothing happens, window flashes shut" on the
 # RDC: the script completed, they just couldn't see the output. Pause at the
 # end so they can read it.
-$Script:IsInteractiveRun = [string]::IsNullOrWhiteSpace($CredentialsFile)
+# -Unattended is authoritative. The CredentialsFile heuristic is kept only as a fallback for a
+# caller that predates the switch: it is right for remote installs (which always pass one) and
+# wrong for local ones, which is exactly the bug the switch exists to close.
+$Script:IsInteractiveRun = (-not $Unattended) -and [string]::IsNullOrWhiteSpace($CredentialsFile)
 function _PauseIfInteractive {
     if ($Script:IsInteractiveRun) {
         Write-Host ""
@@ -281,7 +289,20 @@ try {
     $envFile     = Join-Path $InstallDir '.env'
     $agentScript = Join-Path $InstallDir 'scripts\tally-gui-agent-v2.ps1'
 
-    foreach ($p in @($bundledNode, $bundledNssm, $serverEntry, $agentScript)) {
+    # The prerequisite list is mode-dependent, and was not (#172 C3/C5). Local mode registers no
+    # service, so it never invokes nssm.exe, and it runs dist\index.mjs rather than dist\server.mjs -
+    # yet a local install refused to proceed without both. That is not merely pedantic: it blocks a
+    # local-only installer from dropping the service tooling it will never call, and an install that
+    # demands files it does not use is telling the operator something untrue about what it needs.
+    $required = @($bundledNode, $agentScript)
+    if ($DeploymentMode -eq 'remote') {
+        $required += $bundledNssm    # only the service path shells out to nssm
+        $required += $serverEntry    # dist\server.mjs is the HTTP entrypoint
+    } else {
+        $required += (Join-Path $InstallDir 'dist\index.mjs')   # the stdio entrypoint local mode uses
+    }
+
+    foreach ($p in $required) {
         if (-not (Test-Path -LiteralPath $p)) {
             throw @"
 Required file missing: $p
@@ -620,6 +641,14 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
             Write-Host "[WARN] $connectScript not found - skipping auto-connect. Use the 'Connect Claude to Tally' Start Menu item." -ForegroundColor Yellow
         } else {
             $connectTask = 'TallyMCPConnectOnce'
+            # schtasks writes "cannot find the file specified" to stderr when the task does not
+            # exist - which is the NORMAL case on a first install - and under
+            # ErrorActionPreference='Stop' PowerShell 5.1 promotes a native command's stderr to a
+            # terminating error. That killed the whole auto-connect step (and then the script) on
+            # exactly the path it was written for. The nssm calls in this file already relax the
+            # preference for the same reason; this block has to as well.
+            $savedPrefC = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
             try {
                 schtasks /Delete /TN $connectTask /F 2>$null | Out-Null
 
@@ -656,6 +685,7 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
                 Write-Host "       Use the 'Connect Claude to Tally' Start Menu item instead." -ForegroundColor Yellow
             } finally {
                 schtasks /Delete /TN $connectTask /F 2>$null | Out-Null
+                $ErrorActionPreference = $savedPrefC
             }
         }
 
@@ -843,19 +873,25 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         }
     }
 
-    # --- 5. Start the service ----------------------------------------------
-    # Same defensive pattern: nssm start can write to stderr in benign cases (e.g. service
-    # already running because Windows auto-started it on registration with SERVICE_AUTO_START).
-    $savedPref3 = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        & $bundledNssm start $ServiceName 2>$null | Out-Null
-    } finally {
-        $ErrorActionPreference = $savedPref3
+    # --- 5. Start the service (remote mode only) ----------------------------
+    # Local mode registered no service, so there is nothing to start - and nssm.exe may not even be
+    # present, since it is no longer a prerequisite on that path. Reaching here unguarded threw
+    # "nssm.exe is not recognized" AFTER everything else had succeeded, which is the worst place to
+    # fail: the install was complete and correct, and the operator was told it had errored.
+    if ($DeploymentMode -eq 'remote') {
+        # Same defensive pattern: nssm start can write to stderr in benign cases (e.g. service
+        # already running because Windows auto-started it on registration with SERVICE_AUTO_START).
+        $savedPref3 = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $bundledNssm start $ServiceName 2>$null | Out-Null
+        } finally {
+            $ErrorActionPreference = $savedPref3
+        }
+        Start-Sleep -Seconds 3
+        $svc = Get-Service -Name $ServiceName
+        Write-Host "[OK] Service status after start: $($svc.Status)"
     }
-    Start-Sleep -Seconds 3
-    $svc = Get-Service -Name $ServiceName
-    Write-Host "[OK] Service status after start: $($svc.Status)"
 
     # --- 6. Tell the operator what's next ----------------------------------
     Write-Host ""
