@@ -836,8 +836,20 @@ function Show-Dashboard {
     $lblPublisher.Location  = New-Object System.Drawing.Point 102, 52
     $header.Controls.Add($lblPublisher)
 
+    # Read the real version rather than asserting one. This said 'v1.1.0' while package.json said
+    # 0.1.0 - a version that has never existed - so the one place a customer looks to answer "what
+    # am I running?" was wrong, and any support conversation starting from it started from a lie.
+    $displayVersion = 'unknown'
+    try {
+        $pkgPath = Join-Path $InstallDir 'package.json'
+        if (Test-Path -LiteralPath $pkgPath) {
+            $pkgVersion = (Get-Content -LiteralPath $pkgPath -Raw | ConvertFrom-Json).version
+            if ($pkgVersion) { $displayVersion = "v$pkgVersion" }
+        }
+    } catch { }
+
     $lblVersion = New-Object System.Windows.Forms.Label
-    $lblVersion.Text      = 'v1.1.0'
+    $lblVersion.Text      = $displayVersion
     $lblVersion.Font      = New-Object System.Drawing.Font 'Segoe UI', 9
     $lblVersion.ForeColor = [System.Drawing.Color]::FromArgb(156, 163, 175)
     $lblVersion.BackColor = [System.Drawing.Color]::Transparent
