@@ -15,7 +15,17 @@
     download deps to Program Files; default uses CWD).
 
 .PARAMETER NodeVersion
-    Portable Node version to bundle. Default 20.18.1 (current LTS as of writing).
+    Portable Node version to bundle. Default 22.23.2 (LTS "Jod").
+
+    This is the runtime the customer's MCP client actually spawns against live books, so it must
+    be in security maintenance. Node 20 left maintenance on 2026-04-30 and was still pinned here
+    until #172 - which matters more than it looks, because there is no update channel yet (#177),
+    so a runtime CVE cannot be shipped to an installed machine at all.
+
+    Do NOT jump to 24 without checking the test runner: `node --test dist` resolves `dist` as a
+    module there and fails with MODULE_NOT_FOUND. The repo's own form
+    (`find dist -name '*.test.mjs' -exec node --test {} +`) is unaffected, but any tooling that
+    uses the short form will break.
     Bump along with package.json's engines.node when the project moves up.
 
 .PARAMETER NssmVersion
@@ -41,7 +51,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$NodeVersion   = '20.18.1',
+    [string]$NodeVersion   = '22.23.2',
     [string]$NssmVersion   = '2.24',
     # Supply-chain integrity: Node.js is verified against its official SHASUMS256.txt automatically;
     # override with -NodeSha256 for air-gapped builds. NSSM publishes no signed checksums, so pass
