@@ -26,6 +26,60 @@ $bundledNssm = Join-Path $InstallDir 'bin\nssm.exe'
 
 Write-Host "=== Tally MCP uninstall cleanup ==="
 
+# 0. Remove OUR entry from the user's MCP client config, before anything is deleted (#172 C4/E1).
+#
+# This runs first on purpose: connect-client.ps1 and dist\client-config.mjs are both about to be
+# removed, and a stale entry left behind points Claude at a node.exe and a script that no longer
+# exist - so every launch shows a failed server the user cannot explain and cannot fix without
+# hand-editing the JSON this product exists to keep them out of.
+#
+# Removal is gated on the entry still being OURS (client-config.mjs refuses to delete an entry
+# someone has repointed), and it drops to the config's owner via a one-shot scheduled task for the
+# same reason the install does: %APPDATA% is per-user and this script is elevated.
+try {
+    $connectScript = Join-Path $InstallDir 'scripts\installer\connect-client.ps1'
+    $envForUser    = Join-Path $InstallDir '.env'
+    $agentUser     = ''
+    if (Test-Path -LiteralPath $envForUser) {
+        $line = Select-String -LiteralPath $envForUser -Pattern '^\s*AGENT_TASK_USER\s*=' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($line) { $agentUser = ($line.Line -split '=', 2)[1].Trim().Trim('"') }
+    }
+    if (-not (Test-Path -LiteralPath $connectScript)) {
+        Write-Host "[*] connect-client.ps1 not present - skipping client-config cleanup"
+    } elseif (-not $agentUser) {
+        Write-Host "[WARN] AGENT_TASK_USER not recorded in .env; cannot tell whose Claude config to clean." -ForegroundColor Yellow
+        Write-Host "       If Claude shows a failed 'Tally Prime' server, remove that entry from" -ForegroundColor Yellow
+        Write-Host "       %APPDATA%\Claude\claude_desktop_config.json by hand." -ForegroundColor Yellow
+    } else {
+        $t = 'TallyMCPDisconnectOnce'
+        try {
+            schtasks /Delete /TN $t /F 2>$null | Out-Null
+            $a = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                -Argument ('-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File "' + $connectScript + '" -InstallDir "' + $InstallDir + '" -Remove')
+            $pr = New-ScheduledTaskPrincipal -UserId $agentUser -LogonType Interactive -RunLevel Limited
+            $st = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+            Register-ScheduledTask -TaskName $t -Action $a -Principal $pr -Settings $st -Force | Out-Null
+            Start-ScheduledTask -TaskName $t
+            $deadline = (Get-Date).AddSeconds(20)
+            do {
+                Start-Sleep -Milliseconds 500
+                $info = Get-ScheduledTaskInfo -TaskName $t -ErrorAction SilentlyContinue
+            } while ($info -and $info.LastTaskResult -eq 267009 -and (Get-Date) -lt $deadline)
+            if ($info -and $info.LastTaskResult -eq 0) {
+                Write-Host "[OK] Removed the Tally entry from $agentUser's Claude configuration"
+            } else {
+                Write-Host "[WARN] Could not remove the Claude entry for $agentUser (they may not be logged on)." -ForegroundColor Yellow
+                Write-Host "       If Claude shows a failed 'Tally Prime' server, remove that entry from" -ForegroundColor Yellow
+                Write-Host "       %APPDATA%\Claude\claude_desktop_config.json by hand." -ForegroundColor Yellow
+            }
+        } finally {
+            schtasks /Delete /TN $t /F 2>$null | Out-Null
+        }
+    }
+} catch {
+    Write-Host "[WARN] client-config cleanup raised: $_"
+}
+
 # 1. Stop and remove the NSSM service.
 try {
     if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {

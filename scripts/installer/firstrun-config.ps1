@@ -602,6 +602,63 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         # working - which is the property #172 is sold on.
         Write-Host "[OK] Local mode: no Windows service registered (the MCP client starts the server on demand)"
 
+        # --- Point the user's Claude at this install, AS THAT USER (#172 C4) ------------------
+        # claude_desktop_config.json lives in %APPDATA%, which is per-user, and this script is
+        # running elevated. On the ordinary over-the-shoulder UAC path the elevated account is an
+        # admin who will never open Claude, so writing from here would configure the wrong profile
+        # and the accountant would see no Tally tools with nothing explaining why.
+        #
+        # So drop to AGENT_TASK_USER through a one-shot scheduled task - the same mechanism the
+        # agent and tray tasks already use, and the only way to reach that user's profile from an
+        # elevated session without their password.
+        #
+        # Failure here is NOT fatal. connect-client.ps1 is idempotent and is also on the Start Menu,
+        # which is the route for the very common case of Claude Desktop being installed afterwards.
+        # A missed auto-connect costs one click; a failed install costs the whole session.
+        $connectScript = Join-Path $InstallDir 'scripts\installer\connect-client.ps1'
+        if (-not (Test-Path -LiteralPath $connectScript)) {
+            Write-Host "[WARN] $connectScript not found - skipping auto-connect. Use the 'Connect Claude to Tally' Start Menu item." -ForegroundColor Yellow
+        } else {
+            $connectTask = 'TallyMCPConnectOnce'
+            try {
+                schtasks /Delete /TN $connectTask /F 2>$null | Out-Null
+
+                $connectAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                    -Argument ('-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File "' + $connectScript + '" -InstallDir "' + $InstallDir + '"')
+                # Interactive + Limited: this must land in the user's own profile with their normal
+                # token, not an elevated one, or %APPDATA% resolves somewhere they will never read.
+                $connectPrincipal = New-ScheduledTaskPrincipal -UserId $AgentTaskUser -LogonType Interactive -RunLevel Limited
+                $connectSettings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+                Register-ScheduledTask -TaskName $connectTask -Action $connectAction -Principal $connectPrincipal -Settings $connectSettings -Force | Out-Null
+                Start-ScheduledTask -TaskName $connectTask
+
+                # Bounded wait: the task only runs if that user has an active session. If they are not
+                # logged on it stays queued, which is fine - the Start Menu item covers it.
+                $deadlineC = (Get-Date).AddSeconds(30)
+                do {
+                    Start-Sleep -Milliseconds 500
+                    $info = Get-ScheduledTaskInfo -TaskName $connectTask -ErrorAction SilentlyContinue
+                } while ($info -and $info.LastTaskResult -eq 267009 -and (Get-Date) -lt $deadlineC)  # 267009 = still running
+
+                $resultFile = Join-Path (Split-Path (Split-Path $env:APPDATA -Parent) -Parent) "$AgentTaskUser\AppData\Local\Claudally\last-connect-result.json"
+                if ($info -and $info.LastTaskResult -eq 0) {
+                    Write-Host "[OK] Claude Desktop configuration written for '$AgentTaskUser'"
+                } elseif ($info -and $info.LastTaskResult -eq 267011) {
+                    Write-Host "[*]  Auto-connect queued: '$AgentTaskUser' is not logged on right now." -ForegroundColor Yellow
+                    Write-Host "     They should run 'Connect Claude to Tally' from the Start Menu after signing in." -ForegroundColor Yellow
+                } else {
+                    $code = 'unknown'
+                    if ($info) { $code = $info.LastTaskResult }
+                    Write-Host "[WARN] Auto-connect finished with result $code. Run 'Connect Claude to Tally' from the Start Menu as $AgentTaskUser." -ForegroundColor Yellow
+                }
+            } catch {
+                Write-Host "[WARN] Could not run auto-connect: $_" -ForegroundColor Yellow
+                Write-Host "       Use the 'Connect Claude to Tally' Start Menu item instead." -ForegroundColor Yellow
+            } finally {
+                schtasks /Delete /TN $connectTask /F 2>$null | Out-Null
+            }
+        }
+
         # Revoke rather than abandon. Switching remote -> local must not leave the artefacts of the
         # old mode lying around: a stale token store is a credential, and a stale OAuth client list
         # tells an attacker what used to be trusted. verify-deployment.ps1 checks for exactly these.

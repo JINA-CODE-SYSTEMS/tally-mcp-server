@@ -101,6 +101,7 @@ Source: "{#RepoRoot}\scripts\deploy.ps1";             DestDir: "{app}\scripts"; 
 Source: "{#RepoRoot}\scripts\setup-windows.ps1";      DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\installer\firstrun-config.ps1";    DestDir: "{app}\scripts\installer"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\installer\stop-install-processes.ps1"; DestDir: "{app}\scripts\installer"; Flags: ignoreversion
+Source: "{#RepoRoot}\scripts\installer\connect-client.ps1";        DestDir: "{app}\scripts\installer"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\installer\uninstall-cleanup.ps1";  DestDir: "{app}\scripts\installer"; Flags: ignoreversion
 
 ; --- Tray status app (issue #20). Polls service/agent/Tally health and surfaces a
@@ -159,6 +160,7 @@ Name: "{group}\Open {#MyAppName} Dashboard"; Filename: "powershell.exe"; Paramet
 Name: "{autodesktop}\{#MyAppName}";          Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File ""{app}\scripts\tray\tally-mcp-tray.ps1"" -InstallDir ""{app}"" -ShowDashboard"; WorkingDir: "{app}"; Tasks: desktopicon; IconFilename: "{app}\assets\tally-mcp.ico"; Comment: "Open the Tally MCP status dashboard"
 Name: "{group}\{#MyAppName} Logs";       Filename: "{app}\logs"
 Name: "{group}\Reconfigure {#MyAppName}"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"""; WorkingDir: "{app}"
+Name: "{group}\Connect Claude to Tally"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\connect-client.ps1"" -InstallDir ""{app}"""; WorkingDir: "{app}"; Comment: "Point Claude Desktop at this Tally server (run as the person who uses Claude)"
 Name: "{group}\Uninstall {#MyAppName}";  Filename: "{uninstallexe}"
 
 [Run]
