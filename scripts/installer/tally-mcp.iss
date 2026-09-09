@@ -174,7 +174,7 @@ Filename: "powershell.exe"; \
 [UninstallRun]
 ; --- Cleanup BEFORE Inno deletes files: stop service, remove NSSM entry, remove scheduled task ---
 Filename: "powershell.exe"; \
-  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\uninstall-cleanup.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"" -TunnelServiceName ""{#MyTunnelServiceName}"""; \
+  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\uninstall-cleanup.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"" -TunnelServiceName ""{#MyTunnelServiceName}"" {code:GetRemoveVaultFlag}"; \
   RunOnceId: "TallyMcpUninstallCleanup"; \
   Flags: runhidden waituntilterminated
 
@@ -505,6 +505,32 @@ end;
 // neither. In local mode the ONLY visible evidence of success is Tally tools appearing in Claude,
 // and that requires a full quit-and-reopen: a user who merely closes the window sees nothing and
 // reasonably concludes the install failed.
+// Asked once, before anything is removed (#172 E1). The stored Tally company passwords live
+// OUTSIDE the install directory, so uninstalling has always left them on disk - protected only
+// by an NTFS ACL that nothing maintains afterwards, and decryptable by any local account that
+// can read the file (DPAPI is machine-scoped). Removing them is the safer default; keeping them
+// is what someone reinstalling would want. Only the operator can choose, so ask.
+var
+  UninstRemoveVault: Boolean;
+
+function InitializeUninstall(): Boolean;
+begin
+  Result := True;
+  UninstRemoveVault :=
+    MsgBox('Remove saved Tally company passwords?' + #13#10#13#10 +
+           'Claudally can store the password for each password-protected company so Claude can open ' +
+           'them for you. They are encrypted and tied to this computer.' + #13#10#13#10 +
+           'Yes  - delete them now (recommended)' + #13#10 +
+           'No   - keep them, so a future reinstall picks them up',
+           mbConfirmation, MB_YESNO or MB_DEFBUTTON1) = IDYES;
+end;
+
+// Passed to uninstall-cleanup.ps1 as the value of -RemoveVault.
+function GetRemoveVaultFlag(Param: string): string;
+begin
+  if UninstRemoveVault then Result := '-RemoveVault' else Result := '';
+end;
+
 procedure CurPageChanged(CurPageID: Integer);
 begin
   if CurPageID = wpFinished then

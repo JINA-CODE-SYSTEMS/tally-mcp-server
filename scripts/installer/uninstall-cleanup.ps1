@@ -16,7 +16,11 @@ param(
     [string]$ServiceName   = 'TallyMCP',
     [string]$AgentTaskName = 'TallyMCPAgent',
     [string]$TrayTaskName  = 'TallyMCPTray',
-    [string]$TunnelServiceName = 'TallyMCPTunnel'
+    [string]$TunnelServiceName = 'TallyMCPTunnel',
+    # Whether to shred the stored Tally company passwords. The uninstaller asks the operator and
+    # passes the answer; default OFF so an older caller that does not know about the switch keeps
+    # the data rather than destroying it silently.
+    [switch]$RemoveVault
 )
 
 # ErrorActionPreference deliberately Continue: uninstall must finish even if a step throws.
@@ -26,58 +30,112 @@ $bundledNssm = Join-Path $InstallDir 'bin\nssm.exe'
 
 Write-Host "=== Tally MCP uninstall cleanup ==="
 
-# 0. Remove OUR entry from the user's MCP client config, before anything is deleted (#172 C4/E1).
+# 0. Remove OUR entry from every user profile that has one, before anything is deleted (#172 E1).
 #
-# This runs first on purpose: connect-client.ps1 and dist\client-config.mjs are both about to be
-# removed, and a stale entry left behind points Claude at a node.exe and a script that no longer
-# exist - so every launch shows a failed server the user cannot explain and cannot fix without
-# hand-editing the JSON this product exists to keep them out of.
+# Runs first on purpose: dist\client-config.mjs and the bundled node are both about to be removed,
+# and a stale entry points Claude at files that no longer exist - so every launch shows a failed
+# server the user cannot explain and cannot fix without hand-editing the JSON this product exists
+# to keep them out of.
 #
-# Removal is gated on the entry still being OURS (client-config.mjs refuses to delete an entry
-# someone has repointed), and it drops to the config's owner via a one-shot scheduled task for the
-# same reason the install does: %APPDATA% is per-user and this script is elevated.
+# ACROSS EVERY PROFILE, not just AGENT_TASK_USER: the "Connect Claude to Tally" Start Menu item is
+# available to anyone who logs in, so a second user may well have wired themselves up.
+#
+# --require-install-root is what makes touching other people's files defensible. Without it the
+# ownership check compares only the script tail ("dist/index.mjs"), so a colleague running their
+# OWN fork from D:\my-fork\dist\index.mjs looks identical to ours and would have been deleted.
+# With it we remove only entries that actually point inside the directory being uninstalled, and
+# anything else is reported and left byte-identical.
 try {
-    $connectScript = Join-Path $InstallDir 'scripts\installer\connect-client.ps1'
-    $envForUser    = Join-Path $InstallDir '.env'
-    $agentUser     = ''
-    if (Test-Path -LiteralPath $envForUser) {
-        $line = Select-String -LiteralPath $envForUser -Pattern '^\s*AGENT_TASK_USER\s*=' -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($line) { $agentUser = ($line.Line -split '=', 2)[1].Trim().Trim('"') }
-    }
-    if (-not (Test-Path -LiteralPath $connectScript)) {
-        Write-Host "[*] connect-client.ps1 not present - skipping client-config cleanup"
-    } elseif (-not $agentUser) {
-        Write-Host "[WARN] AGENT_TASK_USER not recorded in .env; cannot tell whose Claude config to clean." -ForegroundColor Yellow
-        Write-Host "       If Claude shows a failed 'Tally Prime' server, remove that entry from" -ForegroundColor Yellow
-        Write-Host "       %APPDATA%\Claude\claude_desktop_config.json by hand." -ForegroundColor Yellow
+    $nodeExe   = Join-Path $InstallDir 'node-portable\node.exe'
+    $configCli = Join-Path $InstallDir 'dist\client-config.mjs'
+    if (-not (Test-Path -LiteralPath $nodeExe) -or -not (Test-Path -LiteralPath $configCli)) {
+        Write-Host "[*] client-config tooling not present - skipping Claude config cleanup"
     } else {
-        $t = 'TallyMCPDisconnectOnce'
-        try {
-            schtasks /Delete /TN $t /F 2>$null | Out-Null
-            $a = New-ScheduledTaskAction -Execute 'powershell.exe' `
-                -Argument ('-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File "' + $connectScript + '" -InstallDir "' + $InstallDir + '" -Remove')
-            $pr = New-ScheduledTaskPrincipal -UserId $agentUser -LogonType Interactive -RunLevel Limited
-            $st = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-            Register-ScheduledTask -TaskName $t -Action $a -Principal $pr -Settings $st -Force | Out-Null
-            Start-ScheduledTask -TaskName $t
-            $deadline = (Get-Date).AddSeconds(20)
-            do {
-                Start-Sleep -Milliseconds 500
-                $info = Get-ScheduledTaskInfo -TaskName $t -ErrorAction SilentlyContinue
-            } while ($info -and $info.LastTaskResult -eq 267009 -and (Get-Date) -lt $deadline)
-            if ($info -and $info.LastTaskResult -eq 0) {
-                Write-Host "[OK] Removed the Tally entry from $agentUser's Claude configuration"
-            } else {
-                Write-Host "[WARN] Could not remove the Claude entry for $agentUser (they may not be logged on)." -ForegroundColor Yellow
-                Write-Host "       If Claude shows a failed 'Tally Prime' server, remove that entry from" -ForegroundColor Yellow
-                Write-Host "       %APPDATA%\Claude\claude_desktop_config.json by hand." -ForegroundColor Yellow
+        $profileRoot = Split-Path -Parent $env:PUBLIC          # normally C:\Users
+        $cleaned = 0; $skipped = 0
+        foreach ($dir in (Get-ChildItem -Path $profileRoot -Directory -ErrorAction SilentlyContinue)) {
+            $appData = Join-Path $dir.FullName 'AppData\Roaming'
+            $cfg     = Join-Path $appData 'Claude\claude_desktop_config.json'
+            if (Test-Path -LiteralPath $cfg) {
+                try {
+                    $out = & $nodeExe $configCli remove --target claude-desktop --appdata $appData --install-root $InstallDir --require-install-root --json 2>&1 | Out-String
+                    $res = $null
+                    try { $res = ($out | ConvertFrom-Json).results[0] } catch { }
+                    if ($res -and $res.wrote) {
+                        $cleaned++
+                        Write-Host "[OK] Removed the Tally entry from $($dir.Name)'s Claude configuration"
+                    } elseif ($res -and $res.state -eq 'foreign') {
+                        $skipped++
+                        Write-Host "[*]  Left $($dir.Name)'s Claude entry alone - it points at a different install"
+                    }
+                } catch {
+                    Write-Host "[WARN] Could not clean $($dir.Name)'s Claude configuration: $_"
+                }
             }
-        } finally {
-            schtasks /Delete /TN $t /F 2>$null | Out-Null
+            # Per-user breadcrumb written by connect-client.ps1. Small, but it is ours and it names
+            # paths that are about to stop existing.
+            $crumb = Join-Path $dir.FullName 'AppData\Local\Claudally'
+            if (Test-Path -LiteralPath $crumb) { Remove-Item -Recurse -Force -LiteralPath $crumb -ErrorAction SilentlyContinue }
         }
+        Write-Host "[OK] Claude configuration cleanup: $cleaned removed, $skipped left alone"
     }
 } catch {
     Write-Host "[WARN] client-config cleanup raised: $_"
+}
+
+# 0b. Stored Tally company passwords (#172 E1).
+#
+# The vault lives OUTSIDE the install directory - by default C:\Users\Public\TallyPrimeEditLog\data -
+# so neither this script nor Inno's [UninstallDelete] has ever touched it. Uninstalling therefore
+# left DPAPI-encrypted Tally passwords on disk, protected by an NTFS ACL that nothing maintains any
+# more. DPAPI at LocalMachine scope means any local account that can READ that file can decrypt it,
+# so that ACL was the whole protection.
+#
+# The operator is asked rather than assumed at: these are credentials WE created and are useless
+# without this product, which argues for removing them - but they are also passwords a human typed
+# and may want back after a reinstall, which argues for keeping them. The uninstaller poses the
+# question and defaults to removing.
+if ($RemoveVault) {
+    try {
+        $vaultPath = ''
+        $envFile = Join-Path $InstallDir '.env'
+        if (Test-Path -LiteralPath $envFile) {
+            $dataLine = Select-String -LiteralPath $envFile -Pattern '^\s*TALLY_DATA_PATH\s*=' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($dataLine) {
+                $dataPath = ($dataLine.Line -split '=', 2)[1].Trim().Trim('"')
+                if ($dataPath) { $vaultPath = Join-Path $dataPath '.tally-mcp-companies.json' }
+            }
+        }
+        if (-not $vaultPath) { $vaultPath = Join-Path $env:PUBLIC 'TallyPrimeEditLog\data\.tally-mcp-companies.json' }
+
+        if (Test-Path -LiteralPath $vaultPath) {
+            # Overwrite before unlinking: the file holds encrypted credentials, and a plain delete
+            # leaves them recoverable from free space.
+            try {
+                $len = (Get-Item -LiteralPath $vaultPath).Length
+                if ($len -gt 0) { [System.IO.File]::WriteAllBytes($vaultPath, (New-Object byte[] $len)) }
+            } catch { }
+            Remove-Item -LiteralPath $vaultPath -Force -ErrorAction SilentlyContinue
+            # The pre-entropy backup, if a migration ever ran, holds the OLD weakly-protected blobs.
+            $vaultBackup = "$vaultPath.pre-entropy-backup"
+            if (Test-Path -LiteralPath $vaultBackup) {
+                try {
+                    $len2 = (Get-Item -LiteralPath $vaultBackup).Length
+                    if ($len2 -gt 0) { [System.IO.File]::WriteAllBytes($vaultBackup, (New-Object byte[] $len2)) }
+                } catch { }
+                Remove-Item -LiteralPath $vaultBackup -Force -ErrorAction SilentlyContinue
+            }
+            Write-Host "[OK] Saved Tally company passwords shredded and removed"
+        } else {
+            Write-Host "[*] No saved company passwords found"
+        }
+    } catch {
+        Write-Host "[WARN] Company vault removal raised: $_"
+    }
+} else {
+    Write-Host "[*] Saved Tally company passwords KEPT at the operator's request"
+    Write-Host "    They stay readable only to SYSTEM, Administrators and the agent account, and are"
+    Write-Host "    useless on any other machine (DPAPI is bound to this one)."
 }
 
 # 1. Stop and remove the NSSM service.

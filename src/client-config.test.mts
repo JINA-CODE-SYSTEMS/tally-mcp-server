@@ -9,8 +9,7 @@ import {
   CLIENT_TARGETS, targetById, localLaunchSpec, parseClientConfig, serializeClientConfig,
   statusOfEntry, entryIdentity, mergeEntry, applyEntryToText, removeEntryFromText, parseCliArgs,
   applyToFile, removeFromFile, backupConfigFile,
-  stripJsonComments, stripTrailingCommas, type EditOutcome, type ClientTarget
-} from './client-config.mjs';
+  stripJsonComments, stripTrailingCommas, type EditOutcome, type ClientTarget, entryPointsInside } from './client-config.mjs';
 
 // --- #172 B1: the client-config merge engine ---
 //
@@ -708,4 +707,45 @@ test('importing the module from another script does NOT run the CLI', () => {
   assert.equal(r.stdout.trim(), 'loaded function', 'the CLI must produce no output when merely imported');
   assert.equal(r.stderr, '', 'no CLI output of any kind on import');
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// --- #172 E1: strict ownership for the uninstaller's sweep across other profiles ---
+//
+// entryIdentity compares only the script TAIL, so an entry survives a legitimate move of the
+// install directory. That tolerance is right for our own user and WRONG when deciding whether to
+// delete something out of a colleague's profile: their fork at D:\\my-fork\\dist\\index.mjs has the
+// same tail as ours. entryPointsInside is the stricter question the uninstaller asks instead.
+
+const ROOT = 'C:\\Program Files\\TallyMCP';
+
+test('entryPointsInside accepts an entry whose script is inside the install root', () => {
+  const entry = { command: 'node', args: [ROOT + '\\dist\\index.mjs'] };
+  assert.equal(entryPointsInside(entry, ROOT, path.win32), true);
+});
+
+test('entryPointsInside REJECTS a fork with an identical script tail', () => {
+  // The exact case that would have deleted a colleague's entry: same tail, different install.
+  const fork = { command: 'node', args: ['D:\\my-fork\\dist\\index.mjs'] };
+  assert.equal(entryPointsInside(fork, ROOT, path.win32), false);
+  // ...while the tolerant identity check cannot tell them apart, which is why this exists.
+  assert.deepEqual(entryIdentity(fork), entryIdentity({ command: 'node', args: [ROOT + '\\dist\\index.mjs'] }));
+});
+
+test('entryPointsInside is case-insensitive on Windows paths', () => {
+  const entry = { command: 'node', args: ['c:\\program files\\tallymcp\\dist\\index.mjs'] };
+  assert.equal(entryPointsInside(entry, ROOT, path.win32), true);
+});
+
+test('entryPointsInside refuses a sibling directory that merely shares the prefix', () => {
+  const entry = { command: 'node', args: ['C:\\Program Files\\TallyMCP-old\\dist\\index.mjs'] };
+  assert.equal(entryPointsInside(entry, ROOT, path.win32), false);
+});
+
+test('entryPointsInside also considers the command, for launcher-style entries', () => {
+  const entry = { command: ROOT + '\\bin\\tally-mcp.exe', args: [] };
+  assert.equal(entryPointsInside(entry, ROOT, path.win32), true);
+});
+
+test('entryPointsInside says no when there is no install root to compare against', () => {
+  assert.equal(entryPointsInside({ command: 'node', args: ['x.mjs'] }, '', path.win32), false);
 });

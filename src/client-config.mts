@@ -353,6 +353,29 @@ export function entryIdentity(entry: unknown): Identity {
   return { kind: 'unknown' };
 }
 
+/**
+ * Does this entry point at a script inside `installRoot`?
+ *
+ * entryIdentity() deliberately compares only the script TAIL ("dist/index.mjs"), so an entry
+ * survives a legitimate move of the install directory. That tolerance is right when we are
+ * managing OUR OWN user's entry - and wrong when deciding whether to delete an entry out of
+ * somebody else's profile, because a user running their own fork from D:my-forkdistindex.mjs
+ * has exactly the same tail. Mass removal (#172 E1) needs the stricter question, and this is it.
+ */
+export function entryPointsInside(entry: unknown, installRoot: string, p: PathLike = path): boolean {
+  if (!isPlainObject(entry) || !installRoot) return false;
+  const root = p.resolve(installRoot);
+  const rootWithSep = root.endsWith(p.sep) ? root : root + p.sep;
+  const fold = (v: string) => (p.sep === String.fromCharCode(92) ? v.toLowerCase() : v);
+  const candidates: string[] = [];
+  if (Array.isArray(entry.args)) for (const a of entry.args) if (typeof a === "string") candidates.push(a);
+  if (typeof entry.command === "string") candidates.push(entry.command);
+  return candidates.some(c => {
+    const resolved = fold(p.resolve(c));
+    return resolved === fold(root) || resolved.startsWith(fold(rootWithSep));
+  });
+}
+
 function sameIdentity(a: Identity, b: Identity): boolean {
   if (a.kind === 'script' && b.kind === 'script') return a.tail === b.tail;
   if (a.kind === 'url' && b.kind === 'url') return a.url === b.url;
@@ -613,6 +636,25 @@ export interface CliOptions {
   installRoot: string;
   nodeExe: string;
   workspace?: string;
+  /**
+   * Override for %APPDATA%, so a caller can act on ANOTHER user's Claude Desktop config.
+   *
+   * Exists for the uninstaller (#172 E1): our entry may have been added by several Windows
+   * users via the Start Menu item, and after uninstall each stale entry points Claude at files
+   * that no longer exist. Cleaning them means resolving a path in someone else's profile.
+   * Routing that through the same resolvePath/remove code as everything else keeps the
+   * ownership gate - we still refuse to delete an entry that no longer points at this install -
+   * which hand-rolled JSON editing in PowerShell would have thrown away.
+   */
+  appdata?: string;
+  /**
+   * Refuse to remove an entry unless it actually points INSIDE --install-root.
+   *
+   * Off by default, because the normal single-user remove SHOULD still clean up an entry left
+   * behind by an install that has since moved. The uninstaller turns it on for the sweep across
+   * other profiles, where the same tolerance would delete a colleague's fork.
+   */
+  requireInstallRoot: boolean;
   json: boolean;
   dryRun: boolean;
   allowCommentLoss: boolean;
@@ -637,7 +679,8 @@ export function parseCliArgs(argv: string[]): CliOptions {
     nodeExe: process.execPath,
     json: false,
     dryRun: false,
-    allowCommentLoss: false
+    allowCommentLoss: false,
+    requireInstallRoot: false
   };
   let i = hasCommand ? 1 : 0;
   const value = (flag: string): string => {
@@ -654,6 +697,8 @@ export function parseCliArgs(argv: string[]): CliOptions {
     else if (a === '--allow-comment-loss') opts.allowCommentLoss = true;
     else if (a === '--target') opts.targets.push(value(a));
     else if (a === '--workspace') opts.workspace = value(a);
+    else if (a === '--appdata') opts.appdata = value(a);
+    else if (a === '--require-install-root') opts.requireInstallRoot = true;
     else if (a === '--install-root') opts.installRoot = value(a);
     else if (a === '--node') opts.nodeExe = value(a);
     else if (a.startsWith('-')) throw new Error(`unknown option: ${a}`);
@@ -668,7 +713,7 @@ export function parseCliArgs(argv: string[]): CliOptions {
 const CLI_COMMANDS = ['detect', 'status', 'apply', 'remove'];
 
 const USAGE = 'usage: node dist/client-config.mjs <detect|status|apply|remove> [--target claude-desktop|vscode|all]'
-  + ' [--workspace DIR] [--install-root DIR] [--node PATH] [--json] [--dry-run] [--allow-comment-loss]\n';
+  + ' [--workspace DIR] [--appdata DIR] [--require-install-root] [--install-root DIR] [--node PATH] [--json] [--dry-run] [--allow-comment-loss]\n';
 
 export function runCli(argv: string[]): number {
   let opts: CliOptions;
@@ -690,7 +735,11 @@ export function runCli(argv: string[]): number {
   for (const id of opts.targets) {
     const target = targetById(id);
     if (!target) { process.stderr.write(`unknown target: ${id}\n`); exit = Math.max(exit, 1); continue; }
-    const resolved = target.resolvePath({ workspace: opts.workspace });
+    const resolved = target.resolvePath({
+      workspace: opts.workspace,
+      // Only override when asked: an empty --appdata must not blank out the real one.
+      env: opts.appdata ? { ...process.env, APPDATA: opts.appdata } : undefined,
+    });
     if (!resolved.ok) { report.push({ target: id, skipped: resolved.reason }); continue; }
     const file = resolved.file;
     const entry = target.buildEntry(launch);
@@ -701,6 +750,23 @@ export function runCli(argv: string[]): number {
       }
       // `status` is `apply --dry-run`: same parse, same ownership test, no write. One code path, so
       // what status reports is exactly what apply would do.
+      // Strict gate, checked BEFORE the remove runs so nothing is written on refusal.
+      if (opts.command === 'remove' && opts.requireInstallRoot) {
+        let existing: unknown;
+        try {
+          const parsed = parseClientConfig(fs.readFileSync(file, 'utf-8'));
+          if (parsed.ok) {
+            const bucket = parsed.data[target.serversKey];
+            if (isPlainObject(bucket)) existing = bucket[target.serverName];
+          }
+        } catch { /* unreadable: fall through and let the normal path report it */ }
+        if (existing !== undefined && !entryPointsInside(existing, opts.installRoot)) {
+          report.push({ target: id, file, state: 'foreign', changed: false, wrote: false, backup: null,
+            note: `left untouched: the entry under "${target.serverName}" does not point inside ${opts.installRoot}, so it is not ours to delete` });
+          exit = Math.max(exit, 2);
+          continue;
+        }
+      }
       const run = opts.command === 'remove' ? removeFromFile : applyToFile;
       const res = run(target, file, entry, { ...opts, dryRun: opts.dryRun || opts.command === 'status' });
       if (!res.outcome.ok) {
