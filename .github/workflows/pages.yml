@@ -10,9 +10,14 @@ on:
       - 'plugin/**'
       - 'scripts/tray/assets/claudally-logo.png'
       - '.github/workflows/pages.yml'
-  # Republish when a release is published, so the download button and the verification hash on the
-  # site always describe the release that actually exists. Nothing about the version is committed
-  # into the HTML; it is read from the release at deploy time.
+  # Called directly by release.yml once a release is published. This is a workflow_call rather than
+  # a `release: published` trigger because GitHub deliberately suppresses workflow triggers for
+  # events raised with GITHUB_TOKEN, to prevent runs cascading. Our releases are created by CI with
+  # github.token, so a release trigger would never fire for them — as it did not for v0.2.0, which
+  # published while the site kept advertising v0.1.0.
+  workflow_call:
+  # Kept for releases created BY HAND in the GitHub UI, which are raised under a real user and so do
+  # fire this. Harmless alongside workflow_call: the concurrency group below collapses duplicates.
   release:
     types: [published]
   workflow_dispatch:
