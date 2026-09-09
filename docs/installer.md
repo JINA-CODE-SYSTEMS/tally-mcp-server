@@ -8,15 +8,22 @@ A double-click installer that takes a Windows box from "nothing installed" to
 
 1. Unpacks `dist/`, `scripts/`, prebuilt `TallyUI.dll`, portable Node.js, `nssm.exe`, and `cloudflared.exe` to `C:\Program Files\TallyMCP\`.
 2. Runs a wizard that collects:
-   - OAuth password (`PASSWORD`, min 12 chars)
-   - Tally edition (Silver / Gold)
    - Tally exe / data / ini paths (auto-detected; user can override)
-   - Public domain / Cloudflare Tunnel hostname (blank = localhost-only)
-   - Cloudflare Tunnel token (optional — enables the tunnel path below)
+   - Tally edition (Silver / Gold)
    - Windows user the GUI agent runs as
-3. Writes `.env` from the collected values.
-4. Registers the `TallyMCP` Windows service via the bundled NSSM, pointing at the bundled
-   `node-portable\node.exe` (no system Node required).
+   - Whether Claude may drive the Tally window (screenshots + keystrokes) - on by default
+
+   New installs are **local** (`DEPLOYMENT_MODE=local`). No OAuth password is collected, because
+   there is no listener to gate. Remote access is not currently offered by the installer
+   ([#192](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/192)); an existing remote
+   install keeps its mode, password, domain and service across an upgrade, because the wizard
+   passes no mode at all and `firstrun-config.ps1` preserves whatever the install already has.
+3. Writes `.env` from the collected values. In local mode `PASSWORD`, `BIND_HOST`, `MCP_DOMAIN` and
+   `TUNNEL_TOKEN` are not written at all.
+4. **Remote mode only:** registers the `TallyMCP` Windows service via the bundled NSSM, pointing at
+   the bundled portable Node (no system Node required). A local install registers no service -
+   Claude starts the stdio entrypoint on demand - and instead writes the entry into the user's
+   `claude_desktop_config.json`, merging into it rather than replacing it.
 5. **If a Cloudflare Tunnel token was supplied**, registers a second NSSM service `TallyMCPTunnel`
    running the bundled `cloudflared` so the box gets a stable public HTTPS URL with no router/domain
    config (the MCP server then binds loopback-only — cloudflared connects to it on `127.0.0.1`).
