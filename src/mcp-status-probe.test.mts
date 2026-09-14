@@ -11,7 +11,12 @@ test('getTallyRequirements lists the hard external preconditions', () => {
     assert.ok(r.requirement.length > 0 && r.why.length > 0);
   }
   const blob = JSON.stringify(reqs).toLowerCase();
-  assert.ok(blob.includes('xml'), 'mentions the Tally XML server requirement');
+  // Was asserting on the word "xml". That let the requirement be phrased in a way only an engineer
+  // could act on, which is exactly how a first-time user ended up stuck: Tally ships with this
+  // connection OFF and nothing told them where the setting lives. Assert on the click-path instead —
+  // it is the part that has to survive an edit.
+  assert.ok(blob.includes('connectivity'), 'names the Tally menu where the connection is switched on');
+  assert.ok(blob.includes('9000'), 'names the port to set');
   assert.ok(blob.includes('agent'), 'mentions the GUI agent requirement');
 });
 
