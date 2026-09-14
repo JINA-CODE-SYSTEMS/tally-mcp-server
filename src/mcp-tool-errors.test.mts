@@ -39,6 +39,10 @@ test('every ToolErrorCode has a usable default message + retryable', () => {
   const codes = [
     'PASSWORD_REQUIRED', 'AGENT_UNREACHABLE', 'TALLY_DOWN', 'AGENT_TOO_OLD',
     'COMPANY_NOT_FOUND', 'AMBIGUOUS', 'PRECONDITION_FAILED', 'READONLY', 'UNKNOWN',
+    // host extensions: UNSAVED_ENTRY_OPEN was missing from this list, so its defaults were never
+    // asserted. GUI_HANDOFF is new — it hands the Tally window to the caller instead of guessing
+    // keystrokes, so its remedy IS the product behaviour and must not silently go missing.
+    'UNSAVED_ENTRY_OPEN', 'GUI_HANDOFF',
     // spec-10 deterministic-invariant codes added in #99 (H-14)
     'OUT_OF_PERIOD', 'MASTER_NOT_FOUND', 'AMBIGUOUS_INPUT', 'UNBALANCED', 'DUPLICATE',
   ] as const;
@@ -78,4 +82,17 @@ test('errorResult emits isError + structuredContent + machine-parseable JSON tex
   assert.equal(parsed.code, 'TALLY_DOWN');
   assert.equal(parsed.retryable, true);
   assert.equal(parsed.logs, 'transcript');
+});
+
+test('GUI_HANDOFF tells the caller to look before every step', () => {
+  // This remedy is the product behaviour, not decoration. open-company returns GUI_HANDOFF instead
+  // of dispatching a keystroke sequence it guessed, so the instruction to screenshot -> send ONE
+  // step -> screenshot again is the only thing standing between the caller and a blind sequence
+  // fired into an unknown screen. Assert it names both halves of the loop.
+  const e = buildToolError('GUI_HANDOFF');
+  assert.equal(e.retryable, true);
+  assert.ok(e.remedy, 'GUI_HANDOFF must carry a remedy');
+  assert.match(e.remedy, /gui-screenshot/);
+  assert.match(e.remedy, /gui-send-keys/);
+  assert.match(e.remedy, /ONE step/);
 });

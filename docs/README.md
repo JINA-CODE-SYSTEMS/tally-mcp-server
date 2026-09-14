@@ -156,11 +156,7 @@ Copy `.env.example` to `.env` and configure:
 | `GIT_COMMIT` / `BUILD_TIME` | *(unset)* | Optional build info surfaced in `/status` `build.commit` / `build.builtAt`. |
 | **GUI Agent (open-company)** | | |
 | `OPEN_COMPANY_GUI_TIMEOUT_SEC` | `180` | GUI agent timeout in seconds (min 90) |
-| `OPEN_COMPANY_GUI_MAX_STEPS` | `25` | Max LLM-guided steps per command (min 12) |
-| `CLAUDE_MODEL` | `claude-sonnet-4-20250514` | Anthropic model for GUI agent |
-| `OPENAI_MODEL` | `gpt-4o` | OpenAI model for GUI agent |
-| `LLM_MAX_TOKENS` | `300` | Max tokens per LLM response |
-| `LLM_TIMEOUT_SEC` | `30` | LLM API request timeout in seconds |
+| `ENABLE_GUI_CONTROL` | `true` | Exposes `gui-screenshot` / `gui-send-keys`, the supervised look-then-act loop. Set `false` for XML-only boxes. |
 | `ANTHROPIC_API_VERSION` | `2023-06-01` | Anthropic API version header |
 
 ## Editions
@@ -189,7 +185,7 @@ Because the MCP server typically runs as a Windows service in **Session 0** (no 
 - **Install** the agent to start at user logon. `setup-windows.ps1` registers a `TallyMCPAgent` Scheduled Task at-logon for the configured user — no manual setup needed. The Windows installer (option A above) does the same automatically.
 - **Self-update on deploy.** When a `git pull` replaces `tally-gui-agent-v2.ps1` on disk, the running agent detects the mtime change between commands and re-launches into the new version. Combined with the at-logon task, deploys propagate without operator intervention.
 - **Version handshake.** The agent reports `agentVersion` on every response. `load-company` refuses to call destructive actions on an agent older than `REQUIRED_AGENT_VERSION` and returns a clear remediation message instead of silently no-op'ing on unrecognized IPC fields. `open-company-debug` surfaces both the running version and `versionOk` status.
-- **No LLM key required** for the deterministic actions (`ping`, `start-tally`, `select-and-unlock-company`). Only set `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` if you want the LLM-guided UI navigation fallback (`open-company` Strategy 3).
+- **No API key of any kind.** The agent holds no credentials. It used to run its own screenshot -> ask-a-model -> act loop against `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`; that second model is gone. The agent now only captures the window and injects the keystrokes it is given — every decision is made by the MCP client.
 - **`load-company` pings the agent before doing anything destructive** — if the agent isn't responding (or is too old), the tool refuses to kill Tally and returns a clear error. So a misconfigured deployment never ends up worse than it started.
 - **Check liveness** any time via `open-company-debug` — it returns `guiAgentResponding`, `guiAgentVersion`, `guiAgentVersionOk`, and `guiAgentVersionRequired`.
 
@@ -404,15 +400,16 @@ The `scripts/` directory contains Windows-specific automation tools used by the 
 ### GUI Agent — Companion Script for Cross-Session Operations
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\tally-gui-agent-v2.ps1 [-LLMProvider anthropic|openai] [-MaxSteps 15]
+powershell -ExecutionPolicy Bypass -File scripts\tally-gui-agent-v2.ps1
 ```
 
-Runs in the **interactive desktop session** where Tally is visible. The MCP server (which typically runs in Windows Session 0 with no desktop) communicates with this agent via JSON file IPC to perform actions that need a real desktop — most importantly **launching `tally.exe`** for `load-company` and **automating Alt+F3 → Select Company** for the optional LLM-guided fallback.
+Runs in the **interactive desktop session** where Tally is visible. Needed only for **remote** deployments, where the MCP server runs in Windows Session 0 with no desktop and therefore cannot launch `tally.exe` or inject keystrokes; it reaches this agent over JSON file IPC. In **local** deployments the server already runs in the user's session and invokes the same script directly with `-Once`, so there is no long-running agent and nothing is written to disk.
 
-- **Install:** Add to Windows Startup folder or Task Scheduler (run at user logon)
+The agent is **eyes and hands only** — it captures the window and presses what it is told to press. It decides nothing.
+
+- **Install:** Add to Windows Startup folder or Task Scheduler (run at user logon). Local deployments do not need this.
 - Requires `TallyUI.dll` (see below)
-- **LLM key is OPTIONAL.** Deterministic actions (`ping`, `start-tally`) work without one. Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` only if you need the LLM-guided UI navigation fallback (`open-company` Strategy 3).
-- LLM model, tokens, and timeout are configurable via env vars (see [Configuration](#configuration))
+- **No credentials.** The agent needs no API key.
 
 ### TallyUI.dll — Win32 Interop Library
 

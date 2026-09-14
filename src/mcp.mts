@@ -37,7 +37,10 @@ const MCP_INSTALL_ROOT = path.resolve(import.meta.dirname, '..');
 dotenv.config({ path: path.join(import.meta.dirname, '../.env'), override: true, quiet: true });
 
 // Audit logging — logs every tool invocation
-function auditLog(toolName: string, args: Record<string, any>, status: 'success' | 'error' | 'denied' | 'dryrun', durationMs?: number): void {
+// 'handoff' is a distinct outcome from 'error': the server did everything it could and is
+// transferring control of the Tally GUI to the caller. Auditing those as errors would make the
+// trail read as though open-company fails routinely on password-protected companies.
+function auditLog(toolName: string, args: Record<string, any>, status: 'success' | 'error' | 'denied' | 'dryrun' | 'handoff', durationMs?: number): void {
   const entry = {
     timestamp: new Date().toISOString(),
     tool: toolName,
@@ -60,11 +63,169 @@ export function getOpenCompanyGuiTimeoutSeconds(rawValue: string | undefined = p
   return Math.floor(parsed);
 }
 
-export function getOpenCompanyGuiMaxSteps(rawValue: string | undefined = process.env.OPEN_COMPANY_GUI_MAX_STEPS): number {
-  const parsed = Number(rawValue);
-  if (!Number.isFinite(parsed)) return 25;
-  if (parsed < 12) return 12;
-  return Math.floor(parsed);
+// ── WHICH TALLY? ────────────────────────────────────────────────────────────────────────────────
+//
+// A machine can carry several Tally installs (Prime 3.x, 4.x, Edit Log) and run several of them at
+// once — accountants do this routinely to keep an old financial year openable. That broke this
+// server in a way that looked like flakiness rather than a bug, because the two channels into Tally
+// chose their target INDEPENDENTLY:
+//
+//   * every data read goes to whichever instance owns the XML port (only one process can bind it);
+//   * every keystroke went to `Get-Process -Name tally | Select-Object -First 1`, i.e. whichever
+//     one Windows happened to enumerate first.
+//
+// When those disagree, Claude reads company A's ledger and then types into company B's window.
+// Nothing errors. The user sees "erratic".
+//
+// The rule this code establishes: THE INSTANCE THAT OWNS THE XML PORT IS THE ONLY REAL ONE. It is
+// the instance we already read from, so it is the only one we are entitled to keystroke into. When
+// we cannot identify it, we refuse rather than guess — a wrong guess here means keys landing in a
+// live voucher screen of a company nobody asked about.
+//
+// The parsers are split out from the process calls so they can be tested without a Windows box.
+
+// Pulls the owning PID for a local TCP port out of `netstat -ano` output.
+//
+// Matches on the LOCAL port only, so an outbound connection *to* the port is never mistaken for
+// the server. Deliberately does not require the literal word "LISTENING": that string is localised
+// on non-English Windows, and a locale we did not anticipate must not silently degrade us to the
+// "first process named tally" guess this whole module exists to remove. Listener rows (foreign
+// address ":0") win over established ones when both are present.
+export function parseListenerPid(netstatOutput: string, port: number): number | null {
+  let fallback: number | null = null;
+  for (const line of netstatOutput.split(/\r?\n/)) {
+    // Proto, local address, foreign address, state, PID.
+    const m = /^\s*TCP\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)\s*$/i.exec(line);
+    if (!m) continue;
+    const [, local, foreign, , pidRaw] = m;
+    // Last colon splits host from port and so handles IPv6 "[::]:9000" as well as "0.0.0.0:9000".
+    const colon = local.lastIndexOf(':');
+    if (colon < 0) continue;
+    if (Number(local.slice(colon + 1)) !== port) continue;
+    const pid = Number(pidRaw);
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    if (/:0$/.test(foreign)) return pid;   // a listening socket — the authoritative answer
+    if (fallback === null) fallback = pid;
+  }
+  return fallback;
+}
+
+// First column of one `tasklist /FO CSV /NH` row: the image name.
+export function parseTasklistCsvImage(tasklistOutput: string): string | null {
+  for (const line of tasklistOutput.split(/\r?\n/)) {
+    const m = /^"([^"]+)"/.exec(line.trim());
+    if (m) return m[1];
+  }
+  return null;
+}
+
+// Every PID in `tasklist /FO CSV /NH` output. Used to count running Tally instances when the port
+// tells us nothing.
+export function parseTasklistCsvPids(tasklistOutput: string): number[] {
+  const pids: number[] = [];
+  for (const line of tasklistOutput.split(/\r?\n/)) {
+    const m = /^"[^"]*",\s*"(\d+)"/.exec(line.trim());
+    if (m) pids.push(Number(m[1]));
+  }
+  return pids;
+}
+
+export type TallyInstance =
+  | { ok: true; pid: number; image: string; via: 'port' | 'sole-process' }
+  | { ok: false; reason: string; remedy: string };
+
+function runCmd(cmd: string): string {
+  try {
+    return execSync(cmd, { timeout: 8000, windowsHide: true, encoding: 'utf-8' }) as unknown as string;
+  } catch (err: any) {
+    // tasklist exits non-zero when a filter matches nothing; that is an answer, not a failure.
+    return String(err?.stdout ?? '');
+  }
+}
+
+// Identifies the one Tally process this server is entitled to act on.
+//
+// Order matters. The port owner is checked FIRST because it is the instance our XML reads already
+// talk to; falling back to "the only running tally.exe" is safe only when there is exactly one, and
+// with two or more we stop. Refusing is the point of the function.
+export function resolveTallyInstance(port: number = Number(process.env.TALLY_PORT) || 9000): TallyInstance {
+  const owner = parseListenerPid(runCmd('netstat -ano -p TCP'), port);
+
+  if (owner !== null) {
+    const image = parseTasklistCsvImage(runCmd(`tasklist /FI "PID eq ${owner}" /FO CSV /NH`));
+    if (image && /^tally/i.test(image)) return { ok: true, pid: owner, image, via: 'port' };
+    if (image) {
+      return {
+        ok: false,
+        reason: `Port ${port} is held by ${image} (pid ${owner}), which is not Tally.`,
+        remedy: `Something other than Tally is using port ${port}. Close it, or point this server at Tally's real port with TALLY_PORT.`
+      };
+    }
+    // A PID we cannot name (it exited between the two calls, or tasklist was blocked). Fall through.
+  }
+
+  // Nothing owns the port — Tally is closed, or its XML server is switched off. Fall back to
+  // process enumeration, which is sound ONLY when the answer is unambiguous.
+  const pids = parseTasklistCsvPids(runCmd('tasklist /FI "IMAGENAME eq tally.exe" /FO CSV /NH'));
+  if (pids.length === 1) return { ok: true, pid: pids[0], image: 'tally.exe', via: 'sole-process' };
+  if (pids.length === 0) {
+    return {
+      ok: false,
+      reason: 'Tally is not running.',
+      remedy: 'Start Tally Prime, then retry.'
+    };
+  }
+  return {
+    ok: false,
+    reason: `${pids.length} Tally instances are running (pids ${pids.join(', ')}) and none is serving port ${port}, so there is no way to tell which one you mean.`,
+    remedy: `Turn the XML server on in the instance you want this to act on — in Tally press F1 > Settings > Connectivity > Client/Server Configuration, set "TallyPrime acts as" to Server and Port to ${port} — or close the instances you are not using. Refusing to guess: keystrokes sent to the wrong instance land in a different company's window.`
+  };
+}
+
+// ── "Tally is not reachable" — said so a non-technical user can act on it ───────────────────────
+//
+// Tally's XML server is OFF by default. Every first-time install therefore ends the same way: the
+// wizard finishes, the user asks Claude a question, and gets back "Tally Prime is not reachable on
+// its XML port. Ensure Tally Prime is running with the XML/HTTP server enabled" — which assumes the
+// reader knows what an XML port is, and gives no way to tell "I configured this wrong" apart from
+// "the product is broken".
+//
+// The exact click-path existed in the codebase, but only inside verify-deployment.ps1, a diagnostic
+// script no first-time user will ever run. It now lives here, on the error they actually see.
+//
+// The three causes need different answers, and resolveTallyInstance() can already tell them apart,
+// so say which one it is instead of listing possibilities.
+export const TALLY_CONNECTIVITY_STEPS =
+  "In Tally Prime press F1 (Help) > Settings > Connectivity > Client/Server Configuration. " +
+  "Set 'TallyPrime acts as' to Server, and Port to 9000. Press Ctrl+A to accept. " +
+  "Leave Tally open — this connection only works while Tally is running.";
+
+export function describeTallyUnreachable(
+  instance: TallyInstance = resolveTallyInstance()
+): { message: string; remedy: string } {
+  if (instance.ok) {
+    // Tally is up and we know exactly which process it is, yet the port did not answer. Either the
+    // connectivity setting is off, or Tally is blocked on a modal dialog (licence reminder, "Bad
+    // formula", a period prompt) — it stops serving XML entirely while one is on screen, and the
+    // user cannot see that from Claude's side.
+    return {
+      message: 'Tally Prime is running, but it is not answering on its data connection.',
+      remedy:
+        `Two things cause this. First, the connection may simply be switched off — it is off by ` +
+        `default in a fresh Tally. ${TALLY_CONNECTIVITY_STEPS} ` +
+        `Second, if it is already set to Server, look at the Tally window: a dialog waiting for an ` +
+        `answer (a licence reminder, a message box) stops Tally responding until someone clears it.`
+    };
+  }
+  if (/not running/i.test(instance.reason)) {
+    return {
+      message: 'Tally Prime is not open.',
+      remedy: `Start Tally Prime and open your company, then try again. If this is the first time: ${TALLY_CONNECTIVITY_STEPS}`
+    };
+  }
+  // Several instances, or something else holding the port — resolveTallyInstance already wrote a
+  // specific, actionable explanation for both.
+  return { message: instance.reason, remedy: instance.remedy };
 }
 
 export function createGuiAgentCommandId(prefix: string): string {
@@ -1040,7 +1201,13 @@ export function getTallyEdition(rawValue: string | undefined = process.env.TALLY
 // tally-gui-agent-v2.ps1). If a deploy ships a server expecting a newer agent than is running,
 // we fail fast with a clear message instead of letting the agent silently no-op on unknown
 // fields. (issue #15 - version handshake, option D).
-export const REQUIRED_AGENT_VERSION = '1.1.0';
+// Raised to 1.8.0 for the multi-instance fix. This is not housekeeping: an agent older than 1.8.0
+// resolves the Tally window with "first process named tally", so on a machine running two Tally
+// versions it can keystroke into a DIFFERENT instance than the one the server reads from. Pairing a
+// current server with a stale agent is exactly the silent wrong-window bug, so fail closed and make
+// the operator restart the agent. (Local/in-session deployments never hit this check — they run the
+// script shipped in the same install.)
+export const REQUIRED_AGENT_VERSION = '1.8.0';
 
 // The agent version that introduced the `switch-company` action. switch-company refuses to dispatch
 // to an older agent (which would return "Unknown action" and leave Tally untouched) — but we also
@@ -1883,7 +2050,7 @@ async function push(templateName: string, inputParams: Map<string, any>) {
 // can learn what must be running before it loads a company — without hitting walls.
 export function getTallyRequirements(): { requirement: string; why: string }[] {
   return [
-    { requirement: 'Tally Prime running with its XML/HTTP server enabled (default port 9000)', why: 'Every data read (ledgers, vouchers, GST, balance sheet) goes through Tally\'s XML server.' },
+    { requirement: 'Tally Prime open, with its data connection switched on (F1 > Settings > Connectivity > Client/Server Configuration: acts as Server, port 9000)', why: 'Every data read (ledgers, vouchers, GST, balance sheet) goes through that connection. It is OFF in a fresh Tally install, so on a new setup this is the step that has usually been missed.' },
     { requirement: 'GUI automation agent (tally-gui-agent-v2.ps1) running in the interactive desktop session', why: 'Required to load/switch companies and to unlock password-protected companies. Not needed for read-only queries against an already-loaded company.' },
     { requirement: 'Credentials for password-protected companies', why: 'load-company / load-company-by-alias need userName+password for protected companies; list-available-companies flags which folders require them.' },
     { requirement: 'Edition awareness (Silver vs Gold)', why: 'Silver keeps only one company resident at a time — loading another replaces it; Gold allows several.' },
@@ -1906,8 +2073,9 @@ Hard preconditions (discover via \`status\`/\`get-context\`, don't hit walls):
 - On Silver only one company is resident at a time; loading another replaces it.
 - Write tools are refused when readonly is true (READONLY_MODE).
 
-Driving the Tally GUI (only when ENABLE_GUI_CONTROL=true) — YOU drive it, look-verify-act, never blind:
+Driving the Tally GUI (on by default; disabled only if the operator set ENABLE_GUI_CONTROL=false) — YOU drive it, look-verify-act, never blind:
 - Use \`gui-screenshot\` as your eyes and \`gui-send-keys\` as your hands. Screenshot → confirm which screen you're on → send ONE step → screenshot → confirm the transition. Never send a relative sequence into an unknown screen.
+- \`open-company\` returning code GUI_HANDOFF is not a failure: the XML routes are exhausted, Tally is up, and it is handing you the window. Start the loop above — it will NOT navigate for you, by design.
 - Anchor first: press Escape back to the Gateway of Tally and confirm you're there before navigating.
 - Keystrokes are for LOGIN and COMPANY SELECTION only. NEVER keystroke a data write. All vouchers/masters go through the deterministic tools (create-voucher, create-ledger, …) which use Tally's XML API — never the GUI.
 - Fail closed: if a screenshot shows an unexpected screen (especially any Create/Alter master screen), STOP, press Escape back to the anchor, and return the problem — do NOT push more keys into the void.
@@ -2001,6 +2169,7 @@ export type ToolErrorCode =
   | 'COMPANY_NOT_FOUND'
   | 'AMBIGUOUS'
   | 'UNSAVED_ENTRY_OPEN'
+  | 'GUI_HANDOFF'
   | 'UNKNOWN';
 
 export type ToolErrorEnvelope = {
@@ -2015,11 +2184,15 @@ export type ToolErrorEnvelope = {
 const TOOL_ERROR_DEFAULTS: Record<ToolErrorCode, { retryable: boolean; message: string; remedy?: string }> = {
   PASSWORD_REQUIRED: { retryable: true, message: 'The company appears to be password-protected.', remedy: 'Retry with userName and password arguments.' },
   AGENT_UNREACHABLE: { retryable: true, message: 'The Tally GUI automation agent is not responding.', remedy: 'Start tally-gui-agent-v2.ps1 in the interactive desktop session (Task Scheduler "At logon"), then retry.' },
-  TALLY_DOWN: { retryable: true, message: 'Tally Prime is not reachable on its XML port.', remedy: 'Ensure Tally Prime is running with the XML/HTTP server enabled, then retry.' },
+  TALLY_DOWN: { retryable: true, message: 'Tally Prime is not answering on its data connection.', remedy: `Check that Tally Prime is open, then that its connection is switched on. ${TALLY_CONNECTIVITY_STEPS}` },
   AGENT_TOO_OLD: { retryable: true, message: 'The GUI agent is older than the required version.', remedy: 'Restart the agent to pick up the on-disk update (schtasks /End /TN TallyMCPAgent; schtasks /Run /TN TallyMCPAgent).' },
   COMPANY_NOT_FOUND: { retryable: false, message: 'No company matched the given identifier.', remedy: 'Use resolve-company or list-available-companies to find the exact id, name, or alias.' },
   AMBIGUOUS: { retryable: false, message: 'The identifier matched more than one company.', remedy: 'Re-call with the exact folder id or a configured alias.' },
   UNSAVED_ENTRY_OPEN: { retryable: true, message: 'Tally has an unsaved data-entry screen or modal open, so switching companies was refused to avoid discarding it.', remedy: 'Save or close the open voucher/master (or gui-screenshot then Escape back to the Gateway), then retry.' },
+  // Not a failure — an explicit transfer of control. The XML/TDL routes are exhausted, the GUI agent
+  // is alive, and the remaining work needs eyes. YOU drive it from here, one verified step at a time.
+  // The server deliberately does NOT guess a keystroke sequence on the caller's behalf.
+  GUI_HANDOFF: { retryable: true, message: 'This needs the Tally GUI, which you drive yourself.', remedy: 'Call gui-screenshot to see the current screen, send ONE step with gui-send-keys, screenshot again to confirm the transition, and repeat. Never send a relative sequence into a screen you have not looked at.' },
   PRECONDITION_FAILED: { retryable: true, message: 'A required precondition is not met.' },
   READONLY: { retryable: false, message: 'Write operations are disabled (READONLY_MODE=true).', remedy: 'Unset READONLY_MODE on the server to allow writes.' },
   // spec-10 deterministic-invariant codes (H-14 / H-9)
@@ -2749,12 +2922,25 @@ export async function registerMcpServer(): Promise<McpServer> {
         }
       };
 
-      // --- Strategy 3: GUI Agent - sends commands to the companion agent running in the interactive session ---
-      const tryGuiAgent = async (): Promise<boolean> => {
-        logs.push('[Strategy 3: GUI Agent] Attempting...');
+      // --- Strategy 3: hand the GUI to the caller ---
+      //
+      // This strategy used to dispatch 'select-company' / 'load-on-startup' to the companion agent,
+      // which ran its OWN screenshot -> decide -> act loop against gpt-4o (or Claude) over HTTP,
+      // using a separate API key. That was the wrong shape twice over: a second, weaker model drove
+      // the window while the Claude session that asked for the work sat idle waiting, and its
+      // decisions were invisible to the caller and to the user. It is gone.
+      //
+      // What remains is preparation plus an explicit hand-off. We make sure Tally is actually
+      // running (starting it if not, which may load the company by itself via tally.ini) and that
+      // the agent answers, then return GUI_HANDOFF so the caller drives with gui-screenshot /
+      // gui-send-keys — looking before every single step.
+      //
+      // 'loaded'      — the company is open; nothing more to do.
+      // 'handoff'     — Tally and the agent are ready; the caller takes the wheel.
+      // 'unavailable' — we could not even get to a state worth handing over.
+      const tryGuiAgent = async (): Promise<'loaded' | 'handoff' | 'unavailable'> => {
+        logs.push('[Strategy 3: GUI hand-off] Preparing...');
         try {
-          const guiTimeoutSeconds = getOpenCompanyGuiTimeoutSeconds();
-          const guiMaxSteps = getOpenCompanyGuiMaxSteps();
           const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
 
           // Check if Tally is running at all
@@ -2765,8 +2951,7 @@ export async function registerMcpServer(): Promise<McpServer> {
             tallyRunning = false;
           }
 
-          const action = tallyRunning ? 'select-company' : 'load-on-startup';
-          logs.push(`  Tally running: ${tallyRunning}, action: ${action}`);
+          logs.push(`  Tally running: ${tallyRunning}`);
 
           // If Tally isn't running, try to start it first
           if (!tallyRunning) {
@@ -2795,6 +2980,16 @@ export async function registerMcpServer(): Promise<McpServer> {
             }
           }
 
+          // Starting Tally can be enough on its own: tally.ini may auto-load the company at launch.
+          // Check before handing anything over, so the caller is not asked to drive a GUI that has
+          // already arrived where it was going.
+          if (!tallyRunning) {
+            if (await verifyCompanyLoaded(companyName)) {
+              logs.push('  Company loaded on Tally startup (tally.ini auto-load). No GUI work needed.');
+              return 'loaded';
+            }
+          }
+
           // Route through the transport seam rather than hand-rolling IPC here. This block used to
           // write _mcp_gui_command.json and poll for the result itself, which meant it bypassed
           // callGuiAgent() entirely — and would therefore have kept writing files nobody reads once
@@ -2804,32 +2999,13 @@ export async function registerMcpServer(): Promise<McpServer> {
             logs.push(guiTransportNeedsVersionHandshake()
               ? '  GUI agent not running. Please start scripts/tally-gui-agent-v2.ps1 in the interactive desktop session.'
               : '  Could not run the GUI agent script in this session. Check that PowerShell can execute scripts/tally-gui-agent-v2.ps1.');
-            return false;
+            return 'unavailable';
           }
-          logs.push('  GUI agent is alive.');
-
-          const agentResp = await callGuiAgent(
-            action,
-            { companyName, maxSteps: guiMaxSteps },
-            guiTimeoutSeconds,
-            tallyDataPath,
-            logs
-          );
-          if (!agentResp) {
-            logs.push(`  Agent did not respond within ${guiTimeoutSeconds} seconds.`);
-            return false;
-          }
-          if (agentResp.status !== 'success') return false;
-
-          // Wait for Tally to process the company load
-          await new Promise(resolve => setTimeout(resolve, 5000));
-
-          const loaded = await verifyCompanyLoaded(companyName);
-          logs.push(`  Verification: ${loaded ? 'SUCCESS' : 'company not detected in active list'}`);
-          return loaded;
+          logs.push('  GUI agent is alive. Handing the window to the caller.');
+          return 'handoff';
         } catch (err) {
           logs.push(`  Error: ${err}`);
-          return false;
+          return 'unavailable';
         }
       };
 
@@ -2862,13 +3038,23 @@ export async function registerMcpServer(): Promise<McpServer> {
         }
 
         if (strategy === 'auto' || strategy === 'gui-agent') {
-          success = await tryGuiAgent();
-          if (success) {
+          const guiOutcome = await tryGuiAgent();
+          if (guiOutcome === 'loaded') {
             activeCompany = companyName;
             auditLog('open-company', args, 'success', Date.now() - start);
             return {
               content: [{ type: 'text', text: logs.join('\n') + `\n\nCompany "${companyName}" is now active. Subsequent tools will automatically target this company.` }]
             };
+          }
+          if (guiOutcome === 'handoff') {
+            // Audited as a hand-off, not an error: nothing failed, and recording it as a failure
+            // would make the audit trail read as though open-company is broken on every protected
+            // company that simply needs someone to look at the screen.
+            auditLog('open-company', args, 'handoff', Date.now() - start);
+            return errorResult('GUI_HANDOFF', {
+              message: `The XML routes could not open "${companyName}" (it is typically password-protected, or not in Tally's auto-load list). Tally is running and the GUI agent is responding, so drive the Select Company screen yourself.`,
+              logs: logs.join('\n')
+            });
           }
           auditLog('open-company', args, 'error', Date.now() - start);
           return errorResult('AGENT_UNREACHABLE', { message: 'All strategies failed to open the company.', logs: logs.join('\n') });
@@ -2921,10 +3107,8 @@ export async function registerMcpServer(): Promise<McpServer> {
           commandFileExists: fs.existsSync(commandFile),
           resultFile,
           resultFileExists: fs.existsSync(resultFile),
-          openAiKeySet: !!process.env.OPENAI_API_KEY,
-          anthropicKeySet: !!process.env.ANTHROPIC_API_KEY,
+          guiControlEnabled: process.env.ENABLE_GUI_CONTROL === 'true',
           configuredTimeoutSeconds: getOpenCompanyGuiTimeoutSeconds(),
-          configuredMaxSteps: getOpenCompanyGuiMaxSteps(),
           tallyEdition: getTallyEdition(),
           activeCompany: activeCompany || null
         };
@@ -2981,7 +3165,7 @@ export async function registerMcpServer(): Promise<McpServer> {
     'status',
     {
       title: 'Status',
-      description: `Authoritative one-shot health/usability check for this Tally MCP server. Returns a stable five-field contract: { tallyReachable, agentAlive, activeCompany, edition, readonly }. Both liveness probes are retried briefly so a single transient blip doesn't flip the reported state. Call this to answer "is this usable right now, and in what mode?" instead of stitching list-loaded-companies + open-company-debug. Use open-company-debug for the verbose troubleshooting dump (paths, files, agent version, XML sample).`,
+      description: `Authoritative one-shot health/usability check for this Tally MCP server. Returns a stable five-field contract: { tallyReachable, agentAlive, activeCompany, edition, readonly }, plus { tallyProblem: { message, remedy } } whenever tallyReachable is false — RELAY THAT REMEDY TO THE USER VERBATIM, it contains the exact Tally menu path they need and is written for a non-technical reader. Both liveness probes are retried briefly so a single transient blip doesn't flip the reported state. Call this to answer "is this usable right now, and in what mode?" instead of stitching list-loaded-companies + open-company-debug. Use open-company-debug for the verbose troubleshooting dump (paths, files, agent version, XML sample).`,
       inputSchema: {},
       annotations: {
         readOnlyHint: true,
@@ -2992,13 +3176,19 @@ export async function registerMcpServer(): Promise<McpServer> {
       const start = Date.now();
       try {
         const { tallyReachable, agentAlive } = await probeLiveness();
-        const status = {
+        const status: Record<string, unknown> = {
           tallyReachable,
           agentAlive,
           activeCompany: activeCompany || null,
           edition: getTallyEdition(),
           readonly: process.env.READONLY_MODE === 'true'
         };
+        // A bare `tallyReachable: false` is the single least useful thing this server can say. It is
+        // also the FIRST thing a new user ever sees, because callers are told to check status before
+        // anything else — and the commonest reason it is false is not a fault at all, it is that
+        // Tally ships with its data connection switched off and nobody told the user to turn it on.
+        // Attach the diagnosis and the click-path so the caller can relay something actionable.
+        if (!tallyReachable) status.tallyProblem = describeTallyUnreachable();
         auditLog('status', args, 'success', Date.now() - start);
         return { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] };
       } catch (err) {
@@ -3012,7 +3202,7 @@ export async function registerMcpServer(): Promise<McpServer> {
     'get-context',
     {
       title: 'Get Context',
-      description: `One-shot environment + requirements snapshot: { edition, readonly, activeCompany, agentAlive, tallyReachable, requirements }. Wraps status (live liveness, retried) and adds the static list of external requirements so a fresh agent can learn what must be running before it can load a company — without triggering a failure first.`,
+      description: `One-shot environment + requirements snapshot: { edition, readonly, activeCompany, agentAlive, tallyReachable, requirements }, plus { tallyProblem: { message, remedy } } when tallyReachable is false — relay that remedy to the user verbatim. Wraps status (live liveness, retried) and adds the static list of external requirements so a fresh agent can learn what must be running before it can load a company — without triggering a failure first.`,
       inputSchema: {},
       annotations: {
         readOnlyHint: true,
@@ -3023,7 +3213,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       const start = Date.now();
       try {
         const { tallyReachable, agentAlive } = await probeLiveness();
-        const context = {
+        const context: Record<string, unknown> = {
           edition: getTallyEdition(),
           readonly: process.env.READONLY_MODE === 'true',
           activeCompany: activeCompany || null,
@@ -3031,6 +3221,7 @@ export async function registerMcpServer(): Promise<McpServer> {
           tallyReachable,
           requirements: getTallyRequirements()
         };
+        if (!tallyReachable) context.tallyProblem = describeTallyUnreachable();
         auditLog('get-context', args, 'success', Date.now() - start);
         return { content: [{ type: 'text', text: JSON.stringify(context, null, 2) }] };
       } catch (err) {
@@ -3058,7 +3249,10 @@ export async function registerMcpServer(): Promise<McpServer> {
       try {
         if (!(await pingTally(4000))) {
           auditLog('get-period', args, 'error', Date.now() - start);
-          return errorResult('TALLY_DOWN', { logs: 'pingTally failed before get-period.' });
+          // Diagnose rather than restate the symptom: say whether Tally is closed, open but not
+          // serving, or ambiguous, and give the click-path for the one that applies.
+          const diag = describeTallyUnreachable();
+          return errorResult('TALLY_DOWN', { ...diag, logs: 'pingTally failed before get-period.' });
         }
         const company = (args.targetCompany && args.targetCompany.trim()) || activeCompany || null;
         const period = await fetchCompanyPeriod(company);
@@ -3351,13 +3545,31 @@ export async function registerMcpServer(): Promise<McpServer> {
           logs.push('  tally.ini already has the requested Load= entries — skipping rewrite.');
         }
 
-        // Stop Tally
-        logs.push('  Stopping Tally (taskkill /F /IM tally.exe)...');
+        // Stop Tally — BY PID, never by image name.
+        //
+        // This used to be `taskkill /F /IM tally.exe`. /IM matches on the image name, so on any
+        // machine running more than one Tally (an old version kept open for a closed financial
+        // year, say) asking to load a company force-killed EVERY instance, discarding whatever
+        // unsaved voucher was open in the others. That is data loss, from a tool the user thinks
+        // of as "open a company".
+        //
+        // Kill only the instance we actually read from, and if we cannot identify it, do not kill
+        // anything: a restart we cannot aim is worse than no restart.
+        const target = resolveTallyInstance();
+        if (!target.ok) {
+          auditLog('load-company', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', {
+            message: `Refusing to restart Tally: ${target.reason} load-company force-closes Tally, so it will not run without knowing exactly which instance to close.`,
+            remedy: `${target.remedy} Or use switch-company, which changes the resident company through Tally's own Select Company screen and never restarts anything.`,
+            logs: logs.join('\n'),
+          });
+        }
+        logs.push(`  Stopping Tally (pid ${target.pid}, identified via ${target.via})...`);
         try {
-          execSync('taskkill /F /IM tally.exe', { timeout: 10000, windowsHide: true });
+          execSync(`taskkill /F /PID ${target.pid}`, { timeout: 10000, windowsHide: true });
           logs.push('    Tally stopped.');
         } catch (err: any) {
-          // taskkill returns non-zero when process not found — that's fine, means Tally wasn't running
+          // Non-zero also covers "already gone", which is fine — we wanted it stopped.
           logs.push(`    taskkill: ${String(err?.stderr || err?.message || err).trim().split('\n')[0]} (proceeding)`);
         }
         await sleep(2000);
@@ -3383,7 +3595,12 @@ export async function registerMcpServer(): Promise<McpServer> {
         if (!ready) {
           auditLog('load-company', args, 'error', Date.now() - start);
           return errorResult('TALLY_DOWN', {
-            message: 'Tally did not become reachable after restart. The MCP service may be in Session 0 (no desktop) — Tally will not show a window in that case. Run the service in the user session, or have a companion process in the user session start tally.exe.',
+            message: 'Tally was restarted but never answered on its data connection.',
+            remedy:
+              `The most likely cause on a new setup is that the connection is switched off — it is off by ` +
+              `default in a fresh Tally, and restarting does not turn it on. ${TALLY_CONNECTIVITY_STEPS} ` +
+              `(Engineering note: if this server runs as a Session 0 service, Tally has no desktop there and ` +
+              `will never show a window — the GUI agent must launch it in the user session.)`,
             logs: logs.join('\n'),
           });
         }
@@ -5381,7 +5598,12 @@ export async function registerMcpServer(): Promise<McpServer> {
         if (!ready) {
           auditLog('open-tally', args, 'error', Date.now() - start);
           return errorResult('TALLY_DOWN', {
-            message: 'Tally was launched but did not become reachable in time. If the service runs in Session 0, Tally won\'t show a window there — the GUI agent must launch it in the user session.',
+            message: 'Tally was launched but did not answer on its data connection in time.',
+            remedy:
+              `Tally may still be starting — wait a moment and retry. If it is now on screen, the connection ` +
+              `is probably switched off; it is off by default in a fresh Tally. ${TALLY_CONNECTIVITY_STEPS} ` +
+              `(Engineering note: under a Session 0 service Tally shows no window — the GUI agent must launch ` +
+              `it in the user session.)`,
             logs: logs.join('\n'),
           });
         }

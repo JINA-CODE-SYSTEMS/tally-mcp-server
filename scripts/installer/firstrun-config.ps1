@@ -173,9 +173,19 @@ $McpDomain      = _Coalesce $McpDomain      $_existingEnv['MCP_DOMAIN']       ''
 # by a DIFFERENT admin (the bare-InstallDir path omits -AgentTaskUser) does not silently re-point the
 # agent task + all the icacls grants to that admin - which would break the IPC ACL for the real user.
 $AgentTaskUser  = _Coalesce $AgentTaskUser  $_existingEnv['AGENT_TASK_USER']  $env:USERNAME
-# ENABLE_GUI_CONTROL is off by default (arbitrary keystroke injection + screenshots). Preserve the
-# existing value on a bare Reconfigure; normalize anything that isn't the literal 'true' to 'false'.
-$EnableGuiControl = _Coalesce $EnableGuiControl $_existingEnv['ENABLE_GUI_CONTROL'] 'false'
+# ENABLE_GUI_CONTROL is ON by default, matching the installer checkbox (tally-mcp.iss), which has
+# always defaulted it checked. This fallback only applies when NO value is passed and none is on
+# record - a bare Reconfigure of a pre-flag install, or a manual/dev run of this script. It used to
+# say 'false', which meant those paths silently disagreed with the wizard and shipped a server whose
+# GUI tools were absent.
+#
+# On by default because it is the SUPERVISED path: gui-screenshot + gui-send-keys are how Claude
+# looks at the Tally window before deciding each keystroke. Turning it off does not stop keystroke
+# injection - the company-loading tools still send keys - it only removes the ability to SEE, which
+# leaves a modal dialog on screen that nothing can then clear.
+#
+# An operator who deliberately set 'false' keeps it: $_existingEnv is consulted first.
+$EnableGuiControl = _Coalesce $EnableGuiControl $_existingEnv['ENABLE_GUI_CONTROL'] 'true'
 if ($EnableGuiControl -ne 'true') { $EnableGuiControl = 'false' }
 # Cloudflare Tunnel token: preserve across a bare Reconfigure (like MCP_DOMAIN). Blank = no tunnel,
 # and a previously-configured tunnel is torn down below. Trim so a stray-space value counts as blank.

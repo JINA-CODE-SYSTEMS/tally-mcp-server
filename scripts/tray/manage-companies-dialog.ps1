@@ -737,59 +737,123 @@ function Show-ManageCompaniesDialog {
     foreach ($col in $grid.Columns) { $col.SortMode = 'Automatic' }
     $grid.Columns['test'].SortMode = 'NotSortable'
     $grid.AutoSizeColumnsMode = 'Fill'
+
+    # DataGridView paints ungated by default, so every row added during a rebuild causes a visible
+    # repaint - the flicker and much of the lag while typing in the search box. DoubleBuffered is
+    # protected, so reflection is the only way to reach it from PowerShell. Best-effort: if the
+    # property is ever renamed the grid simply keeps its old painting behaviour.
+    try {
+        [System.Windows.Forms.DataGridView].GetProperty(
+            'DoubleBuffered', [System.Reflection.BindingFlags]'Instance,NonPublic'
+        ).SetValue($grid, $true, $null)
+    } catch { }
+
     $form.Controls.Add($grid)
 
     # In-session test status: alias -> 'ok' or 'fail'. Not persisted; reset
     # when the dialog reopens.
     $testStatusByAlias = @{}
 
-    # Renders the grid from the live registry file. Applies the current filter
-    # text (alias / displayName / notes substring match, case-insensitive) and
-    # preserves the user's sort column + selected alias across refreshes.
-    $refreshGrid = {
+    # One Font for the whole grid instead of one per row.
+    #
+    # The old code allocated a new System.Drawing.Font inside the row loop and never disposed it, so
+    # a 200-company registry re-rendered on every keystroke of a 12-character search term burned
+    # through thousands of GDI+ font handles. That is a real part of "it lags as we enter values".
+    $statusFont = New-Object System.Drawing.Font 'Segoe UI', 11, ([System.Drawing.FontStyle]::Bold)
+
+    # The parsed registry, held in a HASHTABLE rather than a plain variable, and that detail is
+    # load-bearing. GetNewClosure() snapshots the enclosing scope BY VALUE, so two closures that each
+    # captured a plain $registryCache would get two independent copies and one could never see the
+    # other's reload. A hashtable is a reference type: both closures capture the same object, so a
+    # write through $cache.Data is visible to all of them.
+    $cache = @{ Data = (& $fnRead -Path $RegistryPath) }
+
+    # Renders the grid FROM MEMORY. Applies the current filter text (alias / displayName / notes
+    # substring match, case-insensitive) and preserves the user's sort column + selected alias.
+    #
+    # Filtering is a view concern and must not touch the disk. It used to: every keystroke re-read
+    # and re-parsed the registry JSON synchronously on the UI thread, which is why typing felt like
+    # wading. Callers that CHANGE the registry use $refreshGrid below, which reloads first.
+    $renderGrid = {
         $selectedAliases = @($grid.SelectedRows | ForEach-Object { $_.Cells['alias'].Value })
         $sortCol   = $grid.SortedColumn
         $sortOrder = $grid.SortOrder
-        $grid.Rows.Clear()
-        $live = & $fnRead -Path $RegistryPath
-        $filter = $tbSearch.Text.Trim().ToLower()
-        $visibleCount = 0
-        foreach ($c in $live.companies) {
-            if ($filter) {
-                $hay = (("$($c.alias) $($c.displayName) $($c.notes)").ToLower())
-                if ($hay -notlike "*${filter}*") { continue }
+
+        # Fill mode recomputes every column width on every single row insert - quadratic in the row
+        # count, and the dominant cost once a registry passes a few dozen companies. Switch it off
+        # for the rebuild and restore it once, at the end.
+        $grid.SuspendLayout()
+        $grid.AutoSizeColumnsMode = 'None'
+        try {
+            $grid.Rows.Clear()
+            $live = $cache.Data
+            $filter = $tbSearch.Text.Trim().ToLower()
+            $visibleCount = 0
+            foreach ($c in $live.companies) {
+                if ($filter) {
+                    $hay = (("$($c.alias) $($c.displayName) $($c.notes)").ToLower())
+                    if ($hay -notlike "*${filter}*") { continue }
+                }
+                $hasPw = if ($c.passwordEnc) { 'Yes' } else { 'No' }
+                $last  = if ($c.lastLoadedAt) {
+                    try { ([datetime]$c.lastLoadedAt).ToLocalTime().ToString('yyyy-MM-dd HH:mm') } catch { [string]$c.lastLoadedAt }
+                } else { '' }
+                $statusKey = $testStatusByAlias[$c.alias]
+                $statusGlyph = switch ($statusKey) { 'ok' { '*' } 'fail' { 'X' } default { '' } }
+                $rowIdx = $grid.Rows.Add($statusGlyph, $c.alias, $c.folderId, $c.displayName, $hasPw, $last, $c.notes)
+                if ($statusKey -eq 'ok')   { $grid.Rows[$rowIdx].Cells['test'].Style.ForeColor = [System.Drawing.Color]::FromArgb(40, 140, 60) }
+                if ($statusKey -eq 'fail') { $grid.Rows[$rowIdx].Cells['test'].Style.ForeColor = [System.Drawing.Color]::FromArgb(190, 50, 50) }
+                $grid.Rows[$rowIdx].Cells['test'].Style.Font = $statusFont
+                $visibleCount++
             }
-            $hasPw = if ($c.passwordEnc) { 'Yes' } else { 'No' }
-            $last  = if ($c.lastLoadedAt) {
-                try { ([datetime]$c.lastLoadedAt).ToLocalTime().ToString('yyyy-MM-dd HH:mm') } catch { [string]$c.lastLoadedAt }
-            } else { '' }
-            $statusKey = $testStatusByAlias[$c.alias]
-            $statusGlyph = switch ($statusKey) { 'ok' { '*' } 'fail' { 'X' } default { '' } }
-            $rowIdx = $grid.Rows.Add($statusGlyph, $c.alias, $c.folderId, $c.displayName, $hasPw, $last, $c.notes)
-            if ($statusKey -eq 'ok')   { $grid.Rows[$rowIdx].Cells['test'].Style.ForeColor = [System.Drawing.Color]::FromArgb(40, 140, 60) }
-            if ($statusKey -eq 'fail') { $grid.Rows[$rowIdx].Cells['test'].Style.ForeColor = [System.Drawing.Color]::FromArgb(190, 50, 50) }
-            $grid.Rows[$rowIdx].Cells['test'].Style.Font = New-Object System.Drawing.Font 'Segoe UI', 11, ([System.Drawing.FontStyle]::Bold)
-            $visibleCount++
-        }
-        if ($selectedAliases.Count -gt 0) {
-            for ($i = 0; $i -lt $grid.Rows.Count; $i++) {
-                if ($selectedAliases -contains $grid.Rows[$i].Cells['alias'].Value) {
-                    $grid.Rows[$i].Selected = $true
+            if ($selectedAliases.Count -gt 0) {
+                for ($i = 0; $i -lt $grid.Rows.Count; $i++) {
+                    if ($selectedAliases -contains $grid.Rows[$i].Cells['alias'].Value) {
+                        $grid.Rows[$i].Selected = $true
+                    }
                 }
             }
+            if ($sortCol -and $sortOrder -ne 'None') {
+                $dir = if ($sortOrder -eq 'Ascending') { [System.ComponentModel.ListSortDirection]::Ascending } else { [System.ComponentModel.ListSortDirection]::Descending }
+                $grid.Sort($sortCol, $dir)
+            }
+            $n = $live.companies.Count
+            $countText = if ($n -eq 0) { 'No companies configured yet.' } elseif ($n -eq 1) { '1 company configured' } else { "$n companies configured" }
+            if ($filter -and $visibleCount -ne $n) { $countText += "  -  showing $visibleCount" }
+            $lblCount.Text = $countText
         }
-        if ($sortCol -and $sortOrder -ne 'None') {
-            $dir = if ($sortOrder -eq 'Ascending') { [System.ComponentModel.ListSortDirection]::Ascending } else { [System.ComponentModel.ListSortDirection]::Descending }
-            $grid.Sort($sortCol, $dir)
+        finally {
+            # One width computation and one repaint for the whole rebuild, on every exit path.
+            $grid.AutoSizeColumnsMode = 'Fill'
+            $grid.ResumeLayout()
         }
-        $n = $live.companies.Count
-        $countText = if ($n -eq 0) { 'No companies configured yet.' } elseif ($n -eq 1) { '1 company configured' } else { "$n companies configured" }
-        if ($filter -and $visibleCount -ne $n) { $countText += "  -  showing $visibleCount" }
-        $lblCount.Text = $countText
     }.GetNewClosure()
-    & $refreshGrid
 
-    $tbSearch.Add_TextChanged({ & $refreshGrid }.GetNewClosure())
+    # Reload-then-render. Every caller that MUTATES the registry (add, edit, delete, CSV import,
+    # discover) already called $refreshGrid, so they keep working unchanged and still see fresh data.
+    $refreshGrid = {
+        $cache.Data = & $fnRead -Path $RegistryPath
+        & $renderGrid
+    }.GetNewClosure()
+
+    & $renderGrid
+
+    # Typing renders from memory and is DEBOUNCED. Without the timer, a rebuild ran per keystroke and
+    # each one had to finish before the next character was painted, so the text box visibly trailed
+    # the user. 140ms is below the point where a filter feels delayed, and collapses a burst of
+    # typing into a single rebuild.
+    $searchDebounce = New-Object System.Windows.Forms.Timer
+    $searchDebounce.Interval = 140
+    $searchDebounce.Add_Tick({
+        $searchDebounce.Stop()
+        & $renderGrid
+    }.GetNewClosure())
+    $tbSearch.Add_TextChanged({
+        $searchDebounce.Stop()
+        $searchDebounce.Start()
+    }.GetNewClosure())
+    # A Forms.Timer holds an OS timer; without this it outlives the dialog.
+    $form.Add_FormClosed({ try { $searchDebounce.Stop(); $searchDebounce.Dispose() } catch { } }.GetNewClosure())
 
     # Thin divider between grid and buttons
     $divider = New-Object System.Windows.Forms.Panel
