@@ -109,6 +109,8 @@ $State = [hashtable]::Synchronized(@{
     AgentWasRunning  = $false  # for toast on agent crash
     ServiceWasRunning = $false # for toast on service stop
     DeploymentMode   = 'remote' # local | remote, from .env. Decides which rows MEAN anything.
+    LatestVersion    = ''      # newest published version, or '' if unknown/not checked
+    UpdateAvailable  = $false  # LatestVersion is newer than the one installed
     ClientConfigured = $null   # $true / $false / $null (not checked yet) - local mode only
 })
 
@@ -230,6 +232,158 @@ function Dispose-StatusIcon {
 # one (e.g. agent task lookup raising on a domain-joined box without RSAT)
 # never breaks the whole tray.
 # ---------------------------------------------------------------------------
+# --- Update notification --------------------------------------------------------------------------
+#
+# Installed copies had no way to learn that a newer release exists, so every update needed an email
+# to every customer. That is the whole reason this exists, and it deliberately stops at TELLING the
+# user: it downloads nothing and runs nothing.
+#
+# That boundary is what keeps it cheap and safe. An updater that fetches and executes code is a
+# remote code execution channel into every customer machine and needs a signed manifest, key custody
+# and a rotation policy before a line of it is written (#177). A notifier needs none of that - the
+# worst a hostile response can do is show a wrong version number, and the download link below is
+# HARDCODED rather than taken from the response, so it cannot redirect anyone anywhere.
+#
+# Honesty note: this is an outbound network call from a product sold on "nothing leaves your
+# machine". It sends no data beyond the HTTP request itself, it is skipped entirely when
+# UPDATE_CHECK=false in .env, and it runs at most once a day.
+$Script:ReleasesPageUrl = 'https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/releases/latest'
+$Script:ReleasesApiUrl  = 'https://api.github.com/repos/JINA-CODE-SYSTEMS/tally-mcp-server/releases/latest'
+$Script:UpdateCheck     = @{ Shell = $null; Handle = $null }
+
+# Where the last check is remembered, so restarting the tray does not re-hit the API. Under
+# LOCALAPPDATA because the install root is usually Program Files and not user-writable.
+function Get-UpdateStampPath {
+    $dir = Join-Path $env:LOCALAPPDATA 'Claudally'
+    if (-not (Test-Path -LiteralPath $dir)) {
+        try { New-Item -ItemType Directory -Path $dir -Force | Out-Null } catch { return $null }
+    }
+    return (Join-Path $dir 'update-check.json')
+}
+
+# -1 / 0 / 1, comparing dotted numeric versions. A prerelease suffix ("1.0.0-rc.1") is dropped
+# BEFORE comparison, so an rc never reads as newer than the release it precedes.
+function Compare-ProductVersion {
+    param([string]$A, [string]$B)
+    $norm = {
+        param($v)
+        $t = ([string]$v).Trim().TrimStart('v', 'V')
+        $dash = $t.IndexOf('-')
+        if ($dash -ge 0) { $t = $t.Substring(0, $dash) }
+        $parts = @($t -split '\.')
+        $nums = @()
+        foreach ($p in $parts) { if ($p -match '^\d+$') { $nums += [int]$p } else { $nums += 0 } }
+        while ($nums.Count -lt 3) { $nums += 0 }
+        return $nums
+    }
+    $x = & $norm $A
+    $y = & $norm $B
+    for ($i = 0; $i -lt 3; $i++) {
+        if ($x[$i] -gt $y[$i]) { return 1 }
+        if ($x[$i] -lt $y[$i]) { return -1 }
+    }
+    return 0
+}
+
+# The installed version, read rather than asserted (the dashboard header learned this lesson
+# already: it once claimed a version that had never existed).
+function Get-InstalledVersion {
+    try {
+        $pkg = Join-Path $InstallDir 'package.json'
+        if (Test-Path -LiteralPath $pkg) {
+            return [string](Get-Content -LiteralPath $pkg -Raw | ConvertFrom-Json).version
+        }
+    } catch { }
+    return ''
+}
+
+function Test-UpdateCheckEnabled {
+    # Opt-OUT. Default on, because the alternative is the position this replaces: an install base
+    # that can only be reached by email.
+    try { return ((Read-EnvValue -EnvPath (Join-Path $InstallDir '.env') -Key 'UPDATE_CHECK') -ne 'false') }
+    catch { return $true }
+}
+
+# Fires the HTTP call on a background runspace. It MUST NOT run on the UI thread: the status poll
+# ticks every few seconds on that thread, and a request to a host that blackholes packets would
+# freeze the tray for the whole timeout.
+function Start-UpdateCheck {
+    if ($Script:UpdateCheck.Handle) { return }        # one in flight is enough
+    if (-not (Test-UpdateCheckEnabled)) { return }
+
+    $stamp = Get-UpdateStampPath
+    if ($stamp -and (Test-Path -LiteralPath $stamp)) {
+        try {
+            $prev = Get-Content -LiteralPath $stamp -Raw | ConvertFrom-Json
+            # Serve the remembered answer and skip the call entirely inside the 24h window.
+            if ($prev.checkedAt -and ((Get-Date) - [datetime]$prev.checkedAt).TotalHours -lt 24) {
+                if ($prev.latest) { Set-UpdateState -Latest ([string]$prev.latest) }
+                return
+            }
+        } catch { }
+    }
+
+    try {
+        $ps = [PowerShell]::Create()
+        [void]$ps.AddScript({
+            param($url, $timeoutSec)
+            try {
+                # Some Windows builds still default to TLS 1.0, which api.github.com refuses.
+                [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+                $r = Invoke-RestMethod -Uri $url -TimeoutSec $timeoutSec -ErrorAction Stop `
+                        -Headers @{ 'User-Agent' = 'Claudally-Tray'; 'Accept' = 'application/vnd.github+json' }
+                return [string]$r.tag_name
+            } catch {
+                # Offline, rate-limited, proxied, blocked. All the same answer: say nothing.
+                return ''
+            }
+        }).AddArgument($Script:ReleasesApiUrl).AddArgument($ProbeTimeoutSec + 7)
+        $Script:UpdateCheck.Shell  = $ps
+        $Script:UpdateCheck.Handle = $ps.BeginInvoke()
+    } catch {
+        $Script:UpdateCheck.Shell = $null; $Script:UpdateCheck.Handle = $null
+    }
+}
+
+function Set-UpdateState {
+    param([string]$Latest)
+    if (-not $Latest) { return }
+    $installed = Get-InstalledVersion
+    $State.LatestVersion = $Latest.TrimStart('v', 'V')
+    if ($installed) {
+        $State.UpdateAvailable = ((Compare-ProductVersion -A $Latest -B $installed) -gt 0)
+    }
+}
+
+# Collected from the normal status tick. IsCompleted is a non-blocking check, so this costs nothing
+# on the ticks where the answer is not back yet.
+function Complete-UpdateCheck {
+    if (-not $Script:UpdateCheck.Handle) { return }
+    if (-not $Script:UpdateCheck.Handle.IsCompleted) { return }
+    $tag = ''
+    try {
+        $out = $Script:UpdateCheck.Shell.EndInvoke($Script:UpdateCheck.Handle)
+        if ($out) { $tag = [string]($out | Where-Object { $_ } | Select-Object -Last 1) }
+    } catch { }
+    finally {
+        try { $Script:UpdateCheck.Shell.Dispose() } catch { }
+        $Script:UpdateCheck.Shell = $null
+        $Script:UpdateCheck.Handle = $null
+    }
+    if ($tag) {
+        Set-UpdateState -Latest $tag
+        # Only a SUCCESSFUL check is stamped. Stamping a failure would silence checks for 24h every
+        # time the machine happened to be offline when the tray started - which is most laptops.
+        try {
+            $stamp = Get-UpdateStampPath
+            if ($stamp) {
+                @{ checkedAt = (Get-Date).ToString('o'); latest = $tag } |
+                    ConvertTo-Json -Compress | Set-Content -LiteralPath $stamp -Encoding UTF8
+            }
+        } catch { }
+    }
+}
+
 function Invoke-StatusPoll {
     $State.LastPoll = Get-Date
     $State.LastError = $null
@@ -487,6 +641,19 @@ Either:
 })
 $miUrlState = $menu.Items.Add('  Public URL: -')
 $miUrlState.Enabled = $false
+
+# Shown ONLY when there is actually a newer release (see Update-TrayUi). A permanently visible
+# "you are up to date" row is noise; a row that appears is information.
+$miUpdate = $menu.Items.Add('Update available')
+$miUpdate.Visible = $false
+$miUpdate.Font = New-Object System.Drawing.Font($menu.Font, [System.Drawing.FontStyle]::Bold)
+$miUpdate.Add_Click({
+    try {
+        # The URL is a constant in this script, never a value taken from the API response, so a
+        # hostile or spoofed response cannot send anyone to a download of its choosing.
+        Start-Process $Script:ReleasesPageUrl | Out-Null
+    } catch { }
+})
 
 [void]$menu.Items.Add('-')
 
@@ -1281,6 +1448,13 @@ function Update-TrayUi {
         $miAgentState.Text = "  Agent:    task not registered"
     }
 
+    if ($State.UpdateAvailable -and $State.LatestVersion) {
+        $miUpdate.Text = "Update available: $($State.LatestVersion)  -  click to download"
+        $miUpdate.Visible = $true
+    } else {
+        $miUpdate.Visible = $false
+    }
+
     if ($State.TallyProcess) {
         $cmp = if ($State.LoadedCompany) { " - $($State.LoadedCompany)" } else { '' }
         $many = if ($State.TallyCount -gt 1) { " ($($State.TallyCount) copies open)" } else { '' }
@@ -1317,6 +1491,7 @@ $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = [Math]::Max(1000, $PollIntervalSec * 1000)
 $timer.Add_Tick({
     Invoke-StatusPoll
+    Complete-UpdateCheck
     Update-TrayUi
     Update-DashboardUi
 })
@@ -1337,6 +1512,16 @@ $showDashTimer.Add_Tick({
     try { if ($script:ShowDashboardSignal.WaitOne(0)) { Show-Dashboard } } catch {}
 })
 $showDashTimer.Start()
+
+# One-shot, 20s after launch. Late enough that the tray is already usable and a laptop resuming from
+# sleep has probably found its network; the 24h stamp then keeps it to roughly once a day.
+$updateTimer = New-Object System.Windows.Forms.Timer
+$updateTimer.Interval = 20000
+$updateTimer.Add_Tick({
+    $updateTimer.Stop()
+    try { Start-UpdateCheck } catch { }
+}.GetNewClosure())
+$updateTimer.Start()
 
 # Launched via the Open Dashboard shortcut while no tray was running yet -> THIS process is now the
 # singleton tray, so open the dashboard immediately. (When a tray is already running, that launch
