@@ -554,7 +554,10 @@ begin
         'reopens. If you have not installed Claude Desktop yet, install it and then run ' +
         '"Connect Claude to Tally" from the Start Menu.' + #13#10 + #13#10 +
         'The tray icon near the clock tells you if either step is still outstanding. Nothing is ' +
-        'listening on the network and no password was created.'
+        'listening on the network and no password was created.' + #13#10 + #13#10 +
+        'Once a day the tray asks GitHub whether a newer version exists, and tells you if so. It ' +
+        'downloads nothing - installing is always your decision. Turn it off by setting ' +
+        'UPDATE_CHECK=false in the .env file in the install folder.'
     else
       WizardForm.FinishedLabel.Caption :=
         'Claudally is installed and running as a Windows service. One thing left:' + #13#10 + #13#10 +

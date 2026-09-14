@@ -187,6 +187,11 @@ $AgentTaskUser  = _Coalesce $AgentTaskUser  $_existingEnv['AGENT_TASK_USER']  $e
 # An operator who deliberately set 'false' keeps it: $_existingEnv is consulted first.
 $EnableGuiControl = _Coalesce $EnableGuiControl $_existingEnv['ENABLE_GUI_CONTROL'] 'true'
 if ($EnableGuiControl -ne 'true') { $EnableGuiControl = 'false' }
+# Update notification. Opt-OUT: an install that cannot learn a newer release exists can only be
+# reached by emailing its owner, which is the position this replaces. Preserved across a
+# Reconfigure, so an operator who turned it off keeps it off.
+$UpdateCheck = _Coalesce $_existingEnv['UPDATE_CHECK'] 'true'
+if ($UpdateCheck -ne 'false') { $UpdateCheck = 'true' }
 # Cloudflare Tunnel token: preserve across a bare Reconfigure (like MCP_DOMAIN). Blank = no tunnel,
 # and a previously-configured tunnel is torn down below. Trim so a stray-space value counts as blank.
 $TunnelToken = ("$(_Coalesce $TunnelToken $_existingEnv['TUNNEL_TOKEN'] '')").Trim()
@@ -437,8 +442,13 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         # Persisted so a later Reconfigure preserves the agent user instead of falling back to
         # whoever runs the wizard (see the _Coalesce for $AgentTaskUser above).
         "AGENT_TASK_USER=$(_envQuote $AgentTaskUser)"
-        # Claude-driven GUI control (gui-screenshot / gui-send-keys). Off unless the operator opted in.
+        # Claude-driven GUI control (gui-screenshot / gui-send-keys). On unless the operator opted out.
         "ENABLE_GUI_CONTROL=$EnableGuiControl"
+        # Update notification. The tray checks once a day whether a newer release exists and, if so,
+        # says so. It downloads and runs NOTHING - that is a separate, signed channel (#177). Written
+        # explicitly rather than left to a default so the key is visible to anyone auditing .env, and
+        # so turning it off is a one-word edit.
+        "UPDATE_CHECK=$UpdateCheck"
         # Deployment mode (#172). 'local' means no service, no listening port and no OAuth password;
         # 'remote' is the pre-existing behaviour and stays the fallback for any install that predates
         # this key. REMOTE_AUTH and REMOTE_TRANSPORT are consumed by #178 and are written now so the
