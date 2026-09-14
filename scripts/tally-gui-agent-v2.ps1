@@ -1,16 +1,22 @@
-# MCP Tally GUI Agent v2 - LLM-Guided (Computer Use style)
-# Takes screenshots of the Tally window, sends to an LLM for analysis,
-# executes the LLM's recommended action, and loops until the goal is achieved.
+# MCP Tally GUI Agent v2 - eyes and hands for the Tally window.
+#
+# This agent does NOT decide anything. It captures the Tally window on request and injects the
+# keystrokes it is told to inject. The decisions are made by the MCP client (Claude), which sees
+# each screenshot and chooses the next single step: look -> one step -> look again.
+#
+# It used to carry its own vision loop - screenshot, ask gpt-4o/Claude over HTTP for the next
+# action, repeat - which meant a second, weaker model with its own API key was driving the GUI
+# while the Claude session that requested the work sat idle. That loop is gone, and with it the
+# ANTHROPIC_API_KEY / OPENAI_API_KEY requirement: this agent now needs no credentials at all.
 #
 # RUN: In the interactive desktop session where Tally is visible
 #   powershell -ExecutionPolicy Bypass -File tally-gui-agent-v2.ps1
 #
-# REQUIRES: ANTHROPIC_API_KEY or OPENAI_API_KEY in environment (optional - only for LLM-guided actions)
+# In local (same-machine) deployments the MCP server already runs in that session and invokes this
+# script directly with -Once, so there is no long-running agent and no file IPC.
 
 param(
     [string]$WatchDir = $null,
-    [string]$LLMProvider = $null,   # "anthropic" or "openai" (auto-detected from available API key)
-    [int]$MaxSteps = 15,            # Safety limit per command
     [switch]$NoSelfRestart,         # Disable self-watching auto-restart (for debugging)
     [switch]$ShowConsole,           # Keep the console window visible (debugging); hidden by default
     # One-shot mode: read a single command as JSON on stdin, execute it, print the result as JSON on
@@ -45,7 +51,7 @@ if (-not $ShowConsole) {
 # against an agent older than its required minimum (issue #15 - version handshake).
 # Format: MAJOR.MINOR.PATCH. Bump MINOR on any new IPC action or response field;
 # bump PATCH on internal fixes that callers can ignore.
-$Script:AgentVersion = "1.6.3"
+$Script:AgentVersion = "1.8.0"
 
 # --- Single-instance guard ---------------------------------------------------------------------
 # Only ONE *watch-mode* agent may run. Multiple watchers race on the command/result files and each
@@ -79,24 +85,6 @@ if (-not $WatchDir) {
 $CommandFile = Join-Path $WatchDir "_mcp_gui_command.json"
 $ResultFile  = Join-Path $WatchDir "_mcp_gui_result.json"
 
-# --- Detect LLM provider (optional) ---
-# Deterministic actions (ping, start-tally, exit) work without any LLM key.
-# Only LLM-guided actions (select-company, load-on-startup) require a key - those error at dispatch time
-# if the key is missing, instead of refusing to start the agent.
-if (-not $LLMProvider) {
-    if ($env:ANTHROPIC_API_KEY) { $LLMProvider = "anthropic" }
-    elseif ($env:OPENAI_API_KEY) { $LLMProvider = "openai" }
-    else { $LLMProvider = "none" }
-}
-Write-Host "LLM Provider: $LLMProvider$(if ($LLMProvider -eq 'none') { ' (LLM-guided actions disabled - set ANTHROPIC_API_KEY or OPENAI_API_KEY to enable)' })"
-
-# --- Configurable LLM settings (override via environment variables) ---
-$ClaudeModel   = if ($env:CLAUDE_MODEL)        { $env:CLAUDE_MODEL }        else { "claude-sonnet-4-20250514" }
-$OpenAIModel   = if ($env:OPENAI_MODEL)        { $env:OPENAI_MODEL }        else { "gpt-4o" }
-$LLMMaxTokens  = if ($env:LLM_MAX_TOKENS)      { [int]$env:LLM_MAX_TOKENS } else { 300 }
-$LLMTimeoutSec = if ($env:LLM_TIMEOUT_SEC)     { [int]$env:LLM_TIMEOUT_SEC } else { 30 }
-$AnthropicVer  = if ($env:ANTHROPIC_API_VERSION){ $env:ANTHROPIC_API_VERSION } else { "2023-06-01" }
-
 # --- Load precompiled Win32 interop DLL (avoids AMSI/Defender false positives from inline Add-Type) ---
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $dllPath = Join-Path $scriptDir "TallyUI.dll"
@@ -107,12 +95,83 @@ if (-not (Test-Path $dllPath)) {
 }
 Add-Type -Path $dllPath
 
-function Find-TallyWindow {
-    $proc = Get-Process -Name "tally" -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($proc -and $proc.MainWindowHandle -ne [IntPtr]::Zero) {
-        return $proc.MainWindowHandle
+# --- Which Tally? --------------------------------------------------------------------------------
+# A machine can run several Tally instances at once (an old Prime kept open for a closed financial
+# year alongside the current one). Only ONE of them owns the XML port, and that is the instance the
+# MCP server reads every ledger and voucher from. So it is the only instance we may keystroke into.
+#
+# This used to be "Get-Process -Name tally | Select-Object -First 1" - whichever one Windows
+# enumerated first. When that disagreed with the port owner, Claude read one company's books and
+# typed into another company's window, with nothing anywhere reporting an error. That is the
+# "erratic on multi-version machines" behaviour.
+#
+# When the instance cannot be identified we return nothing and say why. Guessing is worse than
+# failing: these keystrokes land in whatever screen the wrong Tally happens to have open.
+$Script:TallyResolveReason = ''
+
+function Resolve-TallyProcess {
+    $Script:TallyResolveReason = ''
+    $port = if ($env:TALLY_PORT) { [int]$env:TALLY_PORT } else { 9000 }
+
+    # 1. Who owns the XML port? That is the authoritative answer.
+    $ownerPid = 0
+    try {
+        $conn = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction Stop | Select-Object -First 1
+        if ($conn) { $ownerPid = [int]$conn.OwningProcess }
+    } catch {
+        # Get-NetTCPConnection is missing on older hosts, and throws when nothing matches. Parse
+        # netstat instead rather than falling straight through to the guess.
+        try {
+            foreach ($line in (netstat -ano -p TCP)) {
+                if ($line -match '^\s*TCP\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)\s*$') {
+                    $localAddr = $Matches[1]
+                    $foreign   = $Matches[2]
+                    $linePid   = [int]$Matches[4]
+                    $idx = $localAddr.LastIndexOf(':')
+                    if ($idx -lt 0) { continue }
+                    $localPort = $localAddr.Substring($idx + 1)
+                    if ($localPort -notmatch '^\d+$') { continue }
+                    if ([int]$localPort -ne $port) { continue }
+                    if ($foreign -match ':0$') { $ownerPid = $linePid; break }
+                }
+            }
+        } catch { }
     }
+
+    if ($ownerPid -gt 0) {
+        $owner = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+        if ($owner -and $owner.ProcessName -like 'tally*') { return $owner }
+        if ($owner) {
+            $Script:TallyResolveReason = "Port $port is held by $($owner.ProcessName) (pid $ownerPid), which is not Tally."
+            return $null
+        }
+    }
+
+    # 2. No port owner. Safe only when the answer is unambiguous.
+    $all = @(Get-Process -Name 'tally' -ErrorAction SilentlyContinue)
+    if ($all.Count -eq 1) { return $all[0] }
+    if ($all.Count -eq 0) {
+        $Script:TallyResolveReason = 'Tally is not running.'
+        return $null
+    }
+    $pidList = ($all | ForEach-Object { $_.Id }) -join ', '
+    $Script:TallyResolveReason = "$($all.Count) Tally instances are running (pids $pidList) and none is serving port $port, so there is no way to tell which one you mean. In the instance you want this to drive, press F1 > Settings > Connectivity > Client/Server Configuration and set 'TallyPrime acts as' = Server, Port = $port. Or close the instances you are not using."
+    return $null
+}
+
+function Find-TallyWindow {
+    $proc = Resolve-TallyProcess
+    if ($null -eq $proc) { return [IntPtr]::Zero }
+    if ($proc.MainWindowHandle -ne [IntPtr]::Zero) { return $proc.MainWindowHandle }
+    $Script:TallyResolveReason = "Tally (pid $($proc.Id)) is running but has no main window yet - it may still be starting, or be minimised to the tray."
     return [IntPtr]::Zero
+}
+
+# Message for a failed resolve. Never blank: a bare "Tally window not found" sent a user hunting a
+# closed Tally when the real problem was two open ones.
+function Get-TallyResolveMessage {
+    if ($Script:TallyResolveReason) { return $Script:TallyResolveReason }
+    return 'Tally window not found - is Tally running?'
 }
 
 function Get-Screenshot {
@@ -130,165 +189,6 @@ function Get-Screenshot {
     } catch {
         Write-Host "  Screenshot error: $_"
         return $null
-    }
-}
-
-function Invoke-LLM {
-    param([string]$ScreenshotPath, [string]$Goal, [string]$PreviousActions)
-
-    $imageBytes = [System.IO.File]::ReadAllBytes($ScreenshotPath)
-    $base64Image = [Convert]::ToBase64String($imageBytes)
-
-    $systemPrompt = @"
-You are a GUI automation agent controlling Tally Prime accounting software on Windows.
-You can see a screenshot of the Tally window and must decide the SINGLE next action to take.
-
-TALLY PRIME KEYBOARD SHORTCUTS:
-- Alt+F3: Company Info menu (Select/Shut/Create/Alter company)
-- F1: Select/open items in lists
-- Enter: Confirm/select
-- Escape: Go back/cancel
-- Alt+F1: Detailed view
-- Alt+F2: Change period
-- Ctrl+A: Alter
-- Arrow keys: Navigate lists
-
-IMPORTANT RULES:
-- Return EXACTLY ONE action per response
-- If the goal appears achieved (company is loaded, shown in title bar or Gateway), return {"action":"done","reason":"..."}
-- If stuck after multiple attempts, return {"action":"fail","reason":"..."}
-- Be precise with text - company names are case-sensitive in Tally
-
-RESPOND WITH ONLY A JSON OBJECT, no other text:
-{"action":"<action_type>","value":"<value>","reason":"<brief explanation>"}
-
-Action types:
-- "key": Press a key. value = "enter"|"escape"|"tab"|"backspace"|"up"|"down"|"left"|"right"|"f1".."f5"|"f10"|"f12"|any single letter a-z (menu hotkeys, y/n confirms)|any digit 0-9
-- "combo": Key combo. value = modifier (alt|ctrl|shift) + one of f1-f5/f10 or any letter a-z or digit 0-9, e.g. "alt+f3"|"alt+d" (delete voucher)|"alt+x" (cancel)|"ctrl+a"
-- "type": Type text. value = the text to type
-- "wait": Wait and take another screenshot. value = milliseconds (e.g. "2000")
-- "done": Goal achieved.
-- "fail": Cannot achieve goal.
-"@
-
-    $userMessage = "GOAL: $Goal`n`nPREVIOUS ACTIONS TAKEN:`n$PreviousActions`n`nLook at the screenshot and decide the next single action."
-
-    if ($LLMProvider -eq "anthropic") {
-        return Invoke-Claude -SystemPrompt $systemPrompt -UserMessage $userMessage -Base64Image $base64Image
-    } else {
-        return Invoke-OpenAI -SystemPrompt $systemPrompt -UserMessage $userMessage -Base64Image $base64Image
-    }
-}
-
-function Invoke-Claude {
-    param([string]$SystemPrompt, [string]$UserMessage, [string]$Base64Image)
-
-    $body = @{
-        model = $ClaudeModel
-        max_tokens = $LLMMaxTokens
-        system = $SystemPrompt
-        messages = @(
-            @{
-                role = "user"
-                content = @(
-                    @{
-                        type = "image"
-                        source = @{
-                            type = "base64"
-                            media_type = "image/png"
-                            data = $Base64Image
-                        }
-                    },
-                    @{
-                        type = "text"
-                        text = $UserMessage
-                    }
-                )
-            }
-        )
-    } | ConvertTo-Json -Depth 10
-
-    $headers = @{
-        "x-api-key" = $env:ANTHROPIC_API_KEY
-        "anthropic-version" = $AnthropicVer
-        "content-type" = "application/json"
-    }
-
-    try {
-        $response = Invoke-RestMethod -Uri "https://api.anthropic.com/v1/messages" -Method POST -Headers $headers -Body $body -TimeoutSec $LLMTimeoutSec
-        $text = $response.content[0].text
-        Write-Host "  LLM response: $text"
-        return Convert-LLMTextToAction -Text $text
-    } catch {
-        Write-Host "  Claude API error: $_"
-        return @{ action = "fail"; reason = "API error: $_" }
-    }
-}
-
-function Convert-LLMTextToAction {
-    param([string]$Text)
-
-    if ([string]::IsNullOrWhiteSpace($Text)) {
-        return @{ action = "fail"; reason = "Empty LLM response" }
-    }
-
-    $trimmed = $Text.Trim()
-
-    # Strip fenced code blocks if present.
-    if ($trimmed.StartsWith('```')) {
-        $trimmed = $trimmed -replace '^```(?:json)?\s*', ''
-        $trimmed = $trimmed -replace '\s*```$', ''
-        $trimmed = $trimmed.Trim()
-    }
-
-    # Extract first JSON object from verbose replies.
-    $firstBrace = $trimmed.IndexOf('{')
-    $lastBrace = $trimmed.LastIndexOf('}')
-    if ($firstBrace -ge 0 -and $lastBrace -gt $firstBrace) {
-        $trimmed = $trimmed.Substring($firstBrace, $lastBrace - $firstBrace + 1)
-    }
-
-    try {
-        return $trimmed | ConvertFrom-Json
-    } catch {
-        return @{ action = "fail"; reason = "Unparseable LLM JSON response" }
-    }
-}
-
-function Invoke-OpenAI {
-    param([string]$SystemPrompt, [string]$UserMessage, [string]$Base64Image)
-
-    $body = @{
-        model = $OpenAIModel
-        max_tokens = $LLMMaxTokens
-        messages = @(
-            @{ role = "system"; content = $SystemPrompt },
-            @{
-                role = "user"
-                content = @(
-                    @{
-                        type = "image_url"
-                        image_url = @{ url = "data:image/png;base64,$Base64Image" }
-                    },
-                    @{ type = "text"; text = $UserMessage }
-                )
-            }
-        )
-    } | ConvertTo-Json -Depth 10
-
-    $headers = @{
-        "Authorization" = "Bearer $($env:OPENAI_API_KEY)"
-        "Content-Type" = "application/json"
-    }
-
-    try {
-        $response = Invoke-RestMethod -Uri "https://api.openai.com/v1/chat/completions" -Method POST -Headers $headers -Body $body -TimeoutSec $LLMTimeoutSec
-        $text = $response.choices[0].message.content
-        Write-Host "  LLM response: $text"
-        return Convert-LLMTextToAction -Text $text
-    } catch {
-        Write-Host "  OpenAI API error: $_"
-        return @{ action = "fail"; reason = "API error: $_" }
     }
 }
 
@@ -348,7 +248,7 @@ function Execute-Action {
             }
         }
         "type" {
-            # Log the length only, NEVER the text itself - a caller (gui-send-keys / the LLM loop) may
+            # Log the length only, NEVER the text itself - a caller (gui-send-keys) may
             # route a password through here, and Write-Host lands in the agent's console/transcript.
             Write-Host "  Action: Type ($($Action.value.Length) chars)"
             # PREFER clipboard paste: char-by-char keybd_event double-registers/drops on Tally's UI
@@ -414,9 +314,9 @@ function Write-Result {
 }
 
 # --- Ground-truth load verification -----------------------------------------------------------------
-# The keystroke-driven load flows (deterministic select-and-unlock, and the LLM "done" path) are
+# The keystroke-driven load flows (deterministic select-and-unlock, and Claude-driven sendkeys) are
 # open-loop: they blast keys and used to report success without ever confirming Tally accepted them.
-# A wrong/rejected password, an unfocused list, or a premature LLM "done" would still be reported as
+# A wrong/rejected password, an unfocused list, or a premature "looks done" would still be reported as
 # success. These helpers close the loop by asking Tally itself what is loaded.
 
 # Query Tally's in-process XML server for the companies currently loaded in memory. Mirrors the probe
@@ -443,14 +343,14 @@ function Get-LoadedCompanyNames {
 
 # Verify a company actually loaded, THEN write the appropriate result - never report a blind success.
 # $Requested is the caller's identifier for the target: a folder id (select-and-unlock) or a company
-# name (LLM path). Matching is deliberately loose because a folder id rarely equals the display name.
+# name. Matching is deliberately loose because a folder id rarely equals the display name.
 # Never echoes credentials - messages only ever contain the requested id and the loaded company names.
 function Write-VerifiedLoadResult {
     param(
         [string]$Requested,
         [string]$Strategy,
         [string]$CommandId = "",
-        [string]$Context = ""     # short, non-secret suffix e.g. " with credentials" or " (LLM: ...)"
+        [string]$Context = ""     # short, non-secret suffix e.g. " with credentials"
     )
 
     $probe     = Get-LoadedCompanyNames
@@ -525,8 +425,6 @@ function Restart-Self {
     # so the new process picks up its own mtime and watches from there.
     $argList = @('-ExecutionPolicy', 'Bypass', '-NoProfile', '-File', $Script:AgentScriptPath)
     if ($WatchDir)    { $argList += @('-WatchDir',    $WatchDir) }
-    if ($LLMProvider) { $argList += @('-LLMProvider', $LLMProvider) }
-    if ($MaxSteps)    { $argList += @('-MaxSteps',    [string]$MaxSteps) }
     try {
         Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -WindowStyle Normal | Out-Null
     } catch {
@@ -536,119 +434,15 @@ function Restart-Self {
     exit 0
 }
 
-function Invoke-LLMGuidedAction {
-    param([string]$CompanyName, [string]$Action, [string]$CommandId = "", [int]$MaxStepsOverride = 0)
-
-    $hwnd = Find-TallyWindow
-    if ($hwnd -eq [IntPtr]::Zero) {
-        Write-Result -Status "error" -Message "Tally window not found. Is Tally running?" -Strategy "llm-gui" -CommandId $CommandId
-        return
-    }
-
-    # Focus Tally
-    [TallyUI2]::ForceForeground($hwnd)
-    Start-Sleep -Milliseconds 500
-
-    $goal = if ($Action -eq "select-company") {
-        "Open/load the company named '$CompanyName' in Tally Prime. Navigate to Company Info (Alt+F3), select the company, and load it. The goal is achieved when the company name appears in the Tally title bar or Gateway screen."
-    } elseif ($Action -eq "load-on-startup") {
-        "Tally just started and is showing the Select Company screen. Load the company named '$CompanyName'. Type the name to filter, then select it."
-    } else {
-        "Perform action: $Action for company '$CompanyName'"
-    }
-
-    $actionHistory = ""
-    $stepCount = 0
-    $effectiveMaxSteps = if ($MaxStepsOverride -gt 0) { $MaxStepsOverride } else { $MaxSteps }
-    $typedSearchFallbackUsed = $false
-    $consecutiveNavActions = 0
-
-    Write-Host "  Goal: $goal"
-    Write-Host "  Starting LLM-guided loop (max $effectiveMaxSteps steps)..."
-
-    for ($step = 0; $step -lt $effectiveMaxSteps; $step++) {
-        $stepCount++
-        Write-Host "`n  --- Step $stepCount ---"
-
-        # Ensure focus
-        [TallyUI2]::ForceForeground($hwnd)
-        Start-Sleep -Milliseconds 300
-
-        # Take screenshot
-        $screenshotPath = Get-Screenshot -Hwnd $hwnd
-        if (-not $screenshotPath) {
-            Write-Host "  Failed to capture screenshot"
-            Start-Sleep -Seconds 1
-            continue
-        }
-
-        # Ask LLM what to do
-        $llmAction = Invoke-LLM -ScreenshotPath $screenshotPath -Goal $goal -PreviousActions $actionHistory
-
-        if ($null -eq $llmAction -or $null -eq $llmAction.action) {
-            Write-Host "  LLM returned invalid response, retrying..."
-            $actionHistory += "Step ${stepCount}: (invalid response, retried)`n"
-            continue
-        }
-
-        # Check if done or failed
-        if ($llmAction.action -eq "done") {
-            Write-Host "  LLM says DONE: $($llmAction.reason)"
-            # The model saying "done" is a claim, not proof - a hallucinated or premature "done" would
-            # otherwise surface as a false success. Confirm against Tally's loaded-company list before
-            # reporting success; the verifier downgrades to error/unverified if nothing (or the wrong
-            # thing) is actually loaded.
-            Write-VerifiedLoadResult -Requested $CompanyName -Strategy "llm-gui" -CommandId $CommandId -Context " (LLM: $($llmAction.reason))"
-            return
-        }
-        if ($llmAction.action -eq "fail") {
-            Write-Host "  LLM says FAIL: $($llmAction.reason)"
-            Write-Result -Status "error" -Message "LLM could not achieve goal: $($llmAction.reason)" -Strategy "llm-gui" -CommandId $CommandId
-            return
-        }
-
-        # Execute the action
-        $actionDesc = "$($llmAction.action): $($llmAction.value) ($($llmAction.reason))"
-        $actionHistory += "Step ${stepCount}: $actionDesc`n"
-        Execute-Action -Action $llmAction
-
-        $keyValue = if ($llmAction.value) { [string]$llmAction.value } else { "" }
-        if ($llmAction.action -eq "key" -and ($keyValue.ToLower() -in @("down", "up", "enter"))) {
-            $consecutiveNavActions++
-        } else {
-            $consecutiveNavActions = 0
-        }
-
-        if (-not $typedSearchFallbackUsed -and $Action -eq "select-company" -and -not [string]::IsNullOrWhiteSpace($CompanyName) -and $consecutiveNavActions -ge 4) {
-            Write-Host "  Fallback: trying direct company name search by typing '$CompanyName'"
-            [TallyUI2]::PressCombo([TallyUI2]::VK_MENU, [TallyUI2]::VK_F3)
-            Start-Sleep -Milliseconds 600
-            [TallyUI2]::PressKey([TallyUI2]::VK_F1)
-            Start-Sleep -Milliseconds 600
-            [TallyUI2]::TypeString($CompanyName)
-            Start-Sleep -Milliseconds 400
-            [TallyUI2]::PressKey([TallyUI2]::VK_RETURN)
-            Start-Sleep -Milliseconds 700
-            $typedSearchFallbackUsed = $true
-            $consecutiveNavActions = 0
-            $actionHistory += "Fallback: typed company name search executed`n"
-        }
-    }
-
-    Write-Result -Status "error" -Message "Reached max steps ($effectiveMaxSteps) without achieving goal" -Strategy "llm-gui" -CommandId $CommandId
-}
-
 # --- Main watch loop ---
 # The startup banner is for the watch-mode console. In one-shot mode the caller parses our stdout,
 # so keep it quiet - and skip the overlay runspace below, which costs an STA thread and a WinForms
 # load that a single short-lived command has no use for.
 if (-not $Once) {
-    Write-Host "=== MCP Tally GUI Agent v2 (LLM-Guided) ==="
+    Write-Host "=== MCP Tally GUI Agent v2 (eyes and hands; Claude decides) ==="
     Write-Host "Version:  $Script:AgentVersion"
     Write-Host "Watching: $CommandFile"
     Write-Host "Results:  $ResultFile"
-    Write-Host "Provider: $LLMProvider"
-    Write-Host "Max steps per command: $MaxSteps"
     Write-Host "Self-restart on script change: $(-not $NoSelfRestart)"
     Write-Host "Agent started. Polling every 500ms for commands..."
 }
@@ -806,42 +600,26 @@ function Hide-ClaudeOverlay { if ($Script:OverlayState) { try { $Script:OverlayS
 function Invoke-AgentCommand {
     param([Parameter(Mandatory = $true)] $Cmd)
 
-    # The switch body below was written against $cmd, $cmdId and $cmdMaxSteps.
+    # The switch body below was written against $cmd and $cmdId.
     $cmd = $Cmd
     $cmdId = if ($cmd.commandId) { [string]$cmd.commandId } else { "" }
-    $cmdMaxSteps = if ($cmd.maxSteps) { [int]$cmd.maxSteps } else { 0 }
 
         Write-Host "`n=== Received command: $($cmd.action) ==="
 
         # Show the "Claude is controlling Tally" frame for GUI-driving commands (screenshot/ping
         # excluded - screenshot must be clean, ping is passive). Auto-hides ~6s after the last action.
-        if (@('select-company','load-on-startup','sendkeys','select-and-unlock-company','switch-company','start-tally') -contains ([string]$cmd.action)) {
+        if (@('sendkeys','select-and-unlock-company','switch-company','start-tally') -contains ([string]$cmd.action)) {
             if (Get-Command Show-ClaudeOverlay -ErrorAction SilentlyContinue) { Show-ClaudeOverlay }
         }
 
         switch ($cmd.action) {
-            "select-company" {
-                if ($LLMProvider -eq "none") {
-                    Write-Result -Status "error" -Message "select-company requires an LLM key (ANTHROPIC_API_KEY or OPENAI_API_KEY). Use load-company (tally.ini-driven) for LLM-free company loading." -Strategy "select-company" -CommandId $cmdId
-                } else {
-                    Invoke-LLMGuidedAction -CompanyName $cmd.companyName -Action "select-company" -CommandId $cmdId -MaxStepsOverride $cmdMaxSteps
-                }
-            }
-            "load-on-startup" {
-                if ($LLMProvider -eq "none") {
-                    Write-Result -Status "error" -Message "load-on-startup requires an LLM key. Use load-company (tally.ini-driven) instead." -Strategy "load-on-startup" -CommandId $cmdId
-                } else {
-                    Invoke-LLMGuidedAction -CompanyName $cmd.companyName -Action "load-on-startup" -CommandId $cmdId -MaxStepsOverride $cmdMaxSteps
-                }
-            }
             "ping" {
                 $extra = @{
-                    llmProvider = $LLMProvider
                     scriptPath  = $Script:AgentScriptPath
                     scriptMTime = if ($Script:AgentScriptMTime) { $Script:AgentScriptMTime.ToString('o') } else { $null }
                     pid         = $PID
                 }
-                Write-Result -Status "success" -Message "Agent v2 is alive (LLM: $LLMProvider, version: $Script:AgentVersion)" -Strategy "ping" -CommandId $cmdId -Extra $extra
+                Write-Result -Status "success" -Message "Agent v2 is alive (version: $Script:AgentVersion)" -Strategy "ping" -CommandId $cmdId -Extra $extra
             }
             "screenshot" {
                 # Capture the current Tally window so the caller (an MCP client / Claude) can SEE the
@@ -850,7 +628,7 @@ function Invoke-AgentCommand {
                 try {
                     $hwnd = Find-TallyWindow
                     if ($hwnd -eq [IntPtr]::Zero) {
-                        Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "screenshot" -CommandId $cmdId
+                        Write-Result -Status "error" -Message (Get-TallyResolveMessage) -Strategy "screenshot" -CommandId $cmdId
                     } else {
                         [TallyUI2]::ForceForeground($hwnd) | Out-Null
                         Start-Sleep -Milliseconds 300
@@ -868,11 +646,11 @@ function Invoke-AgentCommand {
             "sendkeys" {
                 # Execute an ordered list of keystroke steps (type / key / combo / wait) in the Tally
                 # window. Focus is re-asserted before each step so a stray focus-steal can't leak a typed
-                # password into another window. Reuses Execute-Action, the same primitive the LLM loop uses.
+                # password into another window. Reuses Execute-Action, the same primitive sendkeys uses.
                 try {
                     $hwnd = Find-TallyWindow
                     if ($hwnd -eq [IntPtr]::Zero) {
-                        Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "sendkeys" -CommandId $cmdId
+                        Write-Result -Status "error" -Message (Get-TallyResolveMessage) -Strategy "sendkeys" -CommandId $cmdId
                     } elseif (-not $cmd.keys) {
                         Write-Result -Status "error" -Message "No keys provided" -Strategy "sendkeys" -CommandId $cmdId
                     } else {
@@ -899,7 +677,7 @@ function Invoke-AgentCommand {
                 # IMPORTANT: do NOT send Alt+F3 first - on Tally Prime Edit Log it activates a "Specify Path" sub-mode,
                 # not the regular Select Company list. After Tally launches with no company loaded, the company list is
                 # already in focus and accepts typed input directly.
-                # No LLM, works regardless of password type. Used by load-company when auto-load via tally.ini's
+                # Deterministic, works regardless of password type. Used by load-company when auto-load via tally.ini's
                 # Load= directive can't proceed past the credential prompt.
                 $companyId = if ($cmd.companyId) { [string]$cmd.companyId } else { "" }
                 $userName  = if ($cmd.userName)  { [string]$cmd.userName }  else { "" }
@@ -912,7 +690,7 @@ function Invoke-AgentCommand {
                     try {
                         $hwnd = Find-TallyWindow
                         if ($hwnd -eq [IntPtr]::Zero) {
-                            Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "select-and-unlock" -CommandId $cmdId
+                            Write-Result -Status "error" -Message (Get-TallyResolveMessage) -Strategy "select-and-unlock" -CommandId $cmdId
                         } else {
                             [TallyUI2]::ForceForeground($hwnd) | Out-Null
                             Start-Sleep -Milliseconds 500
@@ -991,9 +769,9 @@ function Invoke-AgentCommand {
                 # Tally (and the connection) up.
                 #
                 # Composition of two ALREADY-PROVEN sequences:
-                #   1. PREFIX (open Select Company on a running Tally): Alt+F3 -> F1. This mirrors the LLM
-                #      select-company fallback above (search "typed company name search"), which empirically
-                #      opens the Select Company list on this Tally build. Alt+F3 = Company menu, F1 = Select Company.
+                #   1. PREFIX (open Select Company on a running Tally): Alt+F3 -> F1. Established empirically
+                #      on this Tally build by the (now removed) vision loop, which converged on this pair every
+                #      time before it was deleted. Alt+F3 = Company menu, F1 = Select Company.
                 #   2. TAIL (pick + unlock): identical to select-and-unlock-company - type the folder id, Enter to
                 #      drill the folder, Enter to select the company, then type credentials if supplied.
                 #
@@ -1014,7 +792,7 @@ function Invoke-AgentCommand {
                     try {
                         $hwnd = Find-TallyWindow
                         if ($hwnd -eq [IntPtr]::Zero) {
-                            Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "switch-company" -CommandId $cmdId
+                            Write-Result -Status "error" -Message (Get-TallyResolveMessage) -Strategy "switch-company" -CommandId $cmdId
                         } else {
                             [TallyUI2]::ForceForeground($hwnd) | Out-Null
                             Start-Sleep -Milliseconds 500
@@ -1106,7 +884,7 @@ function Invoke-AgentCommand {
                 }
             }
             "press-key" {
-                # Step-by-step primitive: press one named key. Lets an LLM drive Tally
+                # Step-by-step primitive: press one named key. Lets Claude drive Tally
                 # interactively (screenshot -> reason -> press a key -> screenshot ->
                 # reason -> ...) instead of relying on the monolithic
                 # select-and-unlock-company keystroke blast.
@@ -1129,7 +907,7 @@ function Invoke-AgentCommand {
                     try {
                         $hwnd = Find-TallyWindow
                         if ($hwnd -eq [IntPtr]::Zero) {
-                            Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "press-key" -CommandId $cmdId
+                            Write-Result -Status "error" -Message (Get-TallyResolveMessage) -Strategy "press-key" -CommandId $cmdId
                         } else {
                             [TallyUI2]::ForceForeground($hwnd) | Out-Null
                             Start-Sleep -Milliseconds 300
@@ -1151,7 +929,7 @@ function Invoke-AgentCommand {
                     try {
                         $hwnd = Find-TallyWindow
                         if ($hwnd -eq [IntPtr]::Zero) {
-                            Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "type-text" -CommandId $cmdId
+                            Write-Result -Status "error" -Message (Get-TallyResolveMessage) -Strategy "type-text" -CommandId $cmdId
                         } else {
                             [TallyUI2]::ForceForeground($hwnd) | Out-Null
                             Start-Sleep -Milliseconds 300
@@ -1167,13 +945,13 @@ function Invoke-AgentCommand {
                 }
             }
             "bring-foreground" {
-                # Quick state probe + focus. Useful before an LLM-driven sequence to make
+                # Quick state probe + focus. Useful before a Claude-driven sequence to make
                 # sure subsequent press-key / type-text actions land in Tally and not in
                 # some other window the user accidentally clicked into.
                 try {
                     $hwnd = Find-TallyWindow
                     if ($hwnd -eq [IntPtr]::Zero) {
-                        Write-Result -Status "error" -Message "Tally window not found - is Tally running?" -Strategy "bring-foreground" -CommandId $cmdId
+                        Write-Result -Status "error" -Message (Get-TallyResolveMessage) -Strategy "bring-foreground" -CommandId $cmdId
                     } else {
                         [TallyUI2]::ForceForeground($hwnd) | Out-Null
                         Start-Sleep -Milliseconds 300
@@ -1232,7 +1010,7 @@ while ($true) {
         }
 
         if ($cmdText) {
-            # Invoke-AgentCommand derives commandId / maxSteps from the command itself.
+            # Invoke-AgentCommand derives the commandId from the command itself.
             $cmd = $cmdText | ConvertFrom-Json
             Invoke-AgentCommand -Cmd $cmd
         }

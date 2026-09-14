@@ -97,6 +97,8 @@ $State = [hashtable]::Synchronized(@{
     AgentTask        = $null   # ScheduledTask object | $null
     AgentProcess     = $null   # Process | $null
     TallyProcess     = $null   # Process | $null
+    TallyCount       = 0       # how many tally.exe are running (>1 is the multi-version ambiguity)
+    TallyXmlOk       = $null   # $true / $false / $null (not probed because Tally is closed)
     PublicUrl        = ''      # full probe URL or '' if no MCP_DOMAIN set
     PublicUrlOk      = $null   # $true / $false / $null (not configured)
     LoadedCompany    = ''      # best-effort name of currently loaded company, or ''
@@ -268,8 +270,13 @@ function Invoke-StatusPoll {
     } catch { $State.AgentProcess = $null }
 
     try {
-        $State.TallyProcess = Get-Process -Name 'tally' -ErrorAction SilentlyContinue | Select-Object -First 1
-    } catch { $State.TallyProcess = $null }
+        # Count them. More than one running Tally is the condition that makes company loading
+        # ambiguous (the server refuses to guess which to drive), and the tray is where a user can
+        # actually see and fix it - so surface the count rather than quietly taking the first.
+        $allTally = @(Get-Process -Name 'tally' -ErrorAction SilentlyContinue)
+        $State.TallyCount   = $allTally.Count
+        $State.TallyProcess = if ($allTally.Count -gt 0) { $allTally[0] } else { $null }
+    } catch { $State.TallyProcess = $null; $State.TallyCount = 0 }
 
     # Public URL probe is optional - if MCP_DOMAIN is unset, the operator is running localhost-only
     # and there's nothing to probe externally. Probe the local OAuth metadata endpoint instead so
@@ -328,11 +335,18 @@ function Invoke-StatusPoll {
             } else {
                 $State.LoadedCompany = ''
             }
+            # Tally answered. This is the distinction the tray used to discard: "the process exists"
+            # and "the process is reachable" are different things, and a fresh Tally has its data
+            # connection switched OFF - so the common first-run state was a tray cheerfully reporting
+            # "Running" while nothing worked.
+            $State.TallyXmlOk = $true
         } catch {
             $State.LoadedCompany = ''
+            $State.TallyXmlOk = $false
         }
     } else {
         $State.LoadedCompany = ''
+        $State.TallyXmlOk = $null
     }
 }
 
@@ -420,7 +434,57 @@ $miServiceState.Enabled = $false
 $miAgentState = $menu.Items.Add('  Agent task: -')
 $miAgentState.Enabled = $false
 $miTallyState = $menu.Items.Add('  Tally: -')
+# Normally a dead label like the rows around it. It becomes clickable only when there IS a problem
+# worth explaining (see the poll handler), because this is the one screen a non-technical user will
+# find on their own - and the two states below are the two that otherwise strand them completely.
 $miTallyState.Enabled = $false
+$miTallyState.Add_Click({
+    try {
+        if ($State.TallyXmlOk -eq $false) {
+            $msg = @"
+Tally Prime is open, but Claude cannot read from it yet.
+
+Tally ships with its data connection switched OFF. It has to be turned on once,
+inside Tally itself - nothing on this machine can do it for you.
+
+In Tally Prime:
+
+  1. Press F1  (Help)
+  2. Choose  Settings
+  3. Choose  Connectivity
+  4. Choose  Client/Server Configuration
+  5. Set  'TallyPrime acts as'  to  Server
+  6. Set  Port  to  9000
+  7. Press Ctrl+A to accept
+
+Leave Tally open. The connection only works while Tally is running.
+
+If it is already set to Server, look at the Tally window: a message box waiting
+for an answer (a licence reminder, for example) stops Tally responding until
+someone clears it.
+"@
+            [System.Windows.Forms.MessageBox]::Show($msg.Trim(), 'Tally is not connected yet', 'OK', 'Information') | Out-Null
+        }
+        elseif ($State.TallyCount -gt 1) {
+            $msg = @"
+You have $($State.TallyCount) copies of Tally open at the same time.
+
+Only one of them can hold the data connection, and Claude can only work with
+that one. Loading or switching a company will be refused while it is unclear
+which copy you mean - deliberately, because keystrokes sent to the wrong copy
+would land in a different company's window.
+
+Either:
+
+  - Close the copies you are not using, or
+  - Turn the connection on in the copy you DO want Claude to use:
+    F1 > Settings > Connectivity > Client/Server Configuration,
+    'TallyPrime acts as' = Server, Port = 9000, then Ctrl+A.
+"@
+            [System.Windows.Forms.MessageBox]::Show($msg.Trim(), 'More than one Tally is open', 'OK', 'Warning') | Out-Null
+        }
+    } catch { }
+})
 $miUrlState = $menu.Items.Add('  Public URL: -')
 $miUrlState.Enabled = $false
 
@@ -1219,10 +1283,18 @@ function Update-TrayUi {
 
     if ($State.TallyProcess) {
         $cmp = if ($State.LoadedCompany) { " - $($State.LoadedCompany)" } else { '' }
-        $miTallyState.Text = "  Tally:    Running$cmp"
+        $many = if ($State.TallyCount -gt 1) { " ($($State.TallyCount) copies open)" } else { '' }
+        if ($State.TallyXmlOk -eq $false) {
+            $miTallyState.Text = "  Tally:    open, but NOT connected$many  -  click for help"
+        } else {
+            $miTallyState.Text = "  Tally:    Running$cmp$many"
+        }
     } else {
         $miTallyState.Text = "  Tally:    not running"
     }
+    # The status row is the only place a non-technical user will look, so make it the thing that
+    # explains itself when it is unhappy. Enabled only while there is something to explain.
+    $miTallyState.Enabled = ($State.TallyXmlOk -eq $false) -or ($State.TallyCount -gt 1)
 
     if ($null -eq $State.PublicUrlOk) {
         $miUrlState.Text = "  Public URL: not configured"

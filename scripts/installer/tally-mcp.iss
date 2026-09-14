@@ -544,18 +544,24 @@ begin
   begin
     if IsLocalMode() then
       WizardForm.FinishedLabel.Caption :=
-        'Claudally is installed on this computer.' + #13#10 + #13#10 +
-        'Now QUIT Claude Desktop COMPLETELY and open it again - closing the window is not enough. ' +
-        'Use File > Exit, or right-click its icon near the clock and choose Quit. Tally tools appear ' +
-        'once it restarts.' + #13#10 + #13#10 +
-        'If you have not installed Claude Desktop yet, install it and then run ' +
+        'Claudally is installed on this computer. Two things left, both one-time:' + #13#10 + #13#10 +
+        '1. TURN ON TALLY''S DATA CONNECTION. Tally comes with it switched off, and Claude cannot ' +
+        'read anything until it is on. In Tally Prime: press F1, then Settings > Connectivity > ' +
+        'Client/Server Configuration. Set "TallyPrime acts as" to Server and Port to 9000, then ' +
+        'press Ctrl+A. Leave Tally open whenever you want to use this.' + #13#10 + #13#10 +
+        '2. RESTART CLAUDE DESKTOP COMPLETELY - closing the window is not enough. Use File > Exit, ' +
+        'or right-click its icon near the clock and choose Quit. Tally tools appear once it ' +
+        'reopens. If you have not installed Claude Desktop yet, install it and then run ' +
         '"Connect Claude to Tally" from the Start Menu.' + #13#10 + #13#10 +
-        'Nothing is listening on the network and no password was created. You can check that ' +
-        'yourself any time by running verify-deployment.ps1 from the install folder.'
+        'The tray icon near the clock tells you if either step is still outstanding. Nothing is ' +
+        'listening on the network and no password was created.'
     else
       WizardForm.FinishedLabel.Caption :=
-        'Claudally is installed and running as a Windows service.' + #13#10 + #13#10 +
-        'Point your MCP client at the public address you entered. The tray icon near the clock ' +
+        'Claudally is installed and running as a Windows service. One thing left:' + #13#10 + #13#10 +
+        'TURN ON TALLY''S DATA CONNECTION - it ships switched off. In Tally Prime: press F1, then ' +
+        'Settings > Connectivity > Client/Server Configuration. Set "TallyPrime acts as" to Server ' +
+        'and Port to 9000, then press Ctrl+A.' + #13#10 + #13#10 +
+        'Then point your MCP client at the public address you entered. The tray icon near the clock ' +
         'shows whether the service and tunnel are healthy.';
   end;
 end;
