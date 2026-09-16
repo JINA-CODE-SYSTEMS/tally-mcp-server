@@ -1210,6 +1210,101 @@ export function resolveEntryOrder(
   return { order: 'credit-first', configured: false };
 }
 
+// Entry order is not one answer — it is one answer PER VOUCHER TYPE.
+//
+// Receipts and payments genuinely differ in which side an accountant expects to lead, and so do
+// sales and purchases. A single global setting forces one of them to read wrong. Worse, voucher
+// types are per-company and user-defined ("RM Purchase", "Contra - Mahad"), so this cannot be a
+// fixed enum either.
+//
+// The map therefore grows as types are actually used: the first voucher of a type we have no answer
+// for is refused, the caller asks the user about THAT type, and the answer is recorded. A user who
+// says "same for everything" sets `default` instead and is never asked again.
+export type EntryOrderConfig = {
+  default?: EntryOrder | null;
+  byVoucherType?: Record<string, EntryOrder>;
+};
+
+export const EMPTY_ENTRY_ORDER_CONFIG: EntryOrderConfig = { default: null, byVoucherType: {} };
+
+export function entryOrderConfigPath(): string {
+  if (process.env.TALLY_ENTRY_ORDER_CONFIG) return process.env.TALLY_ENTRY_ORDER_CONFIG;
+  // Beside the company registry rather than in .env: this map is written repeatedly and holds
+  // user-defined type names, and TALLY_DATA_PATH is writable by the user on both deployment modes
+  // (a service install's .env sits under Program Files and needs an administrator).
+  const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+  return path.join(dataPath, '.tally-mcp-entry-order.json');
+}
+
+// Tolerant by design. A missing file is the normal first-run state, and a corrupt one must not take
+// voucher writing down — it degrades to "nothing configured", which makes the caller ask again.
+export function readEntryOrderConfig(configPath: string = entryOrderConfigPath()): EntryOrderConfig {
+  try {
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    const byVoucherType: Record<string, EntryOrder> = {};
+    for (const [k, v] of Object.entries(raw?.byVoucherType ?? {})) {
+      if (v === 'credit-first' || v === 'debit-first') byVoucherType[k] = v;
+    }
+    const def = raw?.default === 'credit-first' || raw?.default === 'debit-first' ? raw.default : null;
+    return { default: def, byVoucherType };
+  } catch {
+    return { default: null, byVoucherType: {} };
+  }
+}
+
+// Resolution for ONE voucher type. Pure, so the precedence can be tested without a disk.
+//
+// Precedence, most specific first:
+//   1. an answer recorded for this exact voucher type
+//   2. the user's "same for everything" default
+//   3. ENTRY_ORDER in .env — the bootstrap an operator can set by hand, and what installs
+//      configured before per-type support existed still carry
+//   4. nothing: ASK. Not a default in disguise.
+export function resolveEntryOrderFor(
+  voucherType: string | undefined,
+  config: EntryOrderConfig = readEntryOrderConfig(),
+  envRaw: string | undefined = process.env.ENTRY_ORDER
+): { order: EntryOrder; configured: boolean; source: 'voucher-type' | 'default' | 'env' | 'none' } {
+  const wanted = String(voucherType ?? '').trim().toLowerCase();
+  if (wanted) {
+    // Case-insensitive, matching how every other master name is compared in this server: a user
+    // who typed "sales" once should not be asked again because Tally calls it "Sales".
+    for (const [type, order] of Object.entries(config.byVoucherType ?? {})) {
+      if (type.trim().toLowerCase() === wanted) return { order, configured: true, source: 'voucher-type' };
+    }
+  }
+  if (config.default === 'credit-first' || config.default === 'debit-first') {
+    return { order: config.default, configured: true, source: 'default' };
+  }
+  const fromEnv = resolveEntryOrder(envRaw);
+  if (fromEnv.configured) return { order: fromEnv.order, configured: true, source: 'env' };
+  return { order: 'credit-first', configured: false, source: 'none' };
+}
+
+// Records one answer. Passing no voucherType sets the "same for everything" default.
+export function applyEntryOrderChoice(
+  config: EntryOrderConfig,
+  order: EntryOrder,
+  voucherType?: string
+): EntryOrderConfig {
+  const next: EntryOrderConfig = {
+    default: config.default ?? null,
+    byVoucherType: { ...(config.byVoucherType ?? {}) }
+  };
+  if (voucherType && voucherType.trim()) {
+    // Replace any existing entry for this type regardless of how it was cased when first stored,
+    // so answering again corrects the old answer instead of sitting beside it.
+    const wanted = voucherType.trim().toLowerCase();
+    for (const key of Object.keys(next.byVoucherType!)) {
+      if (key.trim().toLowerCase() === wanted) delete next.byVoucherType![key];
+    }
+    next.byVoucherType![voucherType.trim()] = order;
+  } else {
+    next.default = order;
+  }
+  return next;
+}
+
 // The .env this server was loaded from — the same path dotenv reads at startup, so what we write
 // here is what the next start reads.
 export function envFilePath(): string {
@@ -1838,8 +1933,9 @@ export function buildAlterVariants(
   if (!remoteId && !vchKey) return out;   // unkeyed → every form would create, not alter
   const blockNoRemote = block.replace(openTag, openTag.replace(/\s*REMOTEID="[^"]*"/i, ''));
   // One resolution for every candidate form, so an alter cannot reorder lines differently depending
-  // on which envelope Tally happens to accept.
-  const entryOrder = resolveEntryOrder().order;
+  // on which envelope Tally happens to accept. Keyed on the voucher's own type, so an altered
+  // Receipt keeps reading the way the user asked Receipts to read.
+  const entryOrder = resolveEntryOrderFor(voucherType).order;
   const minimal = (id: { remoteId?: string; vchKey?: string }) =>
     buildAlterVoucherXml({ ...patch, ...id, voucherType, voucherNumber, date: patch.date || isoDate }, company, entryOrder);
   out.push({ name: 'block-verbatim', xml: wrapVoucherImport(applyPatchToBlock(block, patch, entryOrder), company) });
@@ -2124,7 +2220,7 @@ Hard preconditions (discover via \`status\`/\`get-context\`, don't hit walls):
 - The GUI automation agent must be running to load/switch companies or unlock protected ones.
 - On Silver only one company is resident at a time; loading another replaces it.
 - Write tools are refused when readonly is true (READONLY_MODE).
-- Voucher writes are refused until entry order is set. \`status\`/\`get-context\` report \`entryOrder\`; if \`configured\` is false, ASK THE USER "should the credit line or the debit line come first in a voucher?", say that it changes only how the voucher READS when opened (the posting, signs and balance are identical), then call \`set-entry-order\` once. Do not guess it for them and do not keep re-asking once it is set.
+- Entry order is PER VOUCHER TYPE, and a type with no answer is REFUSED on write (ENTRY_ORDER_UNSET). Receipts, payments, sales and purchases genuinely differ in which side an accountant expects to lead, so do not assume one answer covers the others. \`status\`/\`get-context\` report \`entryOrder.byVoucherType\` and \`entryOrder.default\`. When a type is unanswered, ASK THE USER "for <type> vouchers, should the credit line or the debit line come first?", say that it changes only how the voucher READS when opened (the posting, signs and balance are identical), then call \`set-entry-order\` with that \`voucherType\`. Omit \`voucherType\` ONLY if they say the same order applies to every type. Never guess, and never re-ask a type that is already answered.
 
 Driving the Tally GUI (on by default; disabled only if the operator set ENABLE_GUI_CONTROL=false) — YOU drive it, look-verify-act, never blind:
 - Use \`gui-screenshot\` as your eyes and \`gui-send-keys\` as your hands. Screenshot → confirm which screen you're on → send ONE step → screenshot → confirm the transition. Never send a relative sequence into an unknown screen.
@@ -2248,7 +2344,7 @@ const TOOL_ERROR_DEFAULTS: Record<ToolErrorCode, { retryable: boolean; message: 
   // The server deliberately does NOT guess a keystroke sequence on the caller's behalf.
   // Asked once per install, before the first voucher is written. Not a fault: the server is refusing
   // to decide, on the user's behalf, how every voucher in their books will read.
-  ENTRY_ORDER_UNSET: { retryable: true, message: 'Nobody has said yet whether vouchers should list credits or debits first.', remedy: 'ASK THE USER: "When I write a voucher, should the credit line or the debit line come first?" Explain it only changes how the voucher reads when opened — the accounting posting is identical either way. Then save the answer with set-entry-order and retry. An operator can instead put ENTRY_ORDER=credit-first (or debit-first) in .env.' },
+  ENTRY_ORDER_UNSET: { retryable: true, message: 'Nobody has said yet whether this kind of voucher should list credits or debits first.', remedy: 'ASK THE USER which side should lead for THIS voucher type — the answer legitimately differs between receipts, payments, sales and purchases. Explain it only changes how the voucher reads when opened; the posting is identical either way. Then call set-entry-order (with voucherType for just this type, or without it to apply to every type) and retry. An operator can instead set ENTRY_ORDER=credit-first in .env as a blanket default.' },
   GUI_HANDOFF: { retryable: true, message: 'This needs the Tally GUI, which you drive yourself.', remedy: 'Call gui-screenshot to see the current screen, send ONE step with gui-send-keys, screenshot again to confirm the transition, and repeat. Never send a relative sequence into a screen you have not looked at.' },
   PRECONDITION_FAILED: { retryable: true, message: 'A required precondition is not met.' },
   READONLY: { retryable: false, message: 'Write operations are disabled (READONLY_MODE=true).', remedy: 'Unset READONLY_MODE on the server to allow writes.' },
@@ -2508,12 +2604,18 @@ export async function executeVoucher(
       return { content: [{ type: 'text', text: JSON.stringify(body) }] };
     }
   }
-  // Ask before the first voucher, not after. Entry order changes how every voucher in these books
-  // reads, and silently picking one means the user discovers our choice by opening their own
-  // accounts later. dryRun is exempt: it writes nothing, so it can show the caller what would be
-  // posted (under the provisional default) while the question is still outstanding.
-  const entryOrder = resolveEntryOrder();
-  if (!entryOrder.configured && !opts.dryRun) return errorResult('ENTRY_ORDER_UNSET');
+  // Ask before the first voucher OF THIS TYPE, not after. Entry order changes how the voucher reads
+  // when the user opens it, it legitimately differs between receipts, payments, sales and purchases,
+  // and silently picking one means they discover our choice by opening their own accounts later.
+  // dryRun is exempt: it writes nothing, so it can still show what would be posted while the
+  // question is open.
+  const entryOrder = resolveEntryOrderFor(voucher.voucherType);
+  if (!entryOrder.configured && !opts.dryRun) {
+    return errorResult('ENTRY_ORDER_UNSET', {
+      message: `No entry order recorded for "${voucher.voucherType}" vouchers, so nothing was written.`,
+      remedy: `ASK THE USER: "For ${voucher.voucherType} vouchers, should the credit line or the debit line come first?" Tell them it only changes how the voucher READS when they open it in Tally - the posting, the signs and the balance are identical either way - and that the answer can differ per voucher type, so you are asking about ${voucher.voucherType} specifically. Then call set-entry-order with voucherType="${voucher.voucherType}", or omit voucherType if they say to use the same order for every type. Then retry.`,
+    });
+  }
 
   const xml = buildVoucherXml(voucher, company, entryOrder.order);
   if (opts.dryRun) {
@@ -3229,9 +3331,10 @@ export async function registerMcpServer(): Promise<McpServer> {
     'set-entry-order',
     {
       title: 'Set Entry Order',
-      description: `Records whether vouchers this server writes should list the CREDIT line first or the DEBIT line first, and persists it to .env so it survives a restart. Ask the user before calling: "When I write a voucher, should the credit line or the debit line come first?" — and tell them it changes only how the voucher READS when they open it in Tally; the accounting posting, the signs and the balance are identical either way. Call this once, after they answer. Until it is set, voucher writes are refused with ENTRY_ORDER_UNSET. Does NOT touch anything already written.`,
+      description: `Records which line comes first — CREDIT or DEBIT — when this server writes a voucher, and persists it so it survives a restart. Pass voucherType to answer for ONE type (receipts and payments genuinely differ, as do sales and purchases); omit it only when the user says the same order should apply to every type. Ask before calling, and tell them it changes only how the voucher READS when opened in Tally — the posting, the signs and the balance are identical either way. Until a type is answered (or a blanket default set), writes of that type are refused with ENTRY_ORDER_UNSET. Never changes anything already written.`,
       inputSchema: {
-        order: z.enum(['credit-first', 'debit-first']).describe('credit-first lists credit lines before debit lines in each voucher; debit-first is the reverse.')
+        order: z.enum(['credit-first', 'debit-first']).describe('credit-first lists credit lines before debit lines in each voucher; debit-first is the reverse.'),
+        voucherType: z.string().optional().describe('the voucher type this answer applies to, e.g. "Receipt", "Payment", "Sales". Matched case-insensitively. OMIT to set the blanket default for every type the user has not answered individually — only do that when they explicitly say the same order applies everywhere.')
       },
       annotations: {
         readOnlyHint: false,
@@ -3243,31 +3346,26 @@ export async function registerMcpServer(): Promise<McpServer> {
     async (args) => {
       const start = Date.now();
       try {
-        const envPath = envFilePath();
-        // Read-modify-write ONE key. .env is generated by the installer and hand-edited by
-        // operators, so every other line — including comments explaining the other settings — has
-        // to survive. Missing file is not an error: local installs can legitimately run on
-        // environment variables alone, and creating it is the right repair.
-        let existing = '';
-        try { existing = fs.readFileSync(envPath, 'utf-8'); } catch { existing = ''; }
-        const updated = upsertEnvLine(existing, 'ENTRY_ORDER', args.order);
+        const cfgPath = entryOrderConfigPath();
+        const updated = applyEntryOrderChoice(readEntryOrderConfig(cfgPath), args.order, args.voucherType);
         try {
-          atomicWriteFile(envPath, updated);
+          fs.mkdirSync(path.dirname(cfgPath), { recursive: true });
+          atomicWriteFile(cfgPath, JSON.stringify(updated, null, 2) + '\n');
         } catch (err) {
           auditLog('set-entry-order', args, 'error', Date.now() - start);
           return errorResult('PRECONDITION_FAILED', {
-            message: `Could not write ${envPath}: ${err instanceof Error ? err.message : String(err)}`,
-            remedy: `Add the line ENTRY_ORDER=${args.order} to that file by hand, then restart the server. (On a service install the file usually sits under Program Files and needs an administrator to edit.)`,
+            message: `Could not write ${cfgPath}: ${err instanceof Error ? err.message : String(err)}`,
+            remedy: `Set a blanket default instead by adding ENTRY_ORDER=${args.order} to the server's .env and restarting. (Per-type answers need this file to be writable.)`,
             retryable: false,
           });
         }
-        // Apply immediately as well as persisting: the user asked a question and expects the very
-        // next voucher to obey the answer, not the one after a restart.
-        process.env.ENTRY_ORDER = args.order;
         auditLog('set-entry-order', args, 'success', Date.now() - start);
         return { content: [{ type: 'text', text: JSON.stringify({
+          scope: args.voucherType ? `${args.voucherType} vouchers only` : 'every voucher type without its own answer',
           entryOrder: args.order,
-          persistedTo: envPath,
+          persistedTo: cfgPath,
+          byVoucherType: updated.byVoucherType,
+          default: updated.default,
           appliesFrom: 'the next voucher written',
           note: 'Vouchers already in Tally are unchanged — this only affects how new ones are written.'
         }) }] };
@@ -3308,10 +3406,15 @@ export async function registerMcpServer(): Promise<McpServer> {
         if (!tallyReachable) status.tallyProblem = describeTallyUnreachable();
         // Reported ALWAYS, not only when unset: a caller that has already written vouchers this
         // session should still be able to see which way round they are going without asking again.
-        const eo = resolveEntryOrder();
-        status.entryOrder = eo.configured
-          ? { value: eo.order, configured: true }
-          : { value: null, configured: false, action: 'ASK THE USER whether vouchers should list credits or debits first, then save it with set-entry-order. Voucher writes are refused until then. It changes only how a voucher READS when opened; the accounting posting is identical either way.' };
+        // The whole map, because "is this configured?" now has a per-type answer. A caller about to
+        // write a Receipt needs to know whether Receipt is answered, not whether anything is.
+        const eoCfg = readEntryOrderConfig();
+        status.entryOrder = {
+          byVoucherType: eoCfg.byVoucherType ?? {},
+          default: eoCfg.default ?? resolveEntryOrder().order ?? null,
+          hasBlanketDefault: !!eoCfg.default || resolveEntryOrder().configured,
+          note: 'A voucher type with no answer here, and no blanket default, is REFUSED on write — ask the user which side should lead for that type, then call set-entry-order. The answer may differ per type.'
+        };
         auditLog('status', args, 'success', Date.now() - start);
         return { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] };
       } catch (err) {
@@ -3345,10 +3448,13 @@ export async function registerMcpServer(): Promise<McpServer> {
           requirements: getTallyRequirements()
         };
         if (!tallyReachable) context.tallyProblem = describeTallyUnreachable();
-        const ctxEo = resolveEntryOrder();
-        context.entryOrder = ctxEo.configured
-          ? { value: ctxEo.order, configured: true }
-          : { value: null, configured: false, action: 'ASK THE USER whether vouchers should list credits or debits first, then save it with set-entry-order. Voucher writes are refused until then.' };
+        const ctxCfg = readEntryOrderConfig();
+        context.entryOrder = {
+          byVoucherType: ctxCfg.byVoucherType ?? {},
+          default: ctxCfg.default ?? resolveEntryOrder().order ?? null,
+          hasBlanketDefault: !!ctxCfg.default || resolveEntryOrder().configured,
+          note: 'A voucher type with no answer here, and no blanket default, is REFUSED on write — ask the user which side should lead for that type, then call set-entry-order.'
+        };
         auditLog('get-context', args, 'success', Date.now() - start);
         return { content: [{ type: 'text', text: JSON.stringify(context, null, 2) }] };
       } catch (err) {

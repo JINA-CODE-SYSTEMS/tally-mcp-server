@@ -322,11 +322,11 @@ begin
   EntryOrderPage := CreateInputOptionPage(EditionPage.ID,
     'Voucher Layout',
     'Which line should come first in a voucher?',
-    'Only affects how a voucher READS when you open it in Tally - the accounting is identical either way, and no figure changes. If you are not sure, leave the first option selected and you will be asked once, in plain language, the first time a voucher is written.',
+    'Only affects how a voucher READS when you open it in Tally - the accounting is identical either way, and no figure changes. Receipts, payments, sales and purchases are often expected to read differently from each other, so the recommended option asks you about each kind the first time it is used, in plain language. The other two apply one order to every kind.',
     True, False);
-  EntryOrderPage.Add('Ask me the first time a voucher is written (recommended)');
-  EntryOrderPage.Add('Credit line first');
-  EntryOrderPage.Add('Debit line first');
+  EntryOrderPage.Add('Ask me for each kind of voucher, the first time it is used (recommended)');
+  EntryOrderPage.Add('Credit line first, for every kind');
+  EntryOrderPage.Add('Debit line first, for every kind');
   EntryOrderPage.SelectedValueIndex := GetPreviousDataIndex(GetPreviousData('EntryOrder', ''));
 
   // Claude-driven GUI control (issue #81). ON by default (opt-OUT): it is Claudally's core capability —
