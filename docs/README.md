@@ -157,6 +157,7 @@ Copy `.env.example` to `.env` and configure:
 | **GUI Agent (open-company)** | | |
 | `OPEN_COMPANY_GUI_TIMEOUT_SEC` | `180` | GUI agent timeout in seconds (min 90) |
 | `ENABLE_GUI_CONTROL` | `true` | Exposes `gui-screenshot` / `gui-send-keys`, the supervised look-then-act loop. Set `false` for XML-only boxes. |
+| `ENTRY_ORDER` | *(unset)* | `credit-first` or `debit-first` — which line leads inside a voucher. **Unset is meaningful**: voucher writes are refused until it is answered, so the user is asked rather than defaulted. Display only; the posting is identical either way. |
 | `UPDATE_CHECK` | `true` | Tray asks GitHub once a day whether a newer release exists and says so. Downloads and runs nothing. The only outbound call a local install makes; set `false` to stop it. |
 | `ANTHROPIC_API_VERSION` | `2023-06-01` | Anthropic API version header |
 

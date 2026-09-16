@@ -270,6 +270,28 @@ export function canonicalizeVoucherMasters(
   return { voucher: out, ambiguous };
 }
 
+// Which side leads inside a voucher.
+//
+// This is a DISPLAY concern and nothing more. Tally carries debit-vs-credit in ISDEEMEDPOSITIVE and
+// the sign of AMOUNT (see the note at the top of this file), never in line position, so reordering
+// changes what a person sees when they open the voucher and leaves the posting identical. The
+// balance check is a sum and ignores position entirely.
+//
+// It is still worth getting right: the voucher and its Edit Log entry are read by an accountant, and
+// firms differ on which side they expect to lead.
+export type EntryOrder = 'credit-first' | 'debit-first';
+
+// Partitions entries onto the requested side. STABLE within each side, which is the part that
+// matters: a GST sales invoice carries several credit lines (sales, CGST, SGST) whose relative
+// order is meaningful to the person reading it, and a naive sort would shuffle them.
+export function orderEntries(entries: VoucherEntry[], order: EntryOrder): VoucherEntry[] {
+  const lead = order === 'credit-first' ? 'cr' : 'dr';
+  const leading: VoucherEntry[] = [];
+  const trailing: VoucherEntry[] = [];
+  for (const e of entries) (e.drCr === lead ? leading : trailing).push(e);
+  return [...leading, ...trailing];
+}
+
 function signedAmount(entry: VoucherEntry): string {
   // debit → negative, credit → positive (Tally convention, see push/voucher.xml)
   return entry.drCr === 'dr' ? `-${entry.amount}` : `${entry.amount}`;
@@ -348,7 +370,7 @@ function inventoryXml(line: InventoryLine): string {
 }
 
 // Builds the full Import envelope. `targetCompany` is injected into STATICVARIABLES when supplied.
-export function buildVoucherXml(v: VoucherInput, targetCompany?: string): string {
+export function buildVoucherXml(v: VoucherInput, targetCompany?: string, entryOrder: EntryOrder = 'credit-first'): string {
   const tallyDate = toTallyDate(v.date);
   const svCompany = targetCompany ? `<SVCURRENTCOMPANY>${xmlName(targetCompany)}</SVCURRENTCOMPANY>` : '';
   // REMOTEID (durable external key) goes as an ATTRIBUTE on the VOUCHER tag — the same shape Tally uses
@@ -365,7 +387,7 @@ export function buildVoucherXml(v: VoucherInput, targetCompany?: string): string
     (v.narration ? `<NARRATION>${escapeXml(v.narration)}</NARRATION>` : '') +
     (v.gst?.placeOfSupply ? `<PLACEOFSUPPLY>${escapeXml(v.gst.placeOfSupply)}</PLACEOFSUPPLY>` : '') +
     (v.gst?.isReverseCharge ? `<ISREVERSECHARGEAPPLICABLE>Yes</ISREVERSECHARGEAPPLICABLE>` : '') +
-    v.entries.map(ledgerEntryXml).join('') +
+    orderEntries(v.entries, entryOrder).map(ledgerEntryXml).join('') +
     (v.inventory?.length ? v.inventory.map(inventoryXml).join('') : '') +
     `</VOUCHER>`;
   return `<?xml version="1.0" encoding="utf-8"?>` +
@@ -461,12 +483,12 @@ export function alterWouldBlankVoucher(block: string, patch: VoucherPatch): bool
 // Rewrite a voucher's OWN exported block into an alter-import. Keeping Tally's exported block as the
 // base (rather than synthesising a fresh body) preserves the fields we never modelled — GST
 // registration details, voucher-class flags, UDFs — which a synthesised body would silently drop.
-export function applyPatchToBlock(block: string, patch: VoucherPatch): string {
+export function applyPatchToBlock(block: string, patch: VoucherPatch, entryOrder: EntryOrder = 'credit-first'): string {
   let out = setAction(block, 'Alter');
   if (patch.entries?.length) {
     out = dropLists(out, 'ALLLEDGERENTRIES.LIST');
     out = dropLists(out, 'LEDGERENTRIES.LIST');
-    out = out.replace(/<\/VOUCHER>\s*$/, `${patch.entries.map(ledgerEntryXml).join('')}</VOUCHER>`);
+    out = out.replace(/<\/VOUCHER>\s*$/, `${orderEntries(patch.entries, entryOrder).map(ledgerEntryXml).join('')}</VOUCHER>`);
   }
   if (patch.inventory?.length) {
     out = dropLists(out, 'ALLINVENTORYENTRIES.LIST');
@@ -488,7 +510,8 @@ export function applyPatchToBlock(block: string, patch: VoucherPatch): string {
 // fallback for builds that reject a full re-imported block.
 export function buildAlterVoucherXml(
   v: { voucherType: string; date?: string; voucherNumber?: string } & VoucherPatch & VoucherIdentity,
-  targetCompany?: string
+  targetCompany?: string,
+  entryOrder: EntryOrder = 'credit-first'
 ): string {
   const tallyDate = v.date ? toTallyDate(v.date) : '';
   const svCompany = targetCompany ? `<SVCURRENTCOMPANY>${xmlName(targetCompany)}</SVCURRENTCOMPANY>` : '';
@@ -503,7 +526,7 @@ export function buildAlterVoucherXml(
     (v.partyLedger ? `<PARTYLEDGERNAME>${xmlName(v.partyLedger)}</PARTYLEDGERNAME>` : '') +
     (v.reference ? `<REFERENCE>${escapeXml(v.reference)}</REFERENCE>` : '') +
     (v.narration ? `<NARRATION>${escapeXml(v.narration)}</NARRATION>` : '') +
-    (v.entries?.length ? v.entries.map(ledgerEntryXml).join('') : '') +
+    (v.entries?.length ? orderEntries(v.entries, entryOrder).map(ledgerEntryXml).join('') : '') +
     (v.inventory?.length ? v.inventory.map(inventoryXml).join('') : '') +
     `</VOUCHER>`;
   return `<?xml version="1.0" encoding="utf-8"?>` +

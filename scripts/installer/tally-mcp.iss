@@ -174,7 +174,7 @@ Name: "{group}\Uninstall {#MyAppName}";  Filename: "{uninstallexe}"
 [Run]
 ; --- 1. First-run wizard: writes .env from collected wizard inputs and registers the NSSM service ---
 Filename: "powershell.exe"; \
-  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"" -TunnelServiceName ""{#MyTunnelServiceName}"" -CredentialsFile ""{code:GetCredentialsFilePath}"" -TallyEdition ""{code:GetWizardEdition}"" -TallyExePath ""{code:GetWizardExePath}"" -TallyDataPath ""{code:GetWizardDataPath}"" -TallyIniPath ""{code:GetWizardIniPath}"" -McpDomain ""{code:GetWizardDomain}"" -TunnelToken ""{code:GetWizardTunnelToken}"" -AgentTaskUser ""{code:GetWizardAgentUser}"" -EnableGuiControl ""{code:GetWizardGuiControl}"" -DeploymentMode ""{code:GetWizardMode}"" -Unattended"; \
+  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"" -TunnelServiceName ""{#MyTunnelServiceName}"" -CredentialsFile ""{code:GetCredentialsFilePath}"" -TallyEdition ""{code:GetWizardEdition}"" -TallyExePath ""{code:GetWizardExePath}"" -TallyDataPath ""{code:GetWizardDataPath}"" -TallyIniPath ""{code:GetWizardIniPath}"" -McpDomain ""{code:GetWizardDomain}"" -TunnelToken ""{code:GetWizardTunnelToken}"" -AgentTaskUser ""{code:GetWizardAgentUser}"" -EnableGuiControl ""{code:GetWizardGuiControl}"" -EntryOrder ""{code:GetWizardEntryOrder}"" -DeploymentMode ""{code:GetWizardMode}"" -Unattended"; \
   WorkingDir: "{app}"; \
   StatusMsg: "Configuring service and writing .env..."; \
   Flags: runhidden waituntilterminated
@@ -209,8 +209,26 @@ var
   ConfigPage: TInputQueryWizardPage;
   RemotePage: TInputQueryWizardPage;
   EditionPage: TInputOptionWizardPage;
+  EntryOrderPage: TInputOptionWizardPage;
   GuiControlOptIn: TNewCheckBox;
   BrandLabel: TNewStaticText;
+
+function GetPreviousDataIndex(Stored: string): Integer;
+begin
+  // Unknown or absent -> "ask me later". An upgrade of an install that predates this key therefore
+  // keeps being asked rather than silently inheriting a layout nobody chose.
+  if Stored = 'credit-first' then Result := 1
+  else if Stored = 'debit-first' then Result := 2
+  else Result := 0;
+end;
+
+// '' means "write no ENTRY_ORDER key", which is what makes the server ask the user later.
+function GetWizardEntryOrder(Param: string): string;
+begin
+  if EntryOrderPage.SelectedValueIndex = 1 then Result := 'credit-first'
+  else if EntryOrderPage.SelectedValueIndex = 2 then Result := 'debit-first'
+  else Result := '';
+end;
 
 procedure InitializeWizard;
 var
@@ -292,6 +310,24 @@ begin
   EditionPage.Add('Silver (single company resident; load-company always swaps)');
   EditionPage.Add('Gold (multiple companies; load-company is additive unless replace=true)');
   EditionPage.SelectedValueIndex := 0;
+
+  // Which side leads inside a voucher. DISPLAY ONLY - Tally records debit-vs-credit in
+  // ISDEEMEDPOSITIVE and the sign of AMOUNT, never in line position - so this changes what an
+  // accountant sees when they open the voucher, and nothing about the posting.
+  //
+  // The DEFAULT is "ask me later", which writes no .env key at all. That is deliberate: a wizard
+  // anyone can click Next through is not really asking, and this decides how every voucher in the
+  // customer's books will read. Leaving the key absent makes the server refuse the first voucher
+  // write and put the question to the user in their own words, in context, once.
+  EntryOrderPage := CreateInputOptionPage(EditionPage.ID,
+    'Voucher Layout',
+    'Which line should come first in a voucher?',
+    'Only affects how a voucher READS when you open it in Tally - the accounting is identical either way, and no figure changes. If you are not sure, leave the first option selected and you will be asked once, in plain language, the first time a voucher is written.',
+    True, False);
+  EntryOrderPage.Add('Ask me the first time a voucher is written (recommended)');
+  EntryOrderPage.Add('Credit line first');
+  EntryOrderPage.Add('Debit line first');
+  EntryOrderPage.SelectedValueIndex := GetPreviousDataIndex(GetPreviousData('EntryOrder', ''));
 
   // Claude-driven GUI control (issue #81). ON by default (opt-OUT): it is Claudally's core capability —
   // it lets Claude log in, select/switch companies and unlock protected companies by driving the Tally
@@ -633,6 +669,7 @@ begin
     SetPreviousData(PreviousDataKey, 'EnableGuiControl', 'true')
   else
     SetPreviousData(PreviousDataKey, 'EnableGuiControl', 'false');
+  SetPreviousData(PreviousDataKey, 'EntryOrder', GetWizardEntryOrder(''));
 end;
 function GetWizardGuiControl(Param: string): string;
 begin

@@ -6,7 +6,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import { cacheTable, executeSQL, validateSQL } from './database.mjs';
 import { handlePull, handlePush, jsonToTSV, pingTally, postTallyXML, pushXml, resolveGSTLedgers } from './tally.mjs';
-import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, buildAlterVoucherXml, applyPatchToBlock, alterWouldBlankVoucher, blockHasLedgerEntries, deriveRemoteId, findRemoteIdCollisions, voucherBalance, isDateInOpenPeriod, findMissingMasters, canonicalizeVoucherMasters, referencedLedgers, decodeXmlEntities, escapeXml, xmlName, type VoucherEntry, type VoucherInput, type VoucherPatch } from './voucher.mjs';
+import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, buildAlterVoucherXml, applyPatchToBlock, alterWouldBlankVoucher, blockHasLedgerEntries, deriveRemoteId, findRemoteIdCollisions, voucherBalance, orderEntries, type EntryOrder, isDateInOpenPeriod, findMissingMasters, canonicalizeVoucherMasters, referencedLedgers, decodeXmlEntities, escapeXml, xmlName, type VoucherEntry, type VoucherInput, type VoucherPatch } from './voucher.mjs';
 import { MASTER_TAGS, MASTER_COLLECTION_TYPES, planMasterNameRepairs, buildRenameMasterXml, verifyRename, buildMasterNamesCollectionXml, parseMasterNamesFromCollection } from './master.mjs';
 import type { ModelPushResponse } from './models.mjs';
 import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
@@ -1191,6 +1191,55 @@ export function planUseCompany(resolved: ResolveCompanyEnriched): UseCompanyPlan
 // Resolves the configured Tally edition from env var. Defaults to "silver" — safer assumption since
 // Silver is more restrictive (single company resident); Gold treated as Silver still works, just slower than necessary.
 // Anything other than "gold" (case-insensitive) is treated as Silver.
+// ── Entry order ─────────────────────────────────────────────────────────────────────────────────
+//
+// Which side leads inside a voucher: credits first, or debits first. Display only — Tally records
+// debit-vs-credit in ISDEEMEDPOSITIVE and the sign of AMOUNT, never in line position — but it is
+// what an accountant reads when they open the voucher or its Edit Log entry, and firms genuinely
+// differ on it.
+//
+// UNSET IS A REAL STATE, not a synonym for the default. A fresh install has no answer yet, and this
+// server does not want to pick one silently and have every voucher in someone's books read the
+// wrong way round to them. `configured: false` is what makes the caller ask before the first write.
+// An unrecognised value is treated the same way: better to ask than to act on a typo.
+export function resolveEntryOrder(
+  rawValue: string | undefined = process.env.ENTRY_ORDER
+): { order: EntryOrder; configured: boolean } {
+  const v = String(rawValue ?? '').trim().toLowerCase();
+  if (v === 'credit-first' || v === 'debit-first') return { order: v, configured: true };
+  return { order: 'credit-first', configured: false };
+}
+
+// The .env this server was loaded from — the same path dotenv reads at startup, so what we write
+// here is what the next start reads.
+export function envFilePath(): string {
+  return path.join(import.meta.dirname, '..', '.env');
+}
+
+// Rewrites ONE key, leaving every other line — comments, ordering, spacing — exactly as it was.
+// .env is a file the operator hand-edits and the installer generates; rewriting it wholesale from a
+// parsed object would silently discard both. Pure, so the merge logic is testable without a disk.
+export function upsertEnvLine(existing: string, key: string, value: string): string {
+  const lines = existing.split(/\r?\n/);
+  const re = new RegExp(`^\\s*${key}\\s*=`);
+  let replaced = false;
+  for (let i = 0; i < lines.length; i++) {
+    // A commented-out key is documentation, not configuration — leave it be and write a live one.
+    if (/^\s*#/.test(lines[i])) continue;
+    if (re.test(lines[i])) {
+      lines[i] = `${key}=${value}`;
+      replaced = true;
+      break;   // only the FIRST live occurrence wins, matching how dotenv reads it
+    }
+  }
+  if (!replaced) {
+    if (lines.length && lines[lines.length - 1].trim() !== '') lines.push('');
+    lines.push(`${key}=${value}`);
+    lines.push('');
+  }
+  return lines.join('\n');
+}
+
 export function getTallyEdition(rawValue: string | undefined = process.env.TALLY_EDITION): 'silver' | 'gold' {
   return String(rawValue || '').trim().toLowerCase() === 'gold' ? 'gold' : 'silver';
 }
@@ -1788,13 +1837,16 @@ export function buildAlterVariants(
   const out: Array<{ name: string; xml: string }> = [];
   if (!remoteId && !vchKey) return out;   // unkeyed → every form would create, not alter
   const blockNoRemote = block.replace(openTag, openTag.replace(/\s*REMOTEID="[^"]*"/i, ''));
+  // One resolution for every candidate form, so an alter cannot reorder lines differently depending
+  // on which envelope Tally happens to accept.
+  const entryOrder = resolveEntryOrder().order;
   const minimal = (id: { remoteId?: string; vchKey?: string }) =>
-    buildAlterVoucherXml({ ...patch, ...id, voucherType, voucherNumber, date: patch.date || isoDate }, company);
-  out.push({ name: 'block-verbatim', xml: wrapVoucherImport(applyPatchToBlock(block, patch), company) });
+    buildAlterVoucherXml({ ...patch, ...id, voucherType, voucherNumber, date: patch.date || isoDate }, company, entryOrder);
+  out.push({ name: 'block-verbatim', xml: wrapVoucherImport(applyPatchToBlock(block, patch, entryOrder), company) });
   if (remoteId && vchKey) out.push({ name: 'minimal-remoteid-vchkey', xml: minimal({ remoteId, vchKey }) });
   if (vchKey) out.push({ name: 'minimal-vchkey', xml: minimal({ vchKey }) });
   if (remoteId) out.push({ name: 'minimal-remoteid', xml: minimal({ remoteId }) });
-  if (vchKey) out.push({ name: 'block-minus-remoteid', xml: wrapVoucherImport(applyPatchToBlock(blockNoRemote, patch), company) });
+  if (vchKey) out.push({ name: 'block-minus-remoteid', xml: wrapVoucherImport(applyPatchToBlock(blockNoRemote, patch, entryOrder), company) });
   return out;
 }
 
@@ -2072,6 +2124,7 @@ Hard preconditions (discover via \`status\`/\`get-context\`, don't hit walls):
 - The GUI automation agent must be running to load/switch companies or unlock protected ones.
 - On Silver only one company is resident at a time; loading another replaces it.
 - Write tools are refused when readonly is true (READONLY_MODE).
+- Voucher writes are refused until entry order is set. \`status\`/\`get-context\` report \`entryOrder\`; if \`configured\` is false, ASK THE USER "should the credit line or the debit line come first in a voucher?", say that it changes only how the voucher READS when opened (the posting, signs and balance are identical), then call \`set-entry-order\` once. Do not guess it for them and do not keep re-asking once it is set.
 
 Driving the Tally GUI (on by default; disabled only if the operator set ENABLE_GUI_CONTROL=false) — YOU drive it, look-verify-act, never blind:
 - Use \`gui-screenshot\` as your eyes and \`gui-send-keys\` as your hands. Screenshot → confirm which screen you're on → send ONE step → screenshot → confirm the transition. Never send a relative sequence into an unknown screen.
@@ -2170,6 +2223,7 @@ export type ToolErrorCode =
   | 'AMBIGUOUS'
   | 'UNSAVED_ENTRY_OPEN'
   | 'GUI_HANDOFF'
+  | 'ENTRY_ORDER_UNSET'
   | 'UNKNOWN';
 
 export type ToolErrorEnvelope = {
@@ -2192,6 +2246,9 @@ const TOOL_ERROR_DEFAULTS: Record<ToolErrorCode, { retryable: boolean; message: 
   // Not a failure — an explicit transfer of control. The XML/TDL routes are exhausted, the GUI agent
   // is alive, and the remaining work needs eyes. YOU drive it from here, one verified step at a time.
   // The server deliberately does NOT guess a keystroke sequence on the caller's behalf.
+  // Asked once per install, before the first voucher is written. Not a fault: the server is refusing
+  // to decide, on the user's behalf, how every voucher in their books will read.
+  ENTRY_ORDER_UNSET: { retryable: true, message: 'Nobody has said yet whether vouchers should list credits or debits first.', remedy: 'ASK THE USER: "When I write a voucher, should the credit line or the debit line come first?" Explain it only changes how the voucher reads when opened — the accounting posting is identical either way. Then save the answer with set-entry-order and retry. An operator can instead put ENTRY_ORDER=credit-first (or debit-first) in .env.' },
   GUI_HANDOFF: { retryable: true, message: 'This needs the Tally GUI, which you drive yourself.', remedy: 'Call gui-screenshot to see the current screen, send ONE step with gui-send-keys, screenshot again to confirm the transition, and repeat. Never send a relative sequence into a screen you have not looked at.' },
   PRECONDITION_FAILED: { retryable: true, message: 'A required precondition is not met.' },
   READONLY: { retryable: false, message: 'Write operations are disabled (READONLY_MODE=true).', remedy: 'Unset READONLY_MODE on the server to allow writes.' },
@@ -2451,7 +2508,14 @@ export async function executeVoucher(
       return { content: [{ type: 'text', text: JSON.stringify(body) }] };
     }
   }
-  const xml = buildVoucherXml(voucher, company);
+  // Ask before the first voucher, not after. Entry order changes how every voucher in these books
+  // reads, and silently picking one means the user discovers our choice by opening their own
+  // accounts later. dryRun is exempt: it writes nothing, so it can show the caller what would be
+  // posted (under the provisional default) while the question is still outstanding.
+  const entryOrder = resolveEntryOrder();
+  if (!entryOrder.configured && !opts.dryRun) return errorResult('ENTRY_ORDER_UNSET');
+
+  const xml = buildVoucherXml(voucher, company, entryOrder.order);
   if (opts.dryRun) {
     // Echo exactly what would be posted; mutate nothing (#96 H-10).
     return { content: [{ type: 'text', text: JSON.stringify({ dryRun: true, wouldPost: true, balance: bal, voucher, xml }, null, 2) }] };
@@ -3162,10 +3226,63 @@ export async function registerMcpServer(): Promise<McpServer> {
   );
 
   mcpServer.registerTool(
+    'set-entry-order',
+    {
+      title: 'Set Entry Order',
+      description: `Records whether vouchers this server writes should list the CREDIT line first or the DEBIT line first, and persists it to .env so it survives a restart. Ask the user before calling: "When I write a voucher, should the credit line or the debit line come first?" — and tell them it changes only how the voucher READS when they open it in Tally; the accounting posting, the signs and the balance are identical either way. Call this once, after they answer. Until it is set, voucher writes are refused with ENTRY_ORDER_UNSET. Does NOT touch anything already written.`,
+      inputSchema: {
+        order: z.enum(['credit-first', 'debit-first']).describe('credit-first lists credit lines before debit lines in each voucher; debit-first is the reverse.')
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      try {
+        const envPath = envFilePath();
+        // Read-modify-write ONE key. .env is generated by the installer and hand-edited by
+        // operators, so every other line — including comments explaining the other settings — has
+        // to survive. Missing file is not an error: local installs can legitimately run on
+        // environment variables alone, and creating it is the right repair.
+        let existing = '';
+        try { existing = fs.readFileSync(envPath, 'utf-8'); } catch { existing = ''; }
+        const updated = upsertEnvLine(existing, 'ENTRY_ORDER', args.order);
+        try {
+          atomicWriteFile(envPath, updated);
+        } catch (err) {
+          auditLog('set-entry-order', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', {
+            message: `Could not write ${envPath}: ${err instanceof Error ? err.message : String(err)}`,
+            remedy: `Add the line ENTRY_ORDER=${args.order} to that file by hand, then restart the server. (On a service install the file usually sits under Program Files and needs an administrator to edit.)`,
+            retryable: false,
+          });
+        }
+        // Apply immediately as well as persisting: the user asked a question and expects the very
+        // next voucher to obey the answer, not the one after a restart.
+        process.env.ENTRY_ORDER = args.order;
+        auditLog('set-entry-order', args, 'success', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify({
+          entryOrder: args.order,
+          persistedTo: envPath,
+          appliesFrom: 'the next voucher written',
+          note: 'Vouchers already in Tally are unchanged — this only affects how new ones are written.'
+        }) }] };
+      } catch (err) {
+        auditLog('set-entry-order', args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: 'set-entry-order failed.', logs: String(err) });
+      }
+    }
+  );
+
+  mcpServer.registerTool(
     'status',
     {
       title: 'Status',
-      description: `Authoritative one-shot health/usability check for this Tally MCP server. Returns a stable five-field contract: { tallyReachable, agentAlive, activeCompany, edition, readonly }, plus { tallyProblem: { message, remedy } } whenever tallyReachable is false — RELAY THAT REMEDY TO THE USER VERBATIM, it contains the exact Tally menu path they need and is written for a non-technical reader. Both liveness probes are retried briefly so a single transient blip doesn't flip the reported state. Call this to answer "is this usable right now, and in what mode?" instead of stitching list-loaded-companies + open-company-debug. Use open-company-debug for the verbose troubleshooting dump (paths, files, agent version, XML sample).`,
+      description: `Authoritative one-shot health/usability check for this Tally MCP server. Returns a stable five-field contract: { tallyReachable, agentAlive, activeCompany, edition, readonly }, plus { tallyProblem: { message, remedy } } whenever tallyReachable is false — RELAY THAT REMEDY TO THE USER VERBATIM, it contains the exact Tally menu path they need and is written for a non-technical reader. Also returns { entryOrder }: when entryOrder.configured is false, ASK THE USER the question in entryOrder.action BEFORE attempting any voucher write — writes are refused until it is answered. Both liveness probes are retried briefly so a single transient blip doesn't flip the reported state. Call this to answer "is this usable right now, and in what mode?" instead of stitching list-loaded-companies + open-company-debug. Use open-company-debug for the verbose troubleshooting dump (paths, files, agent version, XML sample).`,
       inputSchema: {},
       annotations: {
         readOnlyHint: true,
@@ -3189,6 +3306,12 @@ export async function registerMcpServer(): Promise<McpServer> {
         // Tally ships with its data connection switched off and nobody told the user to turn it on.
         // Attach the diagnosis and the click-path so the caller can relay something actionable.
         if (!tallyReachable) status.tallyProblem = describeTallyUnreachable();
+        // Reported ALWAYS, not only when unset: a caller that has already written vouchers this
+        // session should still be able to see which way round they are going without asking again.
+        const eo = resolveEntryOrder();
+        status.entryOrder = eo.configured
+          ? { value: eo.order, configured: true }
+          : { value: null, configured: false, action: 'ASK THE USER whether vouchers should list credits or debits first, then save it with set-entry-order. Voucher writes are refused until then. It changes only how a voucher READS when opened; the accounting posting is identical either way.' };
         auditLog('status', args, 'success', Date.now() - start);
         return { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] };
       } catch (err) {
@@ -3202,7 +3325,7 @@ export async function registerMcpServer(): Promise<McpServer> {
     'get-context',
     {
       title: 'Get Context',
-      description: `One-shot environment + requirements snapshot: { edition, readonly, activeCompany, agentAlive, tallyReachable, requirements }, plus { tallyProblem: { message, remedy } } when tallyReachable is false — relay that remedy to the user verbatim. Wraps status (live liveness, retried) and adds the static list of external requirements so a fresh agent can learn what must be running before it can load a company — without triggering a failure first.`,
+      description: `One-shot environment + requirements snapshot: { edition, readonly, activeCompany, agentAlive, tallyReachable, requirements }, plus { tallyProblem: { message, remedy } } when tallyReachable is false — relay that remedy to the user verbatim. Also returns { entryOrder }; when configured is false, ask the user and save it with set-entry-order before writing any voucher. Wraps status (live liveness, retried) and adds the static list of external requirements so a fresh agent can learn what must be running before it can load a company — without triggering a failure first.`,
       inputSchema: {},
       annotations: {
         readOnlyHint: true,
@@ -3222,6 +3345,10 @@ export async function registerMcpServer(): Promise<McpServer> {
           requirements: getTallyRequirements()
         };
         if (!tallyReachable) context.tallyProblem = describeTallyUnreachable();
+        const ctxEo = resolveEntryOrder();
+        context.entryOrder = ctxEo.configured
+          ? { value: ctxEo.order, configured: true }
+          : { value: null, configured: false, action: 'ASK THE USER whether vouchers should list credits or debits first, then save it with set-entry-order. Voucher writes are refused until then.' };
         auditLog('get-context', args, 'success', Date.now() - start);
         return { content: [{ type: 'text', text: JSON.stringify(context, null, 2) }] };
       } catch (err) {
