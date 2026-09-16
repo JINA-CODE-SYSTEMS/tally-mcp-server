@@ -63,6 +63,44 @@ export function getOpenCompanyGuiTimeoutSeconds(rawValue: string | undefined = p
   return Math.floor(parsed);
 }
 
+// ── Proving a GUI deletion hit the right voucher ────────────────────────────────────────────────
+//
+// On TallyPrime Edit Log builds Tally REFUSES the XML delete ("Cannot delete unnamed object:
+// VOUCHER") for every envelope form, so the only way to remove a mis-booked voucher is the one a
+// human would use: open it and press Alt+D. That means the delete is aimed by reading a screenshot,
+// which is the same judgement that booked the wrong entry in the first place.
+//
+// So it is not trusted. The day's voucher ids are recorded immediately before the keystroke and
+// again after, and the difference has to be EXACTLY the voucher that was asked for. A misnavigation
+// is then caught in seconds - while the Edit Log still holds the deleted voucher's contents and it
+// can be re-entered - instead of at month-end when nobody can say what was lost.
+export type GuiDeleteOutcome = {
+  status: 'deleted' | 'nothing-happened' | 'wrong-voucher' | 'collateral';
+  removed: string[];
+  unexpectedlyRemoved: string[];
+  targetRemoved: boolean;
+};
+
+export function classifyGuiDeleteOutcome(
+  targetMasterId: string,
+  before: string[],
+  after: string[]
+): GuiDeleteOutcome {
+  const afterSet = new Set(after.map(String));
+  const removed = before.map(String).filter(id => !afterSet.has(id));
+  const targetRemoved = removed.includes(String(targetMasterId));
+  const unexpectedlyRemoved = removed.filter(id => id !== String(targetMasterId));
+
+  if (targetRemoved && unexpectedlyRemoved.length === 0) return { status: 'deleted', removed, unexpectedlyRemoved, targetRemoved };
+  // The target went, but so did something else. Alt+D on a screen holding more than one selected
+  // row, or a stray confirm, can do this. Loudest possible outcome.
+  if (targetRemoved) return { status: 'collateral', removed, unexpectedlyRemoved, targetRemoved };
+  // Something vanished and it was NOT what was asked for: the navigation landed elsewhere.
+  if (removed.length > 0) return { status: 'wrong-voucher', removed, unexpectedlyRemoved, targetRemoved };
+  // Nothing moved. Usually Alt+D never reached a voucher screen, or a confirmation is still open.
+  return { status: 'nothing-happened', removed, unexpectedlyRemoved, targetRemoved };
+}
+
 // ── WHICH TALLY? ────────────────────────────────────────────────────────────────────────────────
 //
 // A machine can carry several Tally installs (Prime 3.x, 4.x, Edit Log) and run several of them at
@@ -1768,6 +1806,18 @@ async function locateByMasterId(masterId: string, company?: string): Promise<{ v
   return { voucher: rows[0] ?? null };
 }
 
+// Every voucher id Tally reports for one date. This is the baseline a GUI deletion is proved
+// against, so it deliberately uses a filter-free collection: a snapshot that quietly excluded some
+// vouchers would let exactly the deletion it exists to catch slip through as "nothing else changed".
+async function snapshotVoucherIdsForDate(isoDate: string, company?: string): Promise<{ ids: string[] } | { error: string }> {
+  const p = new Map<string, any>([['fromDate', isoDate], ['toDate', isoDate]]);
+  if (company) p.set('targetCompany', company);
+  const resp = await pull('voucher-day-snapshot', p);
+  if (resp.error) return { error: resp.error };
+  const rows = Array.isArray(resp.data) ? resp.data : [];
+  return { ids: rows.map((r: any) => String(r.master_id)).filter(Boolean) };
+}
+
 // Parse a voucher's durable delete keys (REMOTEID/GUID + VCHKEY) out of Tally's NATIVE Day Book export
 // XML. A live probe showed the collection scalar $Guid/$VoucherKey come back empty on some builds, but
 // the native export carries both as attributes on the <VOUCHER> tag — this reads them from there.
@@ -2261,6 +2311,7 @@ Driving the Tally GUI (on by default; disabled only if the operator set ENABLE_G
 - \`open-company\` returning code GUI_HANDOFF is not a failure: the XML routes are exhausted, Tally is up, and it is handing you the window. Start the loop above — it will NOT navigate for you, by design.
 - Anchor first: press Escape back to the Gateway of Tally and confirm you're there before navigating.
 - Keystrokes are for LOGIN and COMPANY SELECTION only. NEVER keystroke a data write. All vouchers/masters go through the deterministic tools (create-voucher, create-ledger, …) which use Tally's XML API — never the GUI.
+- Removing a mis-booked voucher when delete-voucher reports Tally refused every XML form (normal on Edit Log builds): prefer \`alter-voucher\` to correct it in place. If it must actually be removed, use \`gui-delete-voucher\` — navigate to the voucher, CONFIRM IT BY SCREENSHOT, then confirm; the server checks that exactly that voucher disappeared. Never tell the user a voucher cannot be deleted without saying which of these you tried.
 - Fail closed: if a screenshot shows an unexpected screen (especially any Create/Alter master screen), STOP, press Escape back to the anchor, and return the problem — do NOT push more keys into the void.
 - Unlocking a protected company: when the password prompt is visible (confirm via screenshot first), call \`unlock-stored-credentials\` — the SERVER decrypts and types the vaulted password locally; the plaintext never comes to you and is never logged. If it returns noStoredCredentials or failed, ask the user for the password, then type it and verify by screenshot.`;
 
@@ -5021,7 +5072,147 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
       // None worked — surface every form's raw counters so we can see exactly what this build rejects.
       auditLog('delete-voucher', args, 'error', Date.now() - start);
-      return errorResult('PRECONDITION_FAILED', { message: `No delete form was accepted for master_id ${masterId} (${located.voucher_type} #${voucherNumber ?? '?'}). Nothing was deleted. Per-form results: ${JSON.stringify(attempts)}`, retryable: false });
+      return errorResult('PRECONDITION_FAILED', {
+        message: `Tally refused every XML delete form for master_id ${masterId} (${located.voucher_type} #${voucherNumber ?? '?'}). Nothing was deleted. This is expected on TallyPrime Edit Log builds, which reject ACTION="Delete" for vouchers outright ("Cannot delete unnamed object: VOUCHER") — it is a Tally restriction, not a fault here. Per-form results: ${JSON.stringify(attempts)}`,
+        remedy: `Two routes remain, in this order. (1) PREFER alter-voucher: correct the voucher in place, which is what most mis-bookings actually need and leaves an Edit Log trail. (2) If it must genuinely be removed, use gui-delete-voucher with masterId:"${masterId}" — it presses Alt+D in the Tally window the way a person would, after YOU have confirmed the right voucher is on screen with gui-screenshot, and it verifies afterwards that exactly that voucher disappeared. Do not tell the user this cannot be deleted; tell them which of the two you are doing.`,
+        retryable: false,
+      });
+    }
+  );
+
+  mcpServer.registerTool(
+    'gui-delete-voucher',
+    {
+      title: 'Delete Voucher via Tally window (last resort)',
+      description: `LAST RESORT for TallyPrime Edit Log builds, where Tally REFUSES every XML delete form ("Cannot delete unnamed object: VOUCHER") and delete-voucher therefore cannot work. Presses Alt+D in the Tally window, as a person would. YOU must have navigated to the voucher and CONFIRMED BY SCREENSHOT that it is the one on screen before confirming — this tool does not navigate and cannot see. Two-step like delete-voucher: call without confirm to resolve the target and get instructions, then re-call with masterId + confirm:true. The server records every voucher id for that date immediately before the keystroke and again after, and REPORTS AN ERROR unless exactly the intended voucher disappeared — so a misnavigation is caught at once rather than discovered later. Prefer alter-voucher where a correction will do: it is reversible in effect, and this is not. Requires ENABLE_GUI_CONTROL. Refused when READONLY_MODE=true.`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name; defaults to the active company'),
+        voucherType: z.string().min(1).describe('voucher type exactly as it exists in the company; checked against the voucher master_id points to'),
+        masterId: z.string().describe('immutable Tally master_id of the voucher to delete (from locate-voucher or a delete-voucher preview). Required — this tool never resolves by number, because the keystroke cannot be aimed by number.'),
+        screenshotConfirmed: z.boolean().optional().describe('set true ONLY after you have called gui-screenshot and visually confirmed THIS voucher is the one open in the Tally window. Required alongside confirm.'),
+        confirm: z.boolean().optional().describe('must be true, with screenshotConfirmed, to actually press Alt+D; otherwise the tool only resolves and previews')
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      try {
+        if (process.env.READONLY_MODE === 'true') {
+          auditLog('gui-delete-voucher', args, 'denied', Date.now() - start);
+          return errorResult('READONLY');
+        }
+        if (process.env.ENABLE_GUI_CONTROL !== 'true') {
+          auditLog('gui-delete-voucher', args, 'denied', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: 'GUI control is disabled, so the Tally window cannot be driven.', remedy: 'Enable it from the tray (Allow Claude to control Tally), or set ENABLE_GUI_CONTROL=true in .env and restart.', retryable: false });
+        }
+
+        const company = args.targetCompany || activeCompany || undefined;
+
+        // Resolve against Tally, never against what the caller believes. A stale id, a
+        // cross-company id, or a type mismatch all fail closed BEFORE any keystroke.
+        const loc = await locateByMasterId(args.masterId, company);
+        if ('error' in loc) {
+          auditLog('gui-delete-voucher', args, 'error', Date.now() - start);
+          return errorResult('UNKNOWN', { message: loc.error });
+        }
+        if (!loc.voucher) {
+          auditLog('gui-delete-voucher', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `No voucher with master_id ${args.masterId} exists in ${company ?? 'the active company'}. It may already have been deleted.`, retryable: false });
+        }
+        const located: any = loc.voucher;
+        if (String(located.voucher_type) !== args.voucherType) {
+          auditLog('gui-delete-voucher', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `master_id ${args.masterId} is a ${located.voucher_type} (#${located.voucher_number}), not a ${args.voucherType}. Refusing.`, retryable: false });
+        }
+
+        const isoDate = toIsoDate(located.date);
+        if (!isoDate) {
+          auditLog('gui-delete-voucher', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `Could not read a usable date for master_id ${args.masterId}, so the before/after check that makes this safe cannot run. Refusing.`, retryable: false });
+        }
+        const preview = { master_id: args.masterId, date: located.date, voucher_number: located.voucher_number, voucher_type: located.voucher_type, reference: located.reference, party_ledger: located.party_ledger, amount: located.amount, is_cancelled: located.is_cancelled };
+
+        if (!(args.confirm === true && args.screenshotConfirmed === true)) {
+          auditLog('gui-delete-voucher', args, 'denied', Date.now() - start);
+          return { content: [{ type: 'text', text: JSON.stringify({
+            requiresConfirmation: true,
+            wouldDelete: preview,
+            message: `This PERMANENTLY deletes the voucher above by pressing Alt+D in the Tally window. It cannot be undone (an Edit Log company records what was removed, so it can be re-entered, but it is not an undo).`,
+            doThisFirst: [
+              `Open this exact voucher in Tally — Gateway > Day Book > ${isoDate}, or Display > Vouchers — using gui-send-keys ONE step at a time.`,
+              `Call gui-screenshot and READ IT. Confirm the voucher on screen is ${located.voucher_type} #${located.voucher_number}, ${located.party_ledger ?? 'no party'}, amount ${located.amount}.`,
+              `Only if it matches, re-call with masterId:"${args.masterId}", voucherType:"${args.voucherType}", screenshotConfirmed:true, confirm:true.`,
+              `If it does NOT match, do not confirm — navigate again. The server will catch a wrong deletion afterwards, but catching it before is better.`
+            ]
+          }, null, 2) }] };
+        }
+
+        // Baseline taken NOW, immediately before the keystroke, so it cannot be stale.
+        const beforeSnap = await snapshotVoucherIdsForDate(isoDate, company);
+        if ('error' in beforeSnap) {
+          auditLog('gui-delete-voucher', args, 'error', Date.now() - start);
+          return errorResult('UNKNOWN', { message: `Could not read the day's vouchers before deleting (${beforeSnap.error}). Refusing to press Alt+D without a baseline — the check afterwards is the only thing proving the right voucher went.` });
+        }
+        if (!beforeSnap.ids.includes(String(args.masterId))) {
+          auditLog('gui-delete-voucher', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `master_id ${args.masterId} is not among the ${beforeSnap.ids.length} vouchers Tally reports for ${isoDate}. Refusing — the baseline and the target disagree.`, retryable: false });
+        }
+
+        const logs: string[] = [];
+        const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        // Alt+D, then Tally's Yes/No confirmation. The wait between matters: the prompt has to be up
+        // before the confirm lands, or the "y" goes wherever focus happens to be.
+        const keys = [
+          { action: 'combo', value: 'alt+d' },
+          { action: 'wait', value: '900' },
+          { action: 'key', value: 'y' },
+          { action: 'wait', value: '1500' }
+        ];
+        const resp = await callGuiAgent('sendkeys', { keys }, 45, dataPath, logs);
+        if (!resp) {
+          auditLog('gui-delete-voucher', args, 'error', Date.now() - start);
+          return errorResult('AGENT_UNREACHABLE', { message: 'The GUI agent did not respond, so it is UNKNOWN whether the keystroke landed. Check the Day Book before retrying.', logs: logs.join('\n') });
+        }
+
+        const afterSnap = await snapshotVoucherIdsForDate(isoDate, company);
+        if ('error' in afterSnap) {
+          auditLog('gui-delete-voucher', args, 'error', Date.now() - start);
+          return errorResult('UNKNOWN', { message: `Alt+D was sent, but the day's vouchers could not be re-read (${afterSnap.error}), so the outcome is UNVERIFIED. Check ${isoDate} in the Day Book yourself before doing anything else.`, logs: logs.join('\n') });
+        }
+
+        const outcome = classifyGuiDeleteOutcome(String(args.masterId), beforeSnap.ids, afterSnap.ids);
+        const common = { outcome: outcome.status, target: preview, removedMasterIds: outcome.removed, vouchersOnDateBefore: beforeSnap.ids.length, vouchersOnDateAfter: afterSnap.ids.length };
+
+        if (outcome.status === 'deleted') {
+          auditLog('gui-delete-voucher', args, 'success', Date.now() - start);
+          return { content: [{ type: 'text', text: JSON.stringify({ success: true, ...common, note: 'Verified: exactly this voucher disappeared and nothing else on that date changed.' }, null, 2) }] };
+        }
+        if (outcome.status === 'nothing-happened') {
+          auditLog('gui-delete-voucher', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', {
+            message: `Nothing was deleted — all ${beforeSnap.ids.length} vouchers on ${isoDate} are still there. Alt+D most likely never reached a voucher screen.`,
+            remedy: 'Call gui-screenshot: a confirmation dialog may still be open, or Tally may be on a different screen. Escape back to the Gateway, navigate to the voucher again, and confirm by screenshot before retrying.',
+          });
+        }
+        // Both remaining outcomes mean a voucher nobody asked about is gone. This is the failure the
+        // whole before/after check exists to surface, so it is stated in full and never softened.
+        auditLog('gui-delete-voucher', args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', {
+          message: outcome.status === 'wrong-voucher'
+            ? `WRONG VOUCHER DELETED. master_id ${args.masterId} is still present, but ${outcome.unexpectedlyRemoved.join(', ')} disappeared from ${isoDate}. Alt+D was pressed on something else.`
+            : `COLLATERAL DELETION. The intended voucher went, but so did ${outcome.unexpectedlyRemoved.join(', ')} on ${isoDate}.`,
+          remedy: `TELL THE USER NOW, before doing anything else. On an Edit Log company the deleted voucher's contents are in the Edit Log (Gateway > Display > Exception Reports > Edit Log, or the Day Book with Alt+F1), so it can be re-entered — but it must be done deliberately. Do NOT retry this tool until the books are reconciled.`,
+          logs: JSON.stringify(common),
+        });
+      } catch (err) {
+        auditLog('gui-delete-voucher', args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: 'gui-delete-voucher failed.', logs: String(err) });
+      }
     }
   );
 
