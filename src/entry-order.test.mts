@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveEntryOrder, upsertEnvLine } from './mcp.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { resolveEntryOrder, resolveEntryOrderFor, applyEntryOrderChoice, readEntryOrderConfig, upsertEnvLine, type EntryOrderConfig } from './mcp.mjs';
 import { orderEntries, buildVoucherXml, type VoucherEntry } from './voucher.mjs';
 
 const DR: VoucherEntry = { ledger: 'Rent Expense', drCr: 'dr', amount: 5000 };
@@ -110,4 +113,93 @@ test('a COMMENTED-OUT key is documentation and is not hijacked', () => {
 
 test('writing to an empty file produces a usable one', () => {
   assert.match(upsertEnvLine('', 'ENTRY_ORDER', 'debit-first'), /^ENTRY_ORDER=debit-first$/m);
+});
+
+// --- per voucher type ---------------------------------------------------------------------------
+// One global answer is WRONG: an accountant expects a different side to lead on a receipt than on a
+// payment. These tests pin the precedence chain, because getting it wrong means either nagging the
+// user about types they already answered, or silently writing a type they never answered.
+
+const cfg = (o: Partial<EntryOrderConfig>): EntryOrderConfig => ({ default: null, byVoucherType: {}, ...o });
+
+test('a type-specific answer beats the blanket default', () => {
+  const r = resolveEntryOrderFor('Payment', cfg({ default: 'credit-first', byVoucherType: { Payment: 'debit-first' } }), undefined);
+  assert.deepEqual(r, { order: 'debit-first', configured: true, source: 'voucher-type' });
+});
+
+test('types differ independently — answering Receipt says nothing about Payment', () => {
+  const c = cfg({ byVoucherType: { Receipt: 'credit-first' } });
+  assert.equal(resolveEntryOrderFor('Receipt', c, undefined).configured, true);
+  // The whole point: Payment must still be ASKED, not inherited from Receipt.
+  assert.equal(resolveEntryOrderFor('Payment', c, undefined).configured, false);
+});
+
+test('voucher types match case-insensitively', () => {
+  // Tally calls it "Sales"; a user who answered for "sales" must not be asked twice.
+  const c = cfg({ byVoucherType: { sales: 'credit-first' } });
+  assert.equal(resolveEntryOrderFor('SALES', c, undefined).source, 'voucher-type');
+  assert.equal(resolveEntryOrderFor('  Sales ', c, undefined).source, 'voucher-type');
+});
+
+test('the blanket default covers types with no answer of their own', () => {
+  const r = resolveEntryOrderFor('RM Purchase', cfg({ default: 'debit-first' }), undefined);
+  assert.deepEqual(r, { order: 'debit-first', configured: true, source: 'default' });
+});
+
+test('ENTRY_ORDER in .env is the last resort, below both', () => {
+  // Back-compat: installs configured before per-type support existed still carry this key, and an
+  // operator can still set one by hand.
+  const r = resolveEntryOrderFor('Journal', cfg({}), 'credit-first');
+  assert.deepEqual(r, { order: 'credit-first', configured: true, source: 'env' });
+  // ...but a per-type answer still wins over it.
+  const r2 = resolveEntryOrderFor('Journal', cfg({ byVoucherType: { Journal: 'debit-first' } }), 'credit-first');
+  assert.equal(r2.order, 'debit-first');
+});
+
+test('nothing configured anywhere means ASK, not a silent default', () => {
+  const r = resolveEntryOrderFor('Receipt', cfg({}), undefined);
+  assert.equal(r.configured, false);
+  assert.equal(r.source, 'none');
+});
+
+test('a corrupt config file degrades to asking, never to a guess or a crash', () => {
+  // This file is on a customer's disk and can be hand-edited, truncated by a bad shutdown, or
+  // simply absent on first run. None of those may take voucher writing down, and none may be
+  // silently read as an answer.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'entry-order-'));
+  const file = path.join(dir, 'cfg.json');
+
+  fs.writeFileSync(file, '{ this is not json');
+  assert.deepEqual(readEntryOrderConfig(file), { default: null, byVoucherType: {} }, 'unparseable');
+
+  fs.writeFileSync(file, JSON.stringify({ default: 'sideways', byVoucherType: { Receipt: 'upside-down', Sales: 'debit-first' } }));
+  const cleaned = readEntryOrderConfig(file);
+  assert.equal(cleaned.default, null, 'a nonsense default is dropped, not honoured');
+  assert.deepEqual(cleaned.byVoucherType, { Sales: 'debit-first' }, 'a nonsense per-type value is dropped; valid siblings survive');
+  assert.equal(resolveEntryOrderFor('Receipt', cleaned, undefined).configured, false, 'so Receipt is ASKED');
+
+  assert.deepEqual(readEntryOrderConfig(path.join(dir, 'absent.json')), { default: null, byVoucherType: {} });
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('recording an answer for one type leaves the others alone', () => {
+  let c: EntryOrderConfig = { default: null, byVoucherType: { Receipt: 'credit-first' } };
+  c = applyEntryOrderChoice(c, 'debit-first', 'Payment');
+  assert.deepEqual(c.byVoucherType, { Receipt: 'credit-first', Payment: 'debit-first' });
+  assert.equal(c.default, null);
+});
+
+test('re-answering a type CORRECTS it instead of leaving two cased variants', () => {
+  let c: EntryOrderConfig = { default: null, byVoucherType: { sales: 'credit-first' } };
+  c = applyEntryOrderChoice(c, 'debit-first', 'Sales');
+  assert.equal(Object.keys(c.byVoucherType!).length, 1, 'one entry, not two');
+  assert.equal(resolveEntryOrderFor('sales', c, undefined).order, 'debit-first');
+});
+
+test('omitting the voucher type sets the blanket default and preserves per-type answers', () => {
+  let c: EntryOrderConfig = { default: null, byVoucherType: { Receipt: 'credit-first' } };
+  c = applyEntryOrderChoice(c, 'debit-first');
+  assert.equal(c.default, 'debit-first');
+  assert.deepEqual(c.byVoucherType, { Receipt: 'credit-first' }, 'a deliberate per-type answer is not erased by a later blanket one');
+  assert.equal(resolveEntryOrderFor('Receipt', c, undefined).order, 'credit-first');
 });
