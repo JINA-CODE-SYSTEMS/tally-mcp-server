@@ -1226,6 +1226,30 @@ export type EntryOrderConfig = {
 };
 
 export const EMPTY_ENTRY_ORDER_CONFIG: EntryOrderConfig = { default: null, byVoucherType: {} };
+// Shipped defaults for the four types nearly every book uses.
+//
+// There is one rule behind all four, and it is worth stating because it is what makes them
+// defensible rather than arbitrary: THE PARTY LINE LEADS.
+//
+//   Purchase  Cr Creditor  / Dr Purchases   -> credit-first
+//   Sales     Dr Debtor    / Cr Sales       -> debit-first
+//   Receipt   Cr Party     / Dr Bank        -> credit-first
+//   Payment   Dr Party     / Cr Bank        -> debit-first
+//
+// which is also the order Tally itself prompts for them, so a voucher written by this server reads
+// the way one keyed in by hand does.
+//
+// EXACT names only, matched case-insensitively. Deliberately NOT a prefix or substring match: a
+// company's "Purchase Return" behaves like a credit note, not like a purchase, and inferring a base
+// type from a name is exactly the kind of guess that produces a voucher reading backwards. Custom
+// types get asked about, like any other unknown type.
+export const BUILT_IN_ENTRY_ORDER: Record<string, EntryOrder> = {
+  Purchase: 'credit-first',
+  Sales: 'debit-first',
+  Receipt: 'credit-first',
+  Payment: 'debit-first',
+};
+
 
 export function entryOrderConfigPath(): string {
   if (process.env.TALLY_ENTRY_ORDER_CONFIG) return process.env.TALLY_ENTRY_ORDER_CONFIG;
@@ -1264,7 +1288,7 @@ export function resolveEntryOrderFor(
   voucherType: string | undefined,
   config: EntryOrderConfig = readEntryOrderConfig(),
   envRaw: string | undefined = process.env.ENTRY_ORDER
-): { order: EntryOrder; configured: boolean; source: 'voucher-type' | 'default' | 'env' | 'none' } {
+): { order: EntryOrder; configured: boolean; source: 'voucher-type' | 'default' | 'env' | 'built-in' | 'none' } {
   const wanted = String(voucherType ?? '').trim().toLowerCase();
   if (wanted) {
     // Case-insensitive, matching how every other master name is compared in this server: a user
@@ -1278,6 +1302,15 @@ export function resolveEntryOrderFor(
   }
   const fromEnv = resolveEntryOrder(envRaw);
   if (fromEnv.configured) return { order: fromEnv.order, configured: true, source: 'env' };
+
+  // Only now do our own defaults apply. Everything above is something a HUMAN chose, and a human's
+  // blanket "credit-first for everything" must beat a per-type default we shipped — otherwise
+  // setting it would appear not to work on exactly the four types people post most.
+  if (wanted) {
+    for (const [type, order] of Object.entries(BUILT_IN_ENTRY_ORDER)) {
+      if (type.toLowerCase() === wanted) return { order, configured: true, source: 'built-in' };
+    }
+  }
   return { order: 'credit-first', configured: false, source: 'none' };
 }
 
@@ -2220,6 +2253,7 @@ Hard preconditions (discover via \`status\`/\`get-context\`, don't hit walls):
 - The GUI automation agent must be running to load/switch companies or unlock protected ones.
 - On Silver only one company is resident at a time; loading another replaces it.
 - Write tools are refused when readonly is true (READONLY_MODE).
+- Purchase, Sales, Receipt and Payment ship with a default (the party line leads, matching how Tally prompts). Those write without asking, but the result carries \`entryOrderNote\` — RELAY IT to the user the first time, and when they confirm or change it call \`set-entry-order\` so the note stops. Every OTHER type has no default.
 - Entry order is PER VOUCHER TYPE, and a type with no answer is REFUSED on write (ENTRY_ORDER_UNSET). Receipts, payments, sales and purchases genuinely differ in which side an accountant expects to lead, so do not assume one answer covers the others. \`status\`/\`get-context\` report \`entryOrder.byVoucherType\` and \`entryOrder.default\`. When a type is unanswered, ASK THE USER "for <type> vouchers, should the credit line or the debit line come first?", say that it changes only how the voucher READS when opened (the posting, signs and balance are identical), then call \`set-entry-order\` with that \`voucherType\`. Omit \`voucherType\` ONLY if they say the same order applies to every type. Never guess, and never re-ask a type that is already answered.
 
 Driving the Tally GUI (on by default; disabled only if the operator set ENABLE_GUI_CONTROL=false) — YOU drive it, look-verify-act, never blind:
@@ -2617,6 +2651,15 @@ export async function executeVoucher(
     });
   }
 
+  // A voucher written under a default WE shipped is the one case where the user has not agreed to
+  // anything. Say so in the result, once, with the way to change it — and say it as a fact about
+  // what was written, not a question, because the voucher is already posted by the time this is
+  // read. Once they confirm or change it, set-entry-order records an explicit answer and the source
+  // stops being 'built-in', so this note stops appearing.
+  const builtInNote = entryOrder.source === 'built-in'
+    ? `Written with ${voucher.voucherType} = ${entryOrder.order} (our default: the party line leads, which is how Tally prompts for it). Only affects how the voucher reads when opened — the posting is identical. If you want ${voucher.voucherType} the other way round, say so and it will be changed for future vouchers; if it is right, say so once and this note will stop.`
+    : undefined;
+
   const xml = buildVoucherXml(voucher, company, entryOrder.order);
   if (opts.dryRun) {
     // Echo exactly what would be posted; mutate nothing (#96 H-10).
@@ -2652,6 +2695,9 @@ export async function executeVoucher(
     ...(resp.created === 0 && resp.altered > 0
       ? { note: 'Tally ALTERED an existing binding rather than creating a new row — typically a retry of a voucher whose earlier attempt was rejected. The voucher IS written; do not retry. Verify by reading master id ' + resp.lastVchId + '.' }
       : {}),
+    // Separate key from `note` above, which is about what Tally did. RELAY THIS ONE TO THE USER: it
+    // is the only moment they learn which way round a default we shipped has written their voucher.
+    ...(builtInNote ? { entryOrderNote: builtInNote } : {}),
   };
   // (d) record the idempotency key so a replay short-circuits (#95/#97).
   if (args.idempotencyKey && opts.idempotency) {
@@ -3413,7 +3459,8 @@ export async function registerMcpServer(): Promise<McpServer> {
           byVoucherType: eoCfg.byVoucherType ?? {},
           default: eoCfg.default ?? resolveEntryOrder().order ?? null,
           hasBlanketDefault: !!eoCfg.default || resolveEntryOrder().configured,
-          note: 'A voucher type with no answer here, and no blanket default, is REFUSED on write — ask the user which side should lead for that type, then call set-entry-order. The answer may differ per type.'
+          builtInDefaults: BUILT_IN_ENTRY_ORDER,
+          note: 'byVoucherType holds what the USER chose and always wins. builtInDefaults are ours, used only where the user has chosen nothing — they write without asking but the write result carries entryOrderNote to relay. Any type in NEITHER list, with no blanket default, is REFUSED on write: ask which side should lead for that type, then call set-entry-order. The answer may differ per type.'
         };
         auditLog('status', args, 'success', Date.now() - start);
         return { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] };
@@ -3453,7 +3500,8 @@ export async function registerMcpServer(): Promise<McpServer> {
           byVoucherType: ctxCfg.byVoucherType ?? {},
           default: ctxCfg.default ?? resolveEntryOrder().order ?? null,
           hasBlanketDefault: !!ctxCfg.default || resolveEntryOrder().configured,
-          note: 'A voucher type with no answer here, and no blanket default, is REFUSED on write — ask the user which side should lead for that type, then call set-entry-order.'
+          builtInDefaults: BUILT_IN_ENTRY_ORDER,
+          note: 'byVoucherType holds what the USER chose and always wins. builtInDefaults are ours, used where the user has chosen nothing. A type in neither, with no blanket default, is REFUSED on write — ask, then call set-entry-order.'
         };
         auditLog('get-context', args, 'success', Date.now() - start);
         return { content: [{ type: 'text', text: JSON.stringify(context, null, 2) }] };
