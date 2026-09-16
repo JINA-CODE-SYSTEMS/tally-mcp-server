@@ -157,7 +157,7 @@ Copy `.env.example` to `.env` and configure:
 | **GUI Agent (open-company)** | | |
 | `OPEN_COMPANY_GUI_TIMEOUT_SEC` | `180` | GUI agent timeout in seconds (min 90) |
 | `ENABLE_GUI_CONTROL` | `true` | Exposes `gui-screenshot` / `gui-send-keys`, the supervised look-then-act loop. Set `false` for XML-only boxes. |
-| `ENTRY_ORDER` | *(unset)* | Blanket fallback: `credit-first` or `debit-first`. Per-type answers live in `.tally-mcp-entry-order.json` and take precedence. **Unset is meaningful** — a voucher type with no answer is refused on write, so the user is asked rather than defaulted. Display only; the posting is identical either way. |
+| `ENTRY_ORDER` | *(unset)* | Blanket fallback: `credit-first` or `debit-first`. Resolution order is **user's per-type answer → user's blanket default → this key → built-in defaults → ask**. Purchase / Sales / Receipt / Payment ship with defaults (party line leads, as Tally prompts); any other type with no answer is **refused on write** so the user is asked rather than defaulted. Display only; the posting is identical either way. |
 | `TALLY_ENTRY_ORDER_CONFIG` | `<dataPath>/.tally-mcp-entry-order.json` | Where per-voucher-type entry order is recorded. |
 | `UPDATE_CHECK` | `true` | Tray asks GitHub once a day whether a newer release exists and says so. Downloads and runs nothing. The only outbound call a local install makes; set `false` to stop it. |
 | `ANTHROPIC_API_VERSION` | `2023-06-01` | Anthropic API version header |

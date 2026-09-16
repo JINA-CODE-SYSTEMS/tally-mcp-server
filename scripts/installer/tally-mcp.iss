@@ -322,9 +322,9 @@ begin
   EntryOrderPage := CreateInputOptionPage(EditionPage.ID,
     'Voucher Layout',
     'Which line should come first in a voucher?',
-    'Only affects how a voucher READS when you open it in Tally - the accounting is identical either way, and no figure changes. Receipts, payments, sales and purchases are often expected to read differently from each other, so the recommended option asks you about each kind the first time it is used, in plain language. The other two apply one order to every kind.',
+    'Only affects how a voucher READS when you open it in Tally - the accounting is identical either way, and no figure changes. Purchases, sales, receipts and payments already use the order Tally itself prompts for, with the party line first; any other kind is asked about the first time it is used. You can change any of them later just by saying so.',
     True, False);
-  EntryOrderPage.Add('Ask me for each kind of voucher, the first time it is used (recommended)');
+  EntryOrderPage.Add('Use the usual order for each kind of voucher (recommended)');
   EntryOrderPage.Add('Credit line first, for every kind');
   EntryOrderPage.Add('Debit line first, for every kind');
   EntryOrderPage.SelectedValueIndex := GetPreviousDataIndex(GetPreviousData('EntryOrder', ''));
