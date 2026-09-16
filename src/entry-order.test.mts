@@ -127,11 +127,12 @@ test('a type-specific answer beats the blanket default', () => {
   assert.deepEqual(r, { order: 'debit-first', configured: true, source: 'voucher-type' });
 });
 
-test('types differ independently — answering Receipt says nothing about Payment', () => {
-  const c = cfg({ byVoucherType: { Receipt: 'credit-first' } });
-  assert.equal(resolveEntryOrderFor('Receipt', c, undefined).configured, true);
-  // The whole point: Payment must still be ASKED, not inherited from Receipt.
-  assert.equal(resolveEntryOrderFor('Payment', c, undefined).configured, false);
+test('types differ independently — answering one says nothing about another', () => {
+  // Uses CUSTOM types deliberately: Receipt and Payment now ship with built-in defaults, so they
+  // would no longer demonstrate the "unanswered types are independent" property.
+  const c = cfg({ byVoucherType: { 'RM Purchase': 'credit-first' } });
+  assert.equal(resolveEntryOrderFor('RM Purchase', c, undefined).configured, true);
+  assert.equal(resolveEntryOrderFor('Contra - Mahad', c, undefined).configured, false);
 });
 
 test('voucher types match case-insensitively', () => {
@@ -156,8 +157,8 @@ test('ENTRY_ORDER in .env is the last resort, below both', () => {
   assert.equal(r2.order, 'debit-first');
 });
 
-test('nothing configured anywhere means ASK, not a silent default', () => {
-  const r = resolveEntryOrderFor('Receipt', cfg({}), undefined);
+test('a type we ship no default for, with nothing configured, means ASK', () => {
+  const r = resolveEntryOrderFor('Contra', cfg({}), undefined);
   assert.equal(r.configured, false);
   assert.equal(r.source, 'none');
 });
@@ -176,7 +177,10 @@ test('a corrupt config file degrades to asking, never to a guess or a crash', ()
   const cleaned = readEntryOrderConfig(file);
   assert.equal(cleaned.default, null, 'a nonsense default is dropped, not honoured');
   assert.deepEqual(cleaned.byVoucherType, { Sales: 'debit-first' }, 'a nonsense per-type value is dropped; valid siblings survive');
-  assert.equal(resolveEntryOrderFor('Receipt', cleaned, undefined).configured, false, 'so Receipt is ASKED');
+  // Receipt falls through to the shipped default rather than being asked; a type we ship nothing
+  // for has nothing left to fall back to and is asked.
+  assert.equal(resolveEntryOrderFor('Receipt', cleaned, undefined).source, 'built-in');
+  assert.equal(resolveEntryOrderFor('Journal', cleaned, undefined).configured, false, 'so Journal is ASKED');
 
   assert.deepEqual(readEntryOrderConfig(path.join(dir, 'absent.json')), { default: null, byVoucherType: {} });
   fs.rmSync(dir, { recursive: true, force: true });
@@ -202,4 +206,54 @@ test('omitting the voucher type sets the blanket default and preserves per-type 
   assert.equal(c.default, 'debit-first');
   assert.deepEqual(c.byVoucherType, { Receipt: 'credit-first' }, 'a deliberate per-type answer is not erased by a later blanket one');
   assert.equal(resolveEntryOrderFor('Receipt', c, undefined).order, 'credit-first');
+});
+
+
+// --- the four shipped defaults ------------------------------------------------------------------
+// One rule underneath all four: THE PARTY LINE LEADS, which is also how Tally prompts for them. If
+// any of these flips, a voucher written by this server stops reading like one keyed in by hand.
+
+test('the shipped defaults put the party line first in each of the four common types', () => {
+  const none = cfg({});
+  assert.equal(resolveEntryOrderFor('Purchase', none, undefined).order, 'credit-first'); // Cr Creditor leads
+  assert.equal(resolveEntryOrderFor('Sales',    none, undefined).order, 'debit-first');  // Dr Debtor leads
+  assert.equal(resolveEntryOrderFor('Receipt',  none, undefined).order, 'credit-first'); // Cr Party leads
+  assert.equal(resolveEntryOrderFor('Payment',  none, undefined).order, 'debit-first');  // Dr Party leads
+  for (const t of ['Purchase', 'Sales', 'Receipt', 'Payment']) {
+    assert.equal(resolveEntryOrderFor(t, none, undefined).source, 'built-in', `${t} resolves from the shipped map`);
+  }
+});
+
+test('shipped defaults are matched by EXACT name, never by prefix', () => {
+  const none = cfg({});
+  assert.equal(resolveEntryOrderFor('purchase', none, undefined).source, 'built-in', 'case-insensitive');
+  // "Purchase Return" behaves like a credit note, not a purchase. Inferring a base type from a name
+  // is exactly the guess that would write a voucher backwards, so it is asked about instead.
+  assert.equal(resolveEntryOrderFor('Purchase Return', none, undefined).configured, false);
+  assert.equal(resolveEntryOrderFor('Sales Order', none, undefined).configured, false);
+  assert.equal(resolveEntryOrderFor('Receipt Note', none, undefined).configured, false);
+});
+
+test('anything the user chose outranks what we shipped', () => {
+  // Including a BLANKET choice. A user who says "credit-first for everything" must not find that
+  // silently ignored on the four types they post most.
+  const perType = cfg({ byVoucherType: { Sales: 'credit-first' } });
+  assert.equal(resolveEntryOrderFor('Sales', perType, undefined).order, 'credit-first');
+  assert.equal(resolveEntryOrderFor('Sales', perType, undefined).source, 'voucher-type');
+
+  const blanket = cfg({ default: 'credit-first' });
+  assert.equal(resolveEntryOrderFor('Payment', blanket, undefined).order, 'credit-first');
+  assert.equal(resolveEntryOrderFor('Payment', blanket, undefined).source, 'default');
+
+  // And an operator's .env setting likewise.
+  assert.equal(resolveEntryOrderFor('Payment', cfg({}), 'credit-first').source, 'env');
+});
+
+test('confirming a shipped default records it, which is what stops the reminder', () => {
+  // The note on a written voucher only appears while source is 'built-in'. Saying "yes that's right"
+  // has to make it stop, so an explicit answer must be recordable even when it matches ours.
+  let c: EntryOrderConfig = { default: null, byVoucherType: {} };
+  assert.equal(resolveEntryOrderFor('Receipt', c, undefined).source, 'built-in');
+  c = applyEntryOrderChoice(c, 'credit-first', 'Receipt');
+  assert.equal(resolveEntryOrderFor('Receipt', c, undefined).source, 'voucher-type');
 });
