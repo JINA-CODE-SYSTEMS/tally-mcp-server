@@ -67,6 +67,9 @@ param(
     # Opt-in for Claude-driven GUI control (gui-screenshot / gui-send-keys). Wizard passes
     # 'true'/'false'; a bare Reconfigure omits it, so we preserve the existing .env value below.
     [string]$EnableGuiControl,
+    # '' is a MEANINGFUL value here: it means the wizard's "ask me later" option was chosen, so no
+    # ENTRY_ORDER key is written and the server puts the question to the user at first write.
+    [string]$EntryOrder,
     # Set by the installer, which knows it is running us in a hidden window with no keyboard.
     # NOT inferred from -CredentialsFile any more: local mode deliberately passes no credentials
     # file, so that inference made every local install hang on the "Press Enter" pause below,
@@ -192,6 +195,13 @@ if ($EnableGuiControl -ne 'true') { $EnableGuiControl = 'false' }
 # Reconfigure, so an operator who turned it off keeps it off.
 $UpdateCheck = _Coalesce $_existingEnv['UPDATE_CHECK'] 'true'
 if ($UpdateCheck -ne 'false') { $UpdateCheck = 'true' }
+
+# Voucher entry order. Unlike every other setting here there is NO default: an absent key is how the
+# server knows nobody has answered yet, which is what makes it ask the user instead of silently
+# deciding how every voucher in their books will read. An existing value is preserved; an
+# unrecognised one is dropped so a typo becomes "ask" rather than a layout nobody chose.
+$EntryOrder = _Coalesce $EntryOrder $_existingEnv['ENTRY_ORDER'] ''
+if ($EntryOrder -notin @('credit-first', 'debit-first')) { $EntryOrder = '' }
 # Cloudflare Tunnel token: preserve across a bare Reconfigure (like MCP_DOMAIN). Blank = no tunnel,
 # and a previously-configured tunnel is torn down below. Trim so a stray-space value counts as blank.
 $TunnelToken = ("$(_Coalesce $TunnelToken $_existingEnv['TUNNEL_TOKEN'] '')").Trim()
@@ -449,6 +459,9 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         # explicitly rather than left to a default so the key is visible to anyone auditing .env, and
         # so turning it off is a one-word edit.
         "UPDATE_CHECK=$UpdateCheck"
+        # Written ONLY when the operator actually chose one. The key's absence is the signal that
+        # the question is still open - see the comment on $EntryOrder above.
+        if ($EntryOrder) { "ENTRY_ORDER=$EntryOrder" }
         # Deployment mode (#172). 'local' means no service, no listening port and no OAuth password;
         # 'remote' is the pre-existing behaviour and stays the fallback for any install that predates
         # this key. REMOTE_AUTH and REMOTE_TRANSPORT are consumed by #178 and are written now so the
