@@ -39,10 +39,19 @@
 #        Secrets stored there are unreachable from any other workflow or job.
 #      - checkout uses persist-credentials:false, so the job token is not left
 #        in .git/config where a dependency's build script could find and use it.
-#      - npm ci runs with --ignore-scripts. Dependency lifecycle scripts are the
-#        classic supply-chain vector, and they matter more here because
-#        patch/minor dependency updates auto-merge without human review (#168).
-#        Verified: the full suite passes with scripts disabled.
+#      - NO dependency lifecycle scripts run anywhere in this job. Both installs
+#        (the one below and the one inside build-installer.ps1) are
+#        `npm ci --ignore-scripts`, and NPM_CONFIG_IGNORE_SCRIPTS is set for the
+#        whole job as a backstop, so a later `npm install` slipping back in
+#        still runs none. (build-installer.ps1 used to run a plain `npm install`
+#        here, silently undoing the --ignore-scripts on the first install.)
+#        Lifecycle scripts are the classic supply-chain vector, and they matter
+#        more here because patch/minor dependency updates auto-merge without
+#        human review (#168). No dependency needs one: the lockfile has no
+#        hasInstallScript entry, and DuckDB's native binding is a prebuilt
+#        per-platform optional package. Verified: the full suite passes, and a
+#        working installer builds, with scripts disabled. Explicit `npm run`
+#        / `npm test` still run our own package.json scripts.
 #      - every action is pinned to a full commit SHA, not a movable tag.
 #      - workflow_dispatch is refused from anywhere but the default branch, so a
 #        pushed branch cannot be used to run a modified version of this file.
@@ -81,6 +90,11 @@ jobs:
       contents: write
       id-token: write       # build provenance
       attestations: write   # build provenance
+    env:
+      # Backstop for the explicit --ignore-scripts flags: no npm command in this job may run a
+      # dependency lifecycle script. Explicit `npm run build` / `npm test` are unaffected (npm only
+      # skips their pre/post hooks, and this package defines none).
+      NPM_CONFIG_IGNORE_SCRIPTS: 'true'
 
     steps:
       # Refuse to run a dispatched build from an arbitrary branch: someone with write access could

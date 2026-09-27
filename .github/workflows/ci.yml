@@ -28,8 +28,10 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
+      # --ignore-scripts, like release.yml: no dependency lifecycle scripts, and CI tests the exact
+      # install mode the release build uses (so a dependency that starts needing one fails here).
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: TypeScript compile (strict)
         run: npx tsc --noEmit
@@ -63,8 +65,10 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
 
+      # --ignore-scripts, like release.yml: no dependency lifecycle scripts, and CI tests the exact
+      # install mode the release build uses (so a dependency that starts needing one fails here).
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Run tests
         run: npm test
@@ -83,8 +87,10 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
+      # --ignore-scripts, like release.yml: no dependency lifecycle scripts, and CI tests the exact
+      # install mode the release build uses (so a dependency that starts needing one fails here).
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: npm audit (production)
         run: npm audit --omit=dev --audit-level=high

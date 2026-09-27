@@ -4,7 +4,8 @@
 
 .DESCRIPTION
     Orchestrates the installer build:
-        1. npm install + npm run build (so dist/ is fresh)
+        1. npm ci --ignore-scripts + npm run build (so dist/ is fresh, from the lockfile,
+           with no dependency lifecycle scripts)
         2. Compile TallyUI.dll from TallyUI.cs (so the installer ships a prebuilt DLL)
         3. Stage portable Node.js, nssm.exe and cloudflared.exe under ./installer-staging/
            (downloaded if -DownloadDeps is passed; otherwise expects them to already be there).
@@ -25,7 +26,7 @@
     node-portable\node.exe, nssm.exe and cloudflared.exe are reused - and still hash-checked.
 
 .PARAMETER SkipBuild
-    Skip npm install + build. Use when iterating just on the installer config.
+    Skip npm ci + build (and the TallyUI.dll compile). Use when iterating just on the installer config.
 
 .PARAMETER InnoSetupPath
     Override the path to ISCC.exe. Default checks PATH then the standard install location.
@@ -203,9 +204,17 @@ New-Item -ItemType Directory -Force -Path $staging, $nodeStaging | Out-Null
 
 # --- 1. Build the TS project (unless skipped) -----------------------------
 if (-not $SkipBuild) {
-    Write-Host "==> npm install" -ForegroundColor Cyan
-    npm install
-    if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
+    # `npm ci --ignore-scripts`, not `npm install`: install exactly what package-lock.json pins
+    # (integrity-checked) and run NO dependency lifecycle scripts. Those scripts are arbitrary
+    # code from every transitive dependency, and this runs on the release runner that builds the
+    # binary customers execute as Administrator. Nothing in the tree needs one: package-lock.json
+    # has no `hasInstallScript` entry, and DuckDB's native binding ships prebuilt in a per-platform
+    # optional package (@duckdb/node-bindings-win32-x64) rather than a postinstall download.
+    # If a future dependency does need its install script, run that one explicitly
+    # (`npm rebuild <pkg>`) after review - do not drop --ignore-scripts.
+    Write-Host "==> npm ci --ignore-scripts" -ForegroundColor Cyan
+    npm ci --ignore-scripts
+    if ($LASTEXITCODE -ne 0) { throw "npm ci --ignore-scripts failed" }
 
     Write-Host "==> npm run build" -ForegroundColor Cyan
     npm run build

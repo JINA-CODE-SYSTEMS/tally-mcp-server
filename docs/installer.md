@@ -52,7 +52,8 @@ The installer is built on a Windows box with Inno Setup 6+ installed.
 ```
 
 That:
-- runs `npm install` + `npm run build` (so `dist/` is fresh)
+- runs `npm ci --ignore-scripts` + `npm run build` (so `dist/` is fresh, built from the lockfile,
+  with no dependency lifecycle scripts — none are needed; see the comment in the script)
 - compiles `scripts/TallyUI.dll` from `TallyUI.cs` (so the installer ships
   a prebuilt DLL — clients don't need `csc.exe`)
 - downloads portable Node.js, NSSM and `cloudflared` into `installer-staging/`,
