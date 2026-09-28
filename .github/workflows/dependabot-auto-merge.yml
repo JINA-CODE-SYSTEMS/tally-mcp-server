@@ -33,8 +33,11 @@
 #   Before enabling this workflow you MUST:
 #     a) Settings -> General -> "Allow auto-merge"  = enabled
 #     b) A ruleset / branch protection on `main` requiring these checks:
-#          Build & Type Check, Tests (Node 20), Tests (Node 22),
+#          Build & Type Check, Tests (Node 22), Tests (Node 24),
 #          Security Scan, Secret Leak Detection, File Safety Checks
+#        The test names follow the Node matrix in ci.yml. When that matrix changes,
+#        update the required checks too: a required check that no job reports
+#        never passes, so every PR (this workflow's included) stalls in BLOCKED.
 #     c) OPTIONAL: Settings -> Actions -> General ->
 #          "Allow GitHub Actions to create and approve pull requests"
 #
@@ -72,7 +75,7 @@ jobs:
     steps:
       - name: Fetch Dependabot metadata
         id: meta
-        # dependabot/fetch-metadata v2 pinned to commit 21025c7
+        # dependabot/fetch-metadata v3.1.0 pinned to commit 25dd0e3
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
