@@ -34,8 +34,10 @@
       3. No NSSM service      - the service AND its SCM registry key are gone
       4. No OAuth artefacts   - .oauth-clients.json / .oauth-tokens.json / PASSWORD in .env
       5. No outbound tunnel   - cloudflared process, tunnel service, or a token that revives it
-      6. Company vault ACL    - the entire boundary for stored Tally passwords; BOTH modes
-      7. Tally reachability   - INFORMATIONAL only; never affects the verdict
+      6. Tunnel token storage - remote mode with a tunnel: the token is in no service registry key
+                                and its file is readable by SYSTEM + Administrators only (#193)
+      7. Company vault ACL    - the entire boundary for stored Tally passwords; BOTH modes
+      8. Tally reachability   - INFORMATIONAL only; never affects the verdict
 
     NEVER PRINTS SECRETS. Secret-valued .env keys are tested for PRESENCE through a separate
     function that cannot return the value (Test-EnvKeyPresent), so there is no code path where a
@@ -109,7 +111,7 @@ param(
 )
 
 # Continue, not Stop: a verification tool that aborts on the first surprise reports nothing about
-# the other six checks. Each check owns its own try/catch and turns an unexpected error into a FAIL
+# the other seven checks. Each check owns its own try/catch and turns an unexpected error into a FAIL
 # for that check alone (fail closed - see Invoke-Check). An UNEXPECTED error stays a FAIL, not an
 # UNKNOWN: UNKNOWN is reserved for the specific, understood cases where this run lacked the access
 # to look, each of which names the remedy. An exception nobody anticipated has no such remedy.
@@ -142,6 +144,8 @@ if (-not (Test-Path -LiteralPath $InstallDir)) {
     exit 2
 }
 $EnvFile = Join-Path $InstallDir '.env'
+# Where firstrun-config.ps1 keeps the Cloudflare Tunnel token for cloudflared's --token-file (#193).
+$TunnelTokenFile = Join-Path $InstallDir '.tunnel-token'
 
 # ---------------------------------------------------------------------------
 # Can we actually READ .env? Existence is not the question - readability is.
@@ -737,6 +741,9 @@ Invoke-Check -Id 'no-tunnel' -Name 'No outbound tunnel' -Body {
     # Presence only: the token is a bearer credential for the Cloudflare account and its value is
     # never read here.
     $tokenSet  = Test-EnvKeyPresent 'TUNNEL_TOKEN'
+    # The file firstrun-config.ps1 hands cloudflared its token through (#193). Existence only - it is
+    # locked to SYSTEM + Administrators, and this check has no reason to open it.
+    $tokenFilePresent = Test-Path -LiteralPath $TunnelTokenFile
 
     $svcText = 'not found'
     if ($tunnelSvc) { $svcText = "present, status $($tunnelSvc.Status)" }
@@ -753,12 +760,16 @@ Invoke-Check -Id 'no-tunnel' -Name 'No outbound tunnel' -Body {
         "cloudflared.exe processes: $procText",
         "$EnvFile : TUNNEL_TOKEN $tokenText - presence only; the token value is never read or printed"
     )
+    $tokenFileText = 'absent'
+    if ($tokenFilePresent) { $tokenFileText = 'present' }
+    $evidence += "${TunnelTokenFile}: $tokenFileText - existence only; the file is never opened"
 
     $problems = @()
     if ($tunnelSvc)           { $problems += "the '$TunnelServiceName' service exists (status $($tunnelSvc.Status))" }
     elseif ($tunnelReg)       { $problems += "the '$TunnelServiceName' service registry key survives, so its removal is only pending" }
     if ($cfProcs.Count -gt 0) { $problems += "cloudflared.exe is running" }
     if ($tokenSet)            { $problems += "TUNNEL_TOKEN is still set in .env, so the next Reconfigure would bring the tunnel back" }
+    if ($tokenFilePresent)    { $problems += "$TunnelTokenFile still holds a tunnel token, a live credential local mode never uses" }
 
     if ($problems.Count -gt 0) {
         New-Check -Id 'no-tunnel' -Name 'No outbound tunnel' -Status 'FAIL' `
@@ -772,7 +783,216 @@ Invoke-Check -Id 'no-tunnel' -Name 'No outbound tunnel' -Body {
 }
 
 # ---------------------------------------------------------------------------
-# 6. Company vault ACL
+# Principals that make a file effectively readable by every local account. Used by the tunnel-token
+# and vault checks. Named, so a FAIL can say WHICH mistake was made instead of dumping a raw SID at
+# a non-technical reader.
+# ---------------------------------------------------------------------------
+$BroadSids = @{
+    'S-1-1-0'      = 'Everyone'
+    'S-1-5-32-545' = 'BUILTIN\Users'
+    'S-1-5-11'     = 'Authenticated Users'
+    'S-1-5-4'      = 'INTERACTIVE'
+    'S-1-5-32-546' = 'BUILTIN\Guests'
+    'S-1-5-7'      = 'ANONYMOUS LOGON'
+    'S-1-5-32-547' = 'BUILTIN\Power Users'
+}
+
+# ---------------------------------------------------------------------------
+# 6. Tunnel token storage (remote mode, #193)
+#
+# The Cloudflare Tunnel token is a bearer credential: whoever holds it can run a connector for the
+# tunnel's hostname. Installers before #193 handed it to cloudflared through NSSM's
+# AppEnvironmentExtra, which lives in the service's registry key - readable by BUILTIN\Users. Now it
+# goes through <InstallDir>\.tunnel-token (cloudflared --token-file), locked to SYSTEM +
+# Administrators with Administrators as owner, and firstrun-config.ps1 scrubs the registry copy on
+# every run. This check proves both halves:
+#   - no TUNNEL_TOKEN in the environment of the tunnel service OR the main service (installs from
+#     before #172 C3 copied all of .env, token included, into the main service's environment), and
+#     no --token on the tunnel's command line;
+#   - the token file's ACL is protected, grants only SYSTEM and Administrators, and is owned by one
+#     of them (an owner can always rewrite the DACL).
+# Reads registry values and the ACL only. The value of an AppEnvironmentExtra entry is never kept or
+# printed - only whether its NAME is TUNNEL_TOKEN - and the token file is never opened.
+# ---------------------------------------------------------------------------
+function Get-NssmServiceParameters {
+    # Returns State = absent | denied | read, plus what this check needs from the Parameters key.
+    param([string]$Name)
+    $keyPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$Name\Parameters"
+    $r = New-Object psobject -Property ([ordered]@{
+        KeyPath       = $keyPath
+        State         = 'absent'
+        EnvEntries    = 0
+        EnvHasToken   = $false
+        AppParameters = ''
+    })
+    $key = $null
+    try {
+        $key = Get-Item -LiteralPath $keyPath -ErrorAction Stop
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        return $r
+    } catch [System.Security.SecurityException] {
+        $r.State = 'denied'; return $r
+    } catch [System.UnauthorizedAccessException] {
+        $r.State = 'denied'; return $r
+    }
+    $r.State = 'read'
+    $envExtra = @($key.GetValue('AppEnvironmentExtra'))
+    foreach ($entry in $envExtra) {
+        if ($null -eq $entry -or "$entry" -eq '') { continue }
+        $r.EnvEntries++
+        # Name test only, and only a NON-EMPTY value counts as a token. The value is never stored.
+        if ("$entry" -match '^\s*TUNNEL_TOKEN\s*=\s*\S') { $r.EnvHasToken = $true }
+    }
+    $ap = $key.GetValue('AppParameters')
+    if ($ap) { $r.AppParameters = "$ap" }
+    return $r
+}
+
+Invoke-Check -Id 'tunnel-token-storage' -Name 'Tunnel token kept out of the service registry' -Body {
+    if (-not $ModeKnown) { New-UndeterminedModeCheck -Id 'tunnel-token-storage' -Name 'Tunnel token kept out of the service registry'; return }
+    if ($IsLocal) {
+        New-Check -Id 'tunnel-token-storage' -Name 'Tunnel token kept out of the service registry' -Status 'NA' `
+            -Reason "Local mode runs no tunnel, so there is no tunnel token to store. Any leftover token, file or service is reported by the 'No outbound tunnel' check above." | Out-Null
+        return
+    }
+
+    $evidence = @()
+    $problems = @()
+    $unknowns = @()
+
+    # --- Registry: the tunnel service and the main service -------------------------------------
+    $tunnelParams = $null
+    foreach ($svcName in @($TunnelServiceName, $ServiceName)) {
+        $p = Get-NssmServiceParameters -Name $svcName
+        if ($svcName -eq $TunnelServiceName) { $tunnelParams = $p }
+        if ($p.State -eq 'absent') {
+            $evidence += "$($p.KeyPath): absent"
+        } elseif ($p.State -eq 'denied') {
+            $evidence += "$($p.KeyPath): this account may not read it"
+            $unknowns += "the '$svcName' service registry key could not be read"
+        } else {
+            if ($p.EnvHasToken) {
+                $evidence += "$($p.KeyPath): AppEnvironmentExtra has $($p.EnvEntries) entries, one of them TUNNEL_TOKEN (value not read or printed)"
+                $problems += "the '$svcName' service still carries TUNNEL_TOKEN in its registry environment, where BUILTIN\Users can read it"
+            } else {
+                $evidence += "$($p.KeyPath): AppEnvironmentExtra has $($p.EnvEntries) entries, none of them TUNNEL_TOKEN"
+            }
+        }
+    }
+    if ($tunnelParams -and $tunnelParams.State -eq 'read') {
+        # '--token-file' must not be mistaken for '--token <value>': require whitespace or '=' after it.
+        if ($tunnelParams.AppParameters -match '(^|\s)--token(\s|=)') {
+            $problems += "the '$TunnelServiceName' command line passes the token itself (--token), and NSSM stores that command line in the same registry key BUILTIN\Users can read"
+            $evidence += "$($tunnelParams.KeyPath): AppParameters passes --token (value not printed)"
+        } elseif ($tunnelParams.AppParameters -match '(^|\s)--token-file(\s|=)') {
+            $evidence += "$($tunnelParams.KeyPath): AppParameters reads the token from a file (--token-file)"
+        } else {
+            $evidence += "$($tunnelParams.KeyPath): AppParameters does not use --token-file (a service registered before #193)"
+        }
+    }
+
+    # --- Is a tunnel configured at all? --------------------------------------------------------
+    $tunnelSvc = Get-Service -Name $TunnelServiceName -ErrorAction SilentlyContinue
+    $envToken  = Test-EnvKeyPresent 'TUNNEL_TOKEN'
+    $tokenFileExists = Test-Path -LiteralPath $TunnelTokenFile
+    $tunnelConfigured = ($tunnelSvc -or $envToken -or $tokenFileExists -or ($tunnelParams -and $tunnelParams.State -ne 'absent'))
+
+    # --- The token file's ACL ------------------------------------------------------------------
+    if ($tunnelConfigured) {
+        $acl = $null
+        $fileDenied = $false
+        try {
+            $acl = Get-Acl -LiteralPath $TunnelTokenFile -ErrorAction Stop
+        } catch [System.UnauthorizedAccessException] {
+            $fileDenied = $true
+        } catch [System.Management.Automation.ItemNotFoundException] {
+            $acl = $null
+        }
+
+        if ($fileDenied) {
+            $evidence += "${TunnelTokenFile}: present; reading its ACL from this account failed with Access Denied"
+            if ($IsElevated) {
+                # The installer grants Administrators Full Control and makes them the owner, so an
+                # elevated run being shut out means something rewrote the ACL.
+                $problems += "even this elevated run may not read the token file's permissions, which the installer never sets up"
+            } else {
+                $unknowns += "the token file's permissions could not be read (it is locked to SYSTEM + Administrators, which is what a correct install looks like from here)"
+            }
+        } elseif ($null -eq $acl) {
+            $evidence += "${TunnelTokenFile}: absent"
+            if ($tunnelSvc) {
+                $problems += "the '$TunnelServiceName' service exists but there is no token file, so it was registered by an installer from before #193 (token in the registry) or the file was deleted"
+            }
+        } else {
+            $sidType = [System.Security.Principal.SecurityIdentifier]
+            $allowed = @{ 'S-1-5-18' = 'NT AUTHORITY\SYSTEM'; 'S-1-5-32-544' = 'BUILTIN\Administrators' }
+            if ($acl.AreAccessRulesProtected) {
+                $evidence += "${TunnelTokenFile}: inheritance disabled"
+            } else {
+                $evidence += "${TunnelTokenFile}: inheritance ENABLED"
+                $problems += "the token file inherits its folder's permissions instead of a deliberate list (under Program Files that means BUILTIN\Users can read it)"
+            }
+            $ownerSid = ''
+            try { $ownerSid = $acl.GetOwner($sidType).Value } catch { $ownerSid = "$($acl.Owner)" }
+            if ($allowed.ContainsKey($ownerSid)) {
+                $evidence += "owner: $($allowed[$ownerSid])"
+            } else {
+                $evidence += "owner: $($acl.Owner) (sid $ownerSid)"
+                $problems += "the token file is owned by $($acl.Owner), who can rewrite its permissions and read it without elevating"
+            }
+            foreach ($rule in $acl.Access) {
+                if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
+                    $evidence += "deny entry (not a finding): $($rule.IdentityReference) : $($rule.FileSystemRights)"
+                    continue
+                }
+                $sid = ''
+                try { $sid = $rule.IdentityReference.Translate($sidType).Value } catch { $sid = "$($rule.IdentityReference)" }
+                if ($allowed.ContainsKey($sid)) {
+                    $evidence += "expected: $($allowed[$sid]) : $($rule.FileSystemRights)"
+                    continue
+                }
+                # Unlike the vault, the agent user has no business here: nothing that runs as that
+                # account needs the tunnel token. So there is no "indeterminate" case - any other
+                # allow entry is a finding.
+                $label = "$($rule.IdentityReference)"
+                if ($BroadSids.ContainsKey($sid)) { $label = "$($BroadSids[$sid]) - a group that in practice means every local account" }
+                $evidence += "UNEXPECTED: $label : $($rule.FileSystemRights) (sid $sid)"
+                $problems += "the token file grants $label"
+            }
+        }
+        if ($envToken) {
+            # Honest about the second copy: .env keeps the token so Reconfigure and upgrades can
+            # preserve it, and .env is also readable by AGENT_TASK_USER. Not a finding of this check.
+            $evidence += "note: $EnvFile also holds TUNNEL_TOKEN (so Reconfigure can preserve it); that copy is protected by the .env ACL, which also admits AGENT_TASK_USER"
+        }
+    }
+
+    $name = 'Tunnel token kept out of the service registry'
+    if ($problems.Count -gt 0) {
+        New-Check -Id 'tunnel-token-storage' -Name $name -Status 'FAIL' `
+            -Reason "The Cloudflare Tunnel token is not stored the way it should be: $($problems -join '; '). Run the installer's Reconfigure shortcut as Administrator - it writes the token to a file only SYSTEM and Administrators can read and removes it from the registry. If other people use this machine, also ask your Jina admin to rotate the tunnel token: the copy found here may already have been read." `
+            -Evidence $evidence | Out-Null
+    } elseif (-not $tunnelConfigured) {
+        New-Check -Id 'tunnel-token-storage' -Name $name -Status 'NA' `
+            -Reason "No Cloudflare Tunnel is configured on this remote install, so there is no tunnel token to protect." `
+            -Evidence $evidence | Out-Null
+    } elseif ($unknowns.Count -gt 0) {
+        New-Check -Id 'tunnel-token-storage' -Name $name -Status 'UNKNOWN' `
+            -Reason "Nothing was found wrong, but not everything could be looked at: $($unknowns -join '; '). Re-run this script as Administrator to confirm the tunnel token is stored correctly." `
+            -Evidence $evidence | Out-Null
+    } else {
+        $passReason = "The tunnel token is in no service registry key and not on the command line; cloudflared reads it from a file only SYSTEM and Administrators can open."
+        if (-not $tunnelSvc -and -not $tokenFileExists) {
+            $passReason = "No tunnel service is registered right now, and the tunnel token is in no service registry key."
+        }
+        New-Check -Id 'tunnel-token-storage' -Name $name -Status 'PASS' `
+            -Reason $passReason `
+            -Evidence $evidence | Out-Null
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 7. Company vault ACL
 #
 # THE MOST IMPORTANT FAIL THIS SCRIPT CAN REPORT, and it applies in BOTH modes. The vault
 # (<TALLY_DATA_PATH>\.tally-mcp-companies.json) holds DPAPI-protected Tally company passwords, and
@@ -901,18 +1121,7 @@ Invoke-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' 
         }
     }
 
-    # Principals that make this vault effectively readable by every local account. Named, so the
-    # FAIL message can say WHICH mistake was made instead of dumping a raw SID at a non-technical
-    # reader.
-    $broadSids = @{
-        'S-1-1-0'      = 'Everyone'
-        'S-1-5-32-545' = 'BUILTIN\Users'
-        'S-1-5-11'     = 'Authenticated Users'
-        'S-1-5-4'      = 'INTERACTIVE'
-        'S-1-5-32-546' = 'BUILTIN\Guests'
-        'S-1-5-7'      = 'ANONYMOUS LOGON'
-        'S-1-5-32-547' = 'BUILTIN\Power Users'
-    }
+    # Principals that make the vault readable by every local account: $BroadSids, defined above check 6.
 
     $inheritText = 'ENABLED - the file inherits whatever the parent folder grants'
     if ($acl.AreAccessRulesProtected) { $inheritText = 'disabled (the ACL is protected, as it should be)' }
@@ -957,8 +1166,8 @@ Invoke-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' 
             continue
         }
         $label = "$($rule.IdentityReference)"
-        $isBroad = $broadSids.ContainsKey($sid)
-        if ($isBroad) { $label = "$($broadSids[$sid]) - a group that in practice means every local account" }
+        $isBroad = $BroadSids.ContainsKey($sid)
+        if ($isBroad) { $label = "$($BroadSids[$sid]) - a group that in practice means every local account" }
         $offenders += "$label : $($rule.FileSystemRights)"
         if ($isBroad) { $broadOffenders += "$label : $($rule.FileSystemRights)" }
         $evidence += "UNEXPECTED: $label : $($rule.FileSystemRights) [$origin] (sid $sid)"
@@ -1026,7 +1235,7 @@ Invoke-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' 
 }
 
 # ---------------------------------------------------------------------------
-# 7. Tally reachability - INFORMATIONAL
+# 8. Tally reachability - INFORMATIONAL
 #
 # Deliberately not pass/fail. Tally being closed is a normal weekday-evening state, not a security
 # defect, and a red line here would swamp the four claims this script exists to prove.

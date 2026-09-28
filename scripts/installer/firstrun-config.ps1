@@ -787,9 +787,100 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     # When a tunnel token is configured, register cloudflared as a second NSSM service so a NAT'd box
     # gets a stable public HTTPS URL with no router/domain config. Idempotent: ALWAYS stop/remove any
     # prior instance first (mirrors the main-service teardown above), then re-register ONLY if a token
-    # is present - so blanking the token on a Reconfigure tears the tunnel down cleanly. The token is
-    # passed via the service ENV (TUNNEL_TOKEN), never on the command line where a local user could read it.
+    # is present - so blanking the token on a Reconfigure tears the tunnel down cleanly.
+    #
+    # WHERE THE TOKEN LIVES (#193). The token is a bearer credential: whoever holds it can run a
+    # connector for this tunnel's hostname. It is handed to cloudflared as a FILE, via
+    # `tunnel run --token-file`, and nowhere else:
+    #   - not on the command line: NSSM stores AppParameters in the service's registry key, which
+    #     BUILTIN\Users can read (exactly how cloudflared's own Windows service leaked it, fixed
+    #     upstream as VULN-143514);
+    #   - not in the service environment: NSSM keeps AppEnvironmentExtra in that same registry key.
+    #     That is where it used to be, and the migration below takes it back out on every existing
+    #     install.
+    # The file is readable by SYSTEM (the account NSSM runs cloudflared under - no ObjectName is set,
+    # so it is LocalSystem) and Administrators only. Not the agent user: nothing that runs as that
+    # account needs the token. --token-file exists in cloudflared since 2025.4.0 (the pinned
+    # build-installer.ps1 version is later), and it is what cloudflared's own `service install` does on
+    # Windows, with the same owner and ACL. Note cloudflared gives TUNNEL_TOKEN in its environment
+    # precedence over --token-file, so a stale registry copy would also silently override a rotated
+    # token - another reason the migration is not optional.
+    #
+    # .env still carries TUNNEL_TOKEN so Reconfigure and upgrades can preserve it; that copy is also
+    # readable by AGENT_TASK_USER (see the .env lockdown above), so it is the weaker of the two.
     $cloudflaredExe = Join-Path $InstallDir 'bin\cloudflared.exe'
+    # Relative to AppDirectory ($InstallDir), which NSSM makes the service's working directory - the
+    # same reason the main service passes 'dist\server.mjs': no path with spaces has to survive NSSM's
+    # quoting.
+    $tunnelTokenLeaf = '.tunnel-token'
+    $tunnelTokenFile = Join-Path $InstallDir $tunnelTokenLeaf
+
+    # Zero the bytes, then unlink: the same best-effort shred used for the credentials file and the
+    # .oauth-*.json stores above, so a removed token is not trivially recoverable from free space.
+    # Returns $true when the file is gone afterwards.
+    function _ShredFile([string]$Path) {
+        if (-not (Test-Path -LiteralPath $Path)) { return $true }
+        try {
+            $len = (Get-Item -LiteralPath $Path -Force).Length
+            if ($len -gt 0) { [System.IO.File]::WriteAllBytes($Path, (New-Object byte[] $len)) }
+        } catch { }
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        return (-not (Test-Path -LiteralPath $Path))
+    }
+
+    # Writes the token to $Path readable by SYSTEM + Administrators only, or throws having written no
+    # secret. The lockdown is the icacls idiom .env and the vault use above, minus the agent user, by
+    # SID (so a localized Windows, where the group is not called 'Administrators', cannot break it),
+    # plus an explicit owner: an owner can always rewrite the DACL, so leaving the file owned by the
+    # individual admin who ran the installer would let that account grant itself read later without
+    # elevating. Mirrors the descriptor cloudflared's own `service install` gives its token file:
+    # owner Administrators, protected DACL, full access for Administrators and SYSTEM only.
+    function _WriteLockedTokenFile([string]$Path, [string]$Token) {
+        # Start from a fresh file. A pre-existing one could carry explicit ACEs that /grant:r would
+        # leave in place, since it only replaces entries for the principals it names.
+        if (-not (_ShredFile $Path)) { throw "could not remove the existing $Path" }
+        # Created EMPTY: until icacls runs it carries the install folder's inherited ACL (BUILTIN\Users
+        # can read Program Files), so it must hold nothing worth reading during that window.
+        [System.IO.File]::WriteAllBytes($Path, (New-Object byte[] 0))
+        & icacls $Path /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "icacls exit $LASTEXITCODE while setting the ACL" }
+        & icacls $Path /setowner '*S-1-5-32-544' 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "icacls exit $LASTEXITCODE while setting the owner" }
+        # Prove it before the secret goes in, rather than trusting two exit codes.
+        $acl = Get-Acl -LiteralPath $Path
+        if (-not $acl.AreAccessRulesProtected) { throw 'inheritance is still enabled on the file' }
+        $sidType = [System.Security.Principal.SecurityIdentifier]
+        foreach ($rule in $acl.Access) {
+            $sid = $rule.IdentityReference.Translate($sidType).Value
+            if (@('S-1-5-18', 'S-1-5-32-544') -notcontains $sid) { throw "unexpected ACL entry for $($rule.IdentityReference)" }
+        }
+        $ownerSid = $acl.GetOwner($sidType).Value
+        if (@('S-1-5-18', 'S-1-5-32-544') -notcontains $ownerSid) { throw "owner is $ownerSid, not Administrators" }
+        # Overwriting an existing file keeps its DACL. No BOM and no newline: cloudflared TrimSpace()s
+        # the contents, but a BOM is not whitespace and would make the token unparseable.
+        [System.IO.File]::WriteAllText($Path, $Token, (New-Object System.Text.UTF8Encoding($false)))
+    }
+
+    # Removes a TUNNEL_TOKEN=... entry from an NSSM service's AppEnvironmentExtra (REG_MULTI_SZ under
+    # <service>\Parameters) and leaves every other entry exactly as it was. Returns $true when it
+    # removed something. Takes the key path rather than a service name so it can be exercised against
+    # a scratch HKCU key.
+    function _RemoveTunnelTokenFromServiceEnv([string]$ParametersKey) {
+        if (-not (Test-Path -LiteralPath $ParametersKey)) { return $false }
+        $prop = Get-ItemProperty -LiteralPath $ParametersKey -Name 'AppEnvironmentExtra' -ErrorAction SilentlyContinue
+        if ($null -eq $prop) { return $false }
+        $entries = @($prop.AppEnvironmentExtra)
+        # Windows environment names are case-insensitive, and so is -notmatch.
+        $keep = @($entries | Where-Object { "$_" -notmatch '^\s*TUNNEL_TOKEN\s*=' })
+        if ($keep.Count -eq $entries.Count) { return $false }
+        if ($keep.Count -gt 0) {
+            New-ItemProperty -LiteralPath $ParametersKey -Name 'AppEnvironmentExtra' -PropertyType MultiString -Value ([string[]]$keep) -Force | Out-Null
+        } else {
+            Remove-ItemProperty -LiteralPath $ParametersKey -Name 'AppEnvironmentExtra' -ErrorAction Stop
+        }
+        return $true
+    }
+
     $existingTunnel = Get-Service -Name $TunnelServiceName -ErrorAction SilentlyContinue
     if ($existingTunnel) {
         Write-Host "[*] Existing tunnel service detected; stopping and removing..."
@@ -809,17 +900,53 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
             Start-Sleep -Milliseconds 500
         }
     }
+
+    # Migration (#193): no TUNNEL_TOKEN in any service's registry environment, on every run. An install
+    # configured before this change has the token in TallyMCPTunnel's AppEnvironmentExtra. The
+    # teardown above normally deletes that key with the service, but `nssm remove` only MARKS a
+    # service for deletion; while anything holds a handle to it (the tray polls service status) the
+    # key - token included - survives, and it survives a failed re-registration too. So scrub
+    # explicitly rather than trusting the teardown. The main service is included because installs
+    # from before #172 C3 copied all of .env, TUNNEL_TOKEN with it, into ITS environment. Only the
+    # TUNNEL_TOKEN entry is touched; any other entry is left as it was.
+    foreach ($svcForScrub in @($TunnelServiceName, $ServiceName)) {
+        try {
+            if (_RemoveTunnelTokenFromServiceEnv "HKLM:\SYSTEM\CurrentControlSet\Services\$svcForScrub\Parameters") {
+                Write-Host "[OK] Removed TUNNEL_TOKEN from the '$svcForScrub' service environment in the registry"
+            }
+        } catch {
+            Write-Host "[WARN] Could not remove TUNNEL_TOKEN from the '$svcForScrub' service registry key: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "       It is readable by local users there. Remove the AppEnvironmentExtra value under HKLM\SYSTEM\CurrentControlSet\Services\$svcForScrub\Parameters by hand." -ForegroundColor Yellow
+        }
+    }
+
     # Same shape as the main service: teardown above is unconditional, registration below is gated.
     # The mode test is NOT redundant with the token test. $TunnelToken is a parameter, so a local-mode
     # run can still be handed one - the .env write above refuses to persist it, and without this guard
     # the tunnel service would be registered anyway, leaving an outbound connection and a public
     # hostname pointing at a machine that #172 promises has neither.
+    $tunnelRegistered = $false
     if ($DeploymentMode -eq 'remote' -and $TunnelToken) {
+        $tokenFileOk = $false
         if (-not (Test-Path -LiteralPath $cloudflaredExe)) {
             Write-Host "[WARN] Tunnel token set but cloudflared.exe not found at $cloudflaredExe - skipping tunnel service. Re-run the installer to bundle it." -ForegroundColor Yellow
         } else {
+            try {
+                _WriteLockedTokenFile $tunnelTokenFile $TunnelToken
+                $tokenFileOk = $true
+                Write-Host "[OK] Wrote the tunnel token to $tunnelTokenFile (SYSTEM + Administrators only)"
+            } catch {
+                # Fail closed: no tunnel is better than a token in a file anyone can read, and there is
+                # no less-protected fallback worth having - that is the problem this replaced.
+                $null = _ShredFile $tunnelTokenFile
+                Write-Host "[ERROR] Could not write a locked-down tunnel token file: $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "        The Cloudflare Tunnel service is NOT registered. Re-run Reconfigure as Administrator." -ForegroundColor Red
+            }
+        }
+        if ($tokenFileOk) {
             & $bundledNssm install $TunnelServiceName $cloudflaredExe                               | Out-Null
-            & $bundledNssm set $TunnelServiceName AppParameters 'tunnel run'                        | Out-Null
+            # Only the file's PATH is on the command line - a path is not a secret.
+            & $bundledNssm set $TunnelServiceName AppParameters "tunnel run --token-file $tunnelTokenLeaf" | Out-Null
             & $bundledNssm set $TunnelServiceName AppDirectory $InstallDir                          | Out-Null
             & $bundledNssm set $TunnelServiceName Description  'Claudally Cloudflare Tunnel (cloudflared)' | Out-Null
             & $bundledNssm set $TunnelServiceName Start        SERVICE_AUTO_START                   | Out-Null
@@ -834,15 +961,24 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
             & $bundledNssm set $TunnelServiceName AppExit Default Restart                           | Out-Null
             & $bundledNssm set $TunnelServiceName AppRestartDelay 2000                              | Out-Null
             & $bundledNssm set $TunnelServiceName AppThrottle 5000                                  | Out-Null
-            # cloudflared reads TUNNEL_TOKEN from its environment (so no --token on the command line).
-            & $bundledNssm set $TunnelServiceName AppEnvironmentExtra "TUNNEL_TOKEN=$TunnelToken"   | Out-Null
+            # No AppEnvironmentExtra: the token comes from the file above, never the environment.
             $savedPrefT2 = $ErrorActionPreference
             $ErrorActionPreference = 'Continue'
             try { & $bundledNssm start $TunnelServiceName 2>$null | Out-Null } finally { $ErrorActionPreference = $savedPrefT2 }
+            $tunnelRegistered = $true
             Write-Host "[OK] Cloudflare Tunnel service '$TunnelServiceName' registered and started (cloudflared)"
         }
     } else {
         Write-Host "[*] No Cloudflare Tunnel token configured - tunnel service not registered"
+    }
+    # No tunnel running means no token on disk for one: blanking the token, switching to local mode or
+    # a skipped registration all leave nothing behind for the next reader to find.
+    if (-not $tunnelRegistered -and (Test-Path -LiteralPath $tunnelTokenFile)) {
+        if (_ShredFile $tunnelTokenFile) {
+            Write-Host "[OK] Removed the tunnel token file $tunnelTokenFile (no tunnel is configured)"
+        } else {
+            Write-Host "[WARN] Could not remove $tunnelTokenFile - delete it by hand; it holds a tunnel credential." -ForegroundColor Yellow
+        }
     }
 
     # --- 4. Register the GUI agent at-logon Scheduled Task -----------------
@@ -973,7 +1109,7 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     Write-Host ""
     Write-Host "Configuration complete."
     Write-Host "  Service:        $ServiceName  ($($svc.Status))"
-    Write-Host "  Tunnel:         $(if ($TunnelToken) { "$TunnelServiceName (cloudflared -> $McpDomain)" } else { 'not configured' })"
+    Write-Host "  Tunnel:         $(if ($tunnelRegistered) { "$TunnelServiceName (cloudflared -> $McpDomain, token in $tunnelTokenFile)" } else { 'not configured' })"
     Write-Host "  Agent task:     $AgentTaskName"
     Write-Host "  Tray task:      $TrayTaskName"
     Write-Host "  .env:           $envFile"
