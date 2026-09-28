@@ -54,14 +54,25 @@
       - An existing tunnel service is re-registered with --token-file, the token file written from
         the TUNNEL_TOKEN in .env, and the registry copy scrubbed (#193). If the file cannot be
         locked down the tunnel is left unregistered and the run fails, so Setup exits 10.
+      - The NTFS lockdown of .env, the company vault and the IPC directory is re-applied, by SID.
+        If it cannot be, the run stops with an error (Setup exits 10); the preflight checks for
+        this first.
     See docs/installer.md, "Unattended upgrade".
 
 .PARAMETER PreflightOnly
     With -Upgrade: check that an upgrade can preserve everything, report, and change nothing. Exit 0
     if it can, 1 if not. The installer runs this before it stops or copies anything, so a refused
-    upgrade leaves the running version untouched. The one thing it writes: when there is a tunnel
-    to migrate, it dry-runs the token-file lockdown on a scratch file (.tunnel-token.preflight,
-    holding no secret) and shreds it again.
+    upgrade leaves the running version untouched. The one thing it writes: scratch files holding no
+    secret, to dry-run the lockdowns the upgrade will apply, each shredded again straight away -
+    .tally-mcp-acl.preflight in the install folder and in the Tally data folder (the .env and vault
+    lockdown, #230), and .tunnel-token.preflight when there is a tunnel to migrate (#193).
+
+.NOTES
+    Exit codes: 0 when everything was configured; non-zero (1) when anything failed - including a
+    lockdown of .env, the company vault or the IPC directory that could not be applied and verified
+    (the run stops there, #230), and a configured Cloudflare Tunnel that could not be registered
+    (reported after the agent and tray are restarted). The installer reports a non-zero exit to the
+    person installing it and, for a silent run, as Setup exit code 10.
 
 .PARAMETER ReportFile
     With -PreflightOnly: also write the verdict to this file, so the installer can put the reason
@@ -262,53 +273,161 @@ function _GetTaskOrNull {
     try { return (Get-ScheduledTask -TaskName $Name -ErrorAction Stop | Select-Object -First 1) } catch { return $null }
 }
 
-# --- Tunnel token file helpers (#193) -------------------------------------------------------------
-# Defined here rather than beside the tunnel registration (section 3b) because the -Upgrade preflight
-# below dry-runs _WriteLockedTokenFile before the installer stops anything; see there.
+# --- NTFS lockdown, by SID (#193, #230) -----------------------------------------------------------
+# Defined here rather than beside the steps that use them because the -Upgrade preflight below
+# dry-runs them before the installer stops anything; see there.
+#
+# Every lockdown in this script names its principals by SID, never by name. 'Administrators' is
+# localised (Administratoren, Administrateurs, ...), and on a Windows whose language is not English
+# `icacls ... 'Administrators:F'` fails with "No mapping between account names and security IDs"
+# and changes NOTHING - so .env, the company vault and the IPC directory used to keep their
+# inherited ACL (BUILTIN\Users can read Program Files) behind a yellow warning (#230). The agent
+# user is resolved to its SID up front for the same reason, and so that an account that cannot be
+# resolved at all stops the step before a file is touched.
+$Script:SidSystem = 'S-1-5-18'
+$Script:SidAdmins = 'S-1-5-32-544'
+
 # Zero the bytes, then unlink: the same best-effort shred used for the credentials file and the
-# .oauth-*.json stores above, so a removed token is not trivially recoverable from free space.
+# .oauth-*.json stores below, so a removed secret is not trivially recoverable from free space.
 # Returns $true when the file is gone afterwards.
 function _ShredFile([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return $true }
     try {
         $len = (Get-Item -LiteralPath $Path -Force).Length
         if ($len -gt 0) { [System.IO.File]::WriteAllBytes($Path, (New-Object byte[] $len)) }
-    } catch { }
+    } catch {
+        # Best effort: a file that cannot be zeroed is still unlinked below, and the return value
+        # reports whether it is gone. Nothing to add here, so record that it was considered.
+        $null = $_
+    }
     Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
     return (-not (Test-Path -LiteralPath $Path))
 }
 
-# Writes the token to $Path readable by SYSTEM + Administrators only, or throws having written no
-# secret. The lockdown is the icacls idiom .env and the vault use above, minus the agent user, by
-# SID (so a localized Windows, where the group is not called 'Administrators', cannot break it),
-# plus an explicit owner: an owner can always rewrite the DACL, so leaving the file owned by the
-# individual admin who ran the installer would let that account grant itself read later without
-# elevating. Mirrors the descriptor cloudflared's own `service install` gives its token file:
-# owner Administrators, protected DACL, full access for Administrators and SYSTEM only.
-function _WriteLockedTokenFile([string]$Path, [string]$Token) {
-    # Start from a fresh file. A pre-existing one could carry explicit ACEs that /grant:r would
-    # leave in place, since it only replaces entries for the principals it names.
-    if (-not (_ShredFile $Path)) { throw "could not remove the existing $Path" }
-    # Created EMPTY: until icacls runs it carries the install folder's inherited ACL (BUILTIN\Users
-    # can read Program Files), so it must hold nothing worth reading during that window.
-    [System.IO.File]::WriteAllBytes($Path, (New-Object byte[] 0))
-    & icacls $Path /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "icacls exit $LASTEXITCODE while setting the ACL" }
-    & icacls $Path /setowner '*S-1-5-32-544' 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "icacls exit $LASTEXITCODE while setting the owner" }
-    # Prove it before the secret goes in, rather than trusting two exit codes.
-    $acl = Get-Acl -LiteralPath $Path
-    if (-not $acl.AreAccessRulesProtected) { throw 'inheritance is still enabled on the file' }
-    $sidType = [System.Security.Principal.SecurityIdentifier]
-    foreach ($rule in $acl.Access) {
-        $sid = $rule.IdentityReference.Translate($sidType).Value
-        if (@('S-1-5-18', 'S-1-5-32-544') -notcontains $sid) { throw "unexpected ACL entry for $($rule.IdentityReference)" }
+# The SID of a Windows account, or a throw that says which account could not be resolved.
+function _AccountSid([string]$Account) {
+    try {
+        return ([System.Security.Principal.NTAccount]$Account).Translate([System.Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        $e = $_.Exception
+        if ($e.InnerException) { $e = $e.InnerException }
+        throw "the Windows account '$Account' does not resolve to a security identifier on this machine, so nothing can be granted to it ($($e.Message))"
     }
-    $ownerSid = $acl.GetOwner($sidType).Value
-    if (@('S-1-5-18', 'S-1-5-32-544') -notcontains $ownerSid) { throw "owner is $ownerSid, not Administrators" }
-    # Overwriting an existing file keeps its DACL. No BOM and no newline: cloudflared TrimSpace()s
-    # the contents, but a BOM is not whitespace and would make the token unparseable.
+}
+
+# Runs icacls and returns its exit code, plus its output when it failed. With ErrorActionPreference
+# 'Continue' (local to this function): under the 'Stop' the main body uses, Windows PowerShell 5.1
+# turns a native command's stderr into a terminating error, so a failure would surface as a bare
+# "No mapping between account names..." record rather than a message saying which path and why.
+function _Icacls {
+    $ErrorActionPreference = 'Continue'
+    $out = @(& icacls @args 2>&1)
+    $code = $LASTEXITCODE
+    $text = ''
+    if ($code -ne 0) { $text = (($out | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) -join ' ') }
+    return [pscustomobject]@{ Code = $code; Text = $text }
+}
+
+# Restricts $Path to exactly SYSTEM, Administrators and $ExtraSids, then PROVES it with Get-Acl, or
+# throws. Never trusts an exit code alone: the whole of #230 was a lockdown whose failure was only
+# ever a return value. -Container adds (OI)(CI) so files created inside later inherit the same list;
+# -OwnerAdministrators also makes Administrators the owner (an owner can always rewrite the DACL).
+#
+# /grant:r only replaces entries for the principals it names, so an explicit entry for anyone else
+# (put there by hand, or by another program) would survive it and leave the "locked" path readable
+# or writable by that account. Such entries are removed, by SID, and named in the output - the
+# contract has always been "only these principals", and verify-deployment.ps1 fails the vault on
+# any other allow entry. Returns the display names of what was removed.
+function _LockDown {
+    param([string]$Path, [string[]]$ExtraSids = @(), [switch]$Container, [switch]$OwnerAdministrators)
+    $sids = @(@($Script:SidSystem, $Script:SidAdmins) + @($ExtraSids | Where-Object { $_ }) | Select-Object -Unique)
+    $flags = ''
+    if ($Container) { $flags = '(OI)(CI)' }
+    $grants = @($sids | ForEach-Object { "*${_}:${flags}F" })
+    $r = _Icacls $Path /inheritance:r /grant:r @grants
+    if ($r.Code -ne 0) { throw "icacls exit $($r.Code) while setting the ACL on ${Path}: $($r.Text)" }
+    if ($OwnerAdministrators) {
+        $r = _Icacls $Path /setowner "*$Script:SidAdmins"
+        if ($r.Code -ne 0) { throw "icacls exit $($r.Code) while setting the owner of ${Path}: $($r.Text)" }
+    }
+
+    $sidType = [System.Security.Principal.SecurityIdentifier]
+    $removed = @()
+    $foreign = @((Get-Acl -LiteralPath $Path).GetAccessRules($true, $true, $sidType) |
+                 Where-Object { -not $_.IsInherited -and $sids -notcontains $_.IdentityReference.Value } |
+                 ForEach-Object { $_.IdentityReference.Value } | Select-Object -Unique)
+    foreach ($f in $foreign) {
+        $r = _Icacls $Path /remove "*$f"
+        if ($r.Code -ne 0) { throw "icacls exit $($r.Code) while removing the entry for $f from ${Path}: $($r.Text)" }
+        $name = $f
+        try { $name = "$(([System.Security.Principal.SecurityIdentifier]$f).Translate([System.Security.Principal.NTAccount]).Value) ($f)" } catch { $null = $_ }
+        $removed += $name
+    }
+
+    # Prove it. Deny entries are ignored: they can only narrow access.
+    $acl = Get-Acl -LiteralPath $Path
+    if (-not $acl.AreAccessRulesProtected) { throw "inheritance is still enabled on $Path" }
+    $fullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
+    $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $allows = @($acl.GetAccessRules($true, $true, $sidType) |
+                Where-Object { $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow })
+    foreach ($rule in $allows) {
+        if ($sids -notcontains $rule.IdentityReference.Value) { throw "$Path still grants access to $($rule.IdentityReference.Value)" }
+    }
+    foreach ($sid in $sids) {
+        $ok = @($allows | Where-Object {
+            $_.IdentityReference.Value -eq $sid -and
+            (($_.FileSystemRights -band $fullControl) -eq $fullControl) -and
+            ((-not $Container) -or (($_.InheritanceFlags -band $inherit) -eq $inherit))
+        })
+        if ($ok.Count -eq 0) { throw "the grant to $sid did not take effect on $Path" }
+    }
+    if ($OwnerAdministrators) {
+        $ownerSid = $acl.GetOwner($sidType).Value
+        if (@($Script:SidSystem, $Script:SidAdmins) -notcontains $ownerSid) { throw "the owner of $Path is $ownerSid, not Administrators" }
+    }
+    return , $removed
+}
+
+# Creates $Path EMPTY and locks it down before anything is written to it, or throws having written
+# nothing (and leaves no file behind). Until the lockdown it carries its folder's inherited ACL, so
+# it must hold nothing worth reading during that window. Starts from a fresh file: an old one could
+# carry entries of its own. Overwriting it afterwards keeps the DACL.
+function _NewLockedFile {
+    param([string]$Path, [string[]]$ExtraSids = @(), [switch]$OwnerAdministrators)
+    if (-not (_ShredFile $Path)) { throw "could not remove the existing $Path" }
+    [System.IO.File]::WriteAllBytes($Path, (New-Object byte[] 0))
+    try {
+        $null = _LockDown -Path $Path -ExtraSids $ExtraSids -OwnerAdministrators:$OwnerAdministrators
+    } catch {
+        $null = _ShredFile $Path
+        throw
+    }
+}
+
+# The tunnel token (#193): readable by SYSTEM + Administrators only, owned by Administrators - the
+# descriptor cloudflared's own `service install` gives its token file. Not the agent user: nothing
+# that runs as that account needs the token. Throws having written no secret.
+function _WriteLockedTokenFile([string]$Path, [string]$Token) {
+    _NewLockedFile -Path $Path -OwnerAdministrators
+    # No BOM and no newline: cloudflared TrimSpace()s the contents, but a BOM is not whitespace and
+    # would make the token unparseable.
     [System.IO.File]::WriteAllText($Path, $Token, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# Dry run of the .env / company-vault lockdown in $Dir, on a scratch file holding no secret, through
+# the same function the real step uses; shredded again whatever happens. For the -Upgrade preflight.
+# Returns '' on success or why it failed.
+function _ProbeLockDown([string]$Dir, [string]$AgentSid) {
+    $probe = Join-Path $Dir '.tally-mcp-acl.preflight'
+    $why = ''
+    try {
+        _NewLockedFile -Path $probe -ExtraSids @($AgentSid)
+    } catch {
+        $why = $_.Exception.Message
+    }
+    if (-not (_ShredFile $probe)) { $why = ("$why could not remove the probe file $probe afterwards.").Trim() }
+    return $why
 }
 
 # --- Unattended upgrade: resolve everything from what is already there (#177) --------------------
@@ -403,6 +522,29 @@ if ($Upgrade) {
                     $_upgradeProblems += "a locked-down tunnel token file cannot be written in ${InstallDir} ($($_.Exception.Message)), so the upgrade would have to leave the '$TunnelServiceName' service unregistered. Run Setup elevated, or check that folder's permissions."
                 } finally {
                     if (-not (_ShredFile $_probe)) { $_upgradeProblems += "could not remove the preflight probe file $_probe." }
+                }
+            }
+        }
+
+        # The .env, company-vault and IPC-directory lockdowns (#230). An upgrade re-applies all three
+        # and fails closed if it cannot - after the installer has stopped the service. So find out
+        # now: the agent user must resolve to a SID (every grant is by SID), and the lockdown is
+        # dry-run on a scratch file, holding no secret, in the install folder (.env) and in the Tally
+        # data folder (the vault, and the IPC directory it lives in). Only once nothing else has
+        # refused: the probes need a known agent user, and a refused run should write nothing.
+        if ($_upgradeProblems.Count -eq 0) {
+            $_agentSid = ''
+            try { $_agentSid = _AccountSid $_upgradeAgentUser } catch { $_upgradeProblems += "$($_.Exception.Message). Run Reconfigure from the Start Menu to set a user that exists." }
+            if ($_agentSid) {
+                $_dataDir = _Coalesce $_existingEnv['TALLY_DATA_PATH'] 'C:\Users\Public\TallyPrimeEditLog\data'
+                foreach ($_probeDir in @($InstallDir, $_dataDir)) {
+                    # A data folder that does not exist yet is created by the real step under its
+                    # parent's permissions; there is nothing to probe until then.
+                    if (-not (Test-Path -LiteralPath $_probeDir -PathType Container)) { continue }
+                    $_why = _ProbeLockDown $_probeDir $_agentSid
+                    if ($_why) {
+                        $_upgradeProblems += "the configuration files in ${_probeDir} cannot be locked down to SYSTEM, Administrators and '$_upgradeAgentUser' ($_why), and an upgrade will not leave them readable by other local accounts. Run Setup elevated, or check that folder's permissions."
+                    }
                 }
             }
         }
@@ -538,11 +680,7 @@ if ($Upgrade) {
     Write-Host "[OK] Upgrade: the existing .env (and any password in it) is left as it is"
 } elseif ($DeploymentMode -eq 'local') {
     if ($CredentialsFile -and (Test-Path -LiteralPath $CredentialsFile)) {
-        try {
-            $size = (Get-Item -LiteralPath $CredentialsFile -ErrorAction SilentlyContinue).Length
-            if ($size -gt 0) { [System.IO.File]::WriteAllBytes($CredentialsFile, (New-Object byte[] $size)) }
-        } catch { }
-        Remove-Item -LiteralPath $CredentialsFile -Force -ErrorAction SilentlyContinue
+        $null = _ShredFile $CredentialsFile
         Write-Host "[OK] Local mode: no OAuth password is created; the installer's credentials file was shredded"
     } else {
         Write-Host "[OK] Local mode: no OAuth password is created"
@@ -556,14 +694,7 @@ if ($Upgrade) {
         $credsRaw = [System.IO.File]::ReadAllText($CredentialsFile, [System.Text.Encoding]::UTF8)
     } finally {
         # Best-effort secure delete: overwrite with zeros, then unlink. Bounded residual exposure.
-        try {
-            $size = (Get-Item -LiteralPath $CredentialsFile -ErrorAction SilentlyContinue).Length
-            if ($size -gt 0) {
-                $zeros = New-Object byte[] $size
-                [System.IO.File]::WriteAllBytes($CredentialsFile, $zeros)
-            }
-        } catch {}
-        Remove-Item -LiteralPath $CredentialsFile -Force -ErrorAction SilentlyContinue
+        $null = _ShredFile $CredentialsFile
     }
     try {
         $creds = $credsRaw | ConvertFrom-Json
@@ -818,45 +949,55 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     # An upgrade does not write .env at all. Regenerating it from the template above - even from
     # values read out of it - would drop every key the template does not know (TALLY_PORT is
     # hard-coded to 9000 there, CORS_ORIGINS and READONLY_MODE are not in it at all) and reformat
-    # the rest. Byte-for-byte unchanged is the only property an unattended run can promise.
+    # the rest. Byte-for-byte unchanged is the only property an unattended run can promise. (Its
+    # ACL is still re-applied, below.)
+    #
+    # Lock down .env (security): it holds PASSWORD, the sole OAuth gate for every MCP tool, and
+    # TUNNEL_TOKEN on a tunnel install. Without this it inherits the install dir ACL (Program Files
+    # grants Users read by default, and an upgrade previously widened it further), leaving the
+    # password readable by any local user. Strip inheritance and grant only SYSTEM + Administrators
+    # + the agent task user (the tray rewrites .env in place as that user), by SID - see _LockDown.
+    #
+    # FAIL CLOSED (#230). A lockdown that fails stops the run, with an error and a non-zero exit;
+    # it used to print a yellow [WARN] and carry on with the password readable by every local
+    # account. And the new .env is written into a file that is ALREADY locked down - created empty
+    # as .env.tmp, locked and verified, then filled and renamed over .env (a rename keeps the
+    # file's own ACL) - so a failed lockdown writes no secret at all and leaves the previous .env
+    # exactly as it was.
+    $agentSid = _AccountSid $AgentTaskUser
     if ($Upgrade) {
         Write-Host "[OK] Upgrade: $envFile left exactly as it was"
+        try {
+            $removedAces = _LockDown -Path $envFile -ExtraSids @($agentSid)
+        } catch {
+            throw "$envFile could not be locked down to SYSTEM, Administrators and ${AgentTaskUser}: $($_.Exception.Message). It holds the OAuth password (and any tunnel token); stopping rather than leaving it readable by other local accounts."
+        }
     } else {
         $envTmp = "$envFile.tmp"
-        Set-Content -Path $envTmp -Value $envLines -Encoding UTF8
-        Move-Item -Path $envTmp -Destination $envFile -Force
+        try {
+            _NewLockedFile -Path $envTmp -ExtraSids @($agentSid)
+        } catch {
+            throw "$envFile was NOT written: a locked-down file could not be created for it ($($_.Exception.Message)). Nothing was changed; the previous .env, if any, is as it was."
+        }
+        $removedAces = @()
+        # Set-Content truncates the existing (locked) file rather than replacing it, so the ACL stays.
+        Set-Content -LiteralPath $envTmp -Value $envLines -Encoding UTF8
+        Move-Item -LiteralPath $envTmp -Destination $envFile -Force
         Write-Host "[OK] Wrote $envFile ($($envLines.Count) lines)"
     }
-
-    # Lock down .env (security): it holds PASSWORD, the sole OAuth gate for every MCP tool.
-    # Without this it inherits the install dir ACL (Program Files grants Users read by default,
-    # and an upgrade previously widened it further), leaving the password readable by any local
-    # user. Strip inheritance and grant only SYSTEM + Administrators + the agent task user,
-    # mirroring the company-registry lockdown below.
-    & icacls $envFile /inheritance:r /grant:r 'SYSTEM:F' 'Administrators:F' "${AgentTaskUser}:F" 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "[OK] Locked NTFS ACL on $envFile (SYSTEM + Administrators only)"
-    } else {
-        Write-Host "[WARN] icacls exit $LASTEXITCODE on $envFile - .env is not locked down" -ForegroundColor Yellow
-    }
+    foreach ($r in @($removedAces)) { Write-Host "[WARN] Removed an extra permission entry for $r from $envFile" -ForegroundColor Yellow }
+    Write-Host "[OK] Locked NTFS ACL on $envFile (SYSTEM + Administrators + $AgentTaskUser, by SID; verified)"
 
     # --- 1b. Initialize + lock down the companies registry file -----------
     # The registry stores DPAPI-encrypted passwords for the alias feature. We pre-create an empty
     # file so the ACL is in place before anything sensitive is written, then strip inheritance and
     # grant access only to SYSTEM (the MCP service) and Administrators (operator + tray when
     # elevated). The DPAPI blob is defense-in-depth; the NTFS ACL is the real access boundary.
-    $registryFile = Join-Path $TallyDataPath '.tally-mcp-companies.json'
-    if (-not (Test-Path -LiteralPath (Split-Path $registryFile))) {
-        New-Item -ItemType Directory -Force -Path (Split-Path $registryFile) | Out-Null
-    }
-    if (-not (Test-Path -LiteralPath $registryFile)) {
-        Set-Content -Path $registryFile -Value '{"schemaVersion":1,"companies":[]}' -Encoding UTF8 -NoNewline
-        Write-Host "[OK] Created empty company registry at $registryFile"
-    } else {
-        Write-Host "[*] Existing company registry detected at $registryFile (preserved)"
-    }
-    # icacls /inheritance:r removes inherited ACEs; /grant:r replaces (not adds) the named ACEs.
-    # 2>$null suppresses the per-line "Successfully processed..." stdout chatter from icacls.
+    #
+    # icacls /inheritance:r removes inherited ACEs; /grant:r replaces (not adds) the named ACEs;
+    # every principal is named by SID (see _LockDown). Because the ACL is the real boundary (the
+    # DPAPI scope is LocalMachine), a failed lockdown stops the run, as for .env (#230), instead of
+    # warning and leaving the stored Tally passwords readable.
     #
     # IMPORTANT: also grant the agent task user explicit Full Control. The tray scheduled task
     # runs with -RunLevel Limited (non-elevated), which filters the Administrators group from
@@ -864,12 +1005,26 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     # the Manage Companies dialog's Move-Item -Force silently fails on overwrite - the .tmp file
     # gets written but never gets renamed to the real .json, so Save reports success and
     # nothing actually persists.
-    & icacls $registryFile /inheritance:r /grant:r 'SYSTEM:F' 'Administrators:F' "${AgentTaskUser}:F" 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "[OK] Locked NTFS ACL on $registryFile (SYSTEM + Administrators only)"
-    } else {
-        Write-Host "[WARN] icacls exit $LASTEXITCODE on $registryFile - registry file is not locked down" -ForegroundColor Yellow
+    $registryFile = Join-Path $TallyDataPath '.tally-mcp-companies.json'
+    if (-not (Test-Path -LiteralPath (Split-Path $registryFile))) {
+        New-Item -ItemType Directory -Force -Path (Split-Path $registryFile) | Out-Null
     }
+    $removedAces = @()
+    try {
+        if (-not (Test-Path -LiteralPath $registryFile)) {
+            # Locked before it holds anything, as for .env; if that fails no file is left behind.
+            _NewLockedFile -Path $registryFile -ExtraSids @($agentSid)
+            Set-Content -LiteralPath $registryFile -Value '{"schemaVersion":1,"companies":[]}' -Encoding UTF8 -NoNewline
+            Write-Host "[OK] Created empty company registry at $registryFile"
+        } else {
+            Write-Host "[*] Existing company registry detected at $registryFile (preserved)"
+            $removedAces = _LockDown -Path $registryFile -ExtraSids @($agentSid)
+        }
+    } catch {
+        throw "The company password vault $registryFile could not be locked down to SYSTEM, Administrators and ${AgentTaskUser}: $($_.Exception.Message). Its passwords are decryptable by any local account that can read it, so the run stops here."
+    }
+    foreach ($r in @($removedAces)) { Write-Host "[WARN] Removed an extra permission entry for $r from $registryFile" -ForegroundColor Yellow }
+    Write-Host "[OK] Locked NTFS ACL on $registryFile (SYSTEM + Administrators + $AgentTaskUser, by SID; verified)"
 
     # --- 1c. Lock down the GUI-agent IPC directory ------------------------
     # Security: the GUI agent and MCP server exchange commands via _mcp_gui_command.json /
@@ -886,14 +1041,20 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     # only SYSTEM + Administrators, and load-company looped on Access-denied.) NOTE for reviewers: this
     # changes the ACL of TALLY_DATA_PATH; validate Tally (interactive user = agent task user) still has
     # access on multi-account / service-account deployments.
+    #
+    # Fails closed like .env and the vault (#230), for the same kind of reason: an IPC directory that
+    # every local user can write to is a way to type keystrokes - including stored company
+    # passwords - into the accountant's Tally session. Nothing here is worth that. By SID, and any
+    # explicit entry for another account is removed and named in the output (see _LockDown).
     $ipcDir = Split-Path $registryFile
     if (Test-Path -LiteralPath $ipcDir) {
-        & icacls $ipcDir /inheritance:r /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' "${AgentTaskUser}:(OI)(CI)F" 2>$null | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "[OK] Locked NTFS ACL on IPC directory $ipcDir (SYSTEM + Administrators + $AgentTaskUser)"
-        } else {
-            Write-Host "[WARN] icacls exit $LASTEXITCODE on $ipcDir - GUI agent IPC directory is not locked down" -ForegroundColor Yellow
+        try {
+            $removedAces = _LockDown -Path $ipcDir -ExtraSids @($agentSid) -Container
+        } catch {
+            throw "The GUI agent IPC directory $ipcDir could not be locked down to SYSTEM, Administrators and ${AgentTaskUser}: $($_.Exception.Message). Left as it is, other local accounts could send keystrokes to Tally through it, so the run stops here."
         }
+        foreach ($r in @($removedAces)) { Write-Host "[WARN] Removed an extra permission entry for $r from $ipcDir" -ForegroundColor Yellow }
+        Write-Host "[OK] Locked NTFS ACL on IPC directory $ipcDir (SYSTEM + Administrators + $AgentTaskUser, by SID; verified)"
 
         # Self-heal: clear any STALE IPC files left by a previous install/reconfigure. The MCP service
         # overwrites _mcp_gui_command.json IN PLACE, so a file created under an older/narrower ACL (e.g.
@@ -1131,24 +1292,31 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     $tunnelTokenLeaf = '.tunnel-token'
     $tunnelTokenFile = Join-Path $InstallDir $tunnelTokenLeaf
 
-    # Removes a TUNNEL_TOKEN=... entry from an NSSM service's AppEnvironmentExtra (REG_MULTI_SZ under
-    # <service>\Parameters) and leaves every other entry exactly as it was. Returns $true when it
-    # removed something. Takes the key path rather than a service name so it can be exercised against
-    # a scratch HKCU key.
+    # Removes TUNNEL_TOKEN=... entries from an NSSM service's environment (REG_MULTI_SZ values under
+    # <service>\Parameters) and leaves every other entry exactly as it was. NSSM has two such values:
+    # AppEnvironmentExtra (added to the inherited environment - where earlier installers put the
+    # token) and AppEnvironment (which REPLACES it; nothing here ever set it, but `nssm set` by hand
+    # could have, and a token there would override --token-file just the same). Both are scrubbed.
+    # Outputs the names of the values it changed (nothing when it changed nothing). Takes the key
+    # path rather than a service name so it can be exercised against a scratch HKCU key.
     function _RemoveTunnelTokenFromServiceEnv([string]$ParametersKey) {
-        if (-not (Test-Path -LiteralPath $ParametersKey)) { return $false }
-        $prop = Get-ItemProperty -LiteralPath $ParametersKey -Name 'AppEnvironmentExtra' -ErrorAction SilentlyContinue
-        if ($null -eq $prop) { return $false }
-        $entries = @($prop.AppEnvironmentExtra)
-        # Windows environment names are case-insensitive, and so is -notmatch.
-        $keep = @($entries | Where-Object { "$_" -notmatch '^\s*TUNNEL_TOKEN\s*=' })
-        if ($keep.Count -eq $entries.Count) { return $false }
-        if ($keep.Count -gt 0) {
-            New-ItemProperty -LiteralPath $ParametersKey -Name 'AppEnvironmentExtra' -PropertyType MultiString -Value ([string[]]$keep) -Force | Out-Null
-        } else {
-            Remove-ItemProperty -LiteralPath $ParametersKey -Name 'AppEnvironmentExtra' -ErrorAction Stop
+        $changed = @()
+        if (-not (Test-Path -LiteralPath $ParametersKey)) { return }
+        foreach ($valueName in @('AppEnvironmentExtra', 'AppEnvironment')) {
+            $prop = Get-ItemProperty -LiteralPath $ParametersKey -Name $valueName -ErrorAction SilentlyContinue
+            if ($null -eq $prop) { continue }
+            $entries = @($prop.$valueName)
+            # Windows environment names are case-insensitive, and so is -notmatch.
+            $keep = @($entries | Where-Object { "$_" -notmatch '^\s*TUNNEL_TOKEN\s*=' })
+            if ($keep.Count -eq $entries.Count) { continue }
+            if ($keep.Count -gt 0) {
+                New-ItemProperty -LiteralPath $ParametersKey -Name $valueName -PropertyType MultiString -Value ([string[]]$keep) -Force | Out-Null
+            } else {
+                Remove-ItemProperty -LiteralPath $ParametersKey -Name $valueName -ErrorAction Stop
+            }
+            $changed += $valueName
         }
-        return $true
+        return $changed
     }
 
     $existingTunnel = Get-Service -Name $TunnelServiceName -ErrorAction SilentlyContinue
@@ -1182,13 +1350,45 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     # TUNNEL_TOKEN entry is touched; any other entry is left as it was.
     foreach ($svcForScrub in @($TunnelServiceName, $ServiceName)) {
         try {
-            if (_RemoveTunnelTokenFromServiceEnv "HKLM:\SYSTEM\CurrentControlSet\Services\$svcForScrub\Parameters") {
-                Write-Host "[OK] Removed TUNNEL_TOKEN from the '$svcForScrub' service environment in the registry"
+            foreach ($v in @(_RemoveTunnelTokenFromServiceEnv "HKLM:\SYSTEM\CurrentControlSet\Services\$svcForScrub\Parameters")) {
+                Write-Host "[OK] Removed TUNNEL_TOKEN from the '$svcForScrub' service environment in the registry ($v)"
             }
         } catch {
             Write-Host "[WARN] Could not remove TUNNEL_TOKEN from the '$svcForScrub' service registry key: $($_.Exception.Message)" -ForegroundColor Yellow
-            Write-Host "       It is readable by local users there. Remove the AppEnvironmentExtra value under HKLM\SYSTEM\CurrentControlSet\Services\$svcForScrub\Parameters by hand." -ForegroundColor Yellow
+            Write-Host "       It is readable by local users there. Remove the TUNNEL_TOKEN entry from AppEnvironmentExtra / AppEnvironment under HKLM\SYSTEM\CurrentControlSet\Services\$svcForScrub\Parameters by hand." -ForegroundColor Yellow
         }
+    }
+
+    # A MACHINE-WIDE TUNNEL_TOKEN environment variable. cloudflared gives TUNNEL_TOKEN in its
+    # environment precedence over --token-file, and a service inherits the machine environment, so
+    # such a variable silently overrides the token file - with a stale token after a rotation, or
+    # with somebody else's tunnel. It is also readable by every local account (it sits under
+    # HKLM\...\Session Manager\Environment and in every process's environment). This installer never
+    # sets one, so something or someone else did.
+    #
+    # Reported, loudly, but NOT deleted. A machine variable is shared configuration: another program
+    # (a second cloudflared, a script) may depend on it, removing it changes the environment of every
+    # process started afterwards, and deleting configuration we did not create, unasked, from a run
+    # that may be an unattended upgrade is not ours to decide. Nor does it fail the run: nothing this
+    # script can do would fix it, so failing would only make every upgrade roll back over a problem
+    # that would still be there. verify-deployment.ps1 reports it as a FAIL until it is gone. The
+    # value is compared with the configured token but never printed.
+    $machineEnvKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+    $machineTokenProp = Get-ItemProperty -LiteralPath $machineEnvKey -Name 'TUNNEL_TOKEN' -ErrorAction SilentlyContinue
+    if ($null -ne $machineTokenProp -and "$($machineTokenProp.TUNNEL_TOKEN)".Trim()) {
+        $sameToken = $TunnelToken -and ("$($machineTokenProp.TUNNEL_TOKEN)".Trim() -ceq $TunnelToken)
+        Write-Host ""
+        Write-Host "[WARN] SECURITY: a machine-wide TUNNEL_TOKEN environment variable is set on this computer." -ForegroundColor Red
+        if ($sameToken) {
+            Write-Host "       It holds the same token as this install, so every local account can read that token" -ForegroundColor Red
+            Write-Host "       from its own environment. Remove the variable, then rotate the tunnel token." -ForegroundColor Red
+        } else {
+            Write-Host "       cloudflared gives it precedence over the token file, so the tunnel service would run with" -ForegroundColor Red
+            Write-Host "       THAT token, not the one configured here - and every local account can read it." -ForegroundColor Red
+        }
+        Write-Host "       It was left in place because something else may use it. To remove it (elevated):" -ForegroundColor Red
+        Write-Host "         [Environment]::SetEnvironmentVariable('TUNNEL_TOKEN', `$null, 'Machine')" -ForegroundColor Red
+        Write-Host ""
     }
 
     # Same shape as the main service: teardown above is unconditional, registration below is gated.
@@ -1208,7 +1408,9 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     } elseif ($DeploymentMode -eq 'remote' -and $TunnelToken) {
         $tokenFileOk = $false
         if (-not (Test-Path -LiteralPath $cloudflaredExe)) {
-            Write-Host "[WARN] Tunnel token set but cloudflared.exe not found at $cloudflaredExe - skipping tunnel service. Re-run the installer to bundle it." -ForegroundColor Yellow
+            # An error, not a warning: any previous tunnel was removed above, so the tunnel is down.
+            Write-Host "[ERROR] A tunnel token is configured but cloudflared.exe is not at $cloudflaredExe." -ForegroundColor Red
+            Write-Host "        The Cloudflare Tunnel service is NOT registered. Re-run the installer to put it back." -ForegroundColor Red
         } else {
             try {
                 _WriteLockedTokenFile $tunnelTokenFile $TunnelToken
@@ -1259,12 +1461,18 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
             Write-Host "[WARN] Could not remove $tunnelTokenFile - delete it by hand; it holds a tunnel credential." -ForegroundColor Yellow
         }
     }
-    # Fail closed, AND say so. Outside an upgrade the [ERROR] above is the whole story, told to the
-    # person at the keyboard. An unattended upgrade has nobody reading, so a tunnel that was running
-    # before and is not registered now must fail the run (Setup exit 10), which is the update task's
-    # cue to roll back rather than report success over an outage. Raised after the agent and tray
-    # below have been restarted, so the rest of the install is not left down with it.
-    $upgradeTunnelLost = $Upgrade -and $tunnelExisted -and ($DeploymentMode -eq 'remote') -and $TunnelToken -and -not $tunnelRegistered
+    # Fail closed, AND say so - on every run, not only an upgrade. A tunnel that is configured but
+    # could not be registered (no locked-down token file, no cloudflared.exe) fails the run with a
+    # non-zero exit. That used to be an [ERROR] line followed by "Configuration complete." and exit 0,
+    # which nobody sees in a hidden installer window: the installer now reports the failure, the
+    # Reconfigure window stops on it, and an unattended upgrade exits 10 so the update task rolls
+    # back rather than report success over an outage. Raised at the end, after the agent and tray
+    # below have been restarted, so the rest of the install is not left down with it. (An upgrade
+    # that deliberately created no tunnel, because none existed before, is not a failure.)
+    $deferredFailures = @()
+    if (($DeploymentMode -eq 'remote') -and $TunnelToken -and -not $tunnelRegistered -and -not ($Upgrade -and -not $tunnelExisted)) {
+        $deferredFailures += "the Cloudflare Tunnel is configured but the '$TunnelServiceName' service could not be registered$(if ($tunnelExisted) { ' (it existed before this run and has been removed)' }) - see the [ERROR] above. It has been left unregistered rather than protected less well."
+    }
 
     # --- 4. Register the GUI agent at-logon Scheduled Task -----------------
     # Use the ScheduledTasks PowerShell module rather than schtasks.exe. schtasks.exe via the
@@ -1400,7 +1608,11 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
 
     # --- 6. Tell the operator what's next ----------------------------------
     Write-Host ""
-    Write-Host "Configuration complete."
+    if ($deferredFailures.Count -gt 0) {
+        Write-Host "Configuration INCOMPLETE - see the errors above and below." -ForegroundColor Red
+    } else {
+        Write-Host "Configuration complete."
+    }
     Write-Host "  Service:        $ServiceName  ($($svc.Status))"
     Write-Host "  Tunnel:         $(if ($tunnelRegistered) { "$TunnelServiceName (cloudflared -> $McpDomain, token in $tunnelTokenFile)" } else { 'not configured' })"
     Write-Host "  Agent task:     $AgentTaskName"
@@ -1416,8 +1628,8 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     Write-Host "NOTE: $transcript captures install activity. Delete it if PowerShell parameter binding"
     Write-Host "      may have logged the OAuth password and the box is shared with other admins."
 
-    if ($upgradeTunnelLost) {
-        throw "Upgrade: the '$TunnelServiceName' service existed before this run but could not be re-registered with a locked-down token file (see the errors above). It has been left unregistered rather than protected less well."
+    if ($deferredFailures.Count -gt 0) {
+        throw ("Configuration did not complete: " + ($deferredFailures -join ' '))
     }
 }
 catch {

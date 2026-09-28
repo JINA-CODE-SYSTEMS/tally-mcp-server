@@ -165,7 +165,7 @@ function Test-ClientConfigured {
 
 # Write (replace or append) a single KEY=VALUE in .env, preserving all other lines. Writes in place
 # rather than tmp+rename: firstrun-config.ps1 grants the agent user FullControl on the .env FILE
-# (icacls ${AgentTaskUser}:F) but not the Program Files directory, so we can rewrite the file but not
+# (icacls *<agent user SID>:F) but not the Program Files directory, so we can rewrite the file but not
 # create a sibling .tmp there. Used by the "Allow Claude to control Tally" toggle.
 function Set-EnvValue {
     param([string]$EnvPath, [string]$Key, [string]$Value)

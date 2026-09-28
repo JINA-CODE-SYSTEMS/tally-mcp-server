@@ -42,7 +42,15 @@ $AgentTask  = 'FrcTestAgent'
 $TrayTask   = 'FrcTestTray'
 $Service    = 'FrcTestService'
 $Tunnel     = 'FrcTestTunnel'
-$Accountant = 'tally-test-accountant'     # the person who uses Tally; NOT the account running this
+# The person who uses Tally; NOT the account running this. It has to be a REAL account, because
+# every ACL grant is now made by SID (#230) and firstrun-config.ps1 resolves the agent user to one
+# before it touches a file - an account that does not resolve stops the run. The built-in Guest
+# account exists on every Windows (disabled, which does not matter: nothing runs as it - every task
+# and ACL call is a stand-in). It is found by its well-known RID, 501, not by name, since the name
+# is localised too.
+$_me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$AccountantSid = (New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::AccountGuestSid, $_me.AccountDomainSid)).Value
+$Accountant = ([System.Security.Principal.SecurityIdentifier]$AccountantSid).Translate([System.Security.Principal.NTAccount]).Value
 
 $work = Join-Path ([System.IO.Path]::GetTempPath()) ('frc-test-' + [guid]::NewGuid().ToString('n').Substring(0, 12))
 New-Item -ItemType Directory -Force -Path $work | Out-Null
@@ -173,11 +181,103 @@ function New-ScheduledTask {
     return [pscustomobject]@{ Actions = @($Action); Triggers = @($Trigger); Principal = $Principal; Settings = $Settings; Description = $Description }
 }
 
+# --- A model of NTFS permissions, driven by the icacls stand-in and read back by Get-Acl ----------
+# firstrun-config.ps1 locks .env, the company vault, the IPC directory and the tunnel token file down
+# with icacls and then PROVES the result with Get-Acl before it trusts it (#193, #230). So the
+# stand-in does not just record icacls: it applies each call to a per-path model of the ACL, and the
+# Get-Acl stand-in returns that model as a real FileSecurity/DirectorySecurity, built from SDDL.
+#
+# THIS SIMULATES A LOCALISED WINDOWS, as far as account names go: no account NAME maps. A principal
+# passed by name ('Administrators:F', 'SYSTEM:F', 'alice:F') fails the whole call with exit 1332,
+# "No mapping between account names and security IDs was done", and changes nothing - exactly what
+# icacls does on a German or French Windows for 'Administrators' (#230). Only *SID principals work.
+# Every name that was tried is recorded in $global:FrcIcaclsNames, so a test can also assert none was.
+#
+# A path nobody has locked down reads as the install folder does under Program Files: inheritance
+# on, inherited Full Control for SYSTEM and Administrators, and inherited read for BUILTIN\Users.
+#
+# Failure injection (wildcard patterns, matched against the full path):
+#   $global:FrcIcaclsFail  icacls on a matching path exits 5 (access denied) and changes nothing.
+#   $global:FrcAclIgnore   icacls on a matching path exits 0 but changes nothing - to prove the Get-Acl
+#                          verification, not the exit code, is what the script trusts.
+#   $global:FrcAclSeed     path -> list of explicit ACEs to start from (a "foreign" entry left by hand).
+function _FrcMatch([string]$Path, $Patterns) {
+    foreach ($p in @($Patterns)) { if ($p -and $Path -like $p) { return $true } }
+    return $false
+}
+
+function _FrcAclOf([string]$Path) {
+    $k = $Path.ToLowerInvariant()
+    if (-not $global:FrcAcl.ContainsKey($k)) {
+        $aces = New-Object System.Collections.ArrayList
+        foreach ($s in @('S-1-5-18', 'S-1-5-32-544')) { [void]$aces.Add(@{ Sid = $s; Rights = 'FA'; Inherit = $true; Inherited = $true }) }
+        [void]$aces.Add(@{ Sid = 'S-1-5-32-545'; Rights = 'FR'; Inherit = $true; Inherited = $true })
+        foreach ($seed in @($global:FrcAclSeed[$Path])) { if ($seed) { [void]$aces.Add($seed) } }
+        $global:FrcAcl[$k] = @{ Protected = $false; Owner = 'S-1-5-32-544'; Aces = $aces }
+    }
+    return $global:FrcAcl[$k]
+}
+
 function icacls {
     $target = ''
     if ($args.Count -gt 0) { $target = "$($args[0])" }
-    _FrcRecord 'icacls' $target '' (($args | Select-Object -Skip 1) -join ' ')
+    $rest = @($args | Select-Object -Skip 1 | ForEach-Object { "$_" })
+    _FrcRecord 'icacls' $target '' ($rest -join ' ')
+    if (_FrcMatch $target $global:FrcIcaclsFail) {
+        $global:LASTEXITCODE = 5
+        return "${target}: Access is denied."
+    }
+    $cur = _FrcAclOf $target
+    $new = @{ Protected = $cur.Protected; Owner = $cur.Owner; Aces = New-Object System.Collections.ArrayList }
+    foreach ($a in $cur.Aces) { [void]$new.Aces.Add($a) }
+    $toSid = {
+        param([string]$Principal)
+        if ($Principal.StartsWith('*')) { return $Principal.Substring(1) }
+        [void]$global:FrcIcaclsNames.Add($Principal)
+        return $null
+    }
+    $i = 0
+    while ($i -lt $rest.Count) {
+        $flag = $rest[$i]; $i++
+        if ($flag -eq '/inheritance:r') {
+            $new.Protected = $true
+            $keep = @($new.Aces | Where-Object { -not $_.Inherited })
+            $new.Aces = New-Object System.Collections.ArrayList; foreach ($a in $keep) { [void]$new.Aces.Add($a) }
+        } elseif ($flag -eq '/grant:r') {
+            while ($i -lt $rest.Count -and -not $rest[$i].StartsWith('/')) {
+                $spec = $rest[$i]; $i++
+                $colon = $spec.IndexOf(':')
+                $sid = & $toSid $spec.Substring(0, $colon)
+                if (-not $sid) { $global:LASTEXITCODE = 1332; return "$($spec.Substring(0, $colon)): No mapping between account names and security IDs was done." }
+                $perm = $spec.Substring($colon + 1)
+                $keep = @($new.Aces | Where-Object { $_.Inherited -or $_.Sid -ne $sid })
+                $new.Aces = New-Object System.Collections.ArrayList; foreach ($a in $keep) { [void]$new.Aces.Add($a) }
+                [void]$new.Aces.Add(@{ Sid = $sid; Rights = $(if ($perm -match 'F$') { 'FA' } else { 'FR' }); Inherit = ($perm -like '*(OI)(CI)*'); Inherited = $false })
+            }
+        } elseif ($flag -eq '/setowner' -or $flag -eq '/remove') {
+            $p = $rest[$i]; $i++
+            $sid = & $toSid $p
+            if (-not $sid) { $global:LASTEXITCODE = 1332; return "${p}: No mapping between account names and security IDs was done." }
+            if ($flag -eq '/setowner') { $new.Owner = $sid }
+            else {
+                $keep = @($new.Aces | Where-Object { $_.Inherited -or $_.Sid -ne $sid })
+                $new.Aces = New-Object System.Collections.ArrayList; foreach ($a in $keep) { [void]$new.Aces.Add($a) }
+            }
+        } else {
+            $global:LASTEXITCODE = 87
+            return "Invalid parameter `"$flag`""
+        }
+    }
+    if (-not (_FrcMatch $target $global:FrcAclIgnore)) { $global:FrcAcl[$target.ToLowerInvariant()] = $new }
     $global:LASTEXITCODE = 0
+    return "processed file: $target"
+}
+
+# The model as SIDs, for assertions: "S-1-5-18:FA:OICI" ... sorted, plus whether it is protected.
+function Get-FrcAclText([string]$Path) {
+    $m = _FrcAclOf $Path
+    $aces = @($m.Aces | ForEach-Object { "$($_.Sid):$($_.Rights)$(if ($_.Inherit) { ':OICI' })$(if ($_.Inherited) { ':inherited' })" } | Sort-Object)
+    return "protected=$($m.Protected) owner=$($m.Owner) " + ($aces -join ' ')
 }
 
 function schtasks {
@@ -190,26 +290,25 @@ function Start-Sleep {
     param([int]$Seconds, [int]$Milliseconds)
 }
 
-# The token-file lockdown (#193) runs icacls - stood in for above, so it changes nothing - and then
-# PROVES the result with Get-Acl before writing the secret. This returns the descriptor a correct
-# lockdown produces (protected, SYSTEM + Administrators, owner Administrators), or, to exercise
-# fail-closed, an unprotected one:
-#   $global:FrcAclMode = 'good'        every file locks down
-#   $global:FrcAclMode = 'broken'      nothing locks down (the preflight probe fails too)
-#   $global:FrcAclMode = 'broken-real' only the real .tunnel-token fails (the preflight passed)
+# Returns the modelled ACL of a path (see the icacls stand-in above) as the real .NET type Get-Acl
+# returns, built from SDDL, so firstrun-config.ps1's verification runs its real code on it.
 function Get-Acl {
     [CmdletBinding()]
     param([Parameter(Position = 0)][string]$Path, [string]$LiteralPath)
     $p = $LiteralPath; if (-not $p) { $p = $Path }
     _FrcRecord 'Get-Acl' $p '' ''
-    $broken = ($global:FrcAclMode -eq 'broken') -or ($global:FrcAclMode -eq 'broken-real' -and $p -like '*\.tunnel-token')
-    $fs = New-Object System.Security.AccessControl.FileSecurity
-    $fs.SetAccessRuleProtection((-not $broken), $false)
-    foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
-        $fs.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier $sid), 'FullControl', 'Allow')))
+    $m = _FrcAclOf $p
+    $sddl = "O:$($m.Owner)D:$(if ($m.Protected) { 'P' })"
+    foreach ($a in $m.Aces) {
+        $flags = ''
+        if ($a.Inherit) { $flags += 'OICI' }
+        if ($a.Inherited) { $flags += 'ID' }
+        $sddl += "(A;$flags;$($a.Rights);;;$($a.Sid))"
     }
-    $fs.SetOwner((New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544'))
-    return $fs
+    if (Test-Path -LiteralPath $p -PathType Container) { $sec = New-Object System.Security.AccessControl.DirectorySecurity }
+    else { $sec = New-Object System.Security.AccessControl.FileSecurity }
+    $sec.SetSecurityDescriptorSddlForm($sddl)
+    return $sec
 }
 
 $StandIns = @('Get-Service', 'Get-ScheduledTask', 'Register-ScheduledTask', 'Unregister-ScheduledTask',
@@ -265,25 +364,49 @@ function Add-FakeTask([string]$Name, [string]$User, [string]$Root, [string]$Scri
     }
 }
 
-# A service's NSSM AppEnvironmentExtra, in the redirected registry.
-function Set-FakeServiceEnv([string]$Service, [string[]]$Entries) {
+# A service's NSSM AppEnvironmentExtra (or, with -Value AppEnvironment, AppEnvironment), in the
+# redirected registry.
+function Set-FakeServiceEnv([string]$Service, [string[]]$Entries, [string]$Value = 'AppEnvironmentExtra') {
     $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$Service\Parameters"
-    New-Item -Path $key -Force | Out-Null
-    New-ItemProperty -LiteralPath $key -Name 'AppEnvironmentExtra' -PropertyType MultiString -Value $Entries -Force | Out-Null
+    if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key -Force | Out-Null }
+    New-ItemProperty -LiteralPath $key -Name $Value -PropertyType MultiString -Value $Entries -Force | Out-Null
 }
-function Get-FakeServiceEnv([string]$Service) {
+function Get-FakeServiceEnv([string]$Service, [string]$Value = 'AppEnvironmentExtra') {
     $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$Service\Parameters"
     if (-not (Test-Path -LiteralPath $key)) { return $null }
-    $p = Get-ItemProperty -LiteralPath $key -Name 'AppEnvironmentExtra' -ErrorAction SilentlyContinue
+    $p = Get-ItemProperty -LiteralPath $key -Name $Value -ErrorAction SilentlyContinue
     if ($null -eq $p) { return $null }
-    return @($p.AppEnvironmentExtra)
+    return @($p.$Value)
+}
+
+# The machine-wide environment, in the redirected registry.
+$MachineEnvKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+function Set-FakeMachineEnv([string]$Name, [string]$Value) {
+    if (-not (Test-Path -LiteralPath $MachineEnvKey)) { New-Item -Path $MachineEnvKey -Force | Out-Null }
+    New-ItemProperty -LiteralPath $MachineEnvKey -Name $Name -PropertyType String -Value $Value -Force | Out-Null
+}
+function Get-FakeMachineEnv([string]$Name) {
+    $p = Get-ItemProperty -LiteralPath $MachineEnvKey -Name $Name -ErrorAction SilentlyContinue
+    if ($null -eq $p) { return $null }
+    return "$($p.$Name)"
+}
+
+# Every file under a fake install root that contains $Needle - to prove a secret reached no disk.
+function Find-Secret([string]$Root, [string]$Needle) {
+    return @(Get-ChildItem -LiteralPath $Root -Recurse -Force -File | Where-Object {
+        [System.IO.File]::ReadAllText($_.FullName).IndexOf($Needle) -ge 0
+    } | ForEach-Object { $_.FullName })
 }
 
 function Reset-Fakes {
     $global:FrcCalls.Clear()
     $global:FrcTasks = @{}
     $global:FrcServices = @{}
-    $global:FrcAclMode = 'good'
+    $global:FrcAcl = @{}
+    $global:FrcAclSeed = @{}
+    $global:FrcIcaclsFail = @()
+    $global:FrcAclIgnore = @()
+    $global:FrcIcaclsNames = New-Object System.Collections.ArrayList
     Get-ChildItem -LiteralPath $ScratchReg -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
     $env:FRC_NSSM_LOG = Join-Path $work ('nssm-' + [guid]::NewGuid().ToString('n').Substring(0, 8) + '.log')
 }
@@ -306,6 +429,13 @@ function Invoke-Firstrun {
     $global:LASTEXITCODE = 0
     $base = @{ ServiceName = $Service; AgentTaskName = $AgentTask; TrayTaskName = $TrayTask; TunnelServiceName = $Tunnel; NoElevate = $true }
     foreach ($k in $Params.Keys) { $base[$k] = $Params[$k] }
+    # A fresh install with no .env and no -TallyDataPath would fall back to the REAL default Tally data
+    # folder (C:\Users\Public\...) and create the vault there. Point it at the fake root instead. (An
+    # upgrade takes no setting parameters, and reads the path from its .env.)
+    if (-not $base.ContainsKey('Upgrade') -and -not $base.ContainsKey('TallyDataPath') -and
+        -not (Test-Path -LiteralPath (Join-Path $base.InstallDir '.env'))) {
+        $base['TallyDataPath'] = Join-Path $base.InstallDir 'data'
+    }
     Assert-StandIns     # before EVERY run: see the Import-Module note above
     try {
         & $Target @base *>&1 | ForEach-Object { [void]$buf.Add("$_") }
@@ -368,6 +498,16 @@ CORS_ORIGINS=https://claude.ai
 $runningUser = $env:USERNAME
 if ($runningUser -eq $Accountant) { throw "Run this as any account other than '$Accountant'." }
 
+# firstrun-config.ps1's fallback data folder. No test may reach it (see Invoke-Firstrun).
+$DefaultDataPath = 'C:\Users\Public\TallyPrimeEditLog\data'
+function Get-DefaultDataState {
+    $v = Join-Path $DefaultDataPath '.tally-mcp-companies.json'
+    if (-not (Test-Path -LiteralPath $DefaultDataPath)) { return 'absent' }
+    if (-not (Test-Path -LiteralPath $v)) { return 'folder only' }
+    return "vault written $((Get-Item -LiteralPath $v -Force).LastWriteTimeUtc.Ticks)"
+}
+$DefaultDataBefore = Get-DefaultDataState
+
 try {
     # ------------------------------------------------------------------------------------------
     Write-Host "`n[1] Upgrade of a customised local install, run by an account that is not the accountant"
@@ -387,7 +527,9 @@ try {
     Check (@($reg | Where-Object { $_.Target -eq 'TallyMCPConnectOnce' }).Count -eq 0) 'Claude client configuration left alone (no connect task)'
     Check (@(Calls 'Start-ScheduledTask' | Where-Object { $_.Target -in @($AgentTask, $TrayTask) }).Count -eq 2) 'agent and tray restarted'
     $grants = @(Calls 'icacls' | Where-Object { $_.Detail -match '/grant' })
-    Check ($grants.Count -ge 2 -and @($grants | Where-Object { $_.Detail -notmatch [regex]::Escape("${Accountant}:") }).Count -eq 0) "ACL grants go to '$Accountant' only"
+    # (An upgrade re-runs the preflight's checks first, so the two probe files are locked down too.)
+    Check (@($grants | Where-Object { $_.Target -notlike '*.preflight' }).Count -eq 3 -and @($grants | Where-Object { $_.Detail -notmatch [regex]::Escape("*${AccountantSid}:") }).Count -eq 0) "ACL grants (.env, vault, IPC directory) go to '$Accountant' only, by SID"
+    Check ($global:FrcIcaclsNames.Count -eq 0) 'no account is ever passed to icacls by name'
     Check (@(NssmLog).Count -eq 0) 'no service touched (local mode)'
     Check ($r.Output -match 'left exactly as it was') 'says .env was left as it was'
     Show-OnFailure $r
@@ -405,6 +547,9 @@ try {
     # entry that must survive, and (installs from before #172 C3) in the main service's too.
     Set-FakeServiceEnv $Tunnel  @("TUNNEL_TOKEN=$TokenValue", 'NO_PROXY=localhost')
     Set-FakeServiceEnv $Service @("TUNNEL_TOKEN=$TokenValue")
+    # And in NSSM's other environment value, AppEnvironment, which replaces the environment instead
+    # of adding to it. Nothing we shipped wrote it, but `nssm set` by hand could have (#229 review).
+    Set-FakeServiceEnv $Tunnel  @('HTTPS_PROXY=http://proxy:8080', " tunnel_token = $TokenValue") -Value 'AppEnvironment'
     $before = Get-FileHashText (Join-Path $root '.env')
     $r = Invoke-Firstrun @{ InstallDir = $root; Upgrade = $true; Unattended = $true }
     Check ($null -eq $r.Error) 'completes without error (no password prompt, no credentials file needed)'
@@ -425,6 +570,9 @@ try {
     $tunnelEnv = Get-FakeServiceEnv $Tunnel
     Check ($null -ne $tunnelEnv -and (@($tunnelEnv) -join '|') -eq 'NO_PROXY=localhost') 'TUNNEL_TOKEN scrubbed from the tunnel registry environment; the other entry kept'
     Check ($null -eq (Get-FakeServiceEnv $Service)) 'TUNNEL_TOKEN scrubbed from the main service registry environment'
+    $tunnelAppEnv = Get-FakeServiceEnv $Tunnel -Value 'AppEnvironment'
+    Check ($null -ne $tunnelAppEnv -and (@($tunnelAppEnv) -join '|') -eq 'HTTPS_PROXY=http://proxy:8080') 'TUNNEL_TOKEN scrubbed from the tunnel AppEnvironment value too (any case, any spacing); the other entry kept'
+    Check ($r.Output -match 'TUNNEL_TOKEN from the .* \(AppEnvironment\)') 'says it scrubbed AppEnvironment'
     $transcriptText = ''
     $tp = Join-Path $root 'logs\firstrun-config.log'
     if (Test-Path -LiteralPath $tp) { $transcriptText = [System.IO.File]::ReadAllText($tp) }
@@ -441,10 +589,11 @@ try {
     $global:FrcServices[$Service] = 'Running'
     $global:FrcServices[$Tunnel]  = 'Running'
     Set-FakeServiceEnv $Tunnel @("TUNNEL_TOKEN=$TokenValue")
-    $global:FrcAclMode = 'broken-real'
+    # icacls "succeeds" on the real token file but changes nothing: only the Get-Acl check can tell.
+    $global:FrcAclIgnore = @('*\.tunnel-token')
     $before = Get-FileHashText (Join-Path $root '.env')
     $r = Invoke-Firstrun @{ InstallDir = $root; Upgrade = $true; Unattended = $true }
-    Check ($null -ne $r.Error -and "$($r.Error)" -match 'could not be re-registered') 'the run FAILS (so Setup exits 10 and the updater rolls back)'
+    Check ($null -ne $r.Error -and "$($r.Error)" -match "'$Tunnel' service could not be registered \(it existed before this run") 'the run FAILS (so Setup exits 10 and the updater rolls back)'
     $log = NssmLog
     Check (@($log | Where-Object { $_ -like "install | $Tunnel | *" }).Count -eq 0) 'tunnel left unregistered rather than protected less well'
     Check (-not (Test-Path -LiteralPath (Join-Path $root '.tunnel-token'))) 'no token file left behind'
@@ -502,8 +651,13 @@ try {
     $report = Join-Path $work 'preflight-ok.txt'
     $r = Invoke-Firstrun @{ InstallDir = $root; Upgrade = $true; PreflightOnly = $true; ReportFile = $report }
     Check ($null -eq $r.Error -and $r.ExitCode -eq 0) 'exit 0 when the upgrade can preserve everything'
-    Check ((Test-Path -LiteralPath $report) -and ((Get-Content -Raw -LiteralPath $report) -match "^OK: .*$Accountant")) 'report says OK and names the preserved user'
-    Check (@($global:FrcCalls | Where-Object { $_.Cmd -ne 'Get-ScheduledTask' }).Count -eq 0) 'nothing changed'
+    Check ((Test-Path -LiteralPath $report) -and ((Get-Content -Raw -LiteralPath $report) -match "^OK: .*$([regex]::Escape($Accountant))")) 'report says OK and names the preserved user'
+    $probeCalls = @($global:FrcCalls | Where-Object { $_.Cmd -in @('icacls', 'Get-Acl') })
+    Check (@($global:FrcCalls | Where-Object { $_.Cmd -ne 'Get-ScheduledTask' -and $probeCalls -notcontains $_ }).Count -eq 0 -and
+           @($probeCalls | Where-Object { $_.Target -notlike '*\.tally-mcp-acl.preflight' }).Count -eq 0) 'nothing changed (the only ACL calls are on the preflight probe files)'
+    $probedIn = (@(Calls 'icacls' | Where-Object { $_.Detail -like '/inheritance:r*' } | ForEach-Object { Split-Path -Parent $_.Target }) -join '|')
+    Check ($probedIn -eq (@($root, (Join-Path $root 'data')) -join '|')) 'the .env / vault lockdown was dry-run in the install folder and in the Tally data folder'
+    Check (@(Get-ChildItem -LiteralPath $root -Recurse -Force -Filter '*.preflight').Count -eq 0) 'no probe file left behind'
     Check (-not (Test-Path -LiteralPath (Join-Path $root 'logs\firstrun-config.log'))) 'no log written'
     Show-OnFailure $r
 
@@ -519,8 +673,8 @@ try {
     # ------------------------------------------------------------------------------------------
     Write-Host "`n[5b] Preflight refuses, before anything is stopped, what would break the tunnel (#193)"
     $tunnelCases = @(
-        @{ Name = 'token file cannot be locked down'; Env = $legacyRemoteEnv; Acl = 'broken'; Match = 'locked-down tunnel token file cannot be written' }
-        @{ Name = 'tunnel service but no TUNNEL_TOKEN in .env'; Env = ($legacyRemoteEnv -replace "(?m)^TUNNEL_TOKEN=.*\r?\n", ''); Acl = 'good'; Match = 'has no TUNNEL_TOKEN' }
+        @{ Name = 'token file cannot be locked down'; Env = $legacyRemoteEnv; Ignore = @('*'); Match = 'locked-down tunnel token file cannot be written' }
+        @{ Name = 'tunnel service but no TUNNEL_TOKEN in .env'; Env = ($legacyRemoteEnv -replace "(?m)^TUNNEL_TOKEN=.*\r?\n", ''); Ignore = @(); Match = 'has no TUNNEL_TOKEN' }
     )
     foreach ($case in $tunnelCases) {
         Reset-Fakes; $script:FailuresBefore = $script:Failures
@@ -529,7 +683,7 @@ try {
         $global:FrcServices[$Service] = 'Running'
         $global:FrcServices[$Tunnel]  = 'Running'
         Set-FakeServiceEnv $Tunnel @("TUNNEL_TOKEN=$TokenValue")
-        $global:FrcAclMode = $case.Acl
+        $global:FrcAclIgnore = $case.Ignore
         $report = Join-Path $work ('preflight-tunnel-' + [guid]::NewGuid().ToString('n').Substring(0, 6) + '.txt')
         $r = Invoke-Firstrun @{ InstallDir = $root; Upgrade = $true; PreflightOnly = $true; ReportFile = $report }
         Check ($r.ExitCode -eq 1 -and (Get-Content -Raw -LiteralPath $report) -match $case.Match) "$($case.Name): preflight refuses and says why"
@@ -584,7 +738,7 @@ try {
     Check ($null -eq $r.Error) "fresh unattended run with an explicit user completes"
     $envText = Get-Content -Raw -LiteralPath (Join-Path $root '.env')
     Check ($envText -match "(?m)^DEPLOYMENT_MODE=local\s*$") 'a fresh install is local'
-    Check ($envText -match "(?m)^AGENT_TASK_USER=`"$Accountant`"\s*$") 'and records the agent user'
+    Check ($envText -match "(?m)^AGENT_TASK_USER=`"$([regex]::Escape($Accountant))`"\s*$") 'and records the agent user'
     Show-OnFailure $r
 
     # ------------------------------------------------------------------------------------------
@@ -593,18 +747,175 @@ try {
     Reset-Fakes; $script:FailuresBefore = $script:Failures
     $root = New-FakeInstall -EnvText $localEnv
     Add-FakeTask $AgentTask $Accountant $root
-    $r = Invoke-Firstrun @{ InstallDir = $root; Unattended = $true; TallyEdition = 'silver'; TallyExePath = 'C:\Program Files\TallyPrime\tally.exe'; AgentTaskUser = 'wizard-default-user'; EnableGuiControl = 'true'; EntryOrder = ''; DeploymentMode = '' }
+    $r = Invoke-Firstrun @{ InstallDir = $root; Unattended = $true; TallyEdition = 'silver'; TallyExePath = 'C:\Program Files\TallyPrime\tally.exe'; AgentTaskUser = $runningUser; EnableGuiControl = 'true'; EntryOrder = ''; DeploymentMode = '' }
     Check ($null -eq $r.Error) 'completes'
     $envText = Get-Content -Raw -LiteralPath (Join-Path $root '.env')
     Check ($envText -match '(?m)^TALLY_EDITION=silver') 'edition overwritten by the passed value'
     Check ($envText -match '(?m)^DEPLOYMENT_MODE=local') 'mode still preserved (passed as empty, as the installer does)'
     Check ($envText -notmatch 'READONLY_MODE') 'keys the template does not know are dropped - so an upgrade must not rewrite .env'
     Show-OnFailure $r
+
+    # ==========================================================================================
+    # #230: .env, the company vault and the IPC directory are locked down by SID, verified, and a
+    # lockdown that fails stops the run. (#229 follow-ups after that.)
+    # ==========================================================================================
+    $FreshPassword = 'fresh-install-pw-#230-not-real'
+    function New-CredentialsFile {
+        $p = Join-Path $work ('creds-' + [guid]::NewGuid().ToString('n').Substring(0, 6) + '.json')
+        [System.IO.File]::WriteAllText($p, "{`"password`":`"$FreshPassword`"}", (New-Object System.Text.UTF8Encoding $false))
+        return $p
+    }
+    # A fresh remote install with a tunnel, the way the wizard runs it: every secret this script can
+    # write is in play (the OAuth password, the tunnel token).
+    function Invoke-FreshRemote([string]$Root, [string]$Creds) {
+        return Invoke-Firstrun @{ InstallDir = $Root; Unattended = $true; AgentTaskUser = $Accountant; DeploymentMode = 'remote'
+                                  CredentialsFile = $Creds; TunnelToken = $TokenValue; McpDomain = 'https://client42.tally.example.com'; EnableGuiControl = 'true' }
+    }
+
+    # ------------------------------------------------------------------------------------------
+    Write-Host "`n[10] A .env that cannot be locked down is never written (fresh remote install)"
+    $envFailModes = @(
+        @{ Name = 'icacls fails';                               Fail = @('*\.env.tmp'); Ignore = @() }
+        @{ Name = 'icacls exits 0 but the ACL did not change';  Fail = @();             Ignore = @('*\.env.tmp') }
+    )
+    foreach ($mode in $envFailModes) {
+        Reset-Fakes; $script:FailuresBefore = $script:Failures
+        $root = New-FakeInstall -EnvText ''
+        $creds = New-CredentialsFile
+        $global:FrcIcaclsFail = $mode.Fail; $global:FrcAclIgnore = $mode.Ignore
+        $r = Invoke-FreshRemote $root $creds
+        Check ($null -ne $r.Error -and "$($r.Error)" -match '\.env was NOT written') "$($mode.Name): the run FAILS, saying .env was not written"
+        Check (-not (Test-Path -LiteralPath (Join-Path $root '.env')) -and -not (Test-Path -LiteralPath (Join-Path $root '.env.tmp'))) "$($mode.Name): no .env and no .env.tmp on disk"
+        Check ((Find-Secret $root $FreshPassword).Count -eq 0 -and (Find-Secret $root $TokenValue).Count -eq 0) "$($mode.Name): neither the password nor the tunnel token is in any file under the install"
+        Check (-not (Test-Path -LiteralPath $creds)) "$($mode.Name): the installer's credentials file was still shredded"
+        Check (@(NssmLog).Count -eq 0 -and @(Calls 'Register-ScheduledTask').Count -eq 0) "$($mode.Name): nothing registered - the run stopped there"
+        Check (-not (Test-Path -LiteralPath (Join-Path $root 'data\.tally-mcp-companies.json'))) "$($mode.Name): the vault was not created either"
+        Show-OnFailure $r
+    }
+
+    Reset-Fakes; $script:FailuresBefore = $script:Failures
+    $root = New-FakeInstall -EnvText $legacyRemoteEnv
+    Add-FakeTask $AgentTask $Accountant $root
+    $before = Get-FileHashText (Join-Path $root '.env')
+    $global:FrcIcaclsFail = @('*\.env.tmp')
+    $r = Invoke-Firstrun @{ InstallDir = $root; Unattended = $true; TallyEdition = 'gold' }
+    Check ($null -ne $r.Error -and "$($r.Error)" -match '\.env was NOT written') 'Reconfigure: the run FAILS when the new .env cannot be locked down'
+    Check ((Get-FileHashText (Join-Path $root '.env')) -eq $before) 'Reconfigure: the existing .env is exactly as it was (the change was not written anywhere)'
+    Show-OnFailure $r
+
+    # ------------------------------------------------------------------------------------------
+    Write-Host "`n[11] On a Windows where no account NAME maps (as 'Administrators' on a localised one), a full install still locks everything down"
+    Reset-Fakes; $script:FailuresBefore = $script:Failures
+    $root = New-FakeInstall -EnvText ''
+    $dataDir = Join-Path $root 'data'
+    # An explicit entry someone added by hand: BUILTIN\Users may modify the Tally data folder.
+    $global:FrcAclSeed[$dataDir] = @(@{ Sid = 'S-1-5-32-545'; Rights = 'FA'; Inherit = $true; Inherited = $false })
+    $r = Invoke-FreshRemote $root (New-CredentialsFile)
+    Check ($null -eq $r.Error) 'completes without error'
+    Check ($global:FrcIcaclsNames.Count -eq 0) 'no account was ever passed to icacls by name (every name would have failed here)'
+    $fileAcl = "protected=True owner=S-1-5-32-544 $(@("S-1-5-18:FA", "S-1-5-32-544:FA", "${AccountantSid}:FA") | Sort-Object)"
+    Check ((Get-FrcAclText (Join-Path $root '.env.tmp')) -eq $fileAcl) '.env (locked as .env.tmp before a byte was written, then renamed): SYSTEM, Administrators and the agent user only, inheritance off'
+    Check ((Get-FrcAclText (Join-Path $dataDir '.tally-mcp-companies.json')) -eq $fileAcl) 'company vault: SYSTEM, Administrators and the agent user only, inheritance off'
+    Check ((Get-FrcAclText $dataDir) -eq "protected=True owner=S-1-5-32-544 $(@("S-1-5-18:FA:OICI", "S-1-5-32-544:FA:OICI", "${AccountantSid}:FA:OICI") | Sort-Object)") 'IPC directory: the same three, inherited by what is created inside (OI)(CI)'
+    Check ($r.Output -match 'Removed an extra permission entry for .*S-1-5-32-545') 'the hand-added BUILTIN\Users entry on the data folder was removed, by SID, and named'
+    Check ((Get-FrcAclText (Join-Path $root '.tunnel-token')) -eq "protected=True owner=S-1-5-32-544 S-1-5-18:FA S-1-5-32-544:FA") 'tunnel token file: SYSTEM and Administrators only, owned by Administrators'
+    $envText = Get-Content -Raw -LiteralPath (Join-Path $root '.env')
+    Check ($envText -match [regex]::Escape("PASSWORD=`"$FreshPassword`"") -and $envText -match 'DEPLOYMENT_MODE=remote') '.env was written, with the password'
+    Check (-not (Test-Path -LiteralPath (Join-Path $root '.env.tmp'))) 'no .env.tmp left behind'
+    Show-OnFailure $r
+
+    # ------------------------------------------------------------------------------------------
+    Write-Host "`n[12] The vault and the IPC directory fail closed too"
+    $otherFails = @(
+        @{ Name = 'vault: icacls exits 0 but nothing changed'; Ignore = @('*\.tally-mcp-companies.json'); Fail = @(); Match = 'company password vault .* could not be locked down'; Vault = $false }
+        @{ Name = 'IPC directory: icacls fails';               Ignore = @(); Fail = @('*\data'); Match = 'IPC directory .* could not be locked down'; Vault = $true }
+    )
+    foreach ($case in $otherFails) {
+        Reset-Fakes; $script:FailuresBefore = $script:Failures
+        $root = New-FakeInstall -EnvText ''
+        $global:FrcAclIgnore = $case.Ignore; $global:FrcIcaclsFail = $case.Fail
+        $r = Invoke-Firstrun @{ InstallDir = $root; Unattended = $true; AgentTaskUser = $Accountant }
+        Check ($null -ne $r.Error -and "$($r.Error)" -match $case.Match) "$($case.Name): the run FAILS and names it"
+        Check (@(Calls 'Register-ScheduledTask').Count -eq 0) "$($case.Name): nothing registered after it"
+        Check ((Test-Path -LiteralPath (Join-Path $root 'data\.tally-mcp-companies.json')) -eq $case.Vault) "$($case.Name): a vault exists only if it was locked down"
+        Show-OnFailure $r
+    }
+
+    # ------------------------------------------------------------------------------------------
+    Write-Host "`n[13] Upgrade: the preflight finds a lockdown that would fail before anything is stopped"
+    $preflightCases = @(
+        @{ Name = 'the Tally data folder cannot be locked down'; Env = $localEnv; Fail = @('*\data\.tally-mcp-acl.preflight'); Match = 'cannot be locked down to SYSTEM, Administrators' }
+        @{ Name = 'the agent user does not resolve to a SID';   Env = ($localEnv -replace "(?m)^AGENT_TASK_USER=.*$", 'AGENT_TASK_USER="no-such-user-230"'); Fail = @(); Match = "'no-such-user-230' does not resolve" }
+    )
+    foreach ($case in $preflightCases) {
+        Reset-Fakes; $script:FailuresBefore = $script:Failures
+        $root = New-FakeInstall -EnvText $case.Env
+        $global:FrcIcaclsFail = $case.Fail
+        $report = Join-Path $work ('preflight-acl-' + [guid]::NewGuid().ToString('n').Substring(0, 6) + '.txt')
+        $r = Invoke-Firstrun @{ InstallDir = $root; Upgrade = $true; PreflightOnly = $true; ReportFile = $report }
+        Check ($r.ExitCode -eq 1 -and (Get-Content -Raw -LiteralPath $report) -match $case.Match) "$($case.Name): preflight refuses (Setup exits 7) and says why"
+        Check (@(NssmLog).Count -eq 0 -and @(Calls 'Register-ScheduledTask').Count -eq 0 -and
+               @(Calls 'icacls' | Where-Object { $_.Target -notlike '*.preflight' }).Count -eq 0) "$($case.Name): nothing stopped, registered or re-permissioned"
+        Check (@(Get-ChildItem -LiteralPath $root -Recurse -Force -Filter '*.preflight').Count -eq 0) "$($case.Name): no probe file left behind"
+        Show-OnFailure $r
+    }
+
+    # The preflight passed, then the real lockdown fails after the copy: exit 10, .env untouched.
+    Reset-Fakes; $script:FailuresBefore = $script:Failures
+    $root = New-FakeInstall -EnvText $legacyRemoteEnv
+    Add-FakeTask $AgentTask $Accountant $root
+    $global:FrcServices[$Service] = 'Running'
+    $before = Get-FileHashText (Join-Path $root '.env')
+    $global:FrcAclIgnore = @('*\.env')
+    $r = Invoke-Firstrun @{ InstallDir = $root; Upgrade = $true; Unattended = $true }
+    Check ($null -ne $r.Error -and "$($r.Error)" -match '\.env could not be locked down') 'upgrade: a .env lockdown that fails after the copy FAILS the run (Setup exits 10)'
+    Check ((Get-FileHashText (Join-Path $root '.env')) -eq $before) 'upgrade: .env untouched'
+    Show-OnFailure $r
+
+    # ------------------------------------------------------------------------------------------
+    Write-Host "`n[14] A machine-wide TUNNEL_TOKEN is reported loudly, and left in place (#229 follow-up)"
+    foreach ($case in @(@{ Name = 'same token'; Value = $TokenValue; Match = 'same token as this install' },
+                        @{ Name = 'another token'; Value = 'eyJvdGhlci10dW5uZWwtdG9rZW4ifQ=='; Match = 'THAT token' })) {
+        Reset-Fakes; $script:FailuresBefore = $script:Failures
+        $root = New-FakeInstall -EnvText $legacyRemoteEnv
+        Add-FakeTask $AgentTask $Accountant $root
+        $global:FrcServices[$Service] = 'Running'
+        $global:FrcServices[$Tunnel]  = 'Running'
+        Set-FakeMachineEnv 'TUNNEL_TOKEN' $case.Value
+        $r = Invoke-Firstrun @{ InstallDir = $root; Upgrade = $true; Unattended = $true }
+        Check ($null -eq $r.Error) "$($case.Name): the run still completes (nothing here can fix it; failing would only make every upgrade roll back)"
+        Check ($r.Output -match 'SECURITY: a machine-wide TUNNEL_TOKEN' -and $r.Output -match $case.Match) "$($case.Name): reported, saying what it means"
+        Check ((Get-FakeMachineEnv 'TUNNEL_TOKEN') -ceq $case.Value) "$($case.Name): the variable is NOT deleted"
+        Check (($r.Output.IndexOf($TokenValue) -lt 0) -and ($r.Output.IndexOf($case.Value) -lt 0)) "$($case.Name): neither value is printed"
+        Show-OnFailure $r
+    }
+
+    # ------------------------------------------------------------------------------------------
+    Write-Host "`n[15] Outside upgrade mode, a tunnel that cannot be registered fails the run (#229 follow-up)"
+    foreach ($case in @(@{ Name = 'token file cannot be locked down'; Ignore = @('*\.tunnel-token'); NoCloudflared = $false; Match = 'Could not write a locked-down tunnel token file' },
+                        @{ Name = 'cloudflared.exe is missing';        Ignore = @();                    NoCloudflared = $true;  Match = 'cloudflared.exe is not at' })) {
+        Reset-Fakes; $script:FailuresBefore = $script:Failures
+        $root = New-FakeInstall -EnvText $legacyRemoteEnv
+        Add-FakeTask $AgentTask $Accountant $root
+        $global:FrcServices[$Tunnel] = 'Running'
+        if ($case.NoCloudflared) { Remove-Item -LiteralPath (Join-Path $root 'bin\cloudflared.exe') -Force }
+        $global:FrcAclIgnore = $case.Ignore
+        $r = Invoke-Firstrun @{ InstallDir = $root; Unattended = $true }
+        Check ($null -ne $r.Error -and "$($r.Error)" -match "'$Tunnel' service could not be registered") "$($case.Name): the run FAILS (non-zero), not just an [ERROR] line and exit 0"
+        Check ($r.Output -match [regex]::Escape($case.Match) -and $r.Output -match 'Configuration INCOMPLETE' -and $r.Output -notmatch 'Configuration complete') "$($case.Name): says why, and does not claim the configuration is complete"
+        Check (@(NssmLog | Where-Object { $_ -like "install | $Tunnel | *" }).Count -eq 0 -and -not (Test-Path -LiteralPath (Join-Path $root '.tunnel-token'))) "$($case.Name): no tunnel registered, no token file left"
+        Check (@(Calls 'Register-ScheduledTask' | Where-Object { $_.Target -eq $AgentTask }).Count -eq 1) "$($case.Name): the rest of the install was still configured first"
+        Show-OnFailure $r
+    }
+
+    # ------------------------------------------------------------------------------------------
+    Write-Host "`n[16] Nothing outside the scratch folders was touched"
+    Check ((Get-DefaultDataState) -eq $DefaultDataBefore) "the real default Tally data folder ($DefaultDataPath) was not created or changed"
 }
 finally {
     Remove-Item Env:\FRC_NSSM_LOG -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Variable -Scope Global -Name FrcCalls, FrcTasks, FrcServices, FrcAclMode -ErrorAction SilentlyContinue
+    Remove-Variable -Scope Global -Name FrcCalls, FrcTasks, FrcServices, FrcAcl, FrcAclSeed, FrcIcaclsFail, FrcAclIgnore, FrcIcaclsNames -ErrorAction SilentlyContinue
     # Put the real HKLM: drive back, then drop the scratch key.
     Remove-PSDrive -Name HKLM -ErrorAction SilentlyContinue
     New-PSDrive -Name HKLM -PSProvider Registry -Root 'HKEY_LOCAL_MACHINE' -Scope Global | Out-Null

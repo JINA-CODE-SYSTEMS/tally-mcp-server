@@ -19,7 +19,14 @@ A double-click installer that takes a Windows box from "nothing installed" to
    install keeps its mode, password, domain and service across an upgrade, because the wizard
    passes no mode at all and `firstrun-config.ps1` preserves whatever the install already has.
 3. Writes `.env` from the collected values. In local mode `PASSWORD`, `BIND_HOST`, `MCP_DOMAIN` and
-   `TUNNEL_TOKEN` are not written at all.
+   `TUNNEL_TOKEN` are not written at all. `.env`, the company password vault
+   (`<TALLY_DATA_PATH>\.tally-mcp-companies.json`) and the GUI agent's IPC directory (the Tally data
+   folder) are restricted to `SYSTEM`, `Administrators` and the agent user. The groups are granted
+   **by SID** (`*S-1-5-18`, `*S-1-5-32-544`), never by name, because the names are localised and
+   `icacls ... Administrators:F` changes nothing on a non-English Windows
+   ([#230](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/230)). Each lockdown is checked
+   with `Get-Acl` afterwards, and one that did not take **stops the configuration with an error**:
+   `.env` is written into a file that was locked first, so a failed lockdown writes no secret at all.
 4. **Remote mode only:** registers the `TallyMCP` Windows service via the bundled NSSM, pointing at
    the bundled portable Node (no system Node required). A local install registers no service -
    Claude starts the stdio entrypoint on demand - and instead writes the entry into the user's
@@ -27,10 +34,18 @@ A double-click installer that takes a Windows box from "nothing installed" to
 5. **If a Cloudflare Tunnel token was supplied**, registers a second NSSM service `TallyMCPTunnel`
    running the bundled `cloudflared` so the box gets a stable public HTTPS URL with no router/domain
    config (the MCP server then binds loopback-only — cloudflared connects to it on `127.0.0.1`).
-   cloudflared reads the token from `.tunnel-token` in the install directory (`--token-file`),
-   which only `SYSTEM` and `Administrators` can read — never from the service's registry
-   environment, which any local user can read. Upgrading an older tunnel install removes the
-   token from the registry ([#193](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/193)).
+   cloudflared reads the token from `.tunnel-token` in the install directory (`--token-file`) —
+   never from the service's registry environment, which any local user can read. That *file* is
+   readable only by `SYSTEM` and `Administrators`. The *token* is not held to that alone: `.env` keeps
+   a copy (`TUNNEL_TOKEN`) so Reconfigure and upgrades can preserve it, and `.env` is also readable
+   by the agent user. Upgrading an older tunnel install removes the token from the registry —
+   NSSM's `AppEnvironmentExtra` and `AppEnvironment` alike
+   ([#193](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/193)). A machine-wide
+   `TUNNEL_TOKEN` environment variable (which cloudflared would prefer to the file, and which every
+   local account can read) is reported loudly but not deleted, since something else may use it;
+   `verify-deployment.ps1` fails until it is removed. If the tunnel cannot be registered (the token
+   file cannot be locked down, or `cloudflared.exe` is missing), the configuration fails with an
+   error rather than finishing without a tunnel.
 6. Registers the `TallyMCPAgent` scheduled task at-logon for the configured user.
 7. Registers the `TallyMCPTray` scheduled task at-logon (status tray icon — issue #20).
 8. Starts the service(s) and triggers both scheduled tasks immediately so the operator sees
@@ -161,6 +176,13 @@ Start Menu → "Tally MCP Server" → "Reconfigure Tally MCP Server" launches
 idempotent: it stops + re-registers the service so settings actually take
 effect.
 
+Whether run from the installer or from Reconfigure, the script exits non-zero when anything it
+must do fails - a lockdown of `.env`, the vault or the IPC directory that could not be applied and
+verified (it stops there), or a configured tunnel that could not be registered (reported after the
+agent and tray have been restarted). Reconfigure's window stays open on the error. The installer
+shows the error, says so on its last page instead of "installed and running", and exits with
+**code 10**; it used to run the script from `[Run]`, which ignores the exit code.
+
 ## Unattended upgrade and silent installs
 
 The daily `TallyMCPUpdate` task ([#177](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/177),
@@ -209,12 +231,14 @@ It skips every settings page, passes no settings, and runs `firstrun-config.ps1 
   [#193](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/193) receive it: an existing
   `TallyMCPTunnel` is re-registered with `--token-file`, `.tunnel-token` is written from the
   `TUNNEL_TOKEN` already in `.env` (which itself is not touched), and `TUNNEL_TOKEN` is scrubbed
-  from the registry environment of `TallyMCPTunnel` and `TallyMCP`. If the token file cannot be
-  locked down to SYSTEM + Administrators the tunnel is left unregistered - never protected less
-  well - and the run fails (exit 10), so the updater rolls back instead of reporting success over
-  an outage. A missing tunnel service is still not created.
+  from the registry environment (`AppEnvironmentExtra` and `AppEnvironment`) of `TallyMCPTunnel`
+  and `TallyMCP`. If the token file cannot be locked down to SYSTEM + Administrators the tunnel is
+  left unregistered - never protected less well - and the run fails (exit 10), so the updater rolls
+  back instead of reporting success over an outage. A missing tunnel service is still not created.
 - re-applies the NTFS lockdown on `.env`, the company registry and the IPC directory, for the same
-  user.
+  user, by SID ([#230](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/230)). This is
+  also how an install made on a non-English Windows before #230 - where the lockdown silently did
+  nothing - gets it. If a lockdown cannot be applied and verified, the run stops (exit 10).
 
 To *change* a setting, use Reconfigure or run the installer interactively; an unattended upgrade
 never will.
@@ -234,7 +258,9 @@ behaviour, left for a follow-up that pre-fills the wizard from `.env`.
    `TallyMCPTunnel` service with no `TUNNEL_TOKEN` in `.env` (the upgrade could only remove it), and
    dry-runs the token-file lockdown on a scratch file holding no secret (`.tunnel-token.preflight`,
    shredded straight away), so a folder where the lockdown cannot work is found before the tunnel
-   is stopped rather than after.
+   is stopped rather than after. For every install it does the same for the `.env` / vault
+   lockdown (#230): the agent user must resolve to a SID, and the lockdown is dry-run on
+   `.tally-mcp-acl.preflight` in the install folder and in the Tally data folder.
 2. Services and tasks are stopped, files are replaced.
 3. `firstrun-config.ps1 -Upgrade` runs. If it fails, Setup exits with **code 10**: the new files are
    in place but services or tasks may be stopped - the caller must roll back. Its own log is
@@ -244,7 +270,7 @@ behaviour, left for a follow-up that pre-fills the wizard from `.env`.
 |---|---|---|
 | 0 | Upgraded; every setting kept | Health check ([update-manifest.md §7.4](dev/update-manifest.md#74-behaviour-per-deployment-mode)) |
 | 7 | Refused before anything changed (no existing install, or preflight refused) | Report; do not roll back - nothing changed |
-| 10 | Files replaced, reconfiguration failed | Roll back |
+| 10 | Files replaced, reconfiguration failed. Returned by any run, not only an upgrade: a new install whose configuration failed exits 10 too | Roll back |
 | any other | An Inno Setup failure ([Setup exit codes](https://jrsoftware.org/ishelp/index.php?topic=setupexitcodes)) | Roll back if files may have changed (4, 5) |
 
 ### How the updater invokes it
