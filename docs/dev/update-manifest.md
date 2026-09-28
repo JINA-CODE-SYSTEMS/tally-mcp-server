@@ -546,7 +546,7 @@ Before any build with an updater is released:
 Things that would make the updater unsafe or wrong if built on today's code as-is. To verify and fix
 as part of the implementation, not in this PR.
 
-1. **A silent install run as SYSTEM appears to overwrite configuration.** In `tally-mcp.iss`, the
+1. **Resolved in [#231](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/pull/231)** (unattended upgrade mode; [installer.md](../installer.md#unattended-upgrade-and-silent-installs)). **A silent install run as SYSTEM appears to overwrite configuration.** In `tally-mcp.iss`, the
    wizard fields are filled with auto-detected defaults (not the previous install's values), and the
    GUI-agent user defaults to `GetUserNameString()` — under the SYSTEM account that is `SYSTEM`. The
    `[Run]` entry passes these to `firstrun-config.ps1`, which prefers a passed value over the one in

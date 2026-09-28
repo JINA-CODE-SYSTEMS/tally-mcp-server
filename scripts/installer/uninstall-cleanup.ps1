@@ -23,6 +23,13 @@ param(
     [switch]$RemoveVault
 )
 
+# The uninstaller passes the operator's answer in CLAUDALLY_UNINSTALL_REMOVE_VAULT ('1' / '0'), not on
+# the command line: Inno expands [UninstallRun] parameters at INSTALL time, so a switch computed from
+# the answer was always empty and the vault was never removed. The variable reaches every
+# [UninstallRun] entry an upgraded install has accumulated, including ones written by older
+# installers. -RemoveVault still works for a manual run.
+if ($env:CLAUDALLY_UNINSTALL_REMOVE_VAULT -eq '1') { $RemoveVault = [switch]$true }
+
 # ErrorActionPreference deliberately Continue: uninstall must finish even if a step throws.
 $ErrorActionPreference = 'Continue'
 

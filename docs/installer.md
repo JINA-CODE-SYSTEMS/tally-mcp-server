@@ -151,6 +151,7 @@ indices, interactivity, privilege boundaries, upgrade paths - is in
 | `scripts/installer/install-innosetup.ps1` | Installs the pinned, hash-verified Inno Setup compiler (CI and release) |
 | `scripts/installer/firstrun-config.ps1` | Post-install: writes .env, registers service (+ optional `TallyMCPTunnel` cloudflared service) + agent task + tray task, starts them |
 | `scripts/installer/uninstall-cleanup.ps1` | Pre-uninstall: stops the service(s) incl. `TallyMCPTunnel`, removes NSSM entries, deletes both scheduled tasks |
+| `scripts/installer/test-firstrun-config.ps1` | Tests `firstrun-config.ps1` (above all `-Upgrade`) against fake install roots with every service/task/ACL call stubbed; run in CI |
 | `scripts/tray/tally-mcp-tray.ps1`       | Status tray icon (issue #20). WinForms NotifyIcon + polling loop. |
 
 ## Re-configuring an installed instance
@@ -159,6 +160,132 @@ Start Menu → "Tally MCP Server" → "Reconfigure Tally MCP Server" launches
 `firstrun-config.ps1` again with new wizard inputs. The script is
 idempotent: it stops + re-registers the service so settings actually take
 effect.
+
+## Unattended upgrade and silent installs
+
+The daily `TallyMCPUpdate` task ([#177](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/177),
+[update-manifest.md §7](dev/update-manifest.md#7-applying-an-update)) applies updates by running
+this installer silently, as SYSTEM, in both deployment modes. Nobody is there to answer the wizard,
+so the installer must not treat the wizard's pre-filled defaults as answers. Before this mode
+existed it did: a silent run over an install passed auto-detected Tally paths, edition Silver, a
+GUI-control choice remembered from the *original* install, and the running account as the agent
+user to `firstrun-config.ps1`, where passed values win over `.env`. Run as SYSTEM it never got that
+far - it hung on an error dialog nobody could see.
+
+### Which run is which
+
+"Existing install" means the target folder has a `.env` (what `firstrun-config.ps1` writes).
+
+| How Setup is run | Existing install? | Result |
+|---|---|---|
+| `/SILENT` or `/VERYSILENT` | yes | **Unattended upgrade** |
+| with `/UPDATE` (silent or not) | yes | **Unattended upgrade** |
+| with `/UPDATE` | no | Refused, exit code 7. `/UPDATE` never creates an install |
+| `/SILENT` or `/VERYSILENT` | no | New install. **Requires `/AGENTUSER=<user>`**; refused with exit code 7 without it |
+| interactive | either | The wizard, as before |
+
+### What an unattended upgrade keeps
+
+It skips every settings page, passes no settings, and runs `firstrun-config.ps1 -Upgrade`, which:
+
+- **never writes `.env`.** Every line stays byte-for-byte as it was, including keys the installer
+  does not know about (`TALLY_PORT`, `CORS_ORIGINS`, `READONLY_MODE`, anything added by hand or by
+  the tray). No password is read, prompted for, or passed.
+- **takes the GUI-agent user from `AGENT_TASK_USER` in `.env`**, or, for an install that predates
+  that key, from the existing `TallyMCPAgent` task. Never from the account running Setup. It
+  refuses if the two disagree, if neither exists, or if the answer is SYSTEM, LocalService,
+  NetworkService or a computer account.
+- **never changes the deployment mode.** `DEPLOYMENT_MODE` is read, not written; an install from
+  before the key existed is remote, as on every run, and its `.env` stays keyless.
+- **re-registers what exists, and creates nothing new.** The `TallyMCP` and `TallyMCPTunnel`
+  services and the `TallyMCPAgent` and `TallyMCPTray` tasks are each re-registered with the same
+  identity (same user, same token from `.env`) so the new release's definition applies, then
+  restarted - they were stopped to replace their files. One that did not exist before is not
+  created; the log says so. What `.env` rules out is still removed, as on every run: a `TallyMCP`
+  service in local mode, a tunnel with no `TUNNEL_TOKEN`.
+- **leaves the Claude client configuration alone**, unless the install has moved (the existing
+  agent task points at a different folder), in which case it is rewritten for the agent user.
+- **carries out the #193 tunnel-token migration.** This is how installs configured before
+  [#193](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/193) receive it: an existing
+  `TallyMCPTunnel` is re-registered with `--token-file`, `.tunnel-token` is written from the
+  `TUNNEL_TOKEN` already in `.env` (which itself is not touched), and `TUNNEL_TOKEN` is scrubbed
+  from the registry environment of `TallyMCPTunnel` and `TallyMCP`. If the token file cannot be
+  locked down to SYSTEM + Administrators the tunnel is left unregistered - never protected less
+  well - and the run fails (exit 10), so the updater rolls back instead of reporting success over
+  an outage. A missing tunnel service is still not created.
+- re-applies the NTFS lockdown on `.env`, the company registry and the IPC directory, for the same
+  user.
+
+To *change* a setting, use Reconfigure or run the installer interactively; an unattended upgrade
+never will.
+
+**Not covered: interactive upgrades.** Run by hand over an existing install, the wizard still
+pre-fills auto-detected defaults (Tally paths, edition Silver, the current account) and the
+GUI-control choice from the *previous wizard run* rather than from `.env`, and clicking through
+applies them - including undoing a GUI-control change made from the tray. That is the pre-existing
+behaviour, left for a follow-up that pre-fills the wizard from `.env`.
+
+### Order of events, and exit codes
+
+1. **Preflight.** Before anything is stopped or copied, `PrepareToInstall` runs *this* version's
+   `firstrun-config.ps1 -Upgrade -PreflightOnly`, which works out everything above and changes
+   nothing. If it cannot keep every setting, Setup stops with **exit code 7** and the reason in its
+   log, and the running version is untouched. For a remote install with a tunnel it also refuses a
+   `TallyMCPTunnel` service with no `TUNNEL_TOKEN` in `.env` (the upgrade could only remove it), and
+   dry-runs the token-file lockdown on a scratch file holding no secret (`.tunnel-token.preflight`,
+   shredded straight away), so a folder where the lockdown cannot work is found before the tunnel
+   is stopped rather than after.
+2. Services and tasks are stopped, files are replaced.
+3. `firstrun-config.ps1 -Upgrade` runs. If it fails, Setup exits with **code 10**: the new files are
+   in place but services or tasks may be stopped - the caller must roll back. Its own log is
+   `{app}\logs\firstrun-config.log`.
+
+| Exit code | Meaning | Updater action |
+|---|---|---|
+| 0 | Upgraded; every setting kept | Health check ([update-manifest.md §7.4](dev/update-manifest.md#74-behaviour-per-deployment-mode)) |
+| 7 | Refused before anything changed (no existing install, or preflight refused) | Report; do not roll back - nothing changed |
+| 10 | Files replaced, reconfiguration failed | Roll back |
+| any other | An Inno Setup failure ([Setup exit codes](https://jrsoftware.org/ishelp/index.php?topic=setupexitcodes)) | Roll back if files may have changed (4, 5) |
+
+### How the updater invokes it
+
+```
+Claudally-Setup-<v>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /UPDATE /LOG="%ProgramData%\Claudally\update\logs\install-<v>.log"
+```
+
+Always pass `/UPDATE`, even though silent-over-an-existing-install is already an upgrade: it turns
+"the install is not where I expected" into a refusal (exit 7) instead of an attempt at a new
+install. Keep the `/LOG`: the preflight's reason for a refusal is written there.
+
+### Silent new install
+
+```
+Claudally-Setup-<v>.exe /VERYSILENT /SUPPRESSMSGBOXES /AGENTUSER=<windows user who uses Tally>
+```
+
+A silent install onto a machine with nothing installed has nobody to ask whose desktop Tally is
+on, and the only guess available - the account running Setup - is wrong in exactly the cases that
+run silently (SYSTEM under a deployment tool, an IT admin who never opens Tally). So it is told, or
+it refuses. `/AGENTUSER` must be an existing local account (`DOMAIN\user` is accepted and checked by
+`firstrun-config.ps1`), and not a service or computer account. Everything else takes the wizard's
+defaults - auto-detected Tally paths, Silver, GUI control on, local mode - and can be changed
+afterwards with Reconfigure. On an interactive install `/AGENTUSER` just pre-fills the field.
+
+### Silent uninstall
+
+```
+"C:\Program Files\TallyMCP\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+```
+
+An interactive uninstall asks whether to remove the saved Tally company passwords. A silent one
+does not ask (a question nobody can see would hang it, under SYSTEM for good): it removes them, the
+recommended answer, unless you add `/KEEPVAULT`.
+
+Before this, the answer never reached the cleanup script at all, interactive or not: it was passed
+as an `[UninstallRun]` parameter, and Inno expands those at *install* time, so the flag was always
+empty and the passwords were always kept. The uninstaller now passes it in its own environment
+(`CLAUDALLY_UNINSTALL_REMOVE_VAULT`), which also reaches the cleanup entries that older installers
+left in `unins000.dat` on upgraded machines.
 
 ## Why Inno Setup, not WiX
 
