@@ -280,5 +280,34 @@ try {
     Write-Host "[WARN] .env cleanup raised: $_"
 }
 
+# 6b. Scrub the Cloudflare Tunnel token file (#193). firstrun-config.ps1 hands cloudflared its token
+#     through this file rather than the service registry; it is a bearer credential for the tunnel's
+#     hostname. Same zero-then-delete as .env. The tunnel service was stopped in step 1b, so nothing
+#     holds it open. No-op when no tunnel was ever configured.
+try {
+    $tunnelTokenFile = Join-Path $InstallDir '.tunnel-token'
+    if (Test-Path -LiteralPath $tunnelTokenFile) {
+        try {
+            $len = (Get-Item -LiteralPath $tunnelTokenFile -Force).Length
+            if ($len -gt 0) {
+                [System.IO.File]::WriteAllBytes($tunnelTokenFile, (New-Object byte[] $len))
+            }
+        } catch {
+            Write-Host "[WARN] tunnel token overwrite raised: $_"
+        }
+        Remove-Item -LiteralPath $tunnelTokenFile -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $tunnelTokenFile) {
+            Write-Host "[WARN] Could not remove $tunnelTokenFile - delete it by hand; it holds a tunnel credential."
+        } else {
+            Write-Host "[OK] Tunnel token file scrubbed and removed"
+        }
+    } else {
+        Write-Host "[*] No tunnel token file - nothing to scrub"
+    }
+} catch {
+    Write-Host "[WARN] tunnel token cleanup raised: $_"
+}
+
 Write-Host "Cleanup complete; Inno Setup will now remove files."
-Write-Host "NOTE: .env has been scrubbed and removed. If the box is shared, rotate the OAuth password."
+Write-Host "NOTE: .env has been scrubbed and removed. If the box is shared, rotate the OAuth password"
+Write-Host "      (and, if a Cloudflare Tunnel was configured, have the tunnel token rotated or the tunnel deleted)."

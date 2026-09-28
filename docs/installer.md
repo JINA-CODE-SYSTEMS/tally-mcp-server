@@ -27,6 +27,10 @@ A double-click installer that takes a Windows box from "nothing installed" to
 5. **If a Cloudflare Tunnel token was supplied**, registers a second NSSM service `TallyMCPTunnel`
    running the bundled `cloudflared` so the box gets a stable public HTTPS URL with no router/domain
    config (the MCP server then binds loopback-only — cloudflared connects to it on `127.0.0.1`).
+   cloudflared reads the token from `.tunnel-token` in the install directory (`--token-file`),
+   which only `SYSTEM` and `Administrators` can read — never from the service's registry
+   environment, which any local user can read. Upgrading an older tunnel install removes the
+   token from the registry ([#193](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/193)).
 6. Registers the `TallyMCPAgent` scheduled task at-logon for the configured user.
 7. Registers the `TallyMCPTray` scheduled task at-logon (status tray icon — issue #20).
 8. Starts the service(s) and triggers both scheduled tasks immediately so the operator sees
@@ -36,7 +40,7 @@ The uninstaller stops + removes the `TallyMCP` service (and `TallyMCPTunnel`
 if it was configured), deletes the scheduled tasks, kills any leftover
 `node.exe` / `cloudflared.exe`, and removes installed files. `.env` is
 scrubbed and removed on uninstall (it holds the OAuth password and, when a
-tunnel is configured, `TUNNEL_TOKEN`).
+tunnel is configured, `TUNNEL_TOKEN`), and so is `.tunnel-token`.
 
 For the Cloudflare Tunnel path — what it's for, how Jina staff pre-provision a
 tunnel per client, and where the token/hostname come from — see
@@ -201,6 +205,14 @@ It skips every settings page, passes no settings, and runs `firstrun-config.ps1 
   service in local mode, a tunnel with no `TUNNEL_TOKEN`.
 - **leaves the Claude client configuration alone**, unless the install has moved (the existing
   agent task points at a different folder), in which case it is rewritten for the agent user.
+- **carries out the #193 tunnel-token migration.** This is how installs configured before
+  [#193](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/193) receive it: an existing
+  `TallyMCPTunnel` is re-registered with `--token-file`, `.tunnel-token` is written from the
+  `TUNNEL_TOKEN` already in `.env` (which itself is not touched), and `TUNNEL_TOKEN` is scrubbed
+  from the registry environment of `TallyMCPTunnel` and `TallyMCP`. If the token file cannot be
+  locked down to SYSTEM + Administrators the tunnel is left unregistered - never protected less
+  well - and the run fails (exit 10), so the updater rolls back instead of reporting success over
+  an outage. A missing tunnel service is still not created.
 - re-applies the NTFS lockdown on `.env`, the company registry and the IPC directory, for the same
   user.
 
@@ -218,7 +230,11 @@ behaviour, left for a follow-up that pre-fills the wizard from `.env`.
 1. **Preflight.** Before anything is stopped or copied, `PrepareToInstall` runs *this* version's
    `firstrun-config.ps1 -Upgrade -PreflightOnly`, which works out everything above and changes
    nothing. If it cannot keep every setting, Setup stops with **exit code 7** and the reason in its
-   log, and the running version is untouched.
+   log, and the running version is untouched. For a remote install with a tunnel it also refuses a
+   `TallyMCPTunnel` service with no `TUNNEL_TOKEN` in `.env` (the upgrade could only remove it), and
+   dry-runs the token-file lockdown on a scratch file holding no secret (`.tunnel-token.preflight`,
+   shredded straight away), so a folder where the lockdown cannot work is found before the tunnel
+   is stopped rather than after.
 2. Services and tasks are stopped, files are replaced.
 3. `firstrun-config.ps1 -Upgrade` runs. If it fails, Setup exits with **code 10**: the new files are
    in place but services or tasks may be stopped - the caller must roll back. Its own log is

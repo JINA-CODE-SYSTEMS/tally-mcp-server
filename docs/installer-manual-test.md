@@ -122,6 +122,18 @@ with a password and domain, then upgrade with the current build.
       installer always passed a credentials-file path it never wrote, so this upgrade threw
       before reading `.env` and left the service disabled.)
 
+If that install had a Cloudflare Tunnel token (#193 - older builds put it in the service registry):
+
+- [ ] `(Get-Item HKLM:\SYSTEM\CurrentControlSet\Services\TallyMCPTunnel\Parameters).GetValue('AppEnvironmentExtra')`
+      has no `TUNNEL_TOKEN=` entry, and neither does the same value under `TallyMCP`; any other
+      entry that was there before is still there
+- [ ] `nssm get TallyMCPTunnel AppParameters` is `tunnel run --token-file .tunnel-token`
+- [ ] `icacls "C:\Program Files\TallyMCP\.tunnel-token"` shows only `NT AUTHORITY\SYSTEM:(F)` and
+      `BUILTIN\Administrators:(F)`, no `(I)` entries; `(Get-Acl ...).Owner` is `BUILTIN\Administrators`
+- [ ] `TallyMCPTunnel` is running and `logs\tunnel.log` shows `Registered tunnel connection`
+- [ ] `verify-deployment.ps1` (elevated) reports *Tunnel token kept out of the service registry* as PASS
+- [ ] Reconfigure with the token blanked removes `.tunnel-token`
+
 ## 7. Uninstall
 
 Set up first: a second Windows profile that has also connected Claude, and a **fork** of the repo
@@ -137,6 +149,7 @@ at some other path with its own `claude_desktop_config.json` entry pointing at
       install root, not just the `dist\index.mjs` tail
 - [ ] Other MCP servers in those files are untouched
 - [ ] `.env` is gone
+- [ ] `.tunnel-token` is gone (when a tunnel was configured)
 - [ ] No `node.exe` belonging to another application was killed
 
 > **Not yet verified end to end:** the drop-to-user trampoline on the *uninstall* path. The
@@ -183,11 +196,18 @@ echo %ERRORLEVEL%
 - [ ] The Setup log contains "Unattended upgrade of ..." and "OK: the upgrade can preserve this
       install", and `logs\firstrun-config.log` says ".env left exactly as it was"
 
-**b. Remote-mode upgrade.** Repeat (a) over a remote install from section 6, tunnel configured.
+**b. Remote-mode upgrade.** Repeat (a) over a remote install from section 6, tunnel configured,
+installed with a build from **before #193** so its token is in the service registry. This is the
+path every such install will take to receive that migration.
 
 - [ ] Exit code 0, `.env` hash unchanged
 - [ ] `TallyMCP` and `TallyMCPTunnel` exist, are Running and set to Automatic
 - [ ] `https://<host>/.well-known/oauth-protected-resource` answers
+- [ ] Every #193 check in section 6 holds: no `TUNNEL_TOKEN=` in either service's
+      `AppEnvironmentExtra` (other entries kept), `nssm get TallyMCPTunnel AppParameters` is
+      `tunnel run --token-file .tunnel-token`, `.tunnel-token` locked to SYSTEM + Administrators
+- [ ] The Setup log (`/LOG`) and `logs\firstrun-config.log` do not contain the token
+- [ ] No `.tunnel-token.preflight` is left in the install folder
 
 **c. Refused upgrade changes nothing.** Delete the `AGENT_TASK_USER` line from `.env` and run
 `Unregister-ScheduledTask TallyMCPAgent`, then run (a) again as SYSTEM.

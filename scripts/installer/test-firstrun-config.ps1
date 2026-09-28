@@ -73,7 +73,19 @@ if ($compiled.Errors.HasErrors) { throw "Could not compile the fake nssm.exe: $(
 # firstrun-config.ps1 calls (New-ScheduledTaskAction), imports the module's functions over any
 # same-named function already defined here - silently replacing the stand-ins with the real thing
 # for every test after the first. Imported up front, they are shadowed by the definitions below.
-Import-Module ScheduledTasks, Microsoft.PowerShell.Management, Microsoft.PowerShell.Utility
+Import-Module ScheduledTasks, Microsoft.PowerShell.Management, Microsoft.PowerShell.Utility, Microsoft.PowerShell.Security
+
+# --- The services registry, redirected ------------------------------------------------------------
+# firstrun-config.ps1 scrubs TUNNEL_TOKEN out of HKLM:\SYSTEM\CurrentControlSet\Services\<svc>\Parameters
+# (#193). For this session the HKLM: drive is re-rooted at a scratch HKCU key, so that code runs
+# unchanged against a registry the test controls and can never touch the real machine hive. (Only
+# the drive is redirected; the Registry:: provider path to the real hive is untouched, and
+# firstrun-config.ps1 does not use it.) Assert-StandIns checks the redirect before every run.
+$ScratchRegName = 'FrcTest-' + [guid]::NewGuid().ToString('n').Substring(0, 8)
+$ScratchReg     = "HKCU:\Software\$ScratchRegName"
+New-Item -Path $ScratchReg -Force | Out-Null
+Remove-PSDrive -Name HKLM
+New-PSDrive -Name HKLM -PSProvider Registry -Root "HKEY_CURRENT_USER\Software\$ScratchRegName" -Scope Global | Out-Null
 
 # State is global because these functions run inside firstrun-config.ps1's scope, where $script:
 # would mean that script, not this one.
@@ -178,14 +190,41 @@ function Start-Sleep {
     param([int]$Seconds, [int]$Milliseconds)
 }
 
+# The token-file lockdown (#193) runs icacls - stood in for above, so it changes nothing - and then
+# PROVES the result with Get-Acl before writing the secret. This returns the descriptor a correct
+# lockdown produces (protected, SYSTEM + Administrators, owner Administrators), or, to exercise
+# fail-closed, an unprotected one:
+#   $global:FrcAclMode = 'good'        every file locks down
+#   $global:FrcAclMode = 'broken'      nothing locks down (the preflight probe fails too)
+#   $global:FrcAclMode = 'broken-real' only the real .tunnel-token fails (the preflight passed)
+function Get-Acl {
+    [CmdletBinding()]
+    param([Parameter(Position = 0)][string]$Path, [string]$LiteralPath)
+    $p = $LiteralPath; if (-not $p) { $p = $Path }
+    _FrcRecord 'Get-Acl' $p '' ''
+    $broken = ($global:FrcAclMode -eq 'broken') -or ($global:FrcAclMode -eq 'broken-real' -and $p -like '*\.tunnel-token')
+    $fs = New-Object System.Security.AccessControl.FileSecurity
+    $fs.SetAccessRuleProtection((-not $broken), $false)
+    foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+        $fs.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier $sid), 'FullControl', 'Allow')))
+    }
+    $fs.SetOwner((New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544'))
+    return $fs
+}
+
 $StandIns = @('Get-Service', 'Get-ScheduledTask', 'Register-ScheduledTask', 'Unregister-ScheduledTask',
-              'Start-ScheduledTask', 'Get-ScheduledTaskInfo', 'New-ScheduledTask', 'icacls', 'schtasks', 'Start-Sleep')
+              'Start-ScheduledTask', 'Get-ScheduledTaskInfo', 'New-ScheduledTask', 'icacls', 'schtasks', 'Start-Sleep',
+              'Get-Acl')
 function Assert-StandIns {
     foreach ($name in $StandIns) {
         $resolved = Get-Command -Name $name
         if ($resolved.CommandType -ne 'Function' -or $resolved.Source) {
             throw "Stand-in for '$name' does not take precedence (resolves to $($resolved.CommandType) '$($resolved.Source)'); refusing to run firstrun-config.ps1 against real commands."
         }
+    }
+    $root = (Get-PSDrive -Name HKLM).Root
+    if ($root -ne "HKEY_CURRENT_USER\Software\$ScratchRegName") {
+        throw "The HKLM: drive is not redirected to the scratch key (root is '$root'); refusing to run firstrun-config.ps1 against the real services registry."
     }
 }
 Assert-StandIns
@@ -226,10 +265,26 @@ function Add-FakeTask([string]$Name, [string]$User, [string]$Root, [string]$Scri
     }
 }
 
+# A service's NSSM AppEnvironmentExtra, in the redirected registry.
+function Set-FakeServiceEnv([string]$Service, [string[]]$Entries) {
+    $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$Service\Parameters"
+    New-Item -Path $key -Force | Out-Null
+    New-ItemProperty -LiteralPath $key -Name 'AppEnvironmentExtra' -PropertyType MultiString -Value $Entries -Force | Out-Null
+}
+function Get-FakeServiceEnv([string]$Service) {
+    $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$Service\Parameters"
+    if (-not (Test-Path -LiteralPath $key)) { return $null }
+    $p = Get-ItemProperty -LiteralPath $key -Name 'AppEnvironmentExtra' -ErrorAction SilentlyContinue
+    if ($null -eq $p) { return $null }
+    return @($p.AppEnvironmentExtra)
+}
+
 function Reset-Fakes {
     $global:FrcCalls.Clear()
     $global:FrcTasks = @{}
     $global:FrcServices = @{}
+    $global:FrcAclMode = 'good'
+    Get-ChildItem -LiteralPath $ScratchReg -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
     $env:FRC_NSSM_LOG = Join-Path $work ('nssm-' + [guid]::NewGuid().ToString('n').Substring(0, 8) + '.log')
 }
 
@@ -290,6 +345,10 @@ REMOTE_TRANSPORT=tunnel
 READONLY_MODE=true
 "@
 
+# A made-up tunnel token. It must reach the token file and nowhere else: not the output, not the
+# transcript, not the fake nssm log, not any service's registry environment.
+$TokenValue = 'eyJhIjoiZmFrZS10dW5uZWwtdG9rZW4ifQ=='
+
 # A remote install from before DEPLOYMENT_MODE existed: no mode key at all, a password, a public
 # domain and a tunnel.
 $legacyRemoteEnv = @"
@@ -302,7 +361,7 @@ ENABLE_GUI_CONTROL=true
 PASSWORD="correct horse battery #staple"
 BIND_HOST=127.0.0.1
 MCP_DOMAIN=https://client42.tally.example.com
-TUNNEL_TOKEN="eyJhIjoiZmFrZS10dW5uZWwtdG9rZW4ifQ=="
+TUNNEL_TOKEN="$TokenValue"
 CORS_ORIGINS=https://claude.ai
 "@
 
@@ -334,13 +393,18 @@ try {
     Show-OnFailure $r
 
     # ------------------------------------------------------------------------------------------
-    Write-Host "`n[2] Upgrade of a legacy remote install (no DEPLOYMENT_MODE key), with service and tunnel"
+    Write-Host "`n[2] Upgrade of a legacy remote install (no DEPLOYMENT_MODE key, token in the service registry)"
+    Write-Host "    This is how every install configured before #193 receives that migration."
     Reset-Fakes; $script:FailuresBefore = $script:Failures
     $root = New-FakeInstall -EnvText $legacyRemoteEnv
     Add-FakeTask $AgentTask $Accountant $root
     Add-FakeTask $TrayTask  $Accountant $root 'scripts\tray\tally-mcp-tray.ps1'
-    $global:FrcServices[$Service] = 'Stopped'
-    $global:FrcServices[$Tunnel]  = 'Stopped'
+    $global:FrcServices[$Service] = 'Running'
+    $global:FrcServices[$Tunnel]  = 'Running'
+    # What pre-#193 installers left behind: the token in the tunnel's environment next to an unrelated
+    # entry that must survive, and (installs from before #172 C3) in the main service's too.
+    Set-FakeServiceEnv $Tunnel  @("TUNNEL_TOKEN=$TokenValue", 'NO_PROXY=localhost')
+    Set-FakeServiceEnv $Service @("TUNNEL_TOKEN=$TokenValue")
     $before = Get-FileHashText (Join-Path $root '.env')
     $r = Invoke-Firstrun @{ InstallDir = $root; Upgrade = $true; Unattended = $true }
     Check ($null -eq $r.Error) 'completes without error (no password prompt, no credentials file needed)'
@@ -349,8 +413,45 @@ try {
     Check (@($log | Where-Object { $_ -like "install | $Service | *" }).Count -eq 1) 'remote mode kept: service re-registered'
     Check (@($log | Where-Object { $_ -eq "set | $Service | Start | SERVICE_AUTO_START" }).Count -eq 1) 'service set back to automatic start'
     Check (@($log | Where-Object { $_ -eq "start | $Service" }).Count -eq 1) 'service started'
-    Check (@($log | Where-Object { $_ -eq "set | $Tunnel | AppEnvironmentExtra | TUNNEL_TOKEN=eyJhIjoiZmFrZS10dW5uZWwtdG9rZW4ifQ==" }).Count -eq 1) 'tunnel re-registered with the token from .env'
+    Check (@($log | Where-Object { $_ -eq "install | $Tunnel | $(Join-Path $root 'bin\cloudflared.exe')" }).Count -eq 1) 'existing tunnel service re-registered'
+    Check (@($log | Where-Object { $_ -eq "set | $Tunnel | AppParameters | tunnel run --token-file .tunnel-token" }).Count -eq 1) 'tunnel now reads its token with --token-file'
+    Check (@($log | Where-Object { $_ -match 'AppEnvironmentExtra' }).Count -eq 0) 'no service is given an environment'
+    Check (@($log | Where-Object { $_ -eq "start | $Tunnel" }).Count -eq 1) 'tunnel started'
+    $tokenFile = Join-Path $root '.tunnel-token'
+    Check ((Test-Path -LiteralPath $tokenFile) -and ([System.IO.File]::ReadAllText($tokenFile) -ceq $TokenValue)) 'token file holds exactly the token from .env (no BOM, no newline)'
+    $lock = @(Calls 'icacls' | Where-Object { $_.Target -eq $tokenFile })
+    Check (@($lock | Where-Object { $_.Detail -eq '/inheritance:r /grant:r *S-1-5-18:F *S-1-5-32-544:F' }).Count -eq 1 -and
+           @($lock | Where-Object { $_.Detail -eq '/setowner *S-1-5-32-544' }).Count -eq 1) 'token file locked to SYSTEM + Administrators, owned by Administrators'
+    $tunnelEnv = Get-FakeServiceEnv $Tunnel
+    Check ($null -ne $tunnelEnv -and (@($tunnelEnv) -join '|') -eq 'NO_PROXY=localhost') 'TUNNEL_TOKEN scrubbed from the tunnel registry environment; the other entry kept'
+    Check ($null -eq (Get-FakeServiceEnv $Service)) 'TUNNEL_TOKEN scrubbed from the main service registry environment'
+    $transcriptText = ''
+    $tp = Join-Path $root 'logs\firstrun-config.log'
+    if (Test-Path -LiteralPath $tp) { $transcriptText = [System.IO.File]::ReadAllText($tp) }
+    Check (($r.Output + ($log -join "`n") + $transcriptText).IndexOf($TokenValue) -lt 0) 'the token value appears in no output, transcript or nssm call'
     Check (@(Calls 'Register-ScheduledTask' | Where-Object { $_.User -ne $Accountant }).Count -eq 0) "tasks only for '$Accountant'"
+    Check (-not (Test-Path -LiteralPath (Join-Path $root '.tunnel-token.preflight'))) 'no preflight probe file left behind'
+    Show-OnFailure $r
+
+    # ------------------------------------------------------------------------------------------
+    Write-Host "`n[2b] Upgrade fails closed when the token file cannot be locked down after the preflight passed"
+    Reset-Fakes; $script:FailuresBefore = $script:Failures
+    $root = New-FakeInstall -EnvText $legacyRemoteEnv
+    Add-FakeTask $AgentTask $Accountant $root
+    $global:FrcServices[$Service] = 'Running'
+    $global:FrcServices[$Tunnel]  = 'Running'
+    Set-FakeServiceEnv $Tunnel @("TUNNEL_TOKEN=$TokenValue")
+    $global:FrcAclMode = 'broken-real'
+    $before = Get-FileHashText (Join-Path $root '.env')
+    $r = Invoke-Firstrun @{ InstallDir = $root; Upgrade = $true; Unattended = $true }
+    Check ($null -ne $r.Error -and "$($r.Error)" -match 'could not be re-registered') 'the run FAILS (so Setup exits 10 and the updater rolls back)'
+    $log = NssmLog
+    Check (@($log | Where-Object { $_ -like "install | $Tunnel | *" }).Count -eq 0) 'tunnel left unregistered rather than protected less well'
+    Check (-not (Test-Path -LiteralPath (Join-Path $root '.tunnel-token'))) 'no token file left behind'
+    Check ($null -eq (Get-FakeServiceEnv $Tunnel)) 'registry copy still scrubbed'
+    Check (@(Calls 'Register-ScheduledTask' | Where-Object { $_.Target -eq $AgentTask -and $_.User -eq $Accountant }).Count -eq 1) 'the agent task was still restored before the failure was raised'
+    Check ((Get-FileHashText (Join-Path $root '.env')) -eq $before) '.env unchanged'
+    Check ((($r.Output + "$($r.Error)").IndexOf($TokenValue)) -lt 0) 'the token value appears in no output'
     Show-OnFailure $r
 
     # ------------------------------------------------------------------------------------------
@@ -416,6 +517,30 @@ try {
     Show-OnFailure $r
 
     # ------------------------------------------------------------------------------------------
+    Write-Host "`n[5b] Preflight refuses, before anything is stopped, what would break the tunnel (#193)"
+    $tunnelCases = @(
+        @{ Name = 'token file cannot be locked down'; Env = $legacyRemoteEnv; Acl = 'broken'; Match = 'locked-down tunnel token file cannot be written' }
+        @{ Name = 'tunnel service but no TUNNEL_TOKEN in .env'; Env = ($legacyRemoteEnv -replace "(?m)^TUNNEL_TOKEN=.*\r?\n", ''); Acl = 'good'; Match = 'has no TUNNEL_TOKEN' }
+    )
+    foreach ($case in $tunnelCases) {
+        Reset-Fakes; $script:FailuresBefore = $script:Failures
+        $root = New-FakeInstall -EnvText $case.Env
+        Add-FakeTask $AgentTask $Accountant $root
+        $global:FrcServices[$Service] = 'Running'
+        $global:FrcServices[$Tunnel]  = 'Running'
+        Set-FakeServiceEnv $Tunnel @("TUNNEL_TOKEN=$TokenValue")
+        $global:FrcAclMode = $case.Acl
+        $report = Join-Path $work ('preflight-tunnel-' + [guid]::NewGuid().ToString('n').Substring(0, 6) + '.txt')
+        $r = Invoke-Firstrun @{ InstallDir = $root; Upgrade = $true; PreflightOnly = $true; ReportFile = $report }
+        Check ($r.ExitCode -eq 1 -and (Get-Content -Raw -LiteralPath $report) -match $case.Match) "$($case.Name): preflight refuses and says why"
+        Check (@(NssmLog).Count -eq 0 -and @(Calls 'Register-ScheduledTask').Count -eq 0) "$($case.Name): nothing stopped or registered"
+        Check (-not (Test-Path -LiteralPath (Join-Path $root '.tunnel-token.preflight')) -and -not (Test-Path -LiteralPath (Join-Path $root '.tunnel-token'))) "$($case.Name): no probe or token file left behind"
+        Check ((@(Get-FakeServiceEnv $Tunnel) -join '|') -eq "TUNNEL_TOKEN=$TokenValue") "$($case.Name): registry untouched (the preflight changes nothing)"
+        Check ((($r.Output + (Get-Content -Raw -LiteralPath $report)).IndexOf($TokenValue)) -lt 0) "$($case.Name): the token value appears in no output"
+        Show-OnFailure $r
+    }
+
+    # ------------------------------------------------------------------------------------------
     Write-Host "`n[6] Upgrade of an install that has moved rewrites the Claude client configuration"
     Reset-Fakes; $script:FailuresBefore = $script:Failures
     $root = New-FakeInstall -EnvText $localEnv
@@ -479,7 +604,11 @@ try {
 finally {
     Remove-Item Env:\FRC_NSSM_LOG -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Variable -Scope Global -Name FrcCalls, FrcTasks, FrcServices -ErrorAction SilentlyContinue
+    Remove-Variable -Scope Global -Name FrcCalls, FrcTasks, FrcServices, FrcAclMode -ErrorAction SilentlyContinue
+    # Put the real HKLM: drive back, then drop the scratch key.
+    Remove-PSDrive -Name HKLM -ErrorAction SilentlyContinue
+    New-PSDrive -Name HKLM -PSProvider Registry -Root 'HKEY_LOCAL_MACHINE' -Scope Global | Out-Null
+    Remove-Item -LiteralPath $ScratchReg -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host ""
