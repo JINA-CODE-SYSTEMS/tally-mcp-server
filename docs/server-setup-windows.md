@@ -40,11 +40,14 @@ powershell -ExecutionPolicy Bypass -File C:\tally-mcp-server\scripts\setup-windo
 ```
 
 This will:
+- Check that `PASSWORD` is set in `.env` — the server refuses to start without it, so the script stops here rather than register a service that cannot run
 - Install NSSM (if not present)
 - Register `TallyMCP` as a Windows service running `dist\server.mjs`
 - Configure auto-start on boot, log rotation
-- Write `DEPLOYMENT_MODE=remote` to `.env`
+- Write `DEPLOYMENT_MODE=remote` to `.env`, plus `REMOTE_AUTH` / `REMOTE_TRANSPORT` if they are not already there (defaults `oauth-password` / `tunnel`, the same as the installer)
 - Start the service
+
+If a `TallyMCP` service already exists but points at a **different** install directory — for example the packaged installer's, which uses the same service name — the script refuses rather than re-point it. Pass `-ServiceName` with another name for this install.
 
 Environment variables are **not** copied into the service via NSSM `AppEnvironmentExtra`. That exposed `PASSWORD` in a registry key readable by `BUILTIN\Users`, and was redundant: `server.mts` loads `.env` itself by absolute path.
 
