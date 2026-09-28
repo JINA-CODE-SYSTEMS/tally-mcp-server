@@ -69,10 +69,12 @@ test('refuses an unencrypted key file', () => {
   assert.match(r.stderr, /not an encrypted PKCS#8 key/);
 });
 
-test('refuses a wrong passphrase', () => {
-  const r = run(['--payload', payloadPath, '--key', keyA, '--keys', keysPath, '--out', path.join(dir, 'x2.json')], `0.8.0\nwrong\n`);
+test('refuses a wrong passphrase, and leaves no placeholder behind', () => {
+  const out = path.join(dir, 'x2.json');
+  const r = run(['--payload', payloadPath, '--key', keyA, '--keys', keysPath, '--out', out], `0.8.0\nwrong\n`);
   assert.equal(r.status, 1);
   assert.match(r.stderr, /could not decrypt/);
+  assert.equal(fs.existsSync(out), false);
 });
 
 test('refuses a key keys.json does not list as a release key (e.g. the root key)', () => {
@@ -118,7 +120,8 @@ test('the signing script touches no network and writes no key', () => {
   for (const forbidden of [/node:(http|https|http2|net|tls|dgram|dns)\b/, /\bfetch\s*\(/, /WebSocket/, /child_process/, /\.export\s*\(/]) {
     assert.doesNotMatch(src, forbidden, `sign-manifest.mjs must not use ${forbidden}`);
   }
-  // Exactly one write, of the envelope, to --out, refusing to overwrite.
-  assert.deepEqual(src.match(/fs\.\w*[wW]rite\w*\(/g), ['fs.writeFileSync(']);
-  assert.match(src, /fs\.writeFileSync\(outPath, envelope, \{ flag: 'wx' \}\)/);
+  // Exactly one write, of the envelope, through the descriptor --out was created with (exclusively).
+  assert.deepEqual(src.match(/fs\.\w*[wW]rite\w*\(/g), ['fs.writeSync(']);
+  assert.match(src, /fs\.writeSync\(outFd, envelope, off\)/);
+  assert.deepEqual(src.match(/fs\.openSync\([^)]*\)/g), ["fs.openSync(out, 'wx')"]);
 });
