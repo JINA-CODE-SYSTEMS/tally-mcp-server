@@ -36,6 +36,41 @@
 .PARAMETER AgentTaskUser
     Windows user the GUI agent task runs as. Must be the user who logs into
     the box and uses Tally interactively.
+
+.PARAMETER Upgrade
+    Unattended upgrade of an existing install (#177). The installer passes this for a silent run
+    over an existing install, and for any run with /UPDATE; the daily TallyMCPUpdate task runs the
+    installer that way as SYSTEM. In this mode:
+      - .env is never written. Every setting comes from it and every line stays byte-for-byte as it was.
+      - No setting parameter is accepted; passing one is refused rather than silently ignored.
+      - The GUI-agent user comes from AGENT_TASK_USER in .env, or from the existing TallyMCPAgent
+        task if .env predates that key. Never from the account running this script. If the two
+        disagree, or neither exists, or the answer is SYSTEM or another service account, the run
+        is refused.
+      - The deployment mode is read, never changed.
+      - Services and tasks that already exist are re-registered with the same identity (so the new
+        release's definition applies) and restarted. Nothing that did not exist is created.
+      - The Claude client configuration is left alone, unless the install has moved.
+      - An existing tunnel service is re-registered with --token-file, the token file written from
+        the TUNNEL_TOKEN in .env, and the registry copy scrubbed (#193). If the file cannot be
+        locked down the tunnel is left unregistered and the run fails, so Setup exits 10.
+    See docs/installer.md, "Unattended upgrade".
+
+.PARAMETER PreflightOnly
+    With -Upgrade: check that an upgrade can preserve everything, report, and change nothing. Exit 0
+    if it can, 1 if not. The installer runs this before it stops or copies anything, so a refused
+    upgrade leaves the running version untouched. The one thing it writes: when there is a tunnel
+    to migrate, it dry-runs the token-file lockdown on a scratch file (.tunnel-token.preflight,
+    holding no secret) and shreds it again.
+
+.PARAMETER ReportFile
+    With -PreflightOnly: also write the verdict to this file, so the installer can put the reason
+    in its log.
+
+.PARAMETER NoElevate
+    Do not relaunch elevated. For the test harness (scripts\installer\test-firstrun-config.ps1),
+    which replaces every privileged call with a stand-in. Run for real without elevation, the
+    privileged steps simply fail.
 #>
 [CmdletBinding()]
 param(
@@ -91,7 +126,12 @@ param(
     # bare Reconfigure -> preserved from .env below (like McpDomain), so a reconfigure doesn't drop it.
     [string]$TunnelServiceName = 'TallyMCPTunnel',
     [string]$TunnelToken,
-    [switch]$SkipTrayTask
+    [switch]$SkipTrayTask,
+    # --- Unattended upgrade (#177); see the comment-based help above ---
+    [switch]$Upgrade,
+    [switch]$PreflightOnly,
+    [string]$ReportFile = '',
+    [switch]$NoElevate
 )
 
 # --- Elevate, or say why we cannot (#172 C2) -----------------------------------------------------
@@ -110,8 +150,11 @@ param(
 # fix things is a warning nobody reads. Forward every bound parameter so the relaunched run behaves
 # identically. If elevation is declined or unavailable, stop with a clear reason instead of doing
 # half the work.
+#
+# A preflight changes nothing, so it has nothing to elevate for.
 $_principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-if (-not $_principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+if (-not $PreflightOnly -and -not $NoElevate -and
+    -not $_principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "[*] Administrator rights are required; requesting elevation..." -ForegroundColor Yellow
 
     $_fwd = @('-ExecutionPolicy', 'Bypass', '-NoProfile', '-File', "`"$PSCommandPath`"")
@@ -166,6 +209,231 @@ $_existingEnv = _ReadEnvHashtable (Join-Path $InstallDir '.env')
 # Helper: pick first non-empty among the candidates.
 function _Coalesce { foreach ($v in $args) { if ($null -ne $v -and "$v" -ne '') { return $v } }; return '' }
 
+# --- Who may the GUI agent run as? ----------------------------------------------------------------
+# The agent and the tray are interactive, per-user tasks: they drive the Tally window on the
+# desktop of the person who uses it. A service identity has no such desktop. SYSTEM is exactly the
+# account the daily update task runs as (#177), and $env:USERNAME under SYSTEM is the machine
+# account ("HOSTNAME$"), so either would register a task that can never see Tally - and would
+# re-point every ACL grant below at it. Returns why a user is unusable, or '' if it is fine.
+function _AgentUserProblem {
+    param([string]$User)
+    $u = "$User".Trim()
+    if (-not $u) { return 'it is empty' }
+    $leaf = $u.Substring($u.LastIndexOf('\') + 1).ToUpperInvariant()
+    if ($leaf -in @('SYSTEM', 'LOCALSYSTEM', 'LOCAL SERVICE', 'LOCALSERVICE', 'NETWORK SERVICE', 'NETWORKSERVICE')) {
+        return "'$u' is a service account, not a person who can use Tally"
+    }
+    if ($leaf.EndsWith('$')) {
+        return "'$u' is a computer or managed service account, not a person who can use Tally"
+    }
+    try {
+        $sid = ([System.Security.Principal.NTAccount]$u).Translate([System.Security.Principal.SecurityIdentifier]).Value
+        if ($sid -in @('S-1-5-18', 'S-1-5-19', 'S-1-5-20')) {
+            return "'$u' resolves to a service account ($sid), not a person who can use Tally"
+        }
+    } catch {
+        # Unresolvable here (e.g. a domain account with no DC in reach). Not grounds to refuse: task
+        # registration below reports a genuinely unknown account.
+        $null = $_
+    }
+    return ''
+}
+
+# Same account? Compare SIDs when both names resolve, so "alice", ".\alice" and "PC01\alice" match.
+function _SameAccount {
+    param([string]$A, [string]$B)
+    $sids = foreach ($n in @($A, $B)) {
+        try { ([System.Security.Principal.NTAccount]$n).Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { '' }
+    }
+    if ($sids[0] -and $sids[1]) { return $sids[0] -eq $sids[1] }
+    $strip = {
+        param($n)
+        $n = "$n".Trim()
+        foreach ($p in @('.\', "$env:COMPUTERNAME\")) {
+            if ($n.StartsWith($p, [System.StringComparison]::OrdinalIgnoreCase)) { $n = $n.Substring($p.Length) }
+        }
+        $n
+    }
+    return [string]::Equals((& $strip $A), (& $strip $B), [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function _GetTaskOrNull {
+    param([string]$Name)
+    try { return (Get-ScheduledTask -TaskName $Name -ErrorAction Stop | Select-Object -First 1) } catch { return $null }
+}
+
+# --- Tunnel token file helpers (#193) -------------------------------------------------------------
+# Defined here rather than beside the tunnel registration (section 3b) because the -Upgrade preflight
+# below dry-runs _WriteLockedTokenFile before the installer stops anything; see there.
+# Zero the bytes, then unlink: the same best-effort shred used for the credentials file and the
+# .oauth-*.json stores above, so a removed token is not trivially recoverable from free space.
+# Returns $true when the file is gone afterwards.
+function _ShredFile([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $true }
+    try {
+        $len = (Get-Item -LiteralPath $Path -Force).Length
+        if ($len -gt 0) { [System.IO.File]::WriteAllBytes($Path, (New-Object byte[] $len)) }
+    } catch { }
+    Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    return (-not (Test-Path -LiteralPath $Path))
+}
+
+# Writes the token to $Path readable by SYSTEM + Administrators only, or throws having written no
+# secret. The lockdown is the icacls idiom .env and the vault use above, minus the agent user, by
+# SID (so a localized Windows, where the group is not called 'Administrators', cannot break it),
+# plus an explicit owner: an owner can always rewrite the DACL, so leaving the file owned by the
+# individual admin who ran the installer would let that account grant itself read later without
+# elevating. Mirrors the descriptor cloudflared's own `service install` gives its token file:
+# owner Administrators, protected DACL, full access for Administrators and SYSTEM only.
+function _WriteLockedTokenFile([string]$Path, [string]$Token) {
+    # Start from a fresh file. A pre-existing one could carry explicit ACEs that /grant:r would
+    # leave in place, since it only replaces entries for the principals it names.
+    if (-not (_ShredFile $Path)) { throw "could not remove the existing $Path" }
+    # Created EMPTY: until icacls runs it carries the install folder's inherited ACL (BUILTIN\Users
+    # can read Program Files), so it must hold nothing worth reading during that window.
+    [System.IO.File]::WriteAllBytes($Path, (New-Object byte[] 0))
+    & icacls $Path /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls exit $LASTEXITCODE while setting the ACL" }
+    & icacls $Path /setowner '*S-1-5-32-544' 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls exit $LASTEXITCODE while setting the owner" }
+    # Prove it before the secret goes in, rather than trusting two exit codes.
+    $acl = Get-Acl -LiteralPath $Path
+    if (-not $acl.AreAccessRulesProtected) { throw 'inheritance is still enabled on the file' }
+    $sidType = [System.Security.Principal.SecurityIdentifier]
+    foreach ($rule in $acl.Access) {
+        $sid = $rule.IdentityReference.Translate($sidType).Value
+        if (@('S-1-5-18', 'S-1-5-32-544') -notcontains $sid) { throw "unexpected ACL entry for $($rule.IdentityReference)" }
+    }
+    $ownerSid = $acl.GetOwner($sidType).Value
+    if (@('S-1-5-18', 'S-1-5-32-544') -notcontains $ownerSid) { throw "owner is $ownerSid, not Administrators" }
+    # Overwriting an existing file keeps its DACL. No BOM and no newline: cloudflared TrimSpace()s
+    # the contents, but a BOM is not whitespace and would make the token unparseable.
+    [System.IO.File]::WriteAllText($Path, $Token, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# --- Unattended upgrade: resolve everything from what is already there (#177) --------------------
+# The daily update task runs the installer silently, as SYSTEM, with nobody to ask. Before this
+# mode existed, the installer handed its wizard's auto-detected DEFAULTS to this script - not the
+# install's values - and passed values win over .env (see the fallback chain above). So a silent
+# upgrade reset custom Tally paths and the edition, re-applied a stale GUI-control choice, and
+# re-pointed the agent task at whoever ran it. -Upgrade takes nothing from the command line and
+# nothing from the running account: only from .env and the registrations that already exist.
+# Everything it cannot establish for certain is refused - before anything is changed.
+$_upgradeProblems      = @()
+$_upgradeAgentUser     = ''
+$_upgradeTaskExisted   = @{}
+$_upgradeInstallMoved  = $false
+if ($PreflightOnly -and -not $Upgrade) {
+    throw '-PreflightOnly only applies together with -Upgrade.'
+}
+if ($Upgrade) {
+    $_settingParams = @('TallyEdition', 'TallyExePath', 'TallyDataPath', 'TallyIniPath', 'McpDomain',
+                        'AgentTaskUser', 'EnableGuiControl', 'EntryOrder', 'DeploymentMode', 'RemoteAuth',
+                        'RemoteTransport', 'TunnelToken', 'CredentialsFile')
+    $_passed = @($_settingParams | Where-Object { $PSBoundParameters.ContainsKey($_) })
+    if ($_passed.Count -gt 0) {
+        $_upgradeProblems += ("an upgrade takes every setting from the existing .env, but these were passed: -" +
+                              ($_passed -join ', -') + ". Drop them, or run without -Upgrade to change settings.")
+    }
+
+    $_envPath = Join-Path $InstallDir '.env'
+    if (-not (Test-Path -LiteralPath $_envPath)) {
+        $_upgradeProblems += "there is no $_envPath, so there is no existing configuration to preserve. A new install needs the interactive installer, or /AGENTUSER=<windows user> for a silent one."
+    } elseif ($_existingEnv.Count -eq 0) {
+        $_upgradeProblems += "$_envPath has no settings in it (or could not be read), so there is nothing to preserve. Run Reconfigure from the Start Menu to repair it."
+    } else {
+        $_agentTask = _GetTaskOrNull $AgentTaskName
+        $_trayTask  = _GetTaskOrNull $TrayTaskName
+        $_upgradeTaskExisted[$AgentTaskName] = [bool]$_agentTask
+        $_upgradeTaskExisted[$TrayTaskName]  = [bool]$_trayTask
+
+        $_envUser  = "$($_existingEnv['AGENT_TASK_USER'])".Trim()
+        $_taskUser = ''
+        foreach ($_t in @($_agentTask, $_trayTask)) {
+            if (-not $_taskUser -and $_t -and $_t.Principal -and $_t.Principal.UserId) { $_taskUser = "$($_t.Principal.UserId)".Trim() }
+        }
+        if ($_envUser -and $_taskUser -and -not (_SameAccount $_envUser $_taskUser)) {
+            $_upgradeProblems += "AGENT_TASK_USER in .env is '$_envUser' but the existing agent task runs as '$_taskUser'. An unattended upgrade will not guess which is right; run Reconfigure from the Start Menu to settle it."
+        } else {
+            $_upgradeAgentUser = _Coalesce $_envUser $_taskUser
+            if (-not $_upgradeAgentUser) {
+                $_upgradeProblems += "neither .env (AGENT_TASK_USER) nor an existing $AgentTaskName task says which Windows user runs Tally. Run Reconfigure from the Start Menu once, as that user's administrator."
+            } else {
+                $_why = _AgentUserProblem $_upgradeAgentUser
+                if ($_why) { $_upgradeProblems += "the recorded GUI-agent user is unusable: $_why. Run Reconfigure from the Start Menu to set the right one." }
+            }
+        }
+
+        # Has the install moved since the agent task was registered? That is the one case in which
+        # the Claude client configuration (which records the install path) must be rewritten.
+        if ($_agentTask) {
+            $_taskArgs = (@($_agentTask.Actions) | ForEach-Object { "$($_.Arguments)" }) -join ' '
+            $_here = $InstallDir.TrimEnd('\') + '\scripts\'
+            if ($_taskArgs -and $_taskArgs.IndexOf($_here, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+                $_upgradeInstallMoved = $true
+            }
+        }
+
+        foreach ($_k in @(@('DEPLOYMENT_MODE', @('local', 'remote')), @('REMOTE_AUTH', @('oauth-password', 'paired')), @('REMOTE_TRANSPORT', @('tunnel', 'lan')))) {
+            $_v = $_existingEnv[$_k[0]]
+            if ($_v -and ($_k[1] -notcontains $_v)) {
+                $_upgradeProblems += "$($_k[0]) in .env is '$_v', which is not one of: $($_k[1] -join ', '). Fix it in $_envPath."
+            }
+        }
+
+        # The Cloudflare Tunnel (#193). An upgrade re-registers an existing tunnel service with
+        # --token-file, writing the token from .env into a file locked to SYSTEM + Administrators, and
+        # fails closed - no tunnel - if it cannot lock that file down. Find out now, before the
+        # installer stops anything, whether that step can succeed:
+        #   - a tunnel service with no TUNNEL_TOKEN in .env could only be removed, not re-registered
+        #     (its only other copy of the token is the service registry, which #193 no longer uses);
+        #   - the lockdown itself is dry-run on a scratch file in the same folder, with a value that
+        #     is not a secret, through the very function the real step uses, then shredded.
+        # Only relevant in remote mode: a local-mode run removes any tunnel, as on every run.
+        $_mode = _Coalesce $_existingEnv['DEPLOYMENT_MODE'] 'remote'
+        $_tunnelSvc = Get-Service -Name $TunnelServiceName -ErrorAction SilentlyContinue
+        if ($_mode -eq 'remote' -and $_tunnelSvc) {
+            if (-not "$($_existingEnv['TUNNEL_TOKEN'])".Trim()) {
+                $_upgradeProblems += "the '$TunnelServiceName' service exists but .env has no TUNNEL_TOKEN, so an upgrade could only remove the tunnel. Run Reconfigure from the Start Menu to set the token (or blank it deliberately)."
+            } else {
+                $_probe = Join-Path $InstallDir '.tunnel-token.preflight'
+                try {
+                    _WriteLockedTokenFile $_probe 'upgrade-preflight-probe-not-a-token'
+                } catch {
+                    $_upgradeProblems += "a locked-down tunnel token file cannot be written in ${InstallDir} ($($_.Exception.Message)), so the upgrade would have to leave the '$TunnelServiceName' service unregistered. Run Setup elevated, or check that folder's permissions."
+                } finally {
+                    if (-not (_ShredFile $_probe)) { $_upgradeProblems += "could not remove the preflight probe file $_probe." }
+                }
+            }
+        }
+    }
+
+    $_verdict = if ($_upgradeProblems.Count -eq 0) {
+        $_modeShown = _Coalesce $_existingEnv['DEPLOYMENT_MODE'] 'remote (no DEPLOYMENT_MODE key; an install that predates it)'
+        "OK: the upgrade can preserve this install. Deployment mode: $_modeShown. GUI-agent user: $_upgradeAgentUser."
+    } else {
+        "REFUSED: an unattended upgrade cannot preserve this install, so nothing was changed.`r`n" +
+            (($_upgradeProblems | ForEach-Object { " - $_" }) -join "`r`n")
+    }
+
+    if ($PreflightOnly) {
+        Write-Host $_verdict
+        if ($ReportFile) {
+            try { [System.IO.File]::WriteAllText($ReportFile, $_verdict, (New-Object System.Text.UTF8Encoding $false)) } catch { Write-Host "[WARN] Could not write ${ReportFile}: $_" }
+        }
+        if ($_upgradeProblems.Count -eq 0) { exit 0 } else { exit 1 }
+    }
+    if ($_upgradeProblems.Count -gt 0) {
+        # The transcript has not started yet; leave the reason where support will look for it.
+        try {
+            $_log = Join-Path $InstallDir 'logs\firstrun-config.log'
+            New-Item -ItemType Directory -Force -Path (Split-Path $_log) | Out-Null
+            Add-Content -LiteralPath $_log -Value "[$(Get-Date -Format 'o')] $_verdict"
+        } catch { $null = $_ }
+        throw $_verdict
+    }
+}
+
 $TallyEdition   = _Coalesce $TallyEdition   $_existingEnv['TALLY_EDITION']   'silver'
 $TallyExePath   = _Coalesce $TallyExePath   $_existingEnv['TALLY_EXE_PATH']   'C:\Program Files\TallyPrimeEditLog\tally.exe'
 $TallyDataPath  = _Coalesce $TallyDataPath  $_existingEnv['TALLY_DATA_PATH']  'C:\Users\Public\TallyPrimeEditLog\data'
@@ -175,7 +443,20 @@ $McpDomain      = _Coalesce $McpDomain      $_existingEnv['MCP_DOMAIN']       ''
 # AGENT_TASK_USER is persisted in .env (below) and preferred over $env:USERNAME so a Reconfigure run
 # by a DIFFERENT admin (the bare-InstallDir path omits -AgentTaskUser) does not silently re-point the
 # agent task + all the icacls grants to that admin - which would break the IPC ACL for the real user.
-$AgentTaskUser  = _Coalesce $AgentTaskUser  $_existingEnv['AGENT_TASK_USER']  $env:USERNAME
+#
+# The running account is only a fallback for a person at a keyboard (a bare Reconfigure of an install
+# that predates the key). An unattended run has no such person - under the update task it is SYSTEM -
+# so it must be told, or be an upgrade, which resolved the user above from what already exists.
+if ($Upgrade) {
+    $AgentTaskUser = $_upgradeAgentUser
+} else {
+    $AgentTaskUser = _Coalesce $AgentTaskUser $_existingEnv['AGENT_TASK_USER'] $(if ($Unattended) { '' } else { $env:USERNAME })
+}
+$_agentUserWhy = _AgentUserProblem $AgentTaskUser
+if ($_agentUserWhy) {
+    throw ("Cannot choose the Windows user the GUI agent runs as: $_agentUserWhy. Pass -AgentTaskUser <the person who uses Tally>" +
+           $(if ($Unattended) { " (for a silent install: /AGENTUSER=<user>)." } else { "." }))
+}
 # ENABLE_GUI_CONTROL is ON by default, matching the installer checkbox (tally-mcp.iss), which has
 # always defaulted it checked. This fallback only applies when NO value is passed and none is on
 # record - a bare Reconfigure of a pre-flag install, or a manual/dev run of this script. It used to
@@ -251,7 +532,11 @@ _AssertOneOf 'REMOTE_TRANSPORT' $RemoteTransport @('tunnel','lan')
 # is skipped, and any credentials file the installer wrote is still shredded rather than left on
 # disk for the next process to find.
 $Password = $null
-if ($DeploymentMode -eq 'local') {
+if ($Upgrade) {
+    # Nothing to resolve: an upgrade never rewrites .env, so the password (if any) stays exactly
+    # where it is and is never read, prompted for or passed anywhere.
+    Write-Host "[OK] Upgrade: the existing .env (and any password in it) is left as it is"
+} elseif ($DeploymentMode -eq 'local') {
     if ($CredentialsFile -and (Test-Path -LiteralPath $CredentialsFile)) {
         try {
             $size = (Get-Item -LiteralPath $CredentialsFile -ErrorAction SilentlyContinue).Length
@@ -300,6 +585,10 @@ if ($DeploymentMode -eq 'local') {
     Write-Host "Tally MCP Reconfigure" -ForegroundColor Cyan
     Write-Host "(re-running first-run wizard; preserving OAuth password from existing .env)"
     Write-Host ""
+} elseif ($Unattended) {
+    # Nobody is at a keyboard ([Run] is runhidden; the update task has no desktop), so the prompt
+    # below would hang the install forever. Say what is missing instead.
+    throw "Remote mode needs an OAuth password, and none was supplied or found in $(Join-Path $InstallDir '.env'). Run Reconfigure from the Start Menu to set one."
 } else {
     # Interactive prompt path. Reached only when no .env exists yet AND no credentials file was
     # passed (e.g. fresh install via the Reconfigure shortcut after the .env was deleted).
@@ -336,7 +625,7 @@ Start-Transcript -Path $transcript -Append | Out-Null
 # -Unattended is authoritative. The CredentialsFile heuristic is kept only as a fallback for a
 # caller that predates the switch: it is right for remote installs (which always pass one) and
 # wrong for local ones, which is exactly the bug the switch exists to close.
-$Script:IsInteractiveRun = (-not $Unattended) -and [string]::IsNullOrWhiteSpace($CredentialsFile)
+$Script:IsInteractiveRun = (-not $Unattended) -and (-not $Upgrade) -and [string]::IsNullOrWhiteSpace($CredentialsFile)
 function _PauseIfInteractive {
     if ($Script:IsInteractiveRun) {
         Write-Host ""
@@ -350,6 +639,7 @@ try {
     Write-Host "ServiceName  = $ServiceName"
     Write-Host "TallyEdition = $TallyEdition"
     Write-Host "AgentUser    = $AgentTaskUser"
+    Write-Host "Mode         = $DeploymentMode$(if ($Upgrade) { ' (unattended upgrade: every setting preserved)' })"
 
     $bundledNode = Join-Path $InstallDir 'node-portable\node.exe'
     $bundledNssm = Join-Path $InstallDir 'bin\nssm.exe'
@@ -399,7 +689,11 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     # point before the value is persisted, so normalize aggressively here and only fail when the
     # value is genuinely unparseable. Blank MUST stay blank ("localhost-only mode") - we never
     # turn an empty value into a scheme-only URL.
-    if ($McpDomain -and $McpDomain.Trim().Length -gt 0) {
+    # An upgrade writes no .env, so there is nothing to normalize - and refusing an update over a
+    # value the running version already accepts would help nobody.
+    if ($Upgrade) {
+        # Leave $McpDomain exactly as .env has it.
+    } elseif ($McpDomain -and $McpDomain.Trim().Length -gt 0) {
         $McpDomainOriginal = $McpDomain
         $normalized = $McpDomain.Trim()
         # 1. Ensure a scheme. A bare host -> https:// (the safe default for a public OAuth server).
@@ -521,10 +815,18 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         $envLines += "# MCP_DOMAIN intentionally unset - server binds to localhost only (127.0.0.1)"
     }
 
-    $envTmp = "$envFile.tmp"
-    Set-Content -Path $envTmp -Value $envLines -Encoding UTF8
-    Move-Item -Path $envTmp -Destination $envFile -Force
-    Write-Host "[OK] Wrote $envFile ($($envLines.Count) lines)"
+    # An upgrade does not write .env at all. Regenerating it from the template above - even from
+    # values read out of it - would drop every key the template does not know (TALLY_PORT is
+    # hard-coded to 9000 there, CORS_ORIGINS and READONLY_MODE are not in it at all) and reformat
+    # the rest. Byte-for-byte unchanged is the only property an unattended run can promise.
+    if ($Upgrade) {
+        Write-Host "[OK] Upgrade: $envFile left exactly as it was"
+    } else {
+        $envTmp = "$envFile.tmp"
+        Set-Content -Path $envTmp -Value $envLines -Encoding UTF8
+        Move-Item -Path $envTmp -Destination $envFile -Force
+        Write-Host "[OK] Wrote $envFile ($($envLines.Count) lines)"
+    }
 
     # Lock down .env (security): it holds PASSWORD, the sole OAuth gate for every MCP tool.
     # Without this it inherits the install dir ACL (Program Files grants Users read by default,
@@ -619,6 +921,9 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     # aborts the script. Only call `stop` when the service is actually running, and temporarily
     # relax the preference around the nssm invocations so unexpected stderr doesn't kill us.
     $existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    # Recorded before the teardown: an upgrade re-registers what was there and creates nothing new.
+    $serviceExisted = [bool]$existing
+    $skipServiceForUpgrade = $Upgrade -and ($DeploymentMode -eq 'remote') -and -not $serviceExisted
     if ($existing) {
         Write-Host "[*] Existing service detected; stopping and removing..."
         $savedPref = $ErrorActionPreference
@@ -651,7 +956,12 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     # other local users. Removing it costs nothing: both entrypoints already load .env themselves by
     # absolute path with override:true (src/mcp.mts, src/server.mts), so the registry copy was
     # redundant as well as leaky.
-    if ($DeploymentMode -eq 'remote') {
+    #
+    # An upgrade re-registers the service only if it was there: a remote install whose service has
+    # gone was changed by someone, and an unattended run is not the place to second-guess them.
+    if ($skipServiceForUpgrade) {
+        Write-Host "[WARN] Upgrade: remote mode, but no '$ServiceName' service existed before this run, so none is created. Run Reconfigure to register it." -ForegroundColor Yellow
+    } elseif ($DeploymentMode -eq 'remote') {
         # IMPORTANT: pass the script as a RELATIVE path ('dist\server.mjs') against AppDirectory rather
         # than the absolute path 'C:\Program Files\TallyMCP\dist\server.mjs'. NSSM's storage of the
         # AppParameters value via the install command's third positional arg loses the quoting around
@@ -712,8 +1022,14 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         # Failure here is NOT fatal. connect-client.ps1 is idempotent and is also on the Start Menu,
         # which is the route for the very common case of Claude Desktop being installed afterwards.
         # A missed auto-connect costs one click; a failed install costs the whole session.
+        #
+        # An upgrade leaves it alone: the entry records the install path, which has not changed, and
+        # the user may have edited or removed it on purpose. The exception is an install that has
+        # moved (its agent task still points at the old folder), where the old entry is now wrong.
         $connectScript = Join-Path $InstallDir 'scripts\installer\connect-client.ps1'
-        if (-not (Test-Path -LiteralPath $connectScript)) {
+        if ($Upgrade -and -not $_upgradeInstallMoved) {
+            Write-Host "[OK] Upgrade: Claude client configuration left as it is (the install path has not changed)"
+        } elseif (-not (Test-Path -LiteralPath $connectScript)) {
             Write-Host "[WARN] $connectScript not found - skipping auto-connect. Use the 'Connect Claude to Tally' Start Menu item." -ForegroundColor Yellow
         } else {
             $connectTask = 'TallyMCPConnectOnce'
@@ -815,52 +1131,6 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     $tunnelTokenLeaf = '.tunnel-token'
     $tunnelTokenFile = Join-Path $InstallDir $tunnelTokenLeaf
 
-    # Zero the bytes, then unlink: the same best-effort shred used for the credentials file and the
-    # .oauth-*.json stores above, so a removed token is not trivially recoverable from free space.
-    # Returns $true when the file is gone afterwards.
-    function _ShredFile([string]$Path) {
-        if (-not (Test-Path -LiteralPath $Path)) { return $true }
-        try {
-            $len = (Get-Item -LiteralPath $Path -Force).Length
-            if ($len -gt 0) { [System.IO.File]::WriteAllBytes($Path, (New-Object byte[] $len)) }
-        } catch { }
-        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-        return (-not (Test-Path -LiteralPath $Path))
-    }
-
-    # Writes the token to $Path readable by SYSTEM + Administrators only, or throws having written no
-    # secret. The lockdown is the icacls idiom .env and the vault use above, minus the agent user, by
-    # SID (so a localized Windows, where the group is not called 'Administrators', cannot break it),
-    # plus an explicit owner: an owner can always rewrite the DACL, so leaving the file owned by the
-    # individual admin who ran the installer would let that account grant itself read later without
-    # elevating. Mirrors the descriptor cloudflared's own `service install` gives its token file:
-    # owner Administrators, protected DACL, full access for Administrators and SYSTEM only.
-    function _WriteLockedTokenFile([string]$Path, [string]$Token) {
-        # Start from a fresh file. A pre-existing one could carry explicit ACEs that /grant:r would
-        # leave in place, since it only replaces entries for the principals it names.
-        if (-not (_ShredFile $Path)) { throw "could not remove the existing $Path" }
-        # Created EMPTY: until icacls runs it carries the install folder's inherited ACL (BUILTIN\Users
-        # can read Program Files), so it must hold nothing worth reading during that window.
-        [System.IO.File]::WriteAllBytes($Path, (New-Object byte[] 0))
-        & icacls $Path /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' 2>$null | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "icacls exit $LASTEXITCODE while setting the ACL" }
-        & icacls $Path /setowner '*S-1-5-32-544' 2>$null | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "icacls exit $LASTEXITCODE while setting the owner" }
-        # Prove it before the secret goes in, rather than trusting two exit codes.
-        $acl = Get-Acl -LiteralPath $Path
-        if (-not $acl.AreAccessRulesProtected) { throw 'inheritance is still enabled on the file' }
-        $sidType = [System.Security.Principal.SecurityIdentifier]
-        foreach ($rule in $acl.Access) {
-            $sid = $rule.IdentityReference.Translate($sidType).Value
-            if (@('S-1-5-18', 'S-1-5-32-544') -notcontains $sid) { throw "unexpected ACL entry for $($rule.IdentityReference)" }
-        }
-        $ownerSid = $acl.GetOwner($sidType).Value
-        if (@('S-1-5-18', 'S-1-5-32-544') -notcontains $ownerSid) { throw "owner is $ownerSid, not Administrators" }
-        # Overwriting an existing file keeps its DACL. No BOM and no newline: cloudflared TrimSpace()s
-        # the contents, but a BOM is not whitespace and would make the token unparseable.
-        [System.IO.File]::WriteAllText($Path, $Token, (New-Object System.Text.UTF8Encoding($false)))
-    }
-
     # Removes a TUNNEL_TOKEN=... entry from an NSSM service's AppEnvironmentExtra (REG_MULTI_SZ under
     # <service>\Parameters) and leaves every other entry exactly as it was. Returns $true when it
     # removed something. Takes the key path rather than a service name so it can be exercised against
@@ -882,6 +1152,7 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     }
 
     $existingTunnel = Get-Service -Name $TunnelServiceName -ErrorAction SilentlyContinue
+    $tunnelExisted = [bool]$existingTunnel
     if ($existingTunnel) {
         Write-Host "[*] Existing tunnel service detected; stopping and removing..."
         $savedPrefT = $ErrorActionPreference
@@ -925,8 +1196,16 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     # run can still be handed one - the .env write above refuses to persist it, and without this guard
     # the tunnel service would be registered anyway, leaving an outbound connection and a public
     # hostname pointing at a machine that #172 promises has neither.
+    #
+    # An upgrade re-registers the tunnel only if it was there, and this is also how every install
+    # configured before #193 receives the migration: the existing service comes back with
+    # --token-file, the file is written from the TUNNEL_TOKEN .env already holds (.env itself is not
+    # touched), and the scrub above has removed the registry copy.
     $tunnelRegistered = $false
-    if ($DeploymentMode -eq 'remote' -and $TunnelToken) {
+    if ($Upgrade -and $DeploymentMode -eq 'remote' -and $TunnelToken -and -not $tunnelExisted) {
+        # As for the main service: an upgrade re-registers what was there and adds nothing.
+        Write-Host "[WARN] Upgrade: TUNNEL_TOKEN is set but no '$TunnelServiceName' service existed before this run, so none is created. Run Reconfigure to register it." -ForegroundColor Yellow
+    } elseif ($DeploymentMode -eq 'remote' -and $TunnelToken) {
         $tokenFileOk = $false
         if (-not (Test-Path -LiteralPath $cloudflaredExe)) {
             Write-Host "[WARN] Tunnel token set but cloudflared.exe not found at $cloudflaredExe - skipping tunnel service. Re-run the installer to bundle it." -ForegroundColor Yellow
@@ -980,6 +1259,12 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
             Write-Host "[WARN] Could not remove $tunnelTokenFile - delete it by hand; it holds a tunnel credential." -ForegroundColor Yellow
         }
     }
+    # Fail closed, AND say so. Outside an upgrade the [ERROR] above is the whole story, told to the
+    # person at the keyboard. An unattended upgrade has nobody reading, so a tunnel that was running
+    # before and is not registered now must fail the run (Setup exit 10), which is the update task's
+    # cue to roll back rather than report success over an outage. Raised after the agent and tray
+    # below have been restarted, so the rest of the install is not left down with it.
+    $upgradeTunnelLost = $Upgrade -and $tunnelExisted -and ($DeploymentMode -eq 'remote') -and $TunnelToken -and -not $tunnelRegistered
 
     # --- 4. Register the GUI agent at-logon Scheduled Task -----------------
     # Use the ScheduledTasks PowerShell module rather than schtasks.exe. schtasks.exe via the
@@ -989,48 +1274,53 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     # paths with spaces survive without escape gymnastics. The module is built-in on
     # Windows Server 2008 R2+ / Windows 10+, so this is safe across our supported targets.
     $taskRegistered = $false
-    try {
-        # Best-effort cleanup of any stale registration. SilentlyContinue handles "not found".
-        Unregister-ScheduledTask -TaskName $AgentTaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-
-        $taskAction = New-ScheduledTaskAction `
-            -Execute 'powershell.exe' `
-            -Argument "-ExecutionPolicy Bypass -NoProfile -WindowStyle Minimized -File `"$agentScript`""
-        # At-logon trigger is the reliable baseline. Crash-supervision (#88 H-2) is added on top via
-        # RestartCount/Interval + an optional 1-min heartbeat - but BOTH are built best-effort so a
-        # picky Windows build can never abort registration (which previously left the task unregistered).
-        $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $AgentTaskUser
-        $taskPrincipal = New-ScheduledTaskPrincipal -UserId $AgentTaskUser -LogonType Interactive -RunLevel Limited
-
-        # Supervision settings: respawn ~1 min after an abnormal exit; IgnoreNew avoids a double-instance.
-        # Fall back to basic settings if the enhanced set is rejected.
+    # An upgrade refreshes the task only if it already existed, and always for the same user it had.
+    if ($Upgrade -and -not $_upgradeTaskExisted[$AgentTaskName]) {
+        Write-Host "[WARN] Upgrade: no '$AgentTaskName' task existed before this run, so none is created. Run Reconfigure to register it." -ForegroundColor Yellow
+    } else {
         try {
-            $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
-                -MultipleInstances IgnoreNew -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
-        } catch {
-            Write-Host "[WARN] enhanced task settings unavailable; using basic: $_" -ForegroundColor Yellow
-            $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-        }
+            # Best-effort cleanup of any stale registration. SilentlyContinue handles "not found".
+            Unregister-ScheduledTask -TaskName $AgentTaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
 
-        # Optional heartbeat trigger - re-fires the task every minute as a belt for the "process gone
-        # but the engine thinks it completed" case. Some Windows builds reject the repetition params,
-        # so build it in a try/catch and register logon-only if it fails (RestartCount still covers crashes).
-        # NOTE: use a finite 10-year duration, NOT [TimeSpan]::MaxValue, which overflows and threw here.
-        $taskTriggers = @($logonTrigger)
-        try {
-            $heartbeatTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3650)
-            $taskTriggers += $heartbeatTrigger
-        } catch {
-            Write-Host "[WARN] heartbeat trigger unavailable (crash-respawn still covered by RestartCount): $_" -ForegroundColor Yellow
-        }
+            $taskAction = New-ScheduledTaskAction `
+                -Execute 'powershell.exe' `
+                -Argument "-ExecutionPolicy Bypass -NoProfile -WindowStyle Minimized -File `"$agentScript`""
+            # At-logon trigger is the reliable baseline. Crash-supervision (#88 H-2) is added on top via
+            # RestartCount/Interval + an optional 1-min heartbeat - but BOTH are built best-effort so a
+            # picky Windows build can never abort registration (which previously left the task unregistered).
+            $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $AgentTaskUser
+            $taskPrincipal = New-ScheduledTaskPrincipal -UserId $AgentTaskUser -LogonType Interactive -RunLevel Limited
 
-        $taskDef = New-ScheduledTask -Action $taskAction -Trigger $taskTriggers -Principal $taskPrincipal -Settings $taskSettings -Description "Tally MCP GUI agent (companion to TallyMCP service; spawns Tally + keystrokes credentials in user session). Auto-respawns within ~1 min if it crashes."
-        Register-ScheduledTask -TaskName $AgentTaskName -InputObject $taskDef -Force | Out-Null
-        $taskRegistered = $true
-        Write-Host "[OK] Scheduled task '$AgentTaskName' registered (runs at logon, as $AgentTaskUser)"
-    } catch {
-        Write-Host "[WARN] Register-ScheduledTask failed: $_" -ForegroundColor Yellow
-        Write-Host "       GUI agent task NOT registered. Re-run the wizard or register manually." -ForegroundColor Yellow
+            # Supervision settings: respawn ~1 min after an abnormal exit; IgnoreNew avoids a double-instance.
+            # Fall back to basic settings if the enhanced set is rejected.
+            try {
+                $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
+                    -MultipleInstances IgnoreNew -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
+            } catch {
+                Write-Host "[WARN] enhanced task settings unavailable; using basic: $_" -ForegroundColor Yellow
+                $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+            }
+
+            # Optional heartbeat trigger - re-fires the task every minute as a belt for the "process gone
+            # but the engine thinks it completed" case. Some Windows builds reject the repetition params,
+            # so build it in a try/catch and register logon-only if it fails (RestartCount still covers crashes).
+            # NOTE: use a finite 10-year duration, NOT [TimeSpan]::MaxValue, which overflows and threw here.
+            $taskTriggers = @($logonTrigger)
+            try {
+                $heartbeatTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3650)
+                $taskTriggers += $heartbeatTrigger
+            } catch {
+                Write-Host "[WARN] heartbeat trigger unavailable (crash-respawn still covered by RestartCount): $_" -ForegroundColor Yellow
+            }
+
+            $taskDef = New-ScheduledTask -Action $taskAction -Trigger $taskTriggers -Principal $taskPrincipal -Settings $taskSettings -Description "Tally MCP GUI agent (companion to TallyMCP service; spawns Tally + keystrokes credentials in user session). Auto-respawns within ~1 min if it crashes."
+            Register-ScheduledTask -TaskName $AgentTaskName -InputObject $taskDef -Force | Out-Null
+            $taskRegistered = $true
+            Write-Host "[OK] Scheduled task '$AgentTaskName' registered (runs at logon, as $AgentTaskUser)"
+        } catch {
+            Write-Host "[WARN] Register-ScheduledTask failed: $_" -ForegroundColor Yellow
+            Write-Host "       GUI agent task NOT registered. Re-run the wizard or register manually." -ForegroundColor Yellow
+        }
     }
 
     # Trigger the task once now so the agent is alive immediately, not just from next logon.
@@ -1055,6 +1345,9 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     $trayTaskRegistered = $false
     if ($SkipTrayTask) {
         Write-Host "[*] Skipping tray task registration (-SkipTrayTask)" -ForegroundColor DarkGray
+    } elseif ($Upgrade -and -not $_upgradeTaskExisted[$TrayTaskName]) {
+        # Someone removed it (or installed with -SkipTrayTask); an unattended upgrade does not bring it back.
+        Write-Host "[*] Upgrade: no '$TrayTaskName' task existed before this run, so none is created" -ForegroundColor DarkGray
     } elseif (-not (Test-Path -LiteralPath $trayScript)) {
         Write-Host "[WARN] Tray script not found at $trayScript - skipping at-logon registration" -ForegroundColor Yellow
     } else {
@@ -1090,7 +1383,7 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     # present, since it is no longer a prerequisite on that path. Reaching here unguarded threw
     # "nssm.exe is not recognized" AFTER everything else had succeeded, which is the worst place to
     # fail: the install was complete and correct, and the operator was told it had errored.
-    if ($DeploymentMode -eq 'remote') {
+    if ($DeploymentMode -eq 'remote' -and -not $skipServiceForUpgrade) {
         # Same defensive pattern: nssm start can write to stderr in benign cases (e.g. service
         # already running because Windows auto-started it on registration with SERVICE_AUTO_START).
         $savedPref3 = $ErrorActionPreference
@@ -1122,6 +1415,10 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     Write-Host ""
     Write-Host "NOTE: $transcript captures install activity. Delete it if PowerShell parameter binding"
     Write-Host "      may have logged the OAuth password and the box is shared with other admins."
+
+    if ($upgradeTunnelLost) {
+        throw "Upgrade: the '$TunnelServiceName' service existed before this run but could not be re-registered with a locked-down token file (see the errors above). It has been left unregistered rather than protected less well."
+    }
 }
 catch {
     # Show the error in the console (PowerShell already prints it but the transcript

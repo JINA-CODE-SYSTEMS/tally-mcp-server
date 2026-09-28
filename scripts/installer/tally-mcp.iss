@@ -94,6 +94,10 @@ Source: "{#RepoRoot}\package.json";    DestDir: "{app}";          Flags: ignorev
 ; Extracted to {tmp} so PrepareToInstall can run it before any file is copied. On a fresh install
 ; {app}\scripts does not exist yet, and on an upgrade the on-disk copy is the version being replaced.
 Source: "{#RepoRoot}\scripts\installer\stop-install-processes.ps1"; Flags: dontcopy
+; Same reason: an unattended upgrade runs THIS version's firstrun-config.ps1 -Upgrade -PreflightOnly
+; from PrepareToInstall, so an upgrade that could not keep the existing settings is refused before
+; anything is stopped or copied (#177).
+Source: "{#RepoRoot}\scripts\installer\firstrun-config.ps1"; Flags: dontcopy
 Source: "{#RepoRoot}\package-lock.json"; DestDir: "{app}";        Flags: ignoreversion
 Source: "{#RepoRoot}\node_modules\*";  DestDir: "{app}\node_modules"; Flags: ignoreversion recursesubdirs createallsubdirs
 
@@ -176,7 +180,11 @@ Name: "{group}\Uninstall {#MyAppName}";  Filename: "{uninstallexe}"
 
 [Run]
 ; --- 1. First-run wizard: writes .env from collected wizard inputs and registers the NSSM service ---
-Filename: "powershell.exe"; \
+; Not on an unattended upgrade (a silent run over an existing install, or /UPDATE): that has no
+; wizard answers to pass, only defaults, and passed values win over .env. It runs
+; firstrun-config.ps1 -Upgrade from CurStepChanged instead, so its exit code reaches the caller
+; (see GetCustomSetupExitCode and docs/installer.md, "Unattended upgrade").
+Filename: "powershell.exe"; Check: not IsUpgradeRun; \
   Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"" -TunnelServiceName ""{#MyTunnelServiceName}"" -CredentialsFile ""{code:GetCredentialsFilePath}"" -TallyEdition ""{code:GetWizardEdition}"" -TallyExePath ""{code:GetWizardExePath}"" -TallyDataPath ""{code:GetWizardDataPath}"" -TallyIniPath ""{code:GetWizardIniPath}"" -McpDomain ""{code:GetWizardDomain}"" -TunnelToken ""{code:GetWizardTunnelToken}"" -AgentTaskUser ""{code:GetWizardAgentUser}"" -EnableGuiControl ""{code:GetWizardGuiControl}"" -EntryOrder ""{code:GetWizardEntryOrder}"" -DeploymentMode ""{code:GetWizardMode}"" -Unattended"; \
   WorkingDir: "{app}"; \
   StatusMsg: "Configuring service and writing .env..."; \
@@ -184,8 +192,14 @@ Filename: "powershell.exe"; \
 
 [UninstallRun]
 ; --- Cleanup BEFORE Inno deletes files: stop service, remove NSSM entry, remove scheduled task ---
+; The vault answer is NOT on this line. [UninstallRun] parameters are expanded at INSTALL time and
+; stored in unins000.dat, so the {code:GetRemoveVaultFlag} that used to end it was evaluated before
+; anyone had been asked and always came out empty: the vault was never removed, whatever the
+; operator answered. InitializeUninstall now hands the answer over in the uninstaller's environment
+; (CLAUDALLY_UNINSTALL_REMOVE_VAULT), which this child inherits - and which also reaches the older
+; copies of this entry that upgraded installs still carry in unins000.dat (RunOnceId runs one).
 Filename: "powershell.exe"; \
-  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\uninstall-cleanup.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"" -TunnelServiceName ""{#MyTunnelServiceName}"" {code:GetRemoveVaultFlag}"; \
+  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\uninstall-cleanup.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"" -TunnelServiceName ""{#MyTunnelServiceName}"""; \
   RunOnceId: "TallyMcpUninstallCleanup"; \
   Flags: runhidden waituntilterminated
 
@@ -197,6 +211,9 @@ Type: files; Name: "{app}\.env"
 ; Same fallback for the Cloudflare Tunnel token file (#193), a bearer credential that
 ; uninstall-cleanup.ps1 also overwrites and deletes first.
 Type: files; Name: "{app}\.tunnel-token"
+; The unattended-upgrade preflight's lockdown probe (#177). Holds no secret and is shredded as soon as
+; it is written; listed only so a preflight killed mid-probe cannot leave it behind.
+Type: files; Name: "{app}\.tunnel-token.preflight"
 Type: filesandordirs; Name: "{app}\logs"
 Type: filesandordirs; Name: "{app}\node_modules"
 Type: filesandordirs; Name: "{app}\dist"
@@ -218,6 +235,76 @@ var
   EntryOrderPage: TInputOptionWizardPage;
   GuiControlOptIn: TNewCheckBox;
   BrandLabel: TNewStaticText;
+  // Unattended upgrade (#177). Decided once, in PrepareToInstall, and then only read.
+  UpgradeDecided: Boolean;
+  UpgradeRunCached: Boolean;
+  UpgradeExitCode: Integer;
+
+// ---------------------------------------------------------------------------------------------
+// UNATTENDED UPGRADE (#177)
+//
+// The daily TallyMCPUpdate task (docs/dev/update-manifest.md) runs this installer as SYSTEM with
+// /VERYSILENT /SUPPRESSMSGBOXES. Nobody answers the wizard, so its pages hold only what
+// InitializeWizard put there: AUTO-DETECTED DEFAULTS, not this install's values - default Tally
+// paths, edition Silver, and GetUserNameString() for the agent user, which under SYSTEM is
+// "SYSTEM". Before this mode, those defaults went to firstrun-config.ps1 as explicit parameters,
+// and explicit parameters win over .env. (Under SYSTEM it never got that far: `net user SYSTEM`
+// fails, and NextButtonClick's plain MsgBox - which /SUPPRESSMSGBOXES does not suppress - waited
+// on an invisible desktop for a click that could never come.)
+//
+// So: a silent run over an existing install, or any run with /UPDATE, is an upgrade. It skips the
+// settings pages, passes no settings at all, and runs firstrun-config.ps1 -Upgrade, which takes
+// everything from .env and the registrations that already exist. A silent run with NO existing
+// install is a new install with nobody to ask whose desktop Tally is on, so it requires
+// /AGENTUSER=<user> and refuses otherwise.
+// ---------------------------------------------------------------------------------------------
+function HasCmdLineSwitch(const Name: string): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+    if CompareText(ParamStr(I), Name) = 0 then
+    begin
+      Result := True;
+      exit;
+    end;
+end;
+
+// "Existing install" means a configured one: .env is what firstrun-config.ps1 writes and what an
+// upgrade preserves. Program files with no .env (a first run that failed) have nothing to keep.
+function IsExistingInstall(): Boolean;
+begin
+  Result := FileExists(AddBackslash(WizardDirValue) + '.env');
+end;
+
+function IsUpgradeRun(): Boolean;
+begin
+  if UpgradeDecided then
+    Result := UpgradeRunCached
+  else
+    Result := IsExistingInstall() and (WizardSilent or HasCmdLineSwitch('/UPDATE'));
+end;
+
+// The GUI agent drives the Tally window on a person's desktop; a service or computer account has
+// no such desktop. Mirrors _AgentUserProblem in firstrun-config.ps1, which checks again by SID.
+function IsServiceAccountName(User: string): Boolean;
+var
+  Leaf: string;
+  P: Integer;
+begin
+  Leaf := Uppercase(Trim(User));
+  P := Pos('\', Leaf);
+  while P > 0 do
+  begin
+    Leaf := Copy(Leaf, P + 1, Length(Leaf));
+    P := Pos('\', Leaf);
+  end;
+  Result := (Leaf = 'SYSTEM') or (Leaf = 'LOCALSYSTEM') or (Leaf = 'LOCAL SERVICE') or
+            (Leaf = 'LOCALSERVICE') or (Leaf = 'NETWORK SERVICE') or (Leaf = 'NETWORKSERVICE');
+  if (not Result) and (Length(Leaf) > 0) then
+    Result := Copy(Leaf, Length(Leaf), 1) = '$';
+end;
 
 function GetPreviousDataIndex(Stored: string): Integer;
 begin
@@ -277,7 +364,11 @@ begin
     DefaultIniPath := 'C:\Program Files\TallyPrime\tally.ini';
 
   DefaultDomain := '';
-  DefaultUser := GetUserNameString();
+  // /AGENTUSER=<user> names the person who uses Tally. A silent NEW install requires it (see
+  // CheckSilentFreshInstall); on an interactive one it just pre-fills the field.
+  DefaultUser := Trim(ExpandConstant('{param:AGENTUSER|}'));
+  if DefaultUser = '' then
+    DefaultUser := GetUserNameString();
 
   // Reindexed when the password moved to RemotePage. Pascal Script has no bounds checking, so a
   // half-done reindex writes the wrong value into the wrong key with no error anywhere.
@@ -369,6 +460,85 @@ begin
   BrandLabel.Top := WizardForm.CancelButton.Top + (WizardForm.CancelButton.Height - BrandLabel.Height) div 2;
 end;
 
+// A silent install onto a machine with nothing installed has nobody to ask which Windows user uses
+// Tally, and the only guess available - the account running Setup - is wrong in exactly the cases
+// that run silently: SYSTEM under a deployment tool or the update task, or an IT admin who will
+// never open Tally. So it is told, with /AGENTUSER, or it refuses. Returns '' to proceed.
+function CheckSilentFreshInstall(): String;
+var
+  User: string;
+  Code: Integer;
+begin
+  Result := '';
+  User := Trim(ExpandConstant('{param:AGENTUSER|}'));
+  if User = '' then
+  begin
+    Result := 'This is a new installation running silently, so there is nobody to ask which Windows user uses Tally, ' +
+              'and Setup will not guess. Run it again with /AGENTUSER=<Windows logon name of the person who uses Tally>, ' +
+              'or run it interactively. Nothing was installed.';
+    exit;
+  end;
+  if Pos('"', User) > 0 then
+  begin
+    Result := '/AGENTUSER contains a double quote, which no Windows account name can. Nothing was installed.';
+    exit;
+  end;
+  if IsServiceAccountName(User) then
+  begin
+    Result := '/AGENTUSER=' + User + ' is a service or computer account. The GUI agent drives the Tally window on a ' +
+              'person''s desktop, so it must be that person''s account. Nothing was installed.';
+    exit;
+  end;
+  // `net user` only knows local accounts. A DOMAIN\user name is left to firstrun-config.ps1, which
+  // resolves it by SID and refuses a service account however it is spelled.
+  if Pos('\', User) = 0 then
+  begin
+    if not Exec(ExpandConstant('{cmd}'), '/C net user "' + User + '" >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, Code) then
+      Code := -1;
+    if Code <> 0 then
+    begin
+      Result := 'Windows user "' + User + '" (from /AGENTUSER) does not exist on this computer. Nothing was installed.';
+      exit;
+    end;
+  end;
+  ConfigPage.Values[3] := User;
+end;
+
+// Runs THIS version's firstrun-config.ps1 -Upgrade -PreflightOnly against the existing install
+// before anything is stopped or copied. It changes nothing; it only answers "can an unattended
+// upgrade keep every setting?" - and when it cannot (no recorded agent user, .env and the agent task
+// disagree, the recorded user is SYSTEM, ...) Setup stops here, leaving the running version exactly
+// as it was, with the reason in the Setup log. Returns '' to proceed.
+function RunUpgradePreflight(): String;
+var
+  Report: string;
+  Loaded: AnsiString;
+  Code: Integer;
+begin
+  Result := '';
+  ExtractTemporaryFile('firstrun-config.ps1');
+  Report := ExpandConstant('{tmp}\upgrade-preflight.txt');
+  if not Exec('powershell.exe',
+              '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}\firstrun-config.ps1') + '"' +
+              ' -InstallDir "' + ExpandConstant('{app}') + '" -AgentTaskName "{#MyAgentTaskName}" -TrayTaskName "{#MyTrayTaskName}"' +
+              ' -Upgrade -PreflightOnly -ReportFile "' + Report + '"',
+              '', SW_HIDE, ewWaitUntilTerminated, Code) then
+  begin
+    Result := 'Setup could not start PowerShell to check that this upgrade can keep the existing settings, so it changed nothing.';
+    exit;
+  end;
+  if Code <> 0 then
+  begin
+    if LoadStringFromFile(Report, Loaded) then
+      Result := String(Loaded)
+    else
+      Result := 'The upgrade check failed (exit code ' + IntToStr(Code) + ') and left no details. Nothing was changed.';
+    exit;
+  end;
+  if LoadStringFromFile(Report, Loaded) then
+    Log(String(Loaded));
+end;
+
 // Runs after the wizard and before any file copying. Stops the running TallyMCP service
 // and agent/tray scheduled tasks so the installer can overwrite locked DLLs like
 // node_modules\@duckdb\node-bindings-win32-x64\duckdb.dll without hitting
@@ -381,6 +551,31 @@ begin
   Result := '';
   NeedsRestart := False;
   installDir := ExpandConstant('{app}');
+
+  // 0. Decide, once, whether this is an unattended upgrade, and refuse what cannot be done safely -
+  //    BEFORE anything below stops a service or a task. A string returned here ends Setup with exit
+  //    code 7 and the reason in the log (/LOG=...).
+  UpgradeRunCached := IsUpgradeRun();
+  UpgradeDecided := True;
+  if HasCmdLineSwitch('/UPDATE') and (not IsExistingInstall()) then
+  begin
+    Result := 'No existing Claudally installation was found in ' + installDir + ' (it has no .env). ' +
+              '/UPDATE only updates an existing installation; it never creates one. Nothing was changed.';
+    Log(Result);
+    exit;
+  end;
+  if UpgradeRunCached then
+  begin
+    Log('Unattended upgrade of ' + installDir + ': every existing setting is kept (firstrun-config.ps1 -Upgrade).');
+    Result := RunUpgradePreflight();
+  end
+  else if WizardSilent then
+    Result := CheckSilentFreshInstall();
+  if Result <> '' then
+  begin
+    Log(Result);
+    exit;
+  end;
 
   // 1. Stop and disable the NSSM service so SCM doesn't auto-restart it while we're
   //    copying files over locked DLLs. Disable is reverted by firstrun-config.ps1's
@@ -471,6 +666,11 @@ function ShouldSkipPage(PageID: Integer): Boolean;
 begin
   Result := False;
   if (PageID = RemotePage.ID) and IsLocalMode() then Result := True;
+  // An unattended upgrade asks nothing: every setting comes from the existing install. Skipping
+  // these pages also keeps NextButtonClick's validation away from their default values.
+  if IsUpgradeRun() and ((PageID = ConfigPage.ID) or (PageID = RemotePage.ID) or
+                         (PageID = EditionPage.ID) or (PageID = EntryOrderPage.ID)) then
+    Result := True;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
@@ -479,6 +679,10 @@ var
   errCode: Integer;
 begin
   Result := True;
+  // Silent: nobody can answer a MsgBox (and /SUPPRESSMSGBOXES does not suppress MsgBox, only
+  // SuppressibleMsgBox), so a failed check here would hang Setup on an invisible dialog. A silent
+  // new install's agent user is checked in PrepareToInstall (CheckSilentFreshInstall) instead.
+  if WizardSilent then exit;
   if CurPageID = ConfigPage.ID then
   begin
     // Validate the GUI agent user actually exists on this box. Catches typos / paste accidents
@@ -540,9 +744,18 @@ end;
 // Lives in {tmp} (the installer's per-user temp folder, ACL'd to the installing user). The PowerShell
 // script reads it and immediately deletes it, so the password never appears on a process command line
 // where Get-CimInstance Win32_Process / wmic could observe it during the install window.
+//
+// EMPTY IN LOCAL MODE, where no file is written (CurStepChanged). Handing firstrun-config.ps1 the
+// path of a file that does not exist made it throw "Credentials file not found" whenever the
+// install it was upgrading turned out to be REMOTE - which, with the mode passed as '' (#192), is
+// every remote install - before .env was read, and with the service already disabled by
+// PrepareToInstall. Passing nothing lets it keep the PASSWORD already in .env.
 function GetCredentialsFilePath(Param: string): string;
 begin
-  Result := ExpandConstant('{tmp}\tally-mcp-firstrun-creds.json');
+  if IsLocalMode() then
+    Result := ''
+  else
+    Result := ExpandConstant('{tmp}\tally-mcp-firstrun-creds.json');
 end;
 
 // Hook: called by Inno Setup as the install transitions through phases. We write the credentials
@@ -562,24 +775,39 @@ end;
 var
   UninstRemoveVault: Boolean;
 
+// How the answer reaches uninstall-cleanup.ps1 - see the note on [UninstallRun] for why it cannot
+// be a {code:} parameter. The uninstaller's own environment is inherited by the [UninstallRun] child.
+function SetEnvironmentVariable(lpName: string; lpValue: string): BOOL;
+  external 'SetEnvironmentVariableW@kernel32.dll stdcall';
+
+//
+// A SILENT uninstall is never asked. A plain MsgBox is not suppressed by /SUPPRESSMSGBOXES (only
+// SuppressibleMsgBox is), and without that switch nothing is suppressed at all, so under SYSTEM - a
+// deployment tool, or anything run from session 0 - the question would wait on a desktop nobody can
+// see, and the uninstall would hang for good. Silent takes the recommended answer, delete, unless
+// the caller passes /KEEPVAULT (e.g. to uninstall and reinstall unattended).
 function InitializeUninstall(): Boolean;
+var
+  Flag: string;
 begin
   Result := True;
-  UninstRemoveVault :=
-    MsgBox('Remove saved Tally company passwords?' + #13#10#13#10 +
-           'Claudally can store the password for each password-protected company so Claude can open ' +
-           'them for you. They are encrypted and tied to this computer.' + #13#10#13#10 +
-           'Yes  - delete them now (recommended)' + #13#10 +
-           'No   - keep them, so a future reinstall picks them up',
-           mbConfirmation, MB_YESNO or MB_DEFBUTTON1) = IDYES;
+  if UninstallSilent() then
+    UninstRemoveVault := not HasCmdLineSwitch('/KEEPVAULT')
+  else
+    UninstRemoveVault :=
+      MsgBox('Remove saved Tally company passwords?' + #13#10#13#10 +
+             'Claudally can store the password for each password-protected company so Claude can open ' +
+             'them for you. They are encrypted and tied to this computer.' + #13#10#13#10 +
+             'Yes  - delete them now (recommended)' + #13#10 +
+             'No   - keep them, so a future reinstall picks them up',
+             mbConfirmation, MB_YESNO or MB_DEFBUTTON1) = IDYES;
+  // Always set, to 1 or 0, so a value inherited from whoever launched the uninstaller cannot decide
+  // for the operator.
+  if UninstRemoveVault then Flag := '1' else Flag := '0';
+  if not SetEnvironmentVariable('CLAUDALLY_UNINSTALL_REMOVE_VAULT', Flag) then
+    Log('Could not pass the vault answer to uninstall-cleanup.ps1; the saved passwords will be kept.');
+  Log('Remove saved Tally company passwords: ' + Flag);
 end;
-
-// Passed to uninstall-cleanup.ps1 as the value of -RemoveVault.
-function GetRemoveVaultFlag(Param: string): string;
-begin
-  if UninstRemoveVault then Result := '-RemoveVault' else Result := '';
-end;
-
 procedure CurPageChanged(CurPageID: Integer);
 begin
   if CurPageID = wpFinished then
@@ -614,10 +842,40 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   CredsPath, Json, Password, Escaped: string;
+  Code: Integer;
 begin
+  // Unattended upgrade: reconfigure from the existing install, not from the wizard. Run here with
+  // Exec rather than from [Run] because [Run] discards the exit code, and the update task has to
+  // know when the new files are in place but the reconfiguration failed - that is its cue to roll
+  // back. See GetCustomSetupExitCode. ExecAndLogOutput (with no callback) copies the script's
+  // output into the Setup log, so one /LOG file tells support the whole story.
+  if (CurStep = ssPostInstall) and IsUpgradeRun() then
+  begin
+    try
+      if not ExecAndLogOutput('powershell.exe',
+                  '-ExecutionPolicy Bypass -NoProfile -NonInteractive -File "' + ExpandConstant('{app}\scripts\installer\firstrun-config.ps1') + '"' +
+                  ' -InstallDir "' + ExpandConstant('{app}') + '" -ServiceName "{#MyServiceName}" -AgentTaskName "{#MyAgentTaskName}"' +
+                  ' -TrayTaskName "{#MyTrayTaskName}" -TunnelServiceName "{#MyTunnelServiceName}" -Upgrade -Unattended',
+                  ExpandConstant('{app}'), SW_SHOWNORMAL, ewWaitUntilTerminated, Code, nil) then
+        Code := -1;
+    except
+      Log('Could not run firstrun-config.ps1 -Upgrade: ' + GetExceptionMessage);
+      Code := -1;
+    end;
+    if Code <> 0 then
+    begin
+      UpgradeExitCode := 10;
+      Log('firstrun-config.ps1 -Upgrade failed (exit code ' + IntToStr(Code) + '); see ' +
+          ExpandConstant('{app}\logs\firstrun-config.log') + '. Setup will exit with code 10.');
+    end
+    else
+      Log('firstrun-config.ps1 -Upgrade completed; existing settings kept.');
+  end;
+
   // Local mode never writes a credentials file. firstrun-config.ps1 shreds one if it finds it,
-  // but the stronger guarantee is that no password is ever produced to be shredded.
-  if (CurStep = ssInstall) and (not IsLocalMode()) then
+  // but the stronger guarantee is that no password is ever produced to be shredded. Nor does an
+  // upgrade, which keeps whatever password .env already holds.
+  if (CurStep = ssInstall) and (not IsLocalMode()) and (not IsUpgradeRun()) then
   begin
     CredsPath := GetCredentialsFilePath('');
     Password := RemotePage.Values[0];
@@ -630,7 +888,9 @@ begin
     Json := '{"password":"' + Escaped + '"}';
     if not SaveStringToFile(CredsPath, Json, False) then
     begin
-      MsgBox('Failed to write installer credentials file at ' + CredsPath + '. Install cannot continue.', mbError, MB_OK);
+      // Suppressible: this is reachable in a silent run (remote mode, once #192 restores it).
+      Log('Failed to write installer credentials file at ' + CredsPath + '.');
+      SuppressibleMsgBox('Failed to write installer credentials file at ' + CredsPath + '. Install cannot continue.', mbError, MB_OK, IDOK);
       Abort;
     end;
   end;
@@ -683,6 +943,14 @@ begin
     Result := 'true'
   else
     Result := 'false';
+end;
+
+// 10 = the files were installed but firstrun-config.ps1 -Upgrade failed, so services and tasks may
+// be stopped. Only an unattended upgrade sets it. Inno's own codes (1-8) cover everything else,
+// including 7 for an upgrade or silent install refused in PrepareToInstall before anything changed.
+function GetCustomSetupExitCode(): Integer;
+begin
+  Result := UpgradeExitCode;
 end;
 
 function GetWizardEdition(Param: string): string;

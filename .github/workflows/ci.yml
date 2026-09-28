@@ -205,6 +205,16 @@ jobs:
           }
           Write-Host 'No PSScriptAnalyzer errors'
 
+      # The daily update task (#177) will run the installer silently, as SYSTEM, over a working
+      # install, and an unattended upgrade must keep every setting it finds. This runs
+      # firstrun-config.ps1 against fake install roots with every service, task and ACL call
+      # replaced by a recording stand-in - nothing on the runner is registered - and fails if .env
+      # changes by a byte, if a task is registered for anyone but the recorded user, or if a case
+      # it should refuse goes ahead. Windows PowerShell 5.1, because that is what the installer runs.
+      - name: Unattended upgrade keeps every setting (firstrun-config.ps1)
+        shell: powershell
+        run: .\scripts\installer\test-firstrun-config.ps1
+
       # The installer's [Code] section is Pascal Script and nothing in CI ever compiled it, so a
       # broken wizard function or a dangling {code:...} reference could only be caught by cutting a
       # release. This compiles the real .iss against a tree of stub files - seconds, no downloads.
