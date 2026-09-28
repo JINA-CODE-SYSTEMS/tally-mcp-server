@@ -15,6 +15,19 @@
     SUPPOSED to have a service and a listening port, and painting that red would train operators
     to ignore the output.
 
+    Each check reports one of five statuses:
+      PASS     looked, and the property holds
+      FAIL     looked, and found something wrong (or the check broke in a way that is itself a fault)
+      UNKNOWN  could NOT look - most often because this run is not elevated and the thing to inspect
+               belongs to another Windows account. Neither pass nor fail: nothing was found wrong,
+               but nothing was proved either. The reason always says what to do to settle it
+               (usually: re-run as Administrator).
+      NA       the property is not claimed in this mode, so there is nothing to verify
+      INFO     an observation that never affects the verdict
+    UNKNOWN exists so that "we could not look" is never reported as "we looked and it was clean"
+    (a PASS), without painting a correct install red (a FAIL) for a non-admin user. The overall
+    verdict is FAIL if any check FAILed, else UNKNOWN if any check is UNKNOWN, else PASS.
+
     Checks, in order:
       1. Deployment mode      - which mode is configured, and is the value valid
       2. No listening socket  - owned by OUR processes; attributed by PID, never by port number
@@ -45,6 +58,12 @@
     Emit a single JSON object instead of the human report - attach it to a support ticket. All
     human chatter is suppressed so the output stays pipeable (`... -Json | ConvertFrom-Json`).
 
+.PARAMETER AllowUnknown
+    Exit 0 instead of 3 when the verdict is UNKNOWN (no FAIL, but at least one check could not
+    look). For a CI gate or a scheduled task that runs unelevated and should only break on a real
+    FAIL. It changes the exit code ONLY: the report and the JSON still say UNKNOWN, with the
+    reason, so the gap stays visible to whoever reads the output.
+
 .EXAMPLE
     .\scripts\verify-deployment.ps1
     Human-readable report plus a final verdict.
@@ -53,11 +72,24 @@
     powershell -ExecutionPolicy Bypass -File "C:\Program Files\TallyMCP\scripts\verify-deployment.ps1" -Json > verify.json
     Machine-readable output for a support ticket.
 
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File scripts\verify-deployment.ps1 -AllowUnknown
+    CI gate: fails the step on a real FAIL (exit 1) or a run that could not start (exit 2), and
+    lets an unelevated UNKNOWN through with exit 0.
+
 .NOTES
-    Exit codes (so this can gate CI later):
-      0  no check FAILed
-      1  at least one check FAILed
-      2  could not run at all (InstallDir missing)
+    Exit codes:
+      0  PASS - every check passed, or was NA / INFO
+      1  FAIL - at least one check FAILed (wins over UNKNOWN)
+      2  ERROR - could not run at all (InstallDir missing)
+      3  UNKNOWN - nothing FAILed, but at least one check could not look. Exit 0 instead with
+         -AllowUnknown. Kept distinct from 0 by default because a clean exit is what automation
+         reads as "verified", and this run did not verify everything.
+    A CI gate that should break only on real failures either passes -AllowUnknown, or treats
+    exit 1 and 2 as failure and 3 as a warning.
+
+    -Json output is schemaVersion 2: status and verdict can be UNKNOWN, counts carry an 'unknown'
+    field, and the payload records the exitCode it chose (schemaVersion 1 had no UNKNOWN).
 
     Windows PowerShell 5.1 compatible ON PURPOSE - customers have 5.1, not pwsh 7. So: no ternary,
     no ?? / ?., no `class`, no -Parallel. Verify any edit with the 5.1 parser, not just by running
@@ -72,12 +104,15 @@ param(
     [string]$InstallDir,
     [string]$ServiceName       = 'TallyMCP',
     [string]$TunnelServiceName = 'TallyMCPTunnel',
-    [switch]$Json
+    [switch]$Json,
+    [switch]$AllowUnknown
 )
 
 # Continue, not Stop: a verification tool that aborts on the first surprise reports nothing about
 # the other six checks. Each check owns its own try/catch and turns an unexpected error into a FAIL
-# for that check alone (fail closed - see Invoke-Check).
+# for that check alone (fail closed - see Invoke-Check). An UNEXPECTED error stays a FAIL, not an
+# UNKNOWN: UNKNOWN is reserved for the specific, understood cases where this run lacked the access
+# to look, each of which names the remedy. An exception nobody anticipated has no such remedy.
 $ErrorActionPreference = 'Continue'
 
 if (-not $InstallDir -or -not $InstallDir.Trim()) {
@@ -90,14 +125,15 @@ if (-not (Test-Path -LiteralPath $InstallDir)) {
         # -Json is the support-ticket contract: the caller pipes this into ConvertFrom-Json. Emitting
         # a human sentence here broke that for the one case where support most needs the detail.
         (New-Object psobject -Property ([ordered]@{
-            schemaVersion = 1
+            schemaVersion = 2
             tool          = 'scripts/verify-deployment.ps1'
             issue         = 172
             generatedAt   = (Get-Date).ToString('o')
             machine       = $env:COMPUTERNAME
             installDir    = $InstallDir
             verdict       = 'ERROR'
-            error         = "InstallDir does not exist. Pass -InstallDir <path to the Tally MCP install>."
+            exitCode      = 2
+            error         ="InstallDir does not exist. Pass -InstallDir <path to the Tally MCP install>."
             checks        = @()
         })) | ConvertTo-Json -Depth 4
     } else {
@@ -126,6 +162,9 @@ $EnvFile = Join-Path $InstallDir '.env'
 $EnvExists    = $false
 $EnvReadable  = $false
 $EnvReadError = ''
+# Denied specifically, as opposed to any other read failure. Only a denial is the understood
+# "this account may not look" case that check 1 can report as UNKNOWN; anything else stays a FAIL.
+$EnvDenied    = $false
 try {
     $null = Get-Item -LiteralPath $EnvFile -Force -ErrorAction Stop
     $EnvExists = $true
@@ -134,6 +173,7 @@ try {
     # honest answer either way and must not be reported as "missing".
     $EnvExists    = $true
     $EnvReadError = 'access denied'
+    $EnvDenied    = $true
 } catch {
     $EnvExists = $false
 }
@@ -145,6 +185,11 @@ if ($EnvExists -and -not $EnvReadError) {
         $EnvReadable = $true
     } catch {
         $EnvReadError = $_.Exception.Message
+        # Get-Content surfaces a denial as UnauthorizedAccessException, with an error id of
+        # GetContentReaderUnauthorizedAccessError; accept either so a wrapped exception still counts.
+        if (($_.Exception -is [System.UnauthorizedAccessException]) -or ("$($_.FullyQualifiedErrorId)" -like '*UnauthorizedAccess*')) {
+            $EnvDenied = $true
+        }
     }
 }
 
@@ -203,12 +248,19 @@ function Test-EnvKeyPresent {
 }
 
 # ---------------------------------------------------------------------------
-# Check result plumbing. Status is one of PASS / FAIL / NA / INFO.
-#   NA     the property is not claimed in this mode. Carries a Reason. Never a failure.
-#   INFO   an observation, never a verdict input (Tally reachability).
-#   Caveat "this PASS is weaker than it looks" - printed indented under the check and surfaced in
-#          the final verdict, because a security control that silently passes when it could not
-#          actually see anything is worse than no control at all.
+# Check result plumbing. Status is one of PASS / FAIL / UNKNOWN / NA / INFO.
+#   UNKNOWN the check could not look at what it was asked to verify (in practice: this run lacks the
+#           access). Neither pass nor fail - it is its own verdict and its own exit code, so
+#           "could not look" is never folded into "clean" and a correct install is never shown red
+#           to a non-admin. The Reason must say what would settle it. Reserved for the specific,
+#           understood no-access cases below; an unexpected exception is still a FAIL.
+#   NA      the property is not claimed in this mode. Carries a Reason. Never a failure.
+#   INFO    an observation, never a verdict input (Tally reachability).
+#   Caveat  "this PASS is weaker than it looks" - printed indented under the check and surfaced in
+#           the final verdict, because a security control that silently passes when it could not
+#           fully see is worse than no control at all. The line between a caveat and UNKNOWN: a
+#           caveated PASS did look at the thing and found nothing wrong with partial visibility;
+#           UNKNOWN did not get to look at the thing at all.
 # ---------------------------------------------------------------------------
 $Checks = New-Object System.Collections.ArrayList
 
@@ -276,12 +328,22 @@ $UnreadableCandidates = @()
 # install for it. Nothing that is genuinely ours - node running dist\, the tray, the GUI agent -
 # ever names this script, so excluding by this file's own name is exact rather than a heuristic.
 $SelfScriptName = Split-Path -Leaf $PSCommandPath
+# Did the process table come back at all? If it did not, no listener can be attributed either way,
+# and an empty $OurProcesses would otherwise read as "nothing of ours is running" - a free PASS for a
+# check that saw nothing. The socket check turns this into UNKNOWN when anything is listening.
+$ProcessEnumOk    = $false
+$ProcessEnumError = ''
 try {
     # Escape wildcard metacharacters before using the path as a -like pattern; an install dir
     # containing '[' would otherwise silently match nothing and hand back a false PASS.
     $likePattern = '*' + [System.Management.Automation.WildcardPattern]::Escape($InstallDir) + '*'
     $selfPattern = '*' + [System.Management.Automation.WildcardPattern]::Escape($SelfScriptName) + '*'
-    foreach ($p in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
+    $allProcs = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    # A live Windows box always has processes (this one, at least), so an empty table is a failed
+    # query, not an idle machine.
+    $ProcessEnumOk = ($allProcs.Count -gt 0)
+    if (-not $ProcessEnumOk) { $ProcessEnumError = 'Win32_Process returned no processes at all' }
+    foreach ($p in $allProcs) {
         $hasPath = ($p.ExecutablePath -and $p.ExecutablePath.Length -gt 0)
         $hasCmd  = ($p.CommandLine    -and $p.CommandLine.Length    -gt 0)
         if ([int]$p.ProcessId -eq $PID) { continue }
@@ -294,8 +356,11 @@ try {
         }
     }
 } catch {
-    # Leave both sets empty; the socket check reports the shortfall through its own caveat.
+    # Leave both sets empty and record why; the socket check reports the shortfall as UNKNOWN.
+    $OurProcesses         = @()
     $UnreadableCandidates = @()
+    $ProcessEnumOk        = $false
+    $ProcessEnumError     = $_.Exception.Message
 }
 
 function Format-ProcessLine {
@@ -314,10 +379,15 @@ function Format-ProcessLine {
 # non-English box - a false PASS on the single most important check here. Instead it keys on the
 # locale-independent fact that a listening socket has foreign port 0 (0.0.0.0:0 / [::]:0), which an
 # established connection never has.
+#
+# Readable says whether either source actually produced a socket table. It is false only when
+# Get-NetTCPConnection gave nothing AND netstat printed nothing at all (not even its header) - a
+# failed query, which must not be read as "nothing is listening".
 # ---------------------------------------------------------------------------
 function Get-ListeningEndpoint {
     $result = New-Object System.Collections.ArrayList
     $source = ''
+    $readable = $false
     if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
         $source = 'Get-NetTCPConnection'
         foreach ($c in @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue)) {
@@ -326,11 +396,13 @@ function Get-ListeningEndpoint {
                 OwningPid = [int]$c.OwningProcess
             })))
         }
+        if ($result.Count -gt 0) { $readable = $true }
     }
     if ($result.Count -eq 0) {
         $source = 'netstat -ano'
         $lines = @()
         try { $lines = @(& netstat.exe -ano 2>$null) } catch { $lines = @() }
+        if ($lines.Count -gt 0) { $readable = $true }
         foreach ($line in $lines) {
             $m = [regex]::Match($line, '^\s*TCP\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)\s*$')
             if (-not $m.Success) { continue }
@@ -341,7 +413,7 @@ function Get-ListeningEndpoint {
             })))
         }
     }
-    return (New-Object psobject -Property ([ordered]@{ Source = $source; Endpoints = @($result) }))
+    return (New-Object psobject -Property ([ordered]@{ Source = $source; Endpoints = @($result); Readable = $readable }))
 }
 
 # ---------------------------------------------------------------------------
@@ -361,14 +433,32 @@ Invoke-Check -Id 'deployment-mode' -Name 'Deployment mode' -Body {
         # DEPLOYMENT_MODE key, therefore remote" turned a local install into a green report with all
         # four of #172's claims skipped. Stop here instead: $Mode stays '', $ModeKnown stays false,
         # and the four mode-scoped checks report NA-undetermined rather than a fabricated all-clear.
+        $ev = @(
+            "config file: $EnvFile",
+            "opening it failed: $EnvReadError",
+            "running as: $($Identity.Name) (elevated: $IsElevated)",
+            "no value was read from this file, so this run reports no mode at all rather than guessing one"
+        )
+        if ($EnvDenied -and -not $IsElevated) {
+            # UNKNOWN, not FAIL. The installer locks .env to SYSTEM, Administrators and the agent user
+            # (firstrun-config.ps1:397), so an unelevated run by any other account being denied is
+            # exactly what a CORRECT install looks like from outside - painting that red is the
+            # "correct state shown as a fault" #172 forbids. Nothing was verified either, so it is
+            # not a PASS. The overall verdict carries the UNKNOWN; the exit code follows it.
+            New-Check -Id 'deployment-mode' -Name 'Deployment mode' -Status 'UNKNOWN' `
+                -Reason "The configuration file exists but this Windows account is not allowed to read it, so the deployment mode - and with it every mode-specific check below - could not be verified. That is what a correctly locked-down install looks like from an account other than the one that installed it (the installer restricts .env to SYSTEM, Administrators and the agent user), so this is not a fault. Re-run this script as Administrator, or as the account that installed Tally MCP, to get an actual answer." `
+                -Evidence $ev | Out-Null
+            return
+        }
+        # Elevated and still denied, or a read failure that is not a denial at all: the installer
+        # always grants Administrators Full Control, so neither is explained by a correct install.
+        $why = "reading it failed with an error that is not a permissions denial (see below), so this is not explained by which account ran the script"
+        if ($IsElevated) {
+            $why = "even this elevated run could not read it, and the installer always grants Administrators Full Control on .env - so something has changed the file's permissions, or it is unreadable for another reason (see below)"
+        }
         New-Check -Id 'deployment-mode' -Name 'Deployment mode' -Status 'FAIL' `
-            -Reason "The configuration file exists but this Windows account cannot read it, so nothing below could be judged against the real deployment mode. The installer locks .env to SYSTEM, Administrators and the agent user only - so this normally just means the script is being run by a different Windows account than the one that installed Tally MCP. Re-run it as Administrator, or as the account that installed the product." `
-            -Evidence @(
-                "config file: $EnvFile",
-                "opening it failed: $EnvReadError",
-                "running as: $($Identity.Name) (elevated: $IsElevated)",
-                "no value was read from this file, so this run reports no mode at all rather than guessing one"
-            ) | Out-Null
+            -Reason "The configuration file exists but could not be read, so nothing below could be judged against the real deployment mode: $why. Check the file and its permissions (icacls `"$EnvFile`"), then re-run." `
+            -Evidence $ev | Out-Null
         return
     }
     $raw = Get-EnvValue 'DEPLOYMENT_MODE'
@@ -403,7 +493,8 @@ $IsLocal   = ($Mode -eq 'local')
 # When check 1 could not settle the mode (no .env, or a typo'd value), the four mode-scoped checks
 # below have nothing to interpret themselves against. They must NOT fall through to the "remote mode
 # does this by design" reason - that would tell a customer with a broken .env that their install is
-# fine as remote. NA with the real reason instead; check 1 already carries the FAIL and the exit code.
+# fine as remote. NA with the real reason instead; check 1 already carries the FAIL (or, for an
+# unreadable .env on an unelevated run, the UNKNOWN) and with it the verdict and the exit code.
 $ModeKnown = ($Mode -eq 'local' -or $Mode -eq 'remote')
 
 function New-UndeterminedModeCheck {
@@ -492,14 +583,34 @@ Invoke-Check -Id 'no-listening-socket' -Name 'No listening socket owned by Tally
         New-Check -Id 'no-listening-socket' -Name 'No listening socket owned by Tally MCP' -Status 'FAIL' `
             -Reason "A process from this install is listening on $($detail -join ', '). Local mode is supposed to bind nothing at all, so something is still running the HTTP server (dist\server.mjs) - look for a leftover service or a hand-started process." `
             -Evidence $evidence -Caveat $caveat | Out-Null
+    } elseif (-not $listen.Readable) {
+        # Neither Get-NetTCPConnection nor netstat produced a socket table. Zero endpoints here means
+        # "did not look", not "nothing listens" - reporting it as the PASS below would be a false
+        # all-clear on the single most important local-mode claim.
+        New-Check -Id 'no-listening-socket' -Name 'No listening socket owned by Tally MCP' -Status 'UNKNOWN' `
+            -Reason "The list of listening sockets could not be read on this machine (Get-NetTCPConnection returned nothing and netstat produced no output), so whether anything of ours is listening could not be checked at all. Re-run this script; if it still says this, run 'netstat -ano' by hand and look for a listener owned by one of the processes named below." `
+            -Evidence $evidence -Caveat $caveat | Out-Null
     } elseif ($ambiguous.Count -gt 0) {
         # NOT a detection - say so in the first clause. This branch fires because the run lacked the
         # privilege to read a command line, and the named process is very often unrelated software
-        # (any Node app under another Windows account looks exactly like this). It stays a FAIL
-        # because "we could not look" must not be reported as "we looked and it was clean", but a
-        # reason worded as an accusation would send customers hunting a listener they do not have.
-        New-Check -Id 'no-listening-socket' -Name 'No listening socket owned by Tally MCP' -Status 'FAIL' `
-            -Reason "UNVERIFIED, not a detection. $($ambiguous -join ', ') is listening, and this run does not have permission to read that process's command line - so it can be neither confirmed nor ruled out as Tally MCP. It is most likely unrelated software running under another Windows account. Re-run this script as Administrator and it will attribute the process one way or the other." `
+        # (any Node app under another Windows account looks exactly like this). It is UNKNOWN, not
+        # PASS, because "we could not look" must not be reported as "we looked and it was clean" -
+        # and not FAIL either, because on a correct install with an unrelated Node service that
+        # painted every unelevated run red and made the exit code useless as a gate (#193).
+        $settle = "Re-run this script as Administrator and it will attribute the process one way or the other."
+        if ($IsElevated) {
+            # Elevated and still unreadable: a protected process, or one that exited mid-run.
+            # "Re-run as Administrator" would be advice this run has already followed.
+            $settle = "Even this elevated run could not read its command line (a protected process, or one that exited during the check). Re-run once; if it persists, identify the process by its PID in Task Manager's Details tab."
+        }
+        New-Check -Id 'no-listening-socket' -Name 'No listening socket owned by Tally MCP' -Status 'UNKNOWN' `
+            -Reason "Not a detection. $($ambiguous -join ', ') is listening, and this run does not have permission to read that process's command line - so it can be neither confirmed nor ruled out as Tally MCP. It is most likely unrelated software running under another Windows account. $settle" `
+            -Evidence $evidence -Caveat $caveat | Out-Null
+    } elseif ((-not $ProcessEnumOk) -and $listen.Endpoints.Count -gt 0) {
+        # The socket table came back but the process table did not, so no listener could be tested
+        # against our install tree at all - an empty "ours" here is an artefact of not looking.
+        New-Check -Id 'no-listening-socket' -Name 'No listening socket owned by Tally MCP' -Status 'UNKNOWN' `
+            -Reason "$($listen.Endpoints.Count) socket(s) are listening on this machine, but the process list could not be read ($ProcessEnumError), so none of them could be attributed to Tally MCP or ruled out. Re-run this script as Administrator; if it still says this, the WMI service (winmgmt) may need attention." `
             -Evidence $evidence -Caveat $caveat | Out-Null
     } else {
         New-Check -Id 'no-listening-socket' -Name 'No listening socket owned by Tally MCP' -Status 'PASS' `
@@ -688,6 +799,13 @@ Invoke-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' 
         # Same default as src\mcp.mts:5186 and the tray (scripts\tray\tally-mcp-tray.ps1:270).
         $vaultPath = Join-Path $dataPath '.tally-mcp-companies.json'
     }
+    # An unreadable .env looks exactly like one with no overrides, so the default above may not be
+    # where this install keeps its vault at all. Say so rather than claiming the keys are "not set",
+    # and remember it: a vault NOT found at the default is then "did not know where to look".
+    $vaultLocationUnknown = ($EnvExists -and -not $EnvReadable)
+    if ($vaultLocationUnknown) {
+        $vaultNote = ".env could not be read by this account, so any TALLY_DATA_PATH / TALLY_COMPANIES_CONFIG / AGENT_TASK_USER setting in it is unknown; this looked only at the installer default location"
+    }
 
     # Is the default installer data path in play? Only then may the FAIL text talk about what
     # C:\Users\Public grants - see the inheritance problem below, which used to assert that
@@ -736,14 +854,14 @@ Invoke-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' 
                 -Reason "The company vault exists but even this elevated run is denied permission to read its ACL. The installer always grants Administrators Full Control, so something has rewritten this file's permissions and the protection of the stored Tally passwords cannot be established at all. Take ownership and reset it: takeown /f `"$vaultPath`" then icacls `"$vaultPath`" /inheritance:r /grant:r 'SYSTEM:F' 'Administrators:F'" `
                 -Evidence $ev | Out-Null
         } else {
-            # NOT a FAIL. This is what a correctly locked-down vault looks like from an account that
-            # is supposed to be shut out, and #172's rule is that a correct state never shows red.
-            # It is not a PASS either - inheritance and the entry list went unread - so it carries a
-            # caveat, which the verdict footer counts.
-            New-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' -Status 'NA' `
-                -Reason "The company vault exists, but this Windows account is denied permission even to read its permissions. That is what a correctly locked-down vault looks like from an account that is meant to be shut out - so this is not a fault. It does mean nothing here was actually verified." `
-                -Evidence $ev `
-                -Caveat "This check verified nothing. To confirm the vault's permissions are right, re-run this script as Administrator." | Out-Null
+            # UNKNOWN. Not a FAIL: this is what a correctly locked-down vault looks like from an
+            # account that is supposed to be shut out, and #172's rule is that a correct state never
+            # shows red. Not a PASS: inheritance and the entry list went unread. (This used to be NA
+            # plus a caveat, which told the reader "not applicable" about the one check that most
+            # applies in both modes, and let the run exit 0 having verified nothing here.)
+            New-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' -Status 'UNKNOWN' `
+                -Reason "The company vault exists, but this Windows account is denied permission even to read its permissions, so they could not be checked. That is what a correctly locked-down vault looks like from an account that is meant to be shut out - so this is not a fault - but it is not a verification either. Re-run this script as Administrator to confirm the vault's permissions are right." `
+                -Evidence $ev | Out-Null
         }
         return
     }
@@ -752,6 +870,14 @@ Invoke-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' 
         $ev = @("looked for: $vaultPath")
         if ($vaultNote) { $ev += $vaultNote }
         $ev += "the path does not exist (this is 'not found', not 'access denied' - the two are told apart here)"
+        if ($vaultLocationUnknown) {
+            # Not at the default - but .env, which is where a non-default location would be named,
+            # could not be read. "No vault on this machine" would be a claim this run cannot back.
+            New-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' -Status 'UNKNOWN' `
+                -Reason "There is no company vault at the installer's default location, but this account cannot read .env, which is where a different location would be configured - so whether a vault exists elsewhere, and how it is protected, could not be checked. Re-run this script as Administrator, or as the account that installed Tally MCP." `
+                -Evidence $ev | Out-Null
+            return
+        }
         New-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' -Status 'NA' `
             -Reason "There is no company vault on this machine, so no Tally passwords are stored and there is no ACL to get wrong." `
             -Evidence $ev | Out-Null
@@ -845,6 +971,10 @@ Invoke-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' 
     # proven failure, and this script already has the right vehicle for it: a caveat, which says the
     # check could not fully see what it was asked to inspect.
     #
+    # Why a caveated PASS and not UNKNOWN: this run DID read the whole ACL - inheritance, every entry
+    # - and found nothing known to be wrong. What it lacks is a name for one entry. UNKNOWN is kept
+    # for checks that could not look at the thing at all.
+    #
     # A broad group is different. Everyone / Users / INTERACTIVE holding rights on the vault is
     # wrong no matter who the agent account turns out to be, so that stays a hard FAIL.
     $indeterminate = ($offenders.Count -gt 0) -and ($broadOffenders.Count -eq 0) -and (-not $agentSid)
@@ -853,7 +983,9 @@ Invoke-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' 
     if ($broadOffenders.Count -gt 0) {
         $problems += "a group that means every local account holds rights here: $($broadOffenders -join '; ')"
     } elseif ($indeterminate) {
-        $caveat = if (-not $agentUser) {
+        $caveat = if ($vaultLocationUnknown) {
+            "This account cannot read $EnvFile, so the AGENT_TASK_USER it records is unknown and this run cannot confirm that '$($offenders -join '; ')' is the agent account the installer granted rather than an unexpected principal. Inheritance is blocked and no broad group is present, so nothing here is known to be wrong - but this is weaker than a clean pass. Re-run as Administrator."
+        } elseif (-not $agentUser) {
             "AGENT_TASK_USER is not recorded in $EnvFile, so this run cannot confirm that '$($offenders -join '; ')' is the agent account the installer granted rather than an unexpected principal. Inheritance is blocked and no broad group is present, so nothing here is known to be wrong - but this is weaker than a clean pass. Re-run on the installed machine, or run the installer's Reconfigure to persist the key."
         } else {
             "AGENT_TASK_USER '$agentUser' from .env does not resolve to an account on this machine (a renamed account, or a domain that cannot be reached from here), so this run cannot tell whether '$($offenders -join '; ')' is that account or an unexpected principal."
@@ -883,9 +1015,13 @@ Invoke-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' 
     } else {
         $who = 'SYSTEM and Administrators'
         if ($agentSid) { $who = "SYSTEM, Administrators and $agentUser" }
+        $locCaveat = ''
+        if ($vaultLocationUnknown) {
+            $locCaveat = "This is the vault at the installer's default location. This account cannot read .env, so if the install is configured to keep its vault somewhere else, that one was not checked. Re-run as Administrator to be sure."
+        }
         New-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' -Status 'PASS' `
             -Reason "Inheritance is disabled and only $who can reach the vault." `
-            -Evidence $evidence | Out-Null
+            -Evidence $evidence -Caveat $locCaveat | Out-Null
     }
 }
 
@@ -940,17 +1076,30 @@ Invoke-Check -Id 'tally-reachable' -Name 'Tally XML server reachable (informatio
 # ---------------------------------------------------------------------------
 # Verdict and output
 # ---------------------------------------------------------------------------
-$passCount = @($Checks | Where-Object { $_.status -eq 'PASS' }).Count
-$failCount = @($Checks | Where-Object { $_.status -eq 'FAIL' }).Count
-$naCount   = @($Checks | Where-Object { $_.status -eq 'NA'   }).Count
-$infoCount = @($Checks | Where-Object { $_.status -eq 'INFO' }).Count
-$caveated  = @($Checks | Where-Object { $_.caveat })
+$passCount    = @($Checks | Where-Object { $_.status -eq 'PASS'    }).Count
+$failCount    = @($Checks | Where-Object { $_.status -eq 'FAIL'    }).Count
+$unknownCount = @($Checks | Where-Object { $_.status -eq 'UNKNOWN' }).Count
+$naCount      = @($Checks | Where-Object { $_.status -eq 'NA'      }).Count
+$infoCount    = @($Checks | Where-Object { $_.status -eq 'INFO'    }).Count
+$caveated     = @($Checks | Where-Object { $_.caveat })
+$unknownNames = @($Checks | Where-Object { $_.status -eq 'UNKNOWN' } | ForEach-Object { $_.name })
+
+# FAIL outranks UNKNOWN: a run that found a real problem is a FAIL whatever else it could not see.
+# UNKNOWN outranks PASS: a run that could not look at something has not verified the deployment.
 $verdict = 'PASS'
 if ($failCount -gt 0) { $verdict = 'FAIL' }
+elseif ($unknownCount -gt 0) { $verdict = 'UNKNOWN' }
+
+# Exit codes - see .NOTES. 3 is kept apart from 1 so a CI gate can tell "found a problem" from "could
+# not look", and apart from 0 so nothing reads an unverified run as a verified one unless the caller
+# opted in with -AllowUnknown.
+$exitCode = 0
+if ($verdict -eq 'FAIL') { $exitCode = 1 }
+elseif ($verdict -eq 'UNKNOWN' -and -not $AllowUnknown) { $exitCode = 3 }
 
 if ($Json) {
     $payload = New-Object psobject -Property ([ordered]@{
-        schemaVersion  = 1
+        schemaVersion  = 2
         tool           = 'scripts/verify-deployment.ps1'
         issue          = 172
         generatedAt    = (Get-Date).ToString('o')
@@ -960,19 +1109,21 @@ if ($Json) {
         elevated       = $IsElevated
         runAs          = $Identity.Name
         verdict        = $verdict
+        exitCode       = $exitCode
+        allowUnknown   = [bool]$AllowUnknown
         counts         = (New-Object psobject -Property ([ordered]@{
-            pass = $passCount
-            fail = $failCount
-            na   = $naCount
-            info = $infoCount
+            pass    = $passCount
+            fail    = $failCount
+            unknown = $unknownCount
+            na      = $naCount
+            info    = $infoCount
         }))
         checks         = @($Checks)
     })
     # Depth 6: the deepest path is checks -> evidence -> string, but ConvertTo-Json's default of 2
     # would render the whole checks array as bare type names.
     $payload | ConvertTo-Json -Depth 6
-    if ($failCount -gt 0) { exit 1 }
-    exit 0
+    exit $exitCode
 }
 
 function Write-Wrapped {
@@ -1011,9 +1162,11 @@ foreach ($c in $Checks) {
     $colour = 'Gray'
     if ($c.status -eq 'PASS')     { $colour = 'Green' }
     elseif ($c.status -eq 'FAIL') { $colour = 'Red' }
+    elseif ($c.status -eq 'UNKNOWN') { $colour = 'Yellow' }
     elseif ($c.status -eq 'NA')   { $colour = 'DarkGray' }
     elseif ($c.status -eq 'INFO') { $colour = 'Cyan' }
-    Write-Host ("[" + $c.status.PadRight(4) + "] " + $c.name) -ForegroundColor $colour
+    # PadRight(7) = len('UNKNOWN'), so the check names still line up in one column.
+    Write-Host ("[" + $c.status.PadRight(7) + "] " + $c.name) -ForegroundColor $colour
     if ($c.reason) { Write-Wrapped -Text $c.reason }
     if ($c.evidence) {
         foreach ($e in $c.evidence) { Write-Wrapped -Text "- $e" -Indent '         ' }
@@ -1023,23 +1176,38 @@ foreach ($c in $Checks) {
 }
 
 # "not applicable" is not always about the mode: the vault check reports NA when there is no vault at
-# all, and when an unprivileged account is denied the ACL. Appending "to <mode> mode" unconditionally
-# mislabelled those, so name the mode only in the sentence's own clause below.
-$summary = "$passCount passed, $failCount failed, $naCount not applicable"
+# all. Appending "to <mode> mode" unconditionally mislabelled that, so name the mode only in the
+# sentence's own clause below.
+$summary = "$passCount passed, $failCount failed, $unknownCount unknown, $naCount not applicable"
+$elevateHint = ''
+if (-not $IsElevated) {
+    $elevateHint = " This run is not elevated, which is the usual cause: re-run this script as Administrator and those checks will get an actual answer."
+}
 if ($verdict -eq 'PASS') {
     Write-Host "VERDICT: PASS - $summary (mode: $modeText)." -ForegroundColor Green
     if ($IsLocal -and $caveated.Count -eq 0) {
         Write-Wrapped -Indent '' -Text "The security claims this install makes for local mode hold on this machine right now: nothing of ours is listening, no service is registered, no OAuth password or token store exists, and no tunnel is running."
     } elseif ($IsLocal) {
         # Do not read that flat claim out over caveated results. A caveat means a check could not
-        # actually see what it was asked to look at (no Tally MCP process was running, or the run
+        # fully see what it was asked to look at (no Tally MCP process was running, or the run
         # lacked the privilege to inspect something); asserting the claims "hold" on top of that is
         # the exact over-statement the caveat mechanism exists to prevent.
         Write-Wrapped -Indent '' -Text "Nothing was found wrong with this local-mode install. Read the '!' lines above before treating that as proof: those checks could not fully see what they were asked to inspect, so they did not confirm the claim so much as fail to contradict it."
     }
+} elseif ($verdict -eq 'UNKNOWN') {
+    # Neither green nor red, and never phrased as either. Name the checks, so a reader who only
+    # looks at the last lines still learns which properties went unverified.
+    Write-Host "VERDICT: UNKNOWN - $summary (mode: $modeText)." -ForegroundColor Yellow
+    Write-Wrapped -Indent '' -Text "Nothing was found wrong, but this is NOT a pass: $unknownCount check(s) could not look at what they were asked to verify ($($unknownNames -join '; ')). Each UNKNOWN above says why and what would settle it.$elevateHint"
+    if ($AllowUnknown) {
+        Write-Wrapped -Indent '' -Text "Exiting 0 because -AllowUnknown was passed; without it this result exits 3."
+    }
 } else {
     Write-Host "VERDICT: FAIL - $summary." -ForegroundColor Red
     Write-Wrapped -Indent '' -Text "Each FAIL above says what to do about it. Re-run with -Json and send the output to support if you would like help."
+    if ($unknownCount -gt 0) {
+        Write-Wrapped -Indent '' -Text "In addition, $unknownCount check(s) could not look at what they were asked to verify ($($unknownNames -join '; ')), so they are UNKNOWN rather than passed.$elevateHint"
+    }
 }
 if ($caveated.Count -gt 0) {
     Write-Host ""
@@ -1047,5 +1215,4 @@ if ($caveated.Count -gt 0) {
 }
 Write-Host ""
 
-if ($failCount -gt 0) { exit 1 }
-exit 0
+exit $exitCode
