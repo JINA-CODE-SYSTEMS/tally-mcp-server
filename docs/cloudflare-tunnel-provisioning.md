@@ -1,5 +1,22 @@
 # Cloudflare Tunnel provisioning (per client)
 
+> **LEGACY — frozen, and due to be switched off. Do not use this for new installs.**
+>
+> - **The Cloudflare zone this page lists as a prerequisite does not exist.** `jinacode.systems` is
+>   on GoDaddy nameservers with live company email, and has not been delegated to Cloudflare. The
+>   per-client steps below cannot be followed as written.
+> - **The security claim this path relied on is retracted.** Cloudflare terminates TLS, and the
+>   tunnel would sit in Jina's account, so "we are never in the data path" is not true of it.
+> - **The path is frozen**: no new installs are offered it, and it gets no new features. Existing
+>   `oauth-password` + tunnel installs keep working until it is **switched off 90 days after the
+>   relay (internet) release of device-paired remote access ships**, with notice to existing clients.
+>   Browser-based clients (the claude.ai web connector) lose access at the same time.
+> - Remote access is being rebuilt as device-paired access over our own end-to-end encrypted channel
+>   — LAN first, then an untrusted relay. See
+>   [ADR 0001 — Remote transport](adr/0001-remote-transport.md) (decisions D2 and D9) and #178.
+>
+> The rest of this page is kept unchanged as the reference for how existing legacy installs work.
+
 ## Why
 
 Most tax accountants run Tally on an office PC with **no public domain, no static

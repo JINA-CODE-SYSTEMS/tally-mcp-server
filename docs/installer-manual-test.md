@@ -134,6 +134,18 @@ If that install had a Cloudflare Tunnel token (#193 - older builds put it in the
 - [ ] `verify-deployment.ps1` (elevated) reports *Tunnel token kept out of the service registry* as PASS
 - [ ] Reconfigure with the token blanked removes `.tunnel-token`
 
+If that install had a Cloudflare Tunnel token (#193 - older builds put it in the service registry):
+
+- [ ] `(Get-Item HKLM:\SYSTEM\CurrentControlSet\Services\TallyMCPTunnel\Parameters).GetValue('AppEnvironmentExtra')`
+      has no `TUNNEL_TOKEN=` entry, and neither does the same value under `TallyMCP`; any other
+      entry that was there before is still there
+- [ ] `nssm get TallyMCPTunnel AppParameters` is `tunnel run --token-file .tunnel-token`
+- [ ] `icacls "C:\Program Files\TallyMCP\.tunnel-token"` shows only `NT AUTHORITY\SYSTEM:(F)` and
+      `BUILTIN\Administrators:(F)`, no `(I)` entries; `(Get-Acl ...).Owner` is `BUILTIN\Administrators`
+- [ ] `TallyMCPTunnel` is running and `logs\tunnel.log` shows `Registered tunnel connection`
+- [ ] `verify-deployment.ps1` (elevated) reports *Tunnel token kept out of the service registry* as PASS
+- [ ] Reconfigure with the token blanked removes `.tunnel-token`
+
 ## 7. Uninstall
 
 Set up first: a second Windows profile that has also connected Claude, and a **fork** of the repo
