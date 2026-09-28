@@ -107,7 +107,16 @@ These are the properties a local install is built around. They are stated here b
 powershell -ExecutionPolicy Bypass -File "C:\Program Files\TallyMCP\scripts\verify-deployment.ps1"
 ```
 
-It reports each claim as PASS / FAIL / NA with the evidence it used, interpreted against the mode you are actually running — a remote install is *supposed* to have a service and a port, so it says so rather than painting them red. Add `-Json` to attach the result to a support ticket. Run it from an elevated prompt for the most complete answer: without administrator rights it cannot read the command line of processes owned by other accounts, and it will say so rather than guess.
+It reports each claim as PASS / FAIL / UNKNOWN / NA with the evidence it used, interpreted against the mode you are actually running — a remote install is *supposed* to have a service and a port, so it says so rather than painting them red. Add `-Json` to attach the result to a support ticket. Run it from an elevated prompt for the most complete answer: without administrator rights it cannot read `.env` or the company vault's permissions (the installer locks both away from other accounts), nor the command line of processes owned by other accounts. Where that stops it from looking, the check says **UNKNOWN** and tells you what would settle it, rather than guessing either way — UNKNOWN is not a pass, and it is not a failure.
+
+| Exit code | Verdict | Meaning |
+|---|---|---|
+| `0` | PASS | Every check passed, or does not apply in this mode |
+| `1` | FAIL | At least one check found a real problem (wins over UNKNOWN) |
+| `2` | ERROR | Could not run at all — `-InstallDir` does not exist |
+| `3` | UNKNOWN | Nothing failed, but at least one check could not look — usually because the run is not elevated |
+
+To use it as a CI or scheduled-task gate that should break only on a real failure, add `-AllowUnknown`: an UNKNOWN verdict then exits `0`, while the report and the JSON still say UNKNOWN and why. The `-Json` output is `schemaVersion` 2, which added the UNKNOWN status, `counts.unknown` and `exitCode`.
 
 **What a local install still trusts.** Stored Tally company passwords are protected by Windows DPAPI at machine scope, which means the file's NTFS permissions are what actually keep other accounts on the same PC out of them. The installer locks that file down to SYSTEM, Administrators and the agent user, and `verify-deployment.ps1` checks it. If several people share a Windows login on the Tally PC, they share that protection.
 

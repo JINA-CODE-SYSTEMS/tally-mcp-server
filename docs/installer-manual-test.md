@@ -69,7 +69,10 @@ pwsh scripts\verify-deployment.ps1
 - [ ] No `TallyMCP` service exists
 - [ ] Nothing is listening on the MCP port
 - [ ] Both scheduled tasks exist and are Ready/Running
-- [ ] `verify-deployment.ps1` reports no FAIL
+- [ ] `verify-deployment.ps1`, run from an **elevated** prompt, ends `VERDICT: PASS` and exits 0 -
+      no FAIL and no UNKNOWN. (Unelevated, UNKNOWN on the deployment-mode and vault checks is
+      expected, because the installer locks `.env` and the vault away from other accounts; that is
+      exit 3, not a failure, but it is also not the verification this step asks for.)
 
 Then, **as the user who runs Claude**:
 
