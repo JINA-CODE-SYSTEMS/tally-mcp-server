@@ -2,8 +2,9 @@
 
 | | |
 |---|---|
-| **Status** | Proposed |
-| **Date** | 2026-09-27 |
+| **Status** | Accepted |
+| **Date** | Accepted 2026-09-28 (proposed 2026-09-27) |
+| **Decided by** | The owner, Tapan Jain (@jain-t). Decisions and their reasoning are in [§6](#6-owner-decisions) |
 | **Decides** | the transport under #178, the first box of #192, and whether #193 item 1 survives |
 | **Related** | #192 (re-enable remote), #178 (device-paired remote access), #193 (deferred remote items), #179 (roadmap), #175 (signing), #177 (signed auto-update), #37 (closed: central broker) |
 
@@ -261,7 +262,7 @@ is kept, but confidentiality does not depend on it.
 - **C5** — no per-customer domain, DNS, certificate or public listener. **One** public endpoint for
   the relay, total. It does not need a Cloudflare zone and does not require delegating
   `jinacode.systems`: a single record in the existing DNS, a separate domain, or a platform-provided
-  hostname all work. (Which one is an owner decision, and the answer goes in internal docs.)
+  hostname all work. (Decided: a CNAME record in the existing DNS — [§6](#6-owner-decisions), D5.)
 - **C6 — passes fully.** The Tally machine binds nothing beyond loopback (in fact binds nothing:
   the host agent talks to the MCP server over a child process's stdio) and only dials out.
 - **C7 — best of the bridge options.** Per-user install, no admin, no driver; outbound HTTPS/WSS on
@@ -281,8 +282,10 @@ is kept, but confidentiality does not depend on it.
 
 Design risk to name now: a **vetted PAKE implementation** in our runtime. The channel itself can
 use a well-established pattern (Noise-style mutual authentication over static keys) from a mature
-library; PAKE libraries are scarcer and less audited. Library choice and an external review of the
-channel design belong in phase 2 below, before any code that handles books is written against it.
+library; PAKE libraries are scarcer and less audited. Library choice belongs in phase P1 below,
+before any code that handles books is written against it. (An external review was proposed here;
+the owner declined it in favour of a hard no-home-made-cryptography rule and an internal review —
+[§6](#6-owner-decisions), D7.)
 
 ### (e) Other options judged serious
 
@@ -302,7 +305,8 @@ permanently. Listed only so nobody re-proposes it without reading why.
 
 **e4. Browser-client tier on the legacy path, restricted.** Not a transport, but the only way C8
 is ever met: keep the OAuth + tunnel endpoint for cloud-hosted clients, with the weaker claim
-stated plainly and, optionally, read-only enforced (`READONLY_MODE=true`). See owner decisions.
+stated plainly and, optionally, read-only enforced (`READONLY_MODE=true`). **Not adopted** —
+browser-based clients are dropped with a sunset ([§6](#6-owner-decisions), D2).
 
 ---
 
@@ -318,13 +322,13 @@ stated plainly and, optionally, read-only enforced (`READONLY_MODE=true`). See o
 | C6 Tally outbound-only | Yes | Yes (tailnet listener) | Yes (tailnet listener) | **No** — LAN listener, subnet-scoped | **Yes**, binds nothing |
 | C7 locked-down remote | Generic connector: yes | Poor (driver, admin) | Poor | Rarely same LAN | Best of bridges; needs signing |
 | C8 browser clients | **Only option** | No (Funnel aside) | No | No | No |
-| C9 needs #175 / #177 | Bridge: #175 | #175 | #175 | #175 (#177 advised) | #175 **and** #177 |
+| C9 needs #175 / #177 | Bridge: #175 | #175 | #175 | #175 (#177 advised; **both** required by D8) | #175 **and** #177 |
 | C10 cost / dependency | Free; total CF dependency | Per-user; ToS | Jina ops | None | Small service; Jina ops |
 | C12 #193 item 1 | Must fix | Moot | Moot | Moot | Moot |
 
 ---
 
-## 5. Decision (proposed)
+## 5. Decision
 
 **Adopt one bridge and one channel, with two transports under it, delivered LAN first.**
 
@@ -346,9 +350,13 @@ stated plainly and, optionally, read-only enforced (`READONLY_MODE=true`). See o
    the control plane rather than removing it, and it performs worst on locked-down machines. Do
    document "bring your own mesh" (option c over a customer's existing tailnet or VPN) as
    supported.
-6. **Keep the legacy OAuth path working, frozen, and deprecated for new installs** — see §7.
+6. **Keep the legacy OAuth path working, frozen, and closed to new installs, then switch it off
+   90 days after the relay (internet) release ships**, with notice to existing clients — see §7 and
+   [§6](#6-owner-decisions) D9. Browser-based clients go with it (D2).
 7. **Write down e1** (remote desktop into a local-mode Tally machine) as the supported interim
    answer until the LAN release ships.
+8. **No home-made cryptography** — a hard constraint on every phase below ([§6](#6-owner-decisions),
+   D7).
 
 What #192's checklist becomes under this decision:
 
@@ -361,57 +369,118 @@ What #192's checklist becomes under this decision:
 
 ---
 
-## 6. Decisions that need the owner
+## 6. Owner decisions
 
-1. **Accept the architecture** — bridge + E2E channel, LAN then relay — versus a mesh VPN.
-2. **Browser-based clients (claude.ai web, and any cloud-hosted MCP client).** No option except the
-   legacy tunnel can serve them. Choose one:
-   - keep them on the legacy path for *existing* installs only, and never offer it to new installs
-     (**recommended**); or
-   - offer a clearly labelled "browser tier" to new installs with the weaker claim stated, ideally
-     read-only by default (e4), which also means resolving the missing zone; or
-   - drop them for books-grade data, with a sunset date for existing installs.
-3. **Locked-down corporate machines.** Choose between: unsupported (say so up front); an IT
-   allowlisting guide (signed publisher, relay host, outbound 443); remote desktop into the Tally
-   machine (e1); or the browser tier if (2) keeps one.
-4. **Coordination / relay hosting.** Jina-operated relay versus a serverless platform versus
-   letting a customer point at their own relay; and the relay's hostname — a record in the existing
-   DNS, a new domain, or a platform hostname. None requires moving `jinacode.systems` or touching
-   MX. (If the owner prefers a mesh VPN after all: hosted Tailscale vs headscale is the equivalent
-   question, and Tailscale's commercial terms must be confirmed first.)
-5. **Cost and operations.** Budget for the relay (small), its monitoring and abuse handling, and an
-   availability expectation — remote access being down must never affect local use, but customers
-   will notice.
-6. **External review.** Whether to fund an independent review of the channel and pairing design
-   before the internet release. Recommended.
-7. **Release gates.** Whether the LAN release waits only on #175, or on #175 and #177. (This record
-   requires both for the relay release.)
-8. **Legacy deprecation.** Timeline and communication for existing `oauth-password` installs, and
-   whether #193 item 1 gets a small legacy-only fix (recommended if legacy will live longer than a
-   few months — see §7).
+Decided by the owner on 2026-09-28. The proposal put eight questions; the answers are recorded as
+ten decisions (D1–D10), because relay hosting, its hostname and its availability were answered
+separately and the legacy sunset date is its own decision. For each: what was decided, why, and
+which alternatives it supersedes.
+
+**D1 — Architecture. Accepted as recommended.** Our own stdio bridge (connector) on the remote
+machine and a host agent on the Tally machine, speaking one end-to-end encrypted, mutually
+authenticated channel with PAKE pairing and per-device keys; delivered over the LAN first
+(option c), then over an untrusted relay (option d). *Why:* it is the only shape in §4 that passes
+C1 literally, with no broker able to read traffic or enrol a device, and it needs nothing
+provisioned per customer. *Superseded:* a mesh VPN (option b, hosted Tailscale or headscale) as our
+transport — not adopted, because it moves the enrolment problem to the control plane and does worst
+on locked-down machines. "Bring your own mesh" stays a documented customer choice (§5 item 5).
+
+**D2 — Browser-based clients (claude.ai web, and any cloud-hosted MCP client). Dropped, with a
+sunset.** They are not offered to new installs, and existing installs that use them are not kept on
+the legacy path indefinitely: they lose access when the legacy path is switched off (D9). *Why:* no
+option except the legacy tunnel can serve them, and that option fails C1 by design. *Superseded:*
+"keep them on legacy for existing installs indefinitely" (the proposal's recommendation) and "a
+labelled browser tier for new installs" (e4).
+
+**D3 — Locked-down corporate machines. An IT allowlisting guide.** Published for customers' IT
+teams: what the connector is, that it is a per-user install (no admin, no driver), its publisher
+signature and file hashes, and its network needs. It is written once the connector exists and is
+signed (#175), because until then there is nothing accurate to allowlist. Remote desktop into a
+local-mode Tally machine (e1) remains the interim answer. *Superseded:* "unsupported, say so up
+front", and the browser tier (ruled out by D2).
+
+**D4 — Relay hosting. A serverless platform under Jina's account.** The platform itself is still
+open (for example Cloudflare Workers or Fly.io) and is chosen in phase P7. *Why:* the relay is a
+small, stateless forwarder of ciphertext, so running a server of our own buys nothing and costs
+operations. Hosting sits in the availability path only, never the trust path (§3 (d), C1).
+*Superseded:* a Jina-operated server. A customer pointing the connector at their own relay is not
+ruled out later, but is not built now.
+
+**D5 — Relay hostname. A CNAME subdomain in the existing GoDaddy DNS** — for example
+`relay.jinacode.systems`. No nameserver delegation; email and MX are untouched. *Superseded:* a new
+domain, and a platform-provided hostname. (Admission details stay in internal docs, per the scope
+limit at the top of this record.)
+
+**D6 — Relay availability. Best effort, with an external health-check alert; no SLA.** Remote
+access being down never affects local use: the local path does not touch the relay. *Written
+trigger to revisit* — a formal availability commitment is reconsidered when **either** there are
+10 or more remote clients **or** remote access becomes a paid feature.
+
+**D7 — External review. Not commissioned; internal review only.** The proposal recommended an
+independent review of the channel and pairing design before the internet release. The owner
+declined it. In its place, **a hard constraint on every phase of this work**:
+
+- **No home-made cryptography.** Only well-known, audited libraries and standard protocols, used as
+  their documentation says. The kind of thing meant: the channel as a handshake pattern from the
+  **Noise protocol framework** via a maintained implementation, or built from **libsodium**
+  primitives as documented; pairing with a **standard PAKE such as CPace or SPAKE2** from an audited
+  implementation. No new primitives, no custom handshakes, no hand-rolled key derivation, and no
+  home-grown framing of key material.
+- If P1 cannot find a channel or PAKE implementation for our runtime that meets this bar, that goes
+  back to the owner as a decision; it is not worked around by writing one.
+- **A design and code review checklist** (written in P1, worked through in P8) must be completed and
+  its results recorded before the relay release (G2).
+
+*Residual risk, stated plainly:* the hard part of this design is not the primitives but their
+**composition** — binding the PAKE result to the channel, key confirmation, transcript binding,
+rendezvous handling, downgrade and replay resistance, key storage and revocation semantics. Audited
+libraries do not protect against composing them wrongly, and an internal review by the people who
+wrote the design is weaker at catching exactly that class of mistake than an independent one. The
+mitigations are the constraint above, the checklist, the LAN release going first (smaller exposure),
+and the signed update channel (#177) to patch a flaw in the field. The owner accepts this risk; it
+is not eliminated.
+
+**D8 — Release gate for the LAN release. Waits on both #175 (signing) and #177 (signed
+auto-update).** *Why:* the connector and host agent carry security-critical code and must be
+patchable in the field from the first release non-technical users see, not only from the relay
+release. *Superseded:* "the LAN release waits on #175 only".
+
+**D9 — Legacy deprecation. The legacy password/tunnel path — including browser access — is switched
+off 90 days after the relay (internet) release ships, with notice to existing clients.** Until then
+it stays working, frozen and closed to new installs. The notice, the switch-off mechanism and the
+per-client communication are phase P9. This amends §7's "nothing is converted on upgrade" for the
+legacy path from the sunset date onwards: before it, nothing changes unless the owner of the install
+acts; after it, the legacy path is no longer supported or shipped.
+
+**D10 — #193 item 1 (tunnel token readable in the registry on legacy installs). Fix now, with a
+small change** — tracked on #193 and done in a separate pull request, not in this record. *Why:* the
+legacy path now lives until 90 days after G2 (D9), longer than the "short deprecation window" under
+which the proposal would have left it. New configurations have no tunnel token, so the item stays
+moot for them.
 
 ---
 
 ## 7. Migration and the legacy path
 
-- **Nothing is converted on upgrade.** `GetWizardMode()` keeps returning `''` for existing installs;
-  an install carrying `REMOTE_AUTH=oauth-password` stays that way until its owner acts.
+- **Nothing is converted on upgrade — until the sunset.** `GetWizardMode()` keeps returning `''` for
+  existing installs; an install carrying `REMOTE_AUTH=oauth-password` stays that way until its owner
+  acts, or until the legacy path is switched off 90 days after G2 (D9), with notice beforehand.
 - **Coexistence.** The paired host agent is a separate component from the HTTP server. A legacy
   install can pair devices while its tunnel still runs, move users one device at a time, and then
   use a tray action — *turn off password access* — that stops and removes `TallyMCPTunnel`, the HTTP
   service, `PASSWORD`, `TUNNEL_TOKEN` and the persisted `.oauth-*.json` stores, and re-runs
   `verify-deployment.ps1` to prove it.
 - **New installs** are offered `paired` only (whichever transports have shipped). The legacy remote
-  page is not re-enabled for new installs unless decision 2 creates a browser tier.
+  page is never re-enabled for new installs: there is no browser tier (D2).
 - **#193 item 1 (token in the registry).** Moot for every new configuration — there is no tunnel
-  token. For legacy installs it remains a live bearer credential readable by local users. If legacy
-  is expected to outlive a short deprecation window, move the token to an ACL-locked file (or DPAPI
-  with a start-up wrapper) rather than the service environment; confirm the bundled `cloudflared`
-  version's support for reading its token from a file before choosing.
+  token. For legacy installs it is a live bearer credential readable by local users, and legacy now
+  lives until 90 days after G2, so it is **fixed now** with a small change in a separate pull request
+  tracked on #193 (D10).
 - **#193 item 3 (unreachable remote wizard values).** Answered by the tray: paired mode is managed
   there, and legacy values are only ever *removed* (by the switch-off action), not edited.
 - **Docs.** `docs/cloudflare-tunnel-provisioning.md` describes a zone that does not exist and a
-  claim this record retracts; it should be relabelled as the legacy path's reference.
+  claim this record retracts. It is relabelled at the top as the frozen legacy path's reference,
+  due to be switched off per D9; the rest of it is left as the record of how legacy installs work.
 
 ---
 
@@ -422,23 +491,24 @@ Phases are ordered by dependency. **Unblocked** means work can start now; the ga
 
 | Phase | Work | Status |
 |---|---|---|
-| **P0** | Owner review of this record (§6). Relabel the tunnel doc as legacy and correct its zone prerequisite. Write down e1 as the interim answer. Update #178's scope to match §5 (drop "tunnel + DNS + edge identity" from provisioning). | **Unblocked** |
-| **P1** | Channel and pairing threat model: parties, keys, what the relay sees, pairing-code lifetime and rate limits, revocation semantics, key storage at rest (DPAPI + ACL). Choose the channel library and the PAKE library. Public part in-repo at the level of this record; formats and operational detail internal. | **Unblocked** |
-| **P2** | Host agent on the Tally machine: key generation and DPAPI storage; paired-device list; accepts channel sessions; spawns `dist/index.mjs` per session with per-device identity (audit tagging on the `[audit]` stderr stream) and per-device permissions (`READONLY_MODE`); session limits. Transport-agnostic behind an interface. | **Unblocked** |
+| **P0** | Owner review of this record (§6). Relabel the tunnel doc as legacy and correct its zone prerequisite. Update #178's scope to match §5 (drop "tunnel + DNS + edge identity" from provisioning). Write down e1 as the interim answer in user-facing docs. | **Done** 2026-09-28, except the e1 write-up, which is still open |
+| **P1** | Channel and pairing threat model: parties, keys, what the relay sees, pairing-code lifetime and rate limits, revocation semantics, key storage at rest (DPAPI + ACL). Choose the channel library and the PAKE library **under D7's no-home-made-cryptography rule**, and write the design and code review checklist P8 works through. Public part in-repo at the level of this record; formats and operational detail internal. | **Unblocked** |
+| **P2** | Host agent on the Tally machine: key generation and DPAPI storage; paired-device list; accepts channel sessions; spawns `dist/index.mjs` per session with per-device identity (audit tagging on the `[audit]` stderr stream) and per-device permissions (`READONLY_MODE`); session limits. Transport-agnostic behind an interface. | **Unblocked**; library use per P1 |
 | **P3** | Connector on the remote machine: per-user install, stdio ↔ channel pump, device key generation and storage, code entry, writes the client entry through the existing `src/client-config.mts` engine (already designed for this). | **Unblocked** (build); ships under G1 |
 | **P4** | LAN transport: host listener on the LAN interface only, subnet-scoped firewall rule, off by default; local service discovery; PAKE pairing over LAN. `REMOTE_TRANSPORT=lan`. | **Unblocked** |
 | **P5** | Tray and installer: remote toggle, pairing-code display with cancel, paired-device list with individual revoke, visible *turn remote access off*. Re-enable the wizard's remote page per #192's restore steps, offering `paired` only. | **Unblocked** (build); ships under G1 |
-| **P6** | `verify-deployment.ps1` for paired mode: no public listener, LAN listener only when `lan` is on and firewall scoped, no `PASSWORD`/`TUNNEL_TOKEN`/OAuth stores, keys ACL-locked. Fold in #193 item 2 (`UNKNOWN` status) here. | **Unblocked** |
-| **G1** | **LAN release to non-technical users.** Signed host installer and signed connector. | **Gated on #175**; #177 per owner decision 7 |
-| **P7** | Relay: stateless forwarder pairing connections by rendezvous id; licence-based admission; rate limits and abuse monitoring; proxy-friendly (WSS with long-poll fallback). `REMOTE_TRANSPORT=relay` in `firstrun-config.ps1` and `verify-deployment.ps1`. Hostname and admission details in internal docs only. | Build **unblocked**; deploy needs owner decisions 4–5 |
-| **P8** | External review of P1's design and P2–P7's implementation of it. | Unblocked once P7 exists; needs owner decision 6 |
+| **P6** | `verify-deployment.ps1` for paired mode: no public listener, LAN listener only when `lan` is on and firewall scoped, no `PASSWORD`/`TUNNEL_TOKEN`/OAuth stores, keys ACL-locked. (#193 item 2, the `UNKNOWN` status, already landed in #213 and is used here.) | **Unblocked** |
+| **G1** | **LAN release to non-technical users.** Signed host installer and signed connector. | **Gated on #175 and #177** (D8) |
+| **P7** | Relay: stateless forwarder pairing connections by rendezvous id; licence-based admission; rate limits and abuse monitoring; proxy-friendly (WSS with long-poll fallback). Hosted on a serverless platform under Jina's account (D4; the platform is chosen here), reached through a CNAME subdomain in the existing DNS (D5), best effort with an external health-check alert and no SLA (D6). `REMOTE_TRANSPORT=relay` in `firstrun-config.ps1` and `verify-deployment.ps1`. Admission details in internal docs only. | Build **unblocked**; hosting and hostname decided |
+| **P8** | **Internal security review** (D7 — no external review): work through P1's design and code review checklist against P1's design and the P2–P7 implementation; record the results before G2. Confirms nothing in the channel or pairing is home-made cryptography. | Unblocked once P7 exists |
 | **G2** | **Internet (relay) release.** | **Gated on #175 and #177**, and P8 |
-| **P9** | Legacy migration: *turn off password access* tray action; deprecation notice for existing `oauth-password` installs; legacy-only fix for #193 item 1 if decision 8 says so. | Unblocked (build); timeline per owner decision 8 |
-| **Later** | Direct peer-to-peer path under the same channel (e2). Browser tier only if decision 2 creates one. | Deferred |
+| **P9** | Legacy migration and sunset: *turn off password access* tray action; notice to existing `oauth-password` installs (including browser-connector users) well ahead of the switch-off; switch-off 90 days after G2 (D9) and its mechanism. (#193 item 1 is fixed now, separately — D10.) | Unblocked (build); sunset date fixed by G2 + 90 days |
+| **P10** | IT allowlisting guide for locked-down corporate machines (D3): what the connector is, per-user install, publisher signature and file hashes, network needs (the relay host and outbound 443 once P7 ships). | Written once the connector exists and is signed (at G1) |
+| **Later** | Direct peer-to-peer path under the same channel (e2). A formal relay SLA if D6's trigger is met. | Deferred |
 
 When G1 ships, #192's first three checkboxes are met for the LAN case; when G2 ships, for the
-internet case. #192 should close at G1 or G2 by the owner's choice, and #193 item 1 closes as
-"moot for new configurations" at G1 plus whatever decision 8 says for legacy.
+internet case. #192 should close at G1 or G2 by the owner's choice. #193 item 1 is fixed for legacy
+installs now (D10) and is moot for every new configuration.
 
 ---
 
@@ -450,9 +520,10 @@ every customer. Revocation is in the customer's hands on the machine that holds 
 server is unchanged — the same stdio server serves local and remote — and the HTTP/OAuth surface
 stops growing. No Cloudflare zone, no domain delegation, no per-customer DNS.
 
-**Negative.** Browser-based clients are not served by the new path; that is a product decision, not
-a technical gap we will close. We own a piece of cryptographic protocol composition, which needs
-review and must be patchable (#177). We operate one relay service. Three remote configurations
+**Negative.** Browser-based clients are not served by the new path and lose access at the legacy
+sunset (D2, D9); that is a product decision, not a technical gap we will close. We own a piece of
+cryptographic protocol composition, reviewed internally only (D7), which must be patchable (#177).
+We operate one relay service, best effort (D6). Three remote configurations
 (legacy tunnel, LAN, relay) coexist during migration — a maintenance cost, not a swap. LAN mode is
 not strictly outbound-only on the Tally machine.
 
