@@ -192,8 +192,14 @@ Filename: "powershell.exe"; Check: not IsUpgradeRun; \
 
 [UninstallRun]
 ; --- Cleanup BEFORE Inno deletes files: stop service, remove NSSM entry, remove scheduled task ---
+; The vault answer is NOT on this line. [UninstallRun] parameters are expanded at INSTALL time and
+; stored in unins000.dat, so the {code:GetRemoveVaultFlag} that used to end it was evaluated before
+; anyone had been asked and always came out empty: the vault was never removed, whatever the
+; operator answered. InitializeUninstall now hands the answer over in the uninstaller's environment
+; (CLAUDALLY_UNINSTALL_REMOVE_VAULT), which this child inherits - and which also reaches the older
+; copies of this entry that upgraded installs still carry in unins000.dat (RunOnceId runs one).
 Filename: "powershell.exe"; \
-  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\uninstall-cleanup.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"" -TunnelServiceName ""{#MyTunnelServiceName}"" {code:GetRemoveVaultFlag}"; \
+  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\uninstall-cleanup.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"" -TunnelServiceName ""{#MyTunnelServiceName}"""; \
   RunOnceId: "TallyMcpUninstallCleanup"; \
   Flags: runhidden waituntilterminated
 
@@ -769,22 +775,38 @@ end;
 var
   UninstRemoveVault: Boolean;
 
+// How the answer reaches uninstall-cleanup.ps1 - see the note on [UninstallRun] for why it cannot
+// be a {code:} parameter. The uninstaller's own environment is inherited by the [UninstallRun] child.
+function SetEnvironmentVariable(lpName: string; lpValue: string): BOOL;
+  external 'SetEnvironmentVariableW@kernel32.dll stdcall';
+
+//
+// A SILENT uninstall is never asked. A plain MsgBox is not suppressed by /SUPPRESSMSGBOXES (only
+// SuppressibleMsgBox is), and without that switch nothing is suppressed at all, so under SYSTEM - a
+// deployment tool, or anything run from session 0 - the question would wait on a desktop nobody can
+// see, and the uninstall would hang for good. Silent takes the recommended answer, delete, unless
+// the caller passes /KEEPVAULT (e.g. to uninstall and reinstall unattended).
 function InitializeUninstall(): Boolean;
+var
+  Flag: string;
 begin
   Result := True;
-  UninstRemoveVault :=
-    MsgBox('Remove saved Tally company passwords?' + #13#10#13#10 +
-           'Claudally can store the password for each password-protected company so Claude can open ' +
-           'them for you. They are encrypted and tied to this computer.' + #13#10#13#10 +
-           'Yes  - delete them now (recommended)' + #13#10 +
-           'No   - keep them, so a future reinstall picks them up',
-           mbConfirmation, MB_YESNO or MB_DEFBUTTON1) = IDYES;
-end;
-
-// Passed to uninstall-cleanup.ps1 as the value of -RemoveVault.
-function GetRemoveVaultFlag(Param: string): string;
-begin
-  if UninstRemoveVault then Result := '-RemoveVault' else Result := '';
+  if UninstallSilent() then
+    UninstRemoveVault := not HasCmdLineSwitch('/KEEPVAULT')
+  else
+    UninstRemoveVault :=
+      MsgBox('Remove saved Tally company passwords?' + #13#10#13#10 +
+             'Claudally can store the password for each password-protected company so Claude can open ' +
+             'them for you. They are encrypted and tied to this computer.' + #13#10#13#10 +
+             'Yes  - delete them now (recommended)' + #13#10 +
+             'No   - keep them, so a future reinstall picks them up',
+             mbConfirmation, MB_YESNO or MB_DEFBUTTON1) = IDYES;
+  // Always set, to 1 or 0, so a value inherited from whoever launched the uninstaller cannot decide
+  // for the operator.
+  if UninstRemoveVault then Flag := '1' else Flag := '0';
+  if not SetEnvironmentVariable('CLAUDALLY_UNINSTALL_REMOVE_VAULT', Flag) then
+    Log('Could not pass the vault answer to uninstall-cleanup.ps1; the saved passwords will be kept.');
+  Log('Remove saved Tally company passwords: ' + Flag);
 end;
 procedure CurPageChanged(CurPageID: Integer);
 begin
@@ -866,7 +888,9 @@ begin
     Json := '{"password":"' + Escaped + '"}';
     if not SaveStringToFile(CredsPath, Json, False) then
     begin
-      MsgBox('Failed to write installer credentials file at ' + CredsPath + '. Install cannot continue.', mbError, MB_OK);
+      // Suppressible: this is reachable in a silent run (remote mode, once #192 restores it).
+      Log('Failed to write installer credentials file at ' + CredsPath + '.');
+      SuppressibleMsgBox('Failed to write installer credentials file at ' + CredsPath + '. Install cannot continue.', mbError, MB_OK, IDOK);
       Abort;
     end;
   end;

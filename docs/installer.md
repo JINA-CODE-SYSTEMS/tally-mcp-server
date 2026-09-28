@@ -271,6 +271,22 @@ it refuses. `/AGENTUSER` must be an existing local account (`DOMAIN\user` is acc
 defaults - auto-detected Tally paths, Silver, GUI control on, local mode - and can be changed
 afterwards with Reconfigure. On an interactive install `/AGENTUSER` just pre-fills the field.
 
+### Silent uninstall
+
+```
+"C:\Program Files\TallyMCP\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+```
+
+An interactive uninstall asks whether to remove the saved Tally company passwords. A silent one
+does not ask (a question nobody can see would hang it, under SYSTEM for good): it removes them, the
+recommended answer, unless you add `/KEEPVAULT`.
+
+Before this, the answer never reached the cleanup script at all, interactive or not: it was passed
+as an `[UninstallRun]` parameter, and Inno expands those at *install* time, so the flag was always
+empty and the passwords were always kept. The uninstaller now passes it in its own environment
+(`CLAUDALLY_UNINSTALL_REMOVE_VAULT`), which also reaches the cleanup entries that older installers
+left in `unins000.dat` on upgraded machines.
+
 ## Why Inno Setup, not WiX
 
 Inno Setup is approachable: single `.iss` script, easy to maintain, handles

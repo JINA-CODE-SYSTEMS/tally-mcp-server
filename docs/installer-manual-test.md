@@ -143,7 +143,10 @@ at some other path with its own `claude_desktop_config.json` entry pointing at
 - [ ] Uninstall prompts about saved company passwords (the DPAPI vault) rather than silently
       shredding or silently keeping them
 - [ ] Answering "no" leaves the vault file in place
-- [ ] Answering "yes" removes it
+- [ ] Answering "yes" removes it. (Before #177's fix this never happened: the answer was passed as
+      an `[UninstallRun]` parameter, which Inno expands at install time.)
+- [ ] As SYSTEM, `unins000.exe /VERYSILENT` finishes without hanging and removes the vault;
+      with `/KEEPVAULT` added it keeps it
 - [ ] The `tally` entry is removed from **both** profiles' `claude_desktop_config.json`
 - [ ] The fork's entry at `D:\my-fork\...` is **left alone** - the ownership gate compares the full
       install root, not just the `dist\index.mjs` tail
