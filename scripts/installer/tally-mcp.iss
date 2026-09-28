@@ -194,6 +194,9 @@ Filename: "powershell.exe"; \
 ; deletes it before this step; this entry is a fallback for the case where that script did
 ; not run (e.g. it was removed), so a password-bearing file is never left behind.
 Type: files; Name: "{app}\.env"
+; Same fallback for the Cloudflare Tunnel token file (#193), a bearer credential that
+; uninstall-cleanup.ps1 also overwrites and deletes first.
+Type: files; Name: "{app}\.tunnel-token"
 Type: filesandordirs; Name: "{app}\logs"
 Type: filesandordirs; Name: "{app}\node_modules"
 Type: filesandordirs; Name: "{app}\dist"

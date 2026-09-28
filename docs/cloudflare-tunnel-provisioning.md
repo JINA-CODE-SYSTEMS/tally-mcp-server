@@ -84,13 +84,31 @@ When the "Cloudflare Tunnel token" field is non-empty, `firstrun-config.ps1`:
 
 - writes `TUNNEL_TOKEN` and `MCP_DOMAIN=<hostname>` to `.env`, and forces
   `BIND_HOST=127.0.0.1` (loopback-only — cloudflared reaches the server locally);
+- writes the token to `<install dir>\.tunnel-token`, readable only by `SYSTEM` (the account
+  the service runs as) and `Administrators`, with inheritance disabled and `Administrators`
+  as owner — the same descriptor `cloudflared service install` uses for its own token file;
 - registers a second NSSM service **`TallyMCPTunnel`** running the bundled
-  `cloudflared tunnel run`, with the token supplied via the service **environment**
-  (`TUNNEL_TOKEN`) so it never appears on the process command line;
+  `cloudflared tunnel run --token-file .tunnel-token`. Only the file's path is on the command
+  line. The token is **not** put in the service environment: NSSM keeps that
+  (`AppEnvironmentExtra`) in the service's registry key, which any local user can read
+  ([#193](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/193));
 - starts it (auto-start, auto-restart on exit), logging to `logs\tunnel.log`.
 
 The token is **preserved across "Reconfigure"** (read back from `.env`), and **blanking
-it on a Reconfigure tears the tunnel service down** and reverts `BIND_HOST`.
+it on a Reconfigure tears the tunnel service down**, shreds `.tunnel-token` and reverts
+`BIND_HOST`.
+
+**Upgrading an install configured before #193.** Those installs handed the token to
+`cloudflared` through `AppEnvironmentExtra`. The upgrade (or any Reconfigure) re-registers the
+service with `--token-file` and removes the `TUNNEL_TOKEN` entry from the registry
+environment of both `TallyMCPTunnel` and `TallyMCP`, leaving any other entry alone. Because
+the old copy was readable by every local account, rotate the token on a machine other people
+use. `verify-deployment.ps1` confirms the result (check *Tunnel token kept out of the service
+registry*).
+
+**`.env` is the weaker copy.** `.env` still holds `TUNNEL_TOKEN` so Reconfigure and upgrades can
+preserve it, and `.env` is readable by the agent user as well as `SYSTEM` and `Administrators`
+(the tray and GUI agent need it). The token file excludes the agent user.
 
 ## Verify (on the client box / from outside)
 
@@ -104,7 +122,8 @@ it on a Reconfigure tears the tunnel service down** and reverts `BIND_HOST`.
    `https://client123.tally.jinacode.systems/mcp`, complete the OAuth prompt with the
    `PASSWORD`, and confirm a tool call (e.g. `status`) works end to end.
 5. Run **Reconfigure** with the token blanked → `TallyMCPTunnel` stops and is removed,
-   `BIND_HOST` reverts. Uninstall → both services removed, no orphaned `cloudflared.exe`.
+   `BIND_HOST` reverts, and `.tunnel-token` is gone. Uninstall → both services removed, no
+   orphaned `cloudflared.exe`, no `.tunnel-token`.
 
 ## Security & hardening
 

@@ -27,6 +27,10 @@ A double-click installer that takes a Windows box from "nothing installed" to
 5. **If a Cloudflare Tunnel token was supplied**, registers a second NSSM service `TallyMCPTunnel`
    running the bundled `cloudflared` so the box gets a stable public HTTPS URL with no router/domain
    config (the MCP server then binds loopback-only — cloudflared connects to it on `127.0.0.1`).
+   cloudflared reads the token from `.tunnel-token` in the install directory (`--token-file`),
+   which only `SYSTEM` and `Administrators` can read — never from the service's registry
+   environment, which any local user can read. Upgrading an older tunnel install removes the
+   token from the registry ([#193](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/193)).
 6. Registers the `TallyMCPAgent` scheduled task at-logon for the configured user.
 7. Registers the `TallyMCPTray` scheduled task at-logon (status tray icon — issue #20).
 8. Starts the service(s) and triggers both scheduled tasks immediately so the operator sees
@@ -36,7 +40,7 @@ The uninstaller stops + removes the `TallyMCP` service (and `TallyMCPTunnel`
 if it was configured), deletes the scheduled tasks, kills any leftover
 `node.exe` / `cloudflared.exe`, and removes installed files. `.env` is
 scrubbed and removed on uninstall (it holds the OAuth password and, when a
-tunnel is configured, `TUNNEL_TOKEN`).
+tunnel is configured, `TUNNEL_TOKEN`), and so is `.tunnel-token`.
 
 For the Cloudflare Tunnel path — what it's for, how Jina staff pre-provision a
 tunnel per client, and where the token/hostname come from — see

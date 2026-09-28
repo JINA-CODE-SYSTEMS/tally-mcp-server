@@ -115,6 +115,18 @@ with a password and domain, then upgrade with the current build.
 - [ ] The `TallyMCP` service still exists and is running
 - [ ] The wizard still shows no mode or password page (it passes no mode; firstrun preserves)
 
+If that install had a Cloudflare Tunnel token (#193 - older builds put it in the service registry):
+
+- [ ] `(Get-Item HKLM:\SYSTEM\CurrentControlSet\Services\TallyMCPTunnel\Parameters).GetValue('AppEnvironmentExtra')`
+      has no `TUNNEL_TOKEN=` entry, and neither does the same value under `TallyMCP`; any other
+      entry that was there before is still there
+- [ ] `nssm get TallyMCPTunnel AppParameters` is `tunnel run --token-file .tunnel-token`
+- [ ] `icacls "C:\Program Files\TallyMCP\.tunnel-token"` shows only `NT AUTHORITY\SYSTEM:(F)` and
+      `BUILTIN\Administrators:(F)`, no `(I)` entries; `(Get-Acl ...).Owner` is `BUILTIN\Administrators`
+- [ ] `TallyMCPTunnel` is running and `logs\tunnel.log` shows `Registered tunnel connection`
+- [ ] `verify-deployment.ps1` (elevated) reports *Tunnel token kept out of the service registry* as PASS
+- [ ] Reconfigure with the token blanked removes `.tunnel-token`
+
 ## 7. Uninstall
 
 Set up first: a second Windows profile that has also connected Claude, and a **fork** of the repo
@@ -130,6 +142,7 @@ at some other path with its own `claude_desktop_config.json` entry pointing at
       install root, not just the `dist\index.mjs` tail
 - [ ] Other MCP servers in those files are untouched
 - [ ] `.env` is gone
+- [ ] `.tunnel-token` is gone (when a tunnel was configured)
 - [ ] No `node.exe` belonging to another application was killed
 
 > **Not yet verified end to end:** the drop-to-user trampoline on the *uninstall* path. The
