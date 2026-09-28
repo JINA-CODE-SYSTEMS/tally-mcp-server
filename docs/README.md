@@ -442,7 +442,22 @@ One-time setup for a from-source install. It registers two at-logon scheduled ta
 - **local** (the default for a fresh install) — no service, no listening port, no OAuth password. Claude starts `dist\index.mjs` over stdio on demand, and the script points your Claude Desktop config at this install. If an old `TallyMCP` service is present it is removed, because a local install must not leave a listener behind.
 - **remote** — registers the `TallyMCP` service via [NSSM](https://nssm.cc/) running `dist\server.mjs`, with auto-start and log rotation. See [Windows Server Setup](server-setup-windows.md).
 
-Re-running the script never silently changes what a box is: the mode comes from `-DeploymentMode`, else `DEPLOYMENT_MODE` in the existing `.env`, else `remote` if a `TallyMCP` service already exists (a pre-#172 install), else `local`.
+Re-running the script never silently changes what a box is. The mode comes from, in order:
+
+1. `-DeploymentMode`, if you pass it;
+2. `DEPLOYMENT_MODE` in the existing `.env` — an unrecognised value stops the run instead of being guessed at;
+3. `remote`, if a `TallyMCP` service already exists **and its NSSM `AppDirectory` is this checkout** (a pre-#172 from-source install);
+4. otherwise `local`.
+
+This is the same precedence the installer's `firstrun-config.ps1` uses, except for step 3: the installer treats "an `.env` already exists" as the sign of an older install, but a from-source `.env` is hand-made from `.env.example` before the script ever runs, so here the service is the evidence instead. Moving an existing box between modes is only ever explicit (the flag, or a `DEPLOYMENT_MODE` you wrote), and the script says so when it happens.
+
+The script also records `REMOTE_AUTH` and `REMOTE_TRANSPORT` (defaulting to `oauth-password` and `tunnel`, as the installer does, and preserving existing values), and validates all three keys the way the installer and `verify-deployment.ps1` do. A few guard rails:
+
+- A `TallyMCP` service that belongs to a **different** install — the packaged installer uses the same service name — is never adopted or removed. Remote mode refuses and asks for a different `-ServiceName`; local mode leaves it alone.
+- Remote mode refuses to (re-)register the service when `PASSWORD` is not set in `.env`, since `dist\server.mjs` exits at startup without it and the old service would have been replaced by a dead one.
+- Local mode removes leftover `.oauth-clients.json` / `.oauth-tokens.json`, as the installer does. It does **not** edit your `PASSWORD` or `TUNNEL_TOKEN` lines — it warns that local mode never uses them and that `verify-deployment.ps1` will fail the install until you clear them (or re-run with `-DeploymentMode remote` if that is what you meant).
+
+Afterwards, `powershell -File scripts\verify-deployment.ps1 -InstallDir <dir>` checks the box against whichever mode it ended up in.
 
 > `.env` is no longer copied into the service environment via NSSM `AppEnvironmentExtra`. That put every value — `PASSWORD` included — into a services registry key readable by `BUILTIN\Users`, and it was redundant, because `server.mts` loads `.env` itself by absolute path.
 

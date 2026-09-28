@@ -19,9 +19,23 @@
 # The mode is resolved in this order, so re-running the script on an existing box never
 # silently changes what that box is:
 #   1. -DeploymentMode, if you pass it
-#   2. DEPLOYMENT_MODE in the existing .env
-#   3. 'remote' if a service of this name already exists (a pre-#172 install)
+#   2. DEPLOYMENT_MODE in the existing .env (an unrecognised value stops the run)
+#   3. 'remote' if a service of this name already exists AND points at this InstallDir
+#      (a pre-#172 from-source install)
 #   4. 'local'
+#
+# This is the same precedence firstrun-config.ps1 applies for the packaged installer, with one
+# deliberate difference in step 3. There, "an .env already exists" is the evidence of a pre-#172
+# install, because only the installer ever writes that file. Here it is not: a from-source .env is
+# hand-made from .env.example before this script is ever run, so its presence says nothing about
+# what the box used to be. The one artefact the old version of this script always left behind is
+# the NSSM service, so that is the evidence used - and only when the service is ours, since the
+# packaged installer registers a service with the same default name.
+#
+# The three .env keys mean exactly what they mean to the installer, the tray and
+# verify-deployment.ps1: DEPLOYMENT_MODE (local|remote), REMOTE_AUTH (oauth-password|paired) and
+# REMOTE_TRANSPORT (tunnel|lan). They are validated the same way - a typo stops the run rather
+# than being coalesced to a default - and existing values are preserved.
 # ============================================================
 
 param(
@@ -45,16 +59,32 @@ $envFile = Join-Path $InstallDir ".env"
 # --- .env helpers -------------------------------------------------------------------------
 # Deliberately minimal: these read and write a single key without disturbing the rest of the
 # file, because a from-source .env is hand-maintained and clobbering it would be rude.
+#
+# Parsing mirrors _ReadEnvHashtable in installer\firstrun-config.ps1 and Get-EnvLineValue in
+# verify-deployment.ps1, i.e. dotenv semantics: a double-quoted value keeps a literal '#', an
+# unquoted one is cut at the first '#'. That matters because this .env is usually a copy of
+# .env.example, whose lines carry inline comments - without the cut, `DEPLOYMENT_MODE=remote  # ...`
+# read back as an unrecognised mode, and a recorded remote box was quietly treated as a fresh one.
+#
+# Both read the file as UTF-8. Windows PowerShell 5.1's Get-Content otherwise decodes a BOM-less
+# file as ANSI, and Set-EnvValue then wrote that mojibake back as UTF-8 - corrupting every
+# non-ASCII character in the file (.env.example has an em dash) a little further on every run.
 function Get-EnvValue {
     param([string]$Path, [string]$Key)
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
-    foreach ($line in (Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue)) {
+    foreach ($line in (Get-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction SilentlyContinue)) {
         $t = $line.Trim()
         if (-not $t -or $t.StartsWith('#')) { continue }
         $eq = $t.IndexOf('=')
         if ($eq -lt 1) { continue }
         if ($t.Substring(0, $eq).Trim() -ne $Key) { continue }
-        return $t.Substring($eq + 1).Trim().Trim('"').Trim("'")
+        $v = $t.Substring($eq + 1).Trim()
+        if ($v.Length -ge 2 -and $v.StartsWith('"') -and $v.EndsWith('"')) {
+            return $v.Substring(1, $v.Length - 2) -replace '\\"', '"'
+        }
+        $hash = $v.IndexOf('#')
+        if ($hash -ge 0) { $v = $v.Substring(0, $hash).TrimEnd() }
+        return $v.Trim("'")
     }
     return $null
 }
@@ -62,7 +92,7 @@ function Get-EnvValue {
 function Set-EnvValue {
     param([string]$Path, [string]$Key, [string]$Value)
     $lines = @()
-    if (Test-Path -LiteralPath $Path) { $lines = @(Get-Content -LiteralPath $Path) }
+    if (Test-Path -LiteralPath $Path) { $lines = @(Get-Content -LiteralPath $Path -Encoding UTF8) }
     $done = $false
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $t = $lines[$i].Trim()
@@ -80,28 +110,157 @@ function Set-EnvValue {
     [System.IO.File]::WriteAllLines($Path, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
 }
 
+# --- Native-command helper -----------------------------------------------------------------
+# Under $ErrorActionPreference = 'Stop', Windows PowerShell 5.1 turns anything a native command
+# writes to a REDIRECTED stderr into a terminating error. `schtasks /Delete ... 2>$null` on a task
+# that does not exist yet - the normal case on a first run - therefore aborted this script half
+# way through, after .env was written but before the agent and tray tasks were registered. nssm
+# does the same for "service not running". firstrun-config.ps1 relaxes the preference around the
+# same calls for the same reason; this is that, in one place. Callers check $LASTEXITCODE.
+function Invoke-Native {
+    param([scriptblock]$Command)
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & $Command } finally { $ErrorActionPreference = $saved }
+}
+
+# --- Service ownership -----------------------------------------------------------------------
+# The packaged installer registers a service with the same default name (TallyMCP), pointing at
+# its own install root. A service of that name is therefore only evidence about THIS checkout if
+# its NSSM AppDirectory is this InstallDir - otherwise it belongs to another install, and this
+# script must neither adopt it (remote: re-point someone else's service at our dist\) nor delete
+# it (local: tear the listener out of a working deployment we did not create).
+function Get-ServiceOwnership {
+    param([string]$Name, [string]$Dir)
+    if (-not (Get-Service -Name $Name -ErrorAction SilentlyContinue)) {
+        return @{ State = 'none'; AppDirectory = '' }
+    }
+    $appDir = ''
+    try {
+        $p = Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$Name\Parameters" -Name AppDirectory -ErrorAction Stop
+        $appDir = [string]$p.AppDirectory
+    } catch { $appDir = '' }
+    $norm = {
+        param([string]$x)
+        if (-not $x) { return '' }
+        try { $x = [System.IO.Path]::GetFullPath($x) } catch { }
+        return $x.TrimEnd('\').ToLowerInvariant()
+    }
+    if ($appDir -and ((& $norm $appDir) -eq (& $norm $Dir))) {
+        return @{ State = 'ours'; AppDirectory = $appDir }
+    }
+    return @{ State = 'foreign'; AppDirectory = $appDir }
+}
+
+function Test-EnvValueSet {
+    param([string]$Key)
+    $v = Get-EnvValue -Path $envFile -Key $Key
+    return ($null -ne $v -and $v.Trim().Length -gt 0)
+}
+
 # --- Step 0: Resolve the deployment mode ---------------------------------------------------
+# Everything in this step is read-only. Every mode-related reason to refuse is found here, before
+# .env is touched and before any existing service is stopped - so a refusal leaves the install
+# exactly as it was.
+$svcInfo      = Get-ServiceOwnership -Name $ServiceName -Dir $InstallDir
+$recordedMode = Get-EnvValue -Path $envFile -Key 'DEPLOYMENT_MODE'
+if ($null -eq $recordedMode) { $recordedMode = '' }
+
+# An unrecognised recorded value is terminal unless -DeploymentMode overrides it, exactly as in
+# firstrun-config.ps1 and verify-deployment.ps1: a typo in .env must stop the run, not quietly
+# pick a deployment mode (and with it, whether a service exists) for the operator.
+if (-not $DeploymentMode -and $recordedMode -and (@('local', 'remote') -notcontains $recordedMode)) {
+    Write-Error ("DEPLOYMENT_MODE in $envFile is '$recordedMode', which is not one of: local, remote. " +
+                 "Fix it in .env and re-run, or pass -DeploymentMode local|remote explicitly.")
+    exit 1
+}
+
 $mode = ''
 $modeSource = ''
 if ($DeploymentMode) {
     $mode = $DeploymentMode
     $modeSource = "-DeploymentMode $DeploymentMode"
+} elseif ($recordedMode) {
+    $mode = $recordedMode
+    $modeSource = "DEPLOYMENT_MODE in $envFile"
+} elseif ($svcInfo.State -eq 'ours') {
+    # A pre-#172 install: it has our service and no mode key. Preserve what it already is,
+    # rather than quietly demoting a working remote deployment to local on a re-run.
+    $mode = 'remote'
+    $modeSource = "existing '$ServiceName' service for this InstallDir (pre-#172 install, preserved)"
 } else {
-    $fromEnv = Get-EnvValue -Path $envFile -Key 'DEPLOYMENT_MODE'
-    if ($fromEnv -and (@('local', 'remote') -contains $fromEnv)) {
-        $mode = $fromEnv
-        $modeSource = "DEPLOYMENT_MODE in $envFile"
-    } elseif (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
-        # A pre-#172 install: it has a service and no mode key. Preserve what it already is,
-        # rather than quietly demoting a working remote deployment to local on a re-run.
-        $mode = 'remote'
-        $modeSource = "existing '$ServiceName' service (pre-#172 install, preserved)"
-    } else {
-        $mode = 'local'
-        $modeSource = 'default for a fresh install'
-    }
+    $mode = 'local'
+    $modeSource = 'default for a fresh install'
 }
 Write-Host "[OK] Deployment mode: $mode  ($modeSource)" -ForegroundColor Green
+
+# Changing an existing box's mode is only ever the result of an explicit choice (the flag, or a
+# DEPLOYMENT_MODE someone wrote into .env). Say so out loud, because remote -> local removes a
+# service that something may depend on.
+$previousMode = ''
+if (@('local', 'remote') -contains $recordedMode) { $previousMode = $recordedMode }
+elseif ($svcInfo.State -eq 'ours') { $previousMode = 'remote' }
+if ($previousMode -and $previousMode -ne $mode) {
+    Write-Host "[*] Changing this install from '$previousMode' to '$mode' because $modeSource." -ForegroundColor Yellow
+    if ($mode -eq 'local' -and $svcInfo.State -eq 'ours') {
+        Write-Host "    The '$ServiceName' service will be removed: local mode has no service and no listener." -ForegroundColor Yellow
+    }
+}
+
+# REMOTE_AUTH / REMOTE_TRANSPORT: preserved if present, defaulted exactly as firstrun-config.ps1
+# defaults them, and validated the same way. They describe the remote path (#178) and are inert
+# in local mode, but are recorded in both so every install carries the same three keys.
+$remoteAuth = Get-EnvValue -Path $envFile -Key 'REMOTE_AUTH'
+if (-not $remoteAuth) { $remoteAuth = 'oauth-password' }
+$remoteTransport = Get-EnvValue -Path $envFile -Key 'REMOTE_TRANSPORT'
+if (-not $remoteTransport) { $remoteTransport = 'tunnel' }
+if (@('oauth-password', 'paired') -notcontains $remoteAuth) {
+    Write-Error "REMOTE_AUTH in $envFile is '$remoteAuth', which is not one of: oauth-password, paired. Fix it in .env and re-run."
+    exit 1
+}
+if (@('tunnel', 'lan') -notcontains $remoteTransport) {
+    Write-Error "REMOTE_TRANSPORT in $envFile is '$remoteTransport', which is not one of: tunnel, lan. Fix it in .env and re-run."
+    exit 1
+}
+
+$svcOwner = $svcInfo.AppDirectory
+if (-not $svcOwner) { $svcOwner = 'an unknown location (not an NSSM service of this project)' }
+if ($mode -eq 'remote') {
+    # Never adopt another install's service. Re-registering it would point the packaged
+    # product's service at this checkout's dist\ - converting that install behind its back.
+    if ($svcInfo.State -eq 'foreign') {
+        $owner = $svcOwner
+        Write-Error ("A service named '$ServiceName' already exists and belongs to $owner, not $InstallDir. " +
+                     "Refusing to re-point it. Pass -ServiceName with a different name for this install.")
+        exit 1
+    }
+    # server.mts exits FATAL at startup without PASSWORD, and NSSM's restart throttle then leaves
+    # the service stopped. Registering it anyway would replace a working service with a dead one,
+    # so check first. The value is tested for presence only and never printed.
+    if (-not (Test-EnvValueSet 'PASSWORD')) {
+        Write-Error ("Remote mode needs PASSWORD set in $envFile - it is the OAuth password that gates the HTTP " +
+                     "server, and dist\server.mjs refuses to start without it. Set it (see .env.example) and re-run, " +
+                     "or run without -DeploymentMode remote for a local install, which needs no password.")
+        exit 1
+    }
+} else {
+    if ($svcInfo.State -eq 'foreign') {
+        Write-Host "[*] A '$ServiceName' service exists but belongs to $svcOwner, not this InstallDir; it will be left alone." -ForegroundColor DarkGray
+    }
+    # This script writes no secret in local mode, but a hand-made .env may already hold one -
+    # typically copied from the remote setup guide. Nothing in local mode reads it, and
+    # verify-deployment.ps1 fails a local install that still has it. It is not deleted here,
+    # because the .env is the operator's file and the likelier story is "meant remote, forgot
+    # the flag" - so say which it is and how to resolve either way.
+    foreach ($secretKey in @('PASSWORD', 'TUNNEL_TOKEN')) {
+        if (Test-EnvValueSet $secretKey) {
+            Write-Host "[WARN] $secretKey is set in $envFile, but local mode never uses it." -ForegroundColor Yellow
+            Write-Host "       If you meant a remote deployment, re-run with -DeploymentMode remote." -ForegroundColor Yellow
+            Write-Host "       Otherwise clear that line: an unused credential on disk is still a credential, and" -ForegroundColor Yellow
+            Write-Host "       verify-deployment.ps1 reports it as a FAIL for a local install." -ForegroundColor Yellow
+        }
+    }
+}
 
 # --- Step 1: Verify Node.js ----------------------------------------------------------------
 if (-not (Test-Path $NodePath)) {
@@ -175,15 +334,25 @@ if (-not (Test-Path -LiteralPath $envFile)) {
     Write-Host "       Copy .env.example over it and fill in the TALLY_* values before using the server." -ForegroundColor Yellow
 }
 Set-EnvValue -Path $envFile -Key 'DEPLOYMENT_MODE' -Value $mode
-Write-Host "[OK] DEPLOYMENT_MODE=$mode written to $envFile" -ForegroundColor Green
+Set-EnvValue -Path $envFile -Key 'REMOTE_AUTH' -Value $remoteAuth
+Set-EnvValue -Path $envFile -Key 'REMOTE_TRANSPORT' -Value $remoteTransport
+Write-Host "[OK] DEPLOYMENT_MODE=$mode (REMOTE_AUTH=$remoteAuth, REMOTE_TRANSPORT=$remoteTransport) written to $envFile" -ForegroundColor Green
 
 # --- Step 5: NSSM service (remote only) ----------------------------------------------------
 if ($mode -eq 'remote') {
+    # Step 0 has already refused a service that belongs to another install, so one that exists
+    # here is ours.
     $existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if ($existingService) {
         Write-Host "[*] Service '$ServiceName' already exists. Removing and re-installing..." -ForegroundColor Yellow
-        nssm stop $ServiceName 2>$null
-        nssm remove $ServiceName confirm
+        Invoke-Native { & $nssmPath stop $ServiceName 2>$null | Out-Null }
+        Invoke-Native { & $nssmPath remove $ServiceName confirm 2>$null | Out-Null }
+        # Wait for the SCM to reap the registration; installing over one still marked for
+        # deletion fails.
+        $deadline = (Get-Date).AddSeconds(15)
+        while ((Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) -and ((Get-Date) -lt $deadline)) {
+            Start-Sleep -Milliseconds 500
+        }
     }
 
     nssm install $ServiceName $NodePath $entryPoint
@@ -241,22 +410,59 @@ if ($mode -eq 'remote') {
     }
 } else {
     # Local mode must not leave a listener behind - including one this script registered on an
-    # earlier run in remote mode. Tear down unconditionally rather than trusting a marker.
-    $existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    if ($existingService) {
+    # earlier run in remote mode. Tear down on the service's existence rather than trusting a
+    # marker. Only OUR service, though: one pointing at another install is not this script's to
+    # remove (step 0 already said it is being left alone).
+    $serviceGone = $true
+    if ($svcInfo.State -eq 'ours') {
         Write-Host "[*] Local mode: removing the existing '$ServiceName' service..." -ForegroundColor Yellow
         $nssmForRemoval = (Get-Command nssm -ErrorAction SilentlyContinue).Source
         if ($nssmForRemoval) {
-            & $nssmForRemoval stop $ServiceName 2>$null
-            & $nssmForRemoval remove $ServiceName confirm
-            Write-Host "[OK] Service '$ServiceName' removed - local mode has no service" -ForegroundColor Green
+            Invoke-Native { & $nssmForRemoval stop $ServiceName 2>$null | Out-Null }
+            Invoke-Native { & $nssmForRemoval remove $ServiceName confirm 2>$null | Out-Null }
         } else {
-            Write-Host "[WARN] '$ServiceName' exists but nssm is not on PATH, so it was NOT removed." -ForegroundColor Yellow
-            Write-Host "       A listener is still running. Remove it with: sc.exe delete $ServiceName" -ForegroundColor Yellow
+            # NSSM is not a prerequisite of local mode, so it may well be gone from PATH. The SCM
+            # can remove the service without it.
+            try { Stop-Service -Name $ServiceName -Force -ErrorAction Stop } catch { }
+            Invoke-Native { & sc.exe delete $ServiceName 2>$null | Out-Null }
+        }
+        $deadline = (Get-Date).AddSeconds(15)
+        while ((Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) -and ((Get-Date) -lt $deadline)) {
+            Start-Sleep -Milliseconds 500
+        }
+        if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+            $serviceGone = $false
+            Write-Host "[WARN] '$ServiceName' could NOT be removed, so this box may still be listening." -ForegroundColor Yellow
+            Write-Host "       Re-run this script as Administrator, or remove it with: sc.exe delete $ServiceName" -ForegroundColor Yellow
+        } else {
+            Write-Host "[OK] Service '$ServiceName' removed - local mode has no service" -ForegroundColor Green
         }
     }
+
+    # Revoke rather than abandon, as firstrun-config.ps1 does: the OAuth client and token stores
+    # are written by the HTTP server, not by hand, and in local mode nothing reads them. A stale
+    # token store is a live credential, and verify-deployment.ps1 fails a local install that has
+    # one. Zeroed before deletion so the bytes do not linger in the freed clusters.
+    foreach ($leftover in @('.oauth-clients.json', '.oauth-tokens.json')) {
+        $lp = Join-Path $InstallDir $leftover
+        if (Test-Path -LiteralPath $lp) {
+            try {
+                $len = (Get-Item -LiteralPath $lp).Length
+                if ($len -gt 0) { [System.IO.File]::WriteAllBytes($lp, (New-Object byte[] $len)) }
+                Remove-Item -LiteralPath $lp -Force
+                Write-Host "[OK] Removed $leftover (not used in local mode)" -ForegroundColor Green
+            } catch {
+                Write-Host "[WARN] Could not remove ${leftover}: $_" -ForegroundColor Yellow
+            }
+        }
+    }
+
     New-Item -ItemType Directory -Force -Path "$InstallDir\logs" | Out-Null
-    Write-Host "[OK] Local mode: no service, no listening port, no OAuth password" -ForegroundColor Green
+    if ($serviceGone -and -not (Test-EnvValueSet 'PASSWORD')) {
+        Write-Host "[OK] Local mode: no service, no listening port, no OAuth password" -ForegroundColor Green
+    } elseif ($serviceGone) {
+        Write-Host "[OK] Local mode: no service, no listening port (PASSWORD is still in .env - see the warning above)" -ForegroundColor Green
+    }
 }
 
 # --- Step 6: Point the MCP client at this install (local only) ------------------------------
@@ -300,7 +506,7 @@ if ($SkipAgentTask) {
     } else {
         Write-Host "[*] Registering GUI agent at logon for user '$AgentTaskUser'..." -ForegroundColor Yellow
         # Remove any prior registration so re-runs of this script are idempotent
-        schtasks /Delete /TN $AgentTaskName /F 2>$null | Out-Null
+        Invoke-Native { schtasks /Delete /TN $AgentTaskName /F 2>$null | Out-Null }
 
         $taskAction = "powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Minimized -File `"$agentScript`""
         # /RL LIMITED so the task runs with the user's normal token (admin keystrokes don't reach
@@ -334,7 +540,7 @@ if ($SkipTrayTask) {
         Write-Host "[WARN] Tray script not found at $trayScript - skipping at-logon registration" -ForegroundColor Yellow
     } else {
         Write-Host "[*] Registering tray status app at logon for user '$AgentTaskUser'..." -ForegroundColor Yellow
-        schtasks /Delete /TN $TrayTaskName /F 2>$null | Out-Null
+        Invoke-Native { schtasks /Delete /TN $TrayTaskName /F 2>$null | Out-Null }
 
         # WindowStyle Hidden so the PowerShell host doesn't flash a console at every logon.
         # Tray uses NotifyIcon, which lives on the user's interactive desktop, so we need
