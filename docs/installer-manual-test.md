@@ -134,17 +134,34 @@ If that install had a Cloudflare Tunnel token (#193 - older builds put it in the
 - [ ] `verify-deployment.ps1` (elevated) reports *Tunnel token kept out of the service registry* as PASS
 - [ ] Reconfigure with the token blanked removes `.tunnel-token`
 
-If that install had a Cloudflare Tunnel token (#193 - older builds put it in the service registry):
+The #229 follow-ups, on the same install:
 
-- [ ] `(Get-Item HKLM:\SYSTEM\CurrentControlSet\Services\TallyMCPTunnel\Parameters).GetValue('AppEnvironmentExtra')`
-      has no `TUNNEL_TOKEN=` entry, and neither does the same value under `TallyMCP`; any other
-      entry that was there before is still there
-- [ ] `nssm get TallyMCPTunnel AppParameters` is `tunnel run --token-file .tunnel-token`
-- [ ] `icacls "C:\Program Files\TallyMCP\.tunnel-token"` shows only `NT AUTHORITY\SYSTEM:(F)` and
-      `BUILTIN\Administrators:(F)`, no `(I)` entries; `(Get-Acl ...).Owner` is `BUILTIN\Administrators`
-- [ ] `TallyMCPTunnel` is running and `logs\tunnel.log` shows `Registered tunnel connection`
-- [ ] `verify-deployment.ps1` (elevated) reports *Tunnel token kept out of the service registry* as PASS
-- [ ] Reconfigure with the token blanked removes `.tunnel-token`
+- [ ] `nssm set TallyMCPTunnel AppEnvironment TUNNEL_TOKEN=x HTTPS_PROXY=y`, then Reconfigure:
+      `AppEnvironment` keeps `HTTPS_PROXY=y` and has no `TUNNEL_TOKEN`
+- [ ] `[Environment]::SetEnvironmentVariable('TUNNEL_TOKEN', 'x', 'Machine')`, then Reconfigure: a
+      red `SECURITY: a machine-wide TUNNEL_TOKEN` warning, the variable is still there afterwards,
+      and `verify-deployment.ps1` FAILs *Tunnel token kept out of the service registry* until it is
+      removed. Remove it again when done.
+- [ ] Rename `bin\cloudflared.exe`, then Reconfigure: the window stops on an error and the script
+      exits non-zero (it used to print a WARN, say "Configuration complete." and exit 0). Put it back.
+
+## 6b. Non-English Windows (#230)
+
+On a Windows installed in another language - German or French, where `Administrators` is
+`Administratoren` / `Administrateurs` - with the UI language set to it. (The CI harness simulates
+this by making every account *name* fail in its icacls stand-in; this is the real thing.)
+
+- [ ] A fresh install completes, and `icacls` on `.env`, on the vault
+      (`<TALLY_DATA_PATH>\.tally-mcp-companies.json`) and on the data folder shows no `(I)` entries,
+      only SYSTEM, Administrators and the agent user under their localised names
+- [ ] `verify-deployment.ps1` (elevated) reports *Configuration file ACL*, *GUI agent IPC directory
+      ACL* and *Company vault ACL* as PASS
+- [ ] An install made on that machine by a build **before** #230 reports those checks as FAIL
+      (inheritance enabled); an unattended upgrade to this build then turns them PASS
+- [ ] Make the lockdown fail - e.g. set `TALLY_DATA_PATH` to a FAT32 USB stick or a network share
+      that ignores ACLs - and run Setup: it shows the error, its last page says configuring FAILED,
+      and it exits 10. For an unattended upgrade over such an install, the preflight refuses first
+      (exit 7) and nothing is stopped.
 
 ## 7. Uninstall
 
