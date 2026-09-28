@@ -16,6 +16,10 @@ here because it actually broke at least once:
   unit test exercises.
 - **Upgrade paths.** Preserved state (deployment mode, GUI-control choice, password) is only real
   if you upgrade over a *previous* install.
+- **SYSTEM.** The update task runs Setup as SYSTEM, on a desktop nobody can see. CI runs
+  `firstrun-config.ps1 -Upgrade` against fake installs
+  ([test-firstrun-config.ps1](../scripts/installer/test-firstrun-config.ps1)), but only a real
+  install run as SYSTEM proves the whole chain - section 9.
 
 Run this on a throwaway VM, never on a box with a production `TallyMCP` service.
 
@@ -114,6 +118,9 @@ with a password and domain, then upgrade with the current build.
 - [ ] `PASSWORD`, `MCP_DOMAIN` and `TUNNEL_TOKEN` are unchanged
 - [ ] The `TallyMCP` service still exists and is running
 - [ ] The wizard still shows no mode or password page (it passes no mode; firstrun preserves)
+- [ ] `logs\firstrun-config.log` has no "Credentials file not found". (Before #177's fix the
+      installer always passed a credentials-file path it never wrote, so this upgrade threw
+      before reading `.env` and left the service disabled.)
 
 ## 7. Uninstall
 
@@ -141,3 +148,61 @@ at some other path with its own `claude_desktop_config.json` entry pointing at
 CI covers this (`windows-sources` job), but if you are already on a VM with Tally open it is worth
 confirming for real: with the `TallyMCPAgent` task running, ask Claude to take a screenshot. A
 mutex regression here returns `null` in a way that looks exactly like a timeout.
+
+## 9. Unattended upgrade, run as SYSTEM
+
+What the daily update task will do ([installer.md, "Unattended upgrade"](installer.md#unattended-upgrade-and-silent-installs)).
+Needs an elevated prompt on the VM, and a way to run a command as SYSTEM - Sysinternals
+`psexec -s -i 0 cmd.exe` is simplest; a one-shot scheduled task with `-User SYSTEM` is closest to
+the real thing. Never on a production box.
+
+Set up: install the *previous* release interactively, as an admin who is **not** the accountant,
+choosing the accountant as the agent user, then make every setting non-default: point the Tally
+paths somewhere else, choose Gold, untick GUI control **from the tray** (not the wizard), and add a
+line such as `READONLY_MODE=true` to `.env` by hand. Snapshot. Then record:
+
+```powershell
+$app = 'C:\Program Files\TallyMCP'
+Get-FileHash "$app\.env"
+Get-ScheduledTask TallyMCPAgent, TallyMCPTray | ForEach-Object { "$($_.TaskName) $($_.Principal.UserId)" }
+Get-FileHash "C:\Users\<accountant>\AppData\Roaming\Claude\claude_desktop_config.json"
+```
+
+**a. Local-mode upgrade.** As SYSTEM:
+
+```
+Claudally-Setup-<new>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /UPDATE /LOG=C:\Windows\Temp\claudally-upgrade.log
+echo %ERRORLEVEL%
+```
+
+- [ ] It returns (no hang) with exit code 0
+- [ ] `.env` has the **same hash** as before
+- [ ] Both tasks still run as the accountant - not SYSTEM, not the admin
+- [ ] `claude_desktop_config.json` has the same hash
+- [ ] The agent and tray are running again in the accountant's session (if they are logged on)
+- [ ] The Setup log contains "Unattended upgrade of ..." and "OK: the upgrade can preserve this
+      install", and `logs\firstrun-config.log` says ".env left exactly as it was"
+
+**b. Remote-mode upgrade.** Repeat (a) over a remote install from section 6, tunnel configured.
+
+- [ ] Exit code 0, `.env` hash unchanged
+- [ ] `TallyMCP` and `TallyMCPTunnel` exist, are Running and set to Automatic
+- [ ] `https://<host>/.well-known/oauth-protected-resource` answers
+
+**c. Refused upgrade changes nothing.** Delete the `AGENT_TASK_USER` line from `.env` and run
+`Unregister-ScheduledTask TallyMCPAgent`, then run (a) again as SYSTEM.
+
+- [ ] Exit code 7, promptly
+- [ ] The Setup log says `REFUSED:` and why
+- [ ] Nothing was stopped: in remote mode `TallyMCP` is still Running; files in `dist\` still have
+      the old version's timestamps
+
+**d. Silent new install.** Roll back to "nothing installed". As SYSTEM:
+
+- [ ] `/VERYSILENT /SUPPRESSMSGBOXES` with no `/AGENTUSER` exits 7 and installs nothing
+- [ ] `/AGENTUSER=SYSTEM` exits 7
+- [ ] `/AGENTUSER=<accountant>` installs; both tasks run as the accountant
+
+**e. Interactive runs are unchanged.** Run the new installer by double-clicking over an existing
+install: the wizard appears as before. (It still pre-fills defaults rather than this install's
+values - see the note in [installer.md](installer.md#unattended-upgrade-and-silent-installs).)
