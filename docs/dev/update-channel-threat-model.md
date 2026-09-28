@@ -1,11 +1,16 @@
 # Signed auto-update channel — threat model
 
-> **Status: Proposed — needs review by someone who did not write it.**
+> **Status: Accepted — 2026-09-28, by the owner (Tapan Jain, @jain-t), without independent review.**
 >
-> #177 makes independent review a requirement, not a courtesy: "whoever controls the manifest key
-> controls every deployment." Nothing here is implemented, and no key has been generated. The
-> reviewer checklist is at the end ([§12](#12-reviewer-checklist)). Until someone other than the
-> author has worked through it, treat every decision below as a draft.
+> #177 asked for this threat model to be reviewed by someone who did not write it ("whoever controls
+> the manifest key controls every deployment"). **That review did not happen: the owner accepted the
+> design without it.** The reviewer checklist ([§12](#12-reviewer-checklist)) is kept as the
+> self-review list for the implementation and for any later reviewer. The owner's answers to the open
+> questions are recorded in [manifest §13](update-manifest.md#13-owner-decisions) and change key
+> custody here: a **single key holder** and an **offline signing laptop**, not a 2-of-3 root or
+> hardware tokens ([§5.3](#53-thresholds-decided-a-single-holder-for-now),
+> [§5.4](#54-custody-decided-an-offline-signing-laptop)). Nothing here is implemented, and no key
+> has been generated.
 >
 > Companion document: [update-manifest.md](update-manifest.md) — the manifest format, signature
 > scheme and client behaviour that this threat model is the justification for.
@@ -83,21 +88,21 @@ specified in [update-manifest.md](update-manifest.md).
 | A1 | **Compromised hosting** — GitHub Releases, GitHub Pages, the `claudally.jinacode.systems` DNS, or any CDN in front of them | Serve arbitrary bytes at every update URL | Every client installs their build | The manifest is verified against keys **pinned in the installed client**, and the artifact against the manifest's SHA-256 and size. Hosting is treated as untrusted storage | Can withhold updates (freeze, A7) or serve an *old* signed manifest (A6). Both are bounded and detected |
 | A2 | **Compromised transport** — MITM, DNS spoofing, a TLS-intercepting corporate proxy, a hostile Wi-Fi | Read and rewrite traffic | Same as A1 | HTTPS with normal certificate validation (defence in depth), **but no security property depends on TLS**: A2 is strictly weaker than A1 and is defeated by the same signature check. No bypass for validation failures, and `NODE_TLS_REJECT_UNAUTHORIZED` / `NODE_OPTIONS` are cleared in the updater's own process | Same as A1. A captive portal or proxy error page must *not* be reported as an attack ([manifest §8](update-manifest.md#8-failure-surfacing)) |
 | A3 | **Compromised CI** — a malicious action or npm dependency, a poisoned runner, a modified workflow, or a stolen `GITHUB_TOKEN` | Produce a malicious installer with **valid SLSA provenance**, publish it as a release, publish arbitrary files to Pages | A malicious release that looks entirely legitimate, including to `gh attestation verify` | **CI holds no update signing key.** Signing is a separate, offline, human step ([§6](#6-the-release-signing-ceremony)) that verifies the artifact and reviews what changed before signing. Provenance proves *where* a build came from, not that it is *good*; the ceremony is where a human decides that | A malicious build that also survives the ceremony's review. See A5 |
-| A4 | **Compromised maintainer GitHub account** | Push a tag, approve the `release` environment (with one maintainer, the approver and the tagger are the same account), edit workflows, publish releases | Everything A3 gets, with no code review | Same as A3: the offline key is not in GitHub. The ceremony checks that the tagged commit is on `main` and reviews the diff since the previous signed release | If the same person holds the GitHub account *and* the only release key, and both are compromised together (e.g. one stolen laptop holding both) — see [§5.4](#54-custody-rules-that-matter-more-than-the-algorithm) |
+| A4 | **Compromised maintainer GitHub account** | Push a tag, approve the `release` environment (with one maintainer, the approver and the tagger are the same account), edit workflows, publish releases | Everything A3 gets, with no code review | Same as A3: the offline key is not in GitHub. The ceremony checks that the tagged commit is on `main` and reviews the diff since the previous signed release | If the same person holds the GitHub account *and* the only release key, and both are compromised together (e.g. one stolen laptop holding both) — see [§5.4](#54-custody-decided-an-offline-signing-laptop) |
 | A5 | **Stolen release (manifest) key** | Sign any manifest | Before #175: push any build to every client. After #175: nothing by itself, because the build must also carry our Authenticode signature | Offline custody; the key is **revocable by root** without touching clients ([§7.2](#72-revocation)); release-key expiry bounds an undetected theft; every signed manifest is published to an append-only log in the repo, so an unexpected one is visible | **Before #175 lands, a stolen release key is sufficient on its own.** Accepted for now because the alternative is no update channel at all while the CVE backlog grows; revisited once Authenticode exists |
 | A6 | **Rollback attack** — serve an older, validly signed manifest or artifact | Replay anything we ever signed | Downgrade clients onto a known-vulnerable build | Monotonic `sequence` in the manifest and `version` in the key set, persisted client-side; the client **never installs a version lower than the one installed** via the channel. A bad release is fixed by rolling *forward* ([manifest §6](update-manifest.md#6-client-verification-order-normative)) | None through the channel. Local rollback-to-known-good is a separate path that uses only a locally cached, previously verified installer ([manifest §7.5](update-manifest.md#75-rollback-to-known-good)) |
 | A7 | **Freeze attack** — keep serving the latest manifest the client has already seen, or nothing | Stop clients learning about a security release | Clients stay vulnerable, believing they are current | Manifest `expires` (45 days); key-set `expires` (365 days); a client that cannot obtain an unexpired manifest says so in the tray, amber, with the date of the last good check | An attacker can hold a client for up to the manifest's remaining lifetime before it notices. This is the price of not running an online timestamp key ([§9](#9-why-not-full-tuf-here)) |
 | A8 | **Mix-and-match** — combine pieces of different signed documents (an old manifest with a new key set, a beta artifact with a stable manifest, one release's hash with another's URL) | Construct a combination we never signed | Install something no one approved as a unit | The manifest is **one signed document** holding version, URL, hash, size, channel and policy together — there is nothing to mix inside it. It names its `channel` and the minimum key-set `version` it expects. Documents carry a `type` and are verified only with the role that may sign that type | None identified. Would reappear if the design grew multiple independently signed targets files — which is one of the triggers to move to full TUF |
 | A9 | **Endless-data / slow-retrieval** | Stream forever, or trickle | Fill the disk, hang the updater | Hard size caps on metadata (64 KiB) before verification; the artifact is read to at most the manifest's `size` + 1 bytes; connect and total timeouts | Can delay an update (a freeze, A7) but not force one |
-| A10 | **Malicious insider** — a release-key holder, or someone who can reach a key | Sign a malicious manifest deliberately | Same as A5 | Two-person rule where the team size allows it ([§5.3](#53-thresholds-and-what-the-team-size-allows)); the append-only manifest log; the ceremony record; after #175, the insider also needs the Authenticode path | With one maintainer, **the lead maintainer is trusted absolutely**. Stated rather than hidden; it is also true of the source code today |
+| A10 | **Malicious insider** — a release-key holder, or someone who can reach a key | Sign a malicious manifest deliberately | Same as A5 | Two-person rule where the team size allows it ([§5.3](#53-thresholds-decided-a-single-holder-for-now)); the append-only manifest log; the ceremony record; after #175, the insider also needs the Authenticode path | With one maintainer, **the lead maintainer is trusted absolutely**. Stated rather than hidden; it is also true of the source code today |
 | A11 | **Non-admin local user or malware on the customer machine** | Write to user-writable paths (`{app}\logs`, `{app}\data` are `users-modify`), write the consent file, create fake write leases, run as the logged-on user | TOCTOU: swap the staged installer between verification and execution → code as SYSTEM | Staging, state and the known-good cache live under `%ProgramData%\Claudally\update\`, ACL'd SYSTEM + Administrators full control, Users read-only. The SHA-256 is recomputed on the protected copy immediately before execution. Anything a user can write (consent requests, write leases) is an **untrusted hint**: it can make a *signed* update happen earlier or later, never choose what is installed | Can delay updates by faking write leases — bounded by lease validation and the deferral limit, and surfaced |
 | A12 | **Local administrator** | Anything | — | Out of scope. They already own the machine, the service and the vault | — |
 | A13 | **Compromised Authenticode signing** (after #175) | Sign arbitrary executables as us | Customers who download manually run it; SmartScreen is satisfied | Not sufficient for the updater, which also requires the manifest. Revoke the certificate through the CA immediately ([§7.4](#74-key-compromise-response)) | Manual downloads during the window between compromise and revocation |
-| A14 | **Our own bug in the updater** | — | A client that silently stops updating, installs something unverified because of a logic error, or loops rolling back | Verification written once, in one small module, with the negative-test list in [manifest §11](update-manifest.md#11-testing-requirements); a test key set that exists only inside the test suite; no configuration that changes trust | The residual risk every implementation carries. This is why the review requirement exists |
+| A14 | **Our own bug in the updater** | — | A client that silently stops updating, installs something unverified because of a logic error, or loops rolling back | Verification written once, in one small module, with the negative-test list in [manifest §11](update-manifest.md#11-testing-requirements); a test key set that exists only inside the test suite; no configuration that changes trust | The residual risk every implementation carries. This is why #177 asked for an independent review — waived by the owner, so the checklist in §12 and the tests carry it (§10, item 9) |
 
 ### What the updater does *not* change
 
-As proposed ([manifest §7](update-manifest.md#7-applying-an-update)), updates install as SYSTEM
+As decided ([manifest §7](update-manifest.md#7-applying-an-update)), updates install as SYSTEM
 through a scheduled task, so **SmartScreen and UAC never see them** —
 unlike a customer's manual download, which carries Mark-of-the-Web. The updater's own verification
 therefore has to be at least as strong as what Authenticode plus SmartScreen would give a manual
@@ -119,8 +124,8 @@ TUF, without the rest of TUF ([§9](#9-why-not-full-tuf-here)):
 
 | Role | Signs | Held | Used | Threshold | Expiry |
 |---|---|---|---|---|---|
-| **Root** | `keys.json` — the list of valid release keys, the Authenticode policy, the root keys themselves | Offline, split across people and places | Rarely: key rotation, revocation, annual key-set refresh, the Authenticode switch | **2 of 3** (see [§5.3](#53-thresholds-and-what-the-team-size-allows)) | Root public keys are pinned in the client and do not expire; `keys.json` expires after 365 days |
-| **Release** | `manifest.json` — what the current release is and how urgent | Offline, on a signing device separate from the build machine | Every release, and a refresh at least every 30 days | 1 (2 once a second key holder exists) | Each release key carries its own expiry in `keys.json`, one year |
+| **Root** | `keys.json` — the list of valid release keys, the Authenticode policy, the root keys themselves | Offline, on the dedicated signing laptop, by one holder; encrypted backup stored elsewhere ([§5.4](#54-custody-decided-an-offline-signing-laptop)) | Rarely: key rotation, revocation, annual key-set refresh, the Authenticode switch | **1 of 1 for now** — single holder by owner decision; 2 of 3 is the upgrade path ([§5.3](#53-thresholds-decided-a-single-holder-for-now)) | Root public keys are pinned in the client and do not expire; `keys.json` expires after 365 days |
+| **Release** | `manifest.json` — what the current release is and how urgent | Offline, on the same signing laptop, separate from the build machine | Every release, and a refresh at least every 30 days | 1 (a second key once a second holder exists) | Each release key carries its own expiry in `keys.json`, one year |
 
 Both use Ed25519 ([manifest §5](update-manifest.md#5-signature-scheme)). There is deliberately **no
 online key** in v1: no key sits in CI, a cloud KMS, or on a server. See [§9](#9-why-not-full-tuf-here)
@@ -138,42 +143,82 @@ thing that must not hold a key.
 The cost is a human step per release. Releases already require a human approval in the `release`
 environment, so the step is moved rather than added.
 
-### 5.3 Thresholds and what the team size allows
+### 5.3 Thresholds (decided): a single holder for now
 
-`MAINTAINERS.md` lists one maintainer. A 2-of-3 root needs three key holders, and a two-person rule
-on releases needs two people who can each sign. What is realistic:
+`MAINTAINERS.md` lists one maintainer. The proposal was a **2-of-3 root** — the lead maintainer, a
+second person at Jina (a partner of the LLP, who need not be an engineer), and a sealed escrow copy
+kept somewhere physically separate — and it called 1 of 1 unacceptable for root.
 
-- **Root, 2 of 3.** Three root keys held by: (1) the lead maintainer; (2) a second person at Jina —
-  a partner of the LLP need not be an engineer; they need to follow a written procedure once a year;
-  (3) an escrow copy — sealed, offline, stored somewhere physically separate (e.g. a bank locker),
-  used only if one of the other two is lost. No single person can re-key the channel, and the loss
-  of any one key is survivable.
-- **Release, 1 of N for now.** One release key held by the lead maintainer, plus — as soon as a
-  second person can do the ceremony — a second release key, either sufficient on its own. The
-  second key is about **availability** during a CVE (the only signer being on leave must not block a
-  security release). Moving to a 2-of-2 release threshold is the upgrade path once two people
-  routinely release; it is a `keys.json` change, not a client change.
+**Decided (owner, 2026-09-28): a single holder, not 2 of 3.** The lead maintainer holds the root key
+and the release key. Concretely:
 
-If a third root holder cannot be found, 2 of 2 with an escrowed copy of one of them is the fallback;
-1 of 1 is not acceptable for root, because then losing that key means reinstalling every customer.
+- **Root: one key, threshold 1.** An encrypted offline backup of it is kept on a separate encrypted
+  drive in a separate physical location ([§5.4](#54-custody-decided-an-offline-signing-laptop)). The
+  backup is a copy of the same key, not a second key: it protects against **loss**, not **theft**.
+- **Release: one key, threshold 1**, same holder. The root/release split ([§5.1](#51-two-roles-not-one-key))
+  is kept regardless: a stolen or lost *release* key is still recoverable in-band by a root-signed
+  `keys.json` ([§7.4](#74-key-compromise-response)), and root stays out of routine use.
 
-### 5.4 Custody rules that matter more than the algorithm
+**Residual risk, accepted by the owner.** Theft of the root key — for example the signing laptop or
+the backup drive taken together with the passphrase, or the key file copied off a compromised laptop
+— lets the thief sign a `keys.json` of their own and so **control every client until each one is
+reinstalled by hand**. No second signature stands in the way, and nothing in-band recovers from it
+([§7.4](#74-key-compromise-response), "root threshold compromised"). Loss is mitigated by the backup;
+losing both the laptop and the backup also ends in a manual reinstall of every client, once the
+current `keys.json` and release key expire. The holder is trusted absolutely (A10), as they already
+are for the source code.
 
-- **A signing key never touches a machine that holds GitHub credentials, runs CI, or browses the
-  web.** The failure this prevents is A4: one stolen laptop yielding both the account and the key.
-  Concretely: a dedicated signing device (an old laptop with networking disabled and full-disk
-  encryption is enough), or a hardware token that performs Ed25519 (e.g. a YubiKey 5 on firmware
-  5.7 or later via PIV). The format is raw Ed25519, so custody can move from a passphrase-encrypted
-  file to hardware later without any client change.
-- **Private keys are stored encrypted at rest** (passphrase-encrypted PKCS#8, or non-exportable in
-  hardware). The passphrase is never stored with the key.
-- **Each root key is backed up once, offline**, to a medium kept with that holder's other root
-  material — not with any other holder's.
-- **Keys are generated on the signing device**, never on a networked machine, and the public half
-  is carried out on removable media. No private key is ever committed to this repository, pasted
-  into an issue, or stored in a GitHub secret.
-- **The public keys are committed** (the client pins root; `keys.json` lists release keys), so
-  every change to who is trusted is a reviewed diff with history.
+**The path to 2 of 3 stays open.** Moving to 2 of 3 is a normal root rotation ([§7.1](#71-rotation)):
+generate further root keys with their holders, and publish a `keys.json` with `root.threshold: 2`
+signed by the current root and by the new threshold. No client change. Adding a second release key
+(for availability during a CVE) and later a 2-of-2 release threshold are likewise `keys.json`
+changes only.
+
+**Triggers to revisit this decision** — either one reopens it:
+
+- a **second trusted person at Jina** who can follow the written root procedure once a year; or
+- **growth in the install count** — the cost of "reinstall every client by hand" grows with every
+  install, and so does the case for a threshold.
+
+### 5.4 Custody (decided): an offline signing laptop
+
+**Decided (owner, 2026-09-28): passphrase-encrypted keys on a dedicated offline (air-gapped) laptop
+used only for signing, with a backup on a separate encrypted drive stored elsewhere. Hardware tokens
+were considered and declined for now.**
+
+Operational rules — these matter more than the algorithm:
+
+- **Never networked.** Once set up as the signing device, the laptop is never connected to any
+  network, wired or wireless. The only way in or out is removable media: unsigned payloads in, signed
+  envelopes and public keys out.
+- **Used only for signing.** No browsing, email, GitHub credentials, CI or other work, ever. The
+  failure this prevents is A4: one stolen laptop yielding both the GitHub account and the key.
+- **Full-disk encryption** on the laptop, and on the backup drive.
+- **Private keys stored encrypted**, as passphrase-encrypted PKCS#8. The passphrase is never stored
+  with the key, on the laptop, or on the backup drive.
+- **Backup:** the encrypted key files, on a separate encrypted drive used for nothing else, stored in
+  a separate physical location from the laptop.
+- **Keys are generated on the signing laptop**, never on a networked machine, and the public half is
+  carried out on removable media. No private key is ever committed to this repository, pasted into an
+  issue, or stored in a GitHub secret.
+- **The public keys are committed** (the client pins root; `keys.json` lists release keys), so every
+  change to who is trusted is a reviewed diff with history.
+
+**Why hardware tokens were recommended.** A token that performs Ed25519 (for example a YubiKey 5 on
+firmware 5.7 or later, via PIV) holds the key non-exportably: it cannot be copied off the token, so
+stealing the key means stealing the physical token *and* knowing its PIN, and even a compromised
+signing machine can at worst sign while the token is plugged in — it cannot keep the key.
+
+**Residual risk of declining them.** The keys are **copyable files**. If the laptop or the backup
+drive is ever compromised — malware carried in on removable media, or physical theft together with
+the passphrase — the keys can be copied without anyone noticing, and a copied root key is the
+unrecoverable case in [§5.3](#53-thresholds-decided-a-single-holder-for-now). The rules above make
+that unlikely; they do not make it impossible.
+
+**Moving to hardware later.** The format is raw Ed25519, so custody can move to a token without any
+client change. Because an existing key file cannot be made non-copyable after the fact, the move
+means generating new keys on the token: a release-key rotation, and a root rotation for root
+([§7.1](#71-rotation)).
 
 ### 5.5 Bootstrap: trust on first install
 
@@ -233,8 +278,10 @@ the release asset. Customers' clients never phone home, so this is how *we* find
   `blocked_versions` and moves `security_floor` above it. Clients on it treat the next release as a
   security update. There is no "revoke and downgrade": the fix for a bad release is a new release
   with a higher version.
-- **A root key** is removed by a root rotation that excludes it ([§7.1](#71-rotation)). Because root
-  is 2 of 3, one lost or stolen root key is a rotation, not an emergency.
+- **A root key** is removed by a root rotation that excludes it ([§7.1](#71-rotation)). With a single
+  root key ([§5.3](#53-thresholds-decided-a-single-holder-for-now)), a *lost* root key is restored
+  from its backup, and a *stolen* one is the unrecoverable case in [§7.4](#74-key-compromise-response).
+  Only once root is 2 of 3 does one lost or stolen root key become a routine rotation.
 
 ### 7.3 What the client must do for revocation to mean anything
 
@@ -251,8 +298,8 @@ To be turned into a runbook and **exercised against a test key set before the up
 **Release key stolen or suspected (A5).**
 
 1. Stop signing with it. Do not publish anything signed by it from this point.
-2. Root holders (2 of 3) sign a `keys.json` that revokes it and adds a replacement key generated on
-   the signing device. Publish immediately.
+2. The root holder signs a `keys.json` that revokes it and adds a replacement key generated on
+   the signing laptop. Publish immediately.
 3. Sign a new manifest with the replacement key and a `sequence` above anything the stolen key could
    plausibly have signed (e.g. jump by 1000), so a client that has already seen an attacker's
    manifest still accepts ours.
@@ -263,14 +310,22 @@ To be turned into a runbook and **exercised against a test key set before the up
    customer should do, and contact every customer directly — the install base is small enough that
    this is feasible, and the tray cannot be trusted to tell them.
 
-**One root key lost or stolen (below threshold).** Rotate root ([§7.1](#71-rotation)) with the two
-remaining holders. Not an emergency, but done within days, because a second loss would be.
+**Root key lost** (the signing laptop fails, is destroyed or is lost, with no reason to think the
+key or its passphrase was exposed). Restore the key from the backup drive onto a replacement signing
+laptop set up under the same rules ([§5.4](#54-custody-decided-an-offline-signing-laptop)). If there
+is any doubt that the lost device could be read by someone else, treat it as stolen (below). If the
+backup is lost too, there is no in-band way to sign a new `keys.json`: clients keep working until the
+current `keys.json` and release key expire, then fail closed visibly, and every client needs a new
+installer with new root keys, installed by hand.
 
-**Root threshold compromised (two keys).** The channel cannot be recovered in-band: whoever holds
-two root keys can publish a `keys.json` of their own. Publish an advisory, take the manifest
-offline so honest clients at least freeze visibly, and ship a new installer with new root keys that
-customers install by hand. This is the scenario the custody rules in [§5.4](#54-custody-rules-that-matter-more-than-the-algorithm)
-exist to make implausible.
+**Root threshold compromised** — with a single root key ([§5.3](#53-thresholds-decided-a-single-holder-for-now)),
+this means **the root key stolen**: the signing laptop or backup drive taken together with the
+passphrase, or the key copied off a compromised laptop. The channel cannot be recovered in-band:
+whoever holds the root key can publish a `keys.json` of their own. Publish an advisory, take the
+manifest offline so honest clients at least freeze visibly, and ship a new installer with new root
+keys that customers install by hand. This is the scenario the custody rules in
+[§5.4](#54-custody-decided-an-offline-signing-laptop) exist to make implausible, and the reason
+[§5.3](#53-thresholds-decided-a-single-holder-for-now) lists triggers to move to 2 of 3.
 
 **CI or GitHub account compromised (A3/A4).** Rotate every GitHub credential, review workflow and
 tag history, and check whether a release was published that was not signed. Nothing is published to
@@ -367,7 +422,16 @@ Stated so that nobody mistakes the design for more than it is.
    the cost; they do not make it impossible.
 6. **No telemetry.** A client that rejects a malicious update knows; we do not, unless the customer
    tells us or the monitor catches the cause. That is consistent with the product's "nothing leaves
-   your machine" position and is a deliberate trade.
+   your machine" position and is a deliberate trade, confirmed by the owner (no phone-home on a
+   rejected update; the tray shows it locally).
+7. **One root key, one holder.** Theft of the root key gives the thief every client until each is
+   reinstalled by hand ([§5.3](#53-thresholds-decided-a-single-holder-for-now)). Accepted by the
+   owner, with triggers to move to 2 of 3.
+8. **Keys are copyable files**, not held in hardware. A compromise of the signing laptop or the
+   backup drive can copy them unnoticed ([§5.4](#54-custody-decided-an-offline-signing-laptop)).
+9. **No independent review.** #177 asked for one; the owner accepted the design without it. Logic
+   errors in the design or the updater (A14) rely on the author's own review, the checklist in
+   [§12](#12-reviewer-checklist) and the tests in [manifest §11](update-manifest.md#11-testing-requirements).
 
 ---
 
@@ -382,7 +446,11 @@ Stated so that nobody mistakes the design for more than it is.
 
 ## 12. Reviewer checklist
 
-For the independent reviewer #177 requires. Please answer each in the PR, not just approve.
+Written for the independent reviewer #177 asked for. **The owner waived that review** and accepted
+the design on 2026-09-28; the list is kept as the self-review for the implementation pull requests
+(answer each there, not just tick it) and for any reviewer later. The thresholds question is answered
+by the owner's decision in [§5.3](#53-thresholds-decided-a-single-holder-for-now); the 45/30-day
+windows were accepted as proposed.
 
 - [ ] Is there any path by which an installed client runs code that was not both (a) described by a
       manifest verified against keys chained to the pinned root and (b) matched to that manifest's
@@ -392,8 +460,8 @@ For the independent reviewer #177 requires. Please answer each in the PR, not ju
 - [ ] Can anything a non-admin local user writes influence *what* is installed, rather than *when*?
 - [ ] Is the root/release split justified, or is it complexity the team will not operate correctly?
       Would a simpler scheme be safer in practice?
-- [ ] Are the thresholds in [§5.3](#53-thresholds-and-what-the-team-size-allows) achievable with the
-      people Jina actually has?
+- [x] Are the thresholds in [§5.3](#53-thresholds-decided-a-single-holder-for-now) achievable with
+      the people Jina actually has? *(Decided by the owner: a single holder for now.)*
 - [ ] Is 45 days an acceptable freeze window? Is 30-day refresh signing sustainable?
 - [ ] Does the Authenticode latch ([§8](#8-where-it-interacts-with-authenticode-175)) have a failure
       mode that strands clients (e.g. a CA change that the policy cannot express)?
@@ -405,8 +473,8 @@ For the independent reviewer #177 requires. Please answer each in the PR, not ju
 
 ---
 
-## 13. Open questions
+## 13. Owner decisions
 
-The ones that belong to the owner rather than the reviewer — key holders, custody hardware, the
-freeze window, and whether local mode may run a SYSTEM task — are collected in
-[manifest §13](update-manifest.md#13-open-questions-for-the-owner) so there is one list.
+The questions that belonged to the owner — key holders, custody hardware, the freeze window, whether
+local mode may run a SYSTEM task, update policy and hosting — were answered on 2026-09-28 and are
+recorded in one list in [manifest §13](update-manifest.md#13-owner-decisions).

@@ -1,6 +1,10 @@
 # Signed auto-update channel — manifest format and signing scheme
 
-> **Status: Proposed — needs review by someone who did not write it.**
+> **Status: Accepted — 2026-09-28, by the owner (Tapan Jain, @jain-t), without independent review.**
+> #177 asked for the design to be reviewed by someone who did not write it; that review did not
+> happen, and the owner accepted the design without it
+> ([threat model, status](update-channel-threat-model.md)). The owner's answers to the open
+> questions are in [§13](#13-owner-decisions) and are reflected throughout.
 >
 > Design only. Nothing here is implemented, no key has been generated, and the example values
 > below (hashes, key ids, URLs under `/update/`) are placeholders. The reasoning for every decision
@@ -15,12 +19,12 @@
 
 ## 1. Decisions at a glance
 
-| Question | Proposal |
+| Question | Decision |
 |---|---|
 | Tooling | **Minimal custom scheme with TUF semantics**, not full TUF. No new runtime dependency in the privileged updater ([§3](#3-tooling-evaluation-and-recommendation)) |
 | Signature | **Ed25519**, via Node's built-in `crypto` (OpenSSL). No hand-written crypto |
 | Envelope | **DSSE** (the in-toto / sigstore signing envelope) — a published spec, so the signed bytes are unambiguous and outside auditors can verify with existing tools |
-| Roles | **Root** (offline, 2 of 3) signs `keys.json`; **release** (offline, 1 of N) signs `manifest.json`. No online keys |
+| Roles | **Root** (offline, 1 of 1 — a single holder for now; 2 of 3 is the upgrade path) signs `keys.json`; **release** (offline, 1 of N) signs `manifest.json`. No online keys. Custody: passphrase-encrypted keys on a dedicated offline signing laptop ([threat model §5.3–5.4](update-channel-threat-model.md#53-thresholds-decided-a-single-holder-for-now)) |
 | Documents | Two, both small JSON in DSSE envelopes, published from this repository's `site/` to `https://claudally.jinacode.systems/update/v1/` |
 | Artifact | The existing `Claudally-Setup-<v>.exe` on GitHub Releases, pinned by SHA-256 **and** size |
 | Rollback | Monotonic `sequence` and key-set `version`; never install below the installed version through the channel |
@@ -28,7 +32,8 @@
 | Urgency | Per install, from `security_floor` and `blocked_versions` — not a per-release flag |
 | Bypass | **None.** No flag, variable, registry value or build flavour ([§9](#9-no-bypass-explicit-rules)) |
 | Authenticode | Required by root-signed policy once #175 lands; a one-way latch; both checks must pass |
-| Who applies | A SYSTEM scheduled task, `TallyMCPUpdate`, in both deployment modes ([§7.1](#71-who-runs-the-updater)) — **open question for local mode** |
+| Who applies | A short-lived daily SYSTEM scheduled task, `TallyMCPUpdate`, in both deployment modes, local mode included ([§7.1](#71-who-runs-the-updater)) |
+| Policy | Security updates always install automatically; feature updates wait for consent in the tray; `UPDATE_CHECK=false` stops feature updates only. Same in both modes ([§7.1](#71-who-runs-the-updater)) |
 | Tally writes | Never interrupted: a write-lease / drain protocol ([§7.3](#73-never-interrupt-a-tally-write)) |
 | Failed start | Automatic reinstall of the cached, previously verified build; never loops ([§7.5](#75-rollback-to-known-good)) |
 
@@ -70,7 +75,7 @@ These shape the design more than any general principle does.
 | **minisign / signify** | Small, well-regarded signing tools; minisign has passphrase-encrypted keys and a one-line verify command auditors know | A signature primitive and a key-file format — nothing about expiry, rollback, rotation, revocation, thresholds or channels, which are the hard part. minisign signs a BLAKE2b prehash in its own format, so keys cannot move into a hardware token later, and the client would still need a hand-written minisign parser | **Close second.** Would still need every document in [§4](#4-documents) around it |
 | **Sigstore / cosign keyless** | Signing identity = the GitHub Actions workflow, logged in Rekor. Already in use here via `actions/attest-build-provenance` | The signer *is* CI, so A3/A4 are sufficient to sign — exactly what #177 rules out. Client verification needs Fulcio roots, Rekor and OIDC semantics in the privileged updater | **Use at the ceremony, not as the client's trust root.** The provenance check stays; the client does not depend on it |
 | **Windows update frameworks** — Squirrel.Windows / Velopack, WinSparkle, Omaha | Ready-made download/apply UX; WinSparkle signs its appcast with Ed25519 | Squirrel/Velopack install per-user into `%LOCALAPPDATA%`, not a Program Files install that registers services. WinSparkle's signature has no expiry, rollback or rotation story. Omaha is far too heavy | **Rejected.** None fits an admin Inno Setup installer that manages NSSM services |
-| **Minimal custom scheme** (this proposal) | Exactly the TUF subset that matters for one artifact: root/release split, thresholds, versions, expiry, rotation by cross-signing, revocation. DSSE envelope + Ed25519 from `node:crypto` | Our own code to get right — mitigated by keeping it to one small, heavily tested verification module and the independent review | **Recommended** |
+| **Minimal custom scheme** (adopted) | Exactly the TUF subset that matters for one artifact: root/release split, thresholds, versions, expiry, rotation by cross-signing, revocation. DSSE envelope + Ed25519 from `node:crypto` | Our own code to get right — mitigated by keeping it to one small, heavily tested verification module and the review checklist (independent review was waived by the owner) | **Adopted** |
 
 **Why Ed25519 rather than ECDSA P-256.** ECDSA P-256 would let PowerShell 5.1 verify without Node,
 but its signatures depend on a per-signature nonce, and nonce mistakes leak the key. Ed25519 is
@@ -119,11 +124,9 @@ https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/releases/download/v<ver>/C
   "issued": "2026-10-01T09:00:00Z",
   "expires": "2027-10-01T09:00:00Z",
   "root": {
-    "threshold": 2,
+    "threshold": 1,
     "keys": [
-      { "keyid": "<sha256 hex of raw public key>", "public_key": "<base64, 32 bytes>", "holder": "root-1" },
-      { "keyid": "…", "public_key": "…", "holder": "root-2" },
-      { "keyid": "…", "public_key": "…", "holder": "root-escrow" }
+      { "keyid": "<sha256 hex of raw public key>", "public_key": "<base64, 32 bytes>", "holder": "root-1" }
     ]
   },
   "release": {
@@ -146,7 +149,7 @@ https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/releases/download/v<ver>/C
 | `type`, `spec_version` | Must equal `claudally.update.keys` and `1` | A8 (type confusion) |
 | `version` | Monotonic. The client refuses anything lower than it already trusts; equal only if byte-identical | A6 — replaying the key set from before a revocation |
 | `issued`, `expires` | RFC 3339 UTC (`Z`). Expired key set → fail closed and say so | A7 |
-| `root.threshold`, `root.keys` | Who may sign the *next* `keys.json`. Changing this set is a root rotation ([§6](#6-client-verification-order-normative), step 2) | A5, A10 |
+| `root.threshold`, `root.keys` | Who may sign the *next* `keys.json`. Changing this set is a root rotation ([§6](#6-client-verification-order-normative), step 2). One key, threshold 1, for now (owner decision); moving to 2 of 3 is a rotation, not a client change | A5, A10 |
 | `release.threshold`, `release.keys[].expires` | Who may sign manifests, and until when | A5 |
 | `revoked_keyids` | Explicit, so a revoked key is refused even if it somehow reappears in a list | A5 |
 | `channels` | Channels this key set authorises. Only `stable` in v1 | A8 |
@@ -238,9 +241,10 @@ something, any script or command, any second artifact. It can only describe one 
 - **Key ids** are hints for lookup. A signature counts toward a threshold only if it verifies under a
   key the client already trusts for that role; each distinct key counts once however many times its
   signature appears; unknown key ids are ignored, not errors.
-- **Private keys** are generated and used only on the signing device, stored as passphrase-encrypted
-  PKCS#8 (which `node:crypto` reads natively) or held non-exportably in a hardware token. The format
-  does not change when custody moves to hardware.
+- **Private keys** are generated and used only on the signing device — by owner decision, a dedicated
+  offline laptop — stored as passphrase-encrypted PKCS#8 (which `node:crypto` reads natively).
+  Hardware tokens were declined for now; the format does not change if custody moves to hardware
+  later.
 - **Anyone can verify** with a short published script, or with OpenSSL:
   `openssl pkeyutl -verify -pubin -inkey release.pem -rawin -in pae.bin -sigfile sig.bin`
   after building `pae.bin` as above. Publishing that recipe is #177's fifth action.
@@ -304,8 +308,8 @@ record.
 
 ### 7.1 Who runs the updater
 
-**Proposal: one SYSTEM scheduled task, `TallyMCPUpdate`, registered by the installer in both
-deployment modes.** It runs once a day at a randomised time and ten minutes after boot, exits when
+**Decided: one SYSTEM scheduled task, `TallyMCPUpdate`, registered by the installer in both
+deployment modes, local mode included.** It runs once a day at a randomised time and ten minutes after boot, exits when
 done, listens on nothing, and can be started on demand. It is the only component that downloads,
 verifies or installs.
 
@@ -318,23 +322,27 @@ verifies or installs.
   notifier, so there is one source of truth for "is there an update". "Install now" writes a consent
   request (`{ "version": "0.8.0", "sha256": "…" }`) and starts the task. A request is only a hint:
   it can make a verified update happen sooner, never choose what is installed (A11).
-- **For local mode this is a change to the product's promise** — today nothing privileged runs on a
-  local-mode box. The alternative is to have the tray, as the user, request elevation through UAC
-  for each update; that keeps the promise but means security updates wait for a person to click a
-  UAC prompt, and the elevated step must still do every check itself, since nothing an unprivileged
-  process verified can be trusted by an elevated one. **This is the main open question for the
-  owner** ([§13](#13-open-questions-for-the-owner)).
+- **For local mode this is a change to the product's promise** — until now nothing privileged runs
+  on a local-mode box. The owner accepted it ([§13](#13-owner-decisions), 1): the task is short-lived
+  (it runs once a day and exits), listens on nothing, and customer-facing text must say it exists.
+  The alternative, not adopted, was for the tray to request elevation through UAC for each update:
+  that kept the promise but made security updates wait for a person to click a UAC prompt.
 
 Settings, in `.env`, preserved across reconfigure like the rest:
 
 | `UPDATE_POLICY` | Behaviour |
 |---|---|
-| `security-auto` (proposed default) | Security path applies automatically (subject to [§7.3](#73-never-interrupt-a-tally-write)); feature updates wait for "Install now" in the tray |
-| `notify` | Nothing applies automatically; the tray shows both kinds, security ones in red |
-| `all-auto` | Both apply automatically — for unattended remote-mode machines nobody watches |
-| `off` | No network calls at all. The tray says, permanently and in plain words, that security fixes will not be installed |
+| `security-auto` (default) | Security path applies automatically (subject to [§7.3](#73-never-interrupt-a-tally-write) and, in local mode, the deadline in [§7.4](#74-behaviour-per-deployment-mode)); feature updates surface in the tray and wait for "Install now" |
+| `security-only` | Security path exactly as above; feature updates are not offered |
 
-The existing `UPDATE_CHECK=false` maps to `off`: whoever set it asked for no outbound calls.
+**Security updates always install; no setting stops them** (owner decision, [§13](#13-owner-decisions), 2).
+The existing `UPDATE_CHECK=false` maps to `security-only`: it stops feature updates, never security
+updates. An install with it set therefore still fetches `keys.json` and the manifest — a change from
+what `UPDATE_CHECK=false` meant before (no update check at all), which the release that ships the
+updater must state in its notes. Remote-mode machines follow the same policy as local ones.
+
+*Not adopted:* `notify` and `off` (both would let an install stop receiving security fixes) and
+`all-auto` (feature updates without consent, proposed for unattended remote-mode machines).
 
 None of these settings affects *what* is trusted or *how* it is checked — only *when* an already
 verified update is applied.
@@ -379,8 +387,8 @@ Claude Desktop session) and the updater is a different process again.
 | | Local mode (no service) | Remote mode (NSSM service) |
 |---|---|---|
 | What runs | Server processes spawned by Claude Desktop, as the user; GUI agent and tray tasks | `TallyMCP` service; optional `TallyMCPTunnel`; GUI agent and tray tasks |
-| Feature path | Applied when the user clicks "Install now" (the dialog says Claude Desktop must be fully restarted afterwards), or automatically at a moment when no server process from this install is running, if the user has opted into that | Applied on "Install now" in the tray, or automatically under `all-auto` |
-| Security path | Applied at the next moment no server process is running. If Claude Desktop stays open, the tray shows a red "Security update ready — Install now"; after a deadline (proposed 24 h) the updater applies it after a 10-minute tray countdown — still only through the drain protocol, never mid-write | Applied on the next run, after draining. Remote callers see a short outage while the service restarts |
+| Feature path | Applied when the user clicks "Install now" (the dialog says Claude Desktop must be fully restarted afterwards) | Applied on "Install now" in the tray — the same policy as local mode; a machine nobody watches gets security updates but not feature updates until someone consents |
+| Security path | Applied at the next moment no server process is running. If Claude Desktop stays open, the tray shows a red "Security update ready — Install now"; after **24 hours** the updater applies it after a **5-minute** tray countdown (owner decision) — still only through the drain protocol, never mid-write | Applied on the next run, after draining. Remote callers see a short outage while the service restarts |
 | What the install does to running processes | Stops this install's `node.exe` processes, disconnecting open Claude Desktop sessions from Tally tools | Stops the service and tunnel, then re-registers and restarts them |
 | Health check | Spawn `dist\index.mjs` and complete an MCP `initialize` + `tools/list` over stdio within 60 s, with the server reporting the new version; `TallyMCPAgent` and `TallyMCPTray` tasks registered and, if a user is logged on, running | `TallyMCP` Running continuously for 60 s with no NSSM restart in that window; a loopback HTTP request to `/.well-known/oauth-protected-resource` returns 200; `TallyMCPTunnel` Running if configured |
 | After success | Tray: "Updated to <v>. Quit and reopen Claude Desktop to use it." | Tray: "Updated to <v>." |
@@ -432,7 +440,7 @@ fixed event id, so a managed IT team can alert on it.
 | **Verification failed** | **Red**: "An update was rejected because it could not be verified. Nothing was installed. Please tell Jina." | Bad signature, revoked or expired key, lower sequence or key-set version, hash or size mismatch after a retry, Authenticode mismatch |
 | Stale | **Amber** after 7 days without a successful verified check; **red** once the stored manifest has expired | Could not reach the update server; possibly a freeze (A7) |
 | Update keys expired | **Red** | The trusted key set expired and no newer one could be fetched |
-| Updates off | Grey, permanent text | `UPDATE_POLICY=off` |
+| Feature updates off | Grey, permanent text: security fixes still install | `UPDATE_POLICY=security-only` (or `UPDATE_CHECK=false`) |
 
 **Classifying failures matters as much as reporting them.** HTTP errors, TLS errors, timeouts and a
 body that is not a DSSE envelope at all (a captive portal, a proxy's error page) are *transport*
@@ -499,8 +507,9 @@ same `release` block).
 9. The monitor job confirms the live manifest verifies, matches the commit, and its artifact still
    matches the release asset.
 
-Root ceremonies (`keys.json` changes) follow the same shape with two root holders signing in turn on
-their own devices; the envelope is passed between them on removable media.
+Root ceremonies (`keys.json` changes) follow the same shape, signed with the root key on the same
+signing laptop by its single holder. Once root moves to 2 of 3, holders sign in turn on their own
+devices and pass the envelope between them on removable media.
 
 ---
 
@@ -558,24 +567,37 @@ as part of the implementation, not in this PR.
 
 ---
 
-## 13. Open questions for the owner
+## 13. Owner decisions
 
-1. **Local mode and a SYSTEM task.** Is a daily, short-lived SYSTEM scheduled task acceptable on a
-   local-mode box, given the "nothing running while you are not working" promise? The alternative
-   (a UAC prompt per update) keeps the promise but makes security updates wait for a person.
-2. **Default policy.** Is `security-auto` the right default? Should an existing `UPDATE_CHECK=false`
-   really mean "no security updates either", or should those customers be asked again?
-3. **Local-mode deadline.** When Claude Desktop stays open, how long may a security update wait
-   before it applies with a countdown — 24 hours?
-4. **Remote-mode feature updates** on machines nobody watches: tray consent only, or `all-auto`?
-5. **Key holders.** Who holds root keys 2 and 3, and where does the escrow copy live? Who is the
-   second release-key holder, and when?
-6. **Custody hardware.** Hardware tokens that do Ed25519 (a small cost per holder), or
-   passphrase-encrypted keys on a dedicated offline laptop to start?
-7. **Freeze window.** Are a 45-day manifest expiry and a 30-day refresh cadence sustainable?
-8. **Hosting.** Is `claudally.jinacode.systems` (Pages) the right home for the manifest? Who controls
-   that DNS zone?
-9. **Failure reporting.** The design sends nothing home, so a rejected update is known only on that
-   machine. Is that right, or is an opt-in "report a rejected update" worth having?
-10. **Authenticode (#175).** Will signing happen in CI or on an attended machine, and what subject
-    will the certificate carry? Both decide what the signer policy in `keys.json` pins.
+Answered by the owner on 2026-09-28. Numbering follows the questions as they were put.
+
+1. **Local mode and a SYSTEM task — yes.** Local mode uses the short-lived daily SYSTEM scheduled
+   task `TallyMCPUpdate`, like remote mode. It is an exception to "nothing running while you are not
+   working" and customer-facing text says so. The UAC-prompt-per-update alternative is not adopted.
+2. **Default policy.** Security updates always install automatically; feature updates surface in the
+   tray for consent. `UPDATE_CHECK=false` stops feature updates only — never security updates
+   ([§7.1](#71-who-runs-the-updater)).
+3. **Local-mode deadline.** A security update waits up to **24 hours** while Claude Desktop is open,
+   then installs after a **5-minute** tray countdown, through the drain protocol. (The proposal said a
+   10-minute countdown; the owner chose 5.)
+4. **Remote-mode feature updates.** Same policy as decision 2: tray consent. `all-auto` is not
+   adopted.
+5. **Key holders.** A **single holder** — the lead maintainer — for root and release, not 2 of 3.
+   Loss is covered by an encrypted offline backup in a separate physical location; theft is not
+   covered and is an accepted residual risk. Revisit when there is a second trusted person at Jina or
+   the install count grows ([threat model §5.3](update-channel-threat-model.md#53-thresholds-decided-a-single-holder-for-now)).
+6. **Custody hardware.** Passphrase-encrypted keys on a **dedicated offline (air-gapped) laptop** used
+   only for signing, with full-disk encryption, never networked; backup on a separate encrypted drive
+   stored elsewhere. Hardware tokens declined for now
+   ([threat model §5.4](update-channel-threat-model.md#54-custody-decided-an-offline-signing-laptop)).
+7. **Freeze window.** Accepted as proposed: manifest expiry 45 days, re-signed at least every
+   30 days.
+8. **Hosting.** The manifest and key sets are hosted on the existing site,
+   `claudally.jinacode.systems` (GitHub Pages, from this repository's `site/`); installers stay on
+   GitHub Releases. Hosting is not a trust input (A1); the monitor in
+   [threat model §6](update-channel-threat-model.md#6-the-release-signing-ceremony) is how a
+   tampered host is noticed.
+9. **Failure reporting.** No phone-home on a rejected update. The tray (and the event log) shows it
+   locally.
+10. **Authenticode (#175).** Where signing happens and which subject the certificate carries are
+    decided when the #175 certificate is bought; the signer policy in `keys.json` follows from that.
