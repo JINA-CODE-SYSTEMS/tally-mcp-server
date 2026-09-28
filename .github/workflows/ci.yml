@@ -28,8 +28,10 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
+      # --ignore-scripts, like release.yml: no dependency lifecycle scripts, and CI tests the exact
+      # install mode the release build uses (so a dependency that starts needing one fails here).
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: TypeScript compile (strict)
         run: npx tsc --noEmit
@@ -63,8 +65,10 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
 
+      # --ignore-scripts, like release.yml: no dependency lifecycle scripts, and CI tests the exact
+      # install mode the release build uses (so a dependency that starts needing one fails here).
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Run tests
         run: npm test
@@ -83,8 +87,10 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
+      # --ignore-scripts, like release.yml: no dependency lifecycle scripts, and CI tests the exact
+      # install mode the release build uses (so a dependency that starts needing one fails here).
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: npm audit (production)
         run: npm audit --omit=dev --audit-level=high
@@ -203,13 +209,16 @@ jobs:
       # broken wizard function or a dangling {code:...} reference could only be caught by cutting a
       # release. This compiles the real .iss against a tree of stub files - seconds, no downloads.
       # It does not check that the declared source files exist; the release build does that.
-      - name: Install Inno Setup
+      # Same pinned, hash-verified compiler the release build uses (install-innosetup.ps1), so the
+      # PR check compiles with exactly what ships - and exercises the pinned install on every PR.
+      - name: Install Inno Setup (pinned)
+        id: inno
         shell: pwsh
-        run: choco install innosetup --no-progress -y
+        run: .\scripts\installer\install-innosetup.ps1
 
       - name: Inno Setup script compiles
         shell: pwsh
-        run: .\scripts\installer\check-iss.ps1
+        run: .\scripts\installer\check-iss.ps1 -InnoSetupPath '${{ steps.inno.outputs.iscc }}'
 
 
       # Regression test for the transport seam (PR #190). The one-shot (-Once) path is how the MCP

@@ -17,10 +17,15 @@
 # 2. Workflow logs on a public repo are world-readable. Nothing secret may be
 #    echoed here, and that constraint tightens once signing is wired in (#175).
 #
-# 3. Bundled dependencies are integrity-checked by build-installer.ps1: Node.js
-#    against its official SHASUMS256.txt, and NSSM against -NssmSha256 when a
-#    pinned hash is supplied. nssm.cc publishes no signed checksums, so that
-#    hash must come from a trusted source — see NSSM_SHA256 below.
+# 3. Every third-party binary that goes into the installer — portable Node.js,
+#    nssm.exe, cloudflared.exe — is pinned to an exact version and SHA-256
+#    COMMITTED in build-installer.ps1, and a mismatch or a missing pin fails the
+#    build. So is the Inno Setup compiler (install-innosetup.ps1), whose setup
+#    stub is embedded in every installer. There is deliberately no repo variable
+#    or input that can override or skip a pin: the old optional NSSM_SHA256
+#    variable was never set, so every release until then shipped an unverified
+#    nssm.exe without anything failing. Bump pins in a reviewed commit — see
+#    docs/installer.md, "Bumping a pinned dependency".
 #
 # 4. Artifacts are NOT yet code-signed (#175). Until they are, the published
 #    SHA-256 is the only way a customer can verify a download, so the release
@@ -34,10 +39,19 @@
 #        Secrets stored there are unreachable from any other workflow or job.
 #      - checkout uses persist-credentials:false, so the job token is not left
 #        in .git/config where a dependency's build script could find and use it.
-#      - npm ci runs with --ignore-scripts. Dependency lifecycle scripts are the
-#        classic supply-chain vector, and they matter more here because
-#        patch/minor dependency updates auto-merge without human review (#168).
-#        Verified: the full suite passes with scripts disabled.
+#      - NO dependency lifecycle scripts run anywhere in this job. Both installs
+#        (the one below and the one inside build-installer.ps1) are
+#        `npm ci --ignore-scripts`, and NPM_CONFIG_IGNORE_SCRIPTS is set for the
+#        whole job as a backstop, so a later `npm install` slipping back in
+#        still runs none. (build-installer.ps1 used to run a plain `npm install`
+#        here, silently undoing the --ignore-scripts on the first install.)
+#        Lifecycle scripts are the classic supply-chain vector, and they matter
+#        more here because patch/minor dependency updates auto-merge without
+#        human review (#168). No dependency needs one: the lockfile has no
+#        hasInstallScript entry, and DuckDB's native binding is a prebuilt
+#        per-platform optional package. Verified: the full suite passes, and a
+#        working installer builds, with scripts disabled. Explicit `npm run`
+#        / `npm test` still run our own package.json scripts.
 #      - every action is pinned to a full commit SHA, not a movable tag.
 #      - workflow_dispatch is refused from anywhere but the default branch, so a
 #        pushed branch cannot be used to run a modified version of this file.
@@ -76,6 +90,11 @@ jobs:
       contents: write
       id-token: write       # build provenance
       attestations: write   # build provenance
+    env:
+      # Backstop for the explicit --ignore-scripts flags: no npm command in this job may run a
+      # dependency lifecycle script. Explicit `npm run build` / `npm test` are unaffected (npm only
+      # skips their pre/post hooks, and this package defines none).
+      NPM_CONFIG_IGNORE_SCRIPTS: 'true'
 
     steps:
       # Refuse to run a dispatched build from an arbitrary branch: someone with write access could
@@ -132,27 +151,27 @@ jobs:
           npx tsc --noEmit
           npm test
 
-      - name: Install Inno Setup
-        run: choco install innosetup -y --no-progress
+      # Pinned + hash-verified, installed portable into its own directory, and passed to the build
+      # by path - never whichever ISCC the runner image or `choco install` happens to provide.
+      - name: Install Inno Setup (pinned)
+        id: inno
+        shell: pwsh
+        run: .\scripts\installer\install-innosetup.ps1
 
       - name: Build installer
         shell: pwsh
-        env:
-          # nssm.cc publishes no signed checksums. Set this repository variable to a SHA-256
-          # obtained from a trusted source to harden the build; the script warns loudly when it
-          # is absent rather than silently trusting the download.
-          NSSM_SHA256: ${{ vars.NSSM_SHA256 }}
         run: |
           # HASHTABLE splatting, not array splatting. An array splat passes its elements
           # POSITIONALLY, so '-DownloadDeps' did not bind the switch — the script silently skipped
           # staging Node and then failed on the "node.exe not found" check. A hashtable binds by
           # name and is the only correct way to pass a switch this way.
           # Not named $args: that is a PowerShell automatic variable.
+          # Dependency hashes are pinned in build-installer.ps1 itself; nothing here can relax them.
           $buildArgs = @{
-            DownloadDeps = $true
-            Version      = '${{ steps.ver.outputs.version }}'
+            DownloadDeps  = $true
+            Version       = '${{ steps.ver.outputs.version }}'
+            InnoSetupPath = '${{ steps.inno.outputs.iscc }}'
           }
-          if ($env:NSSM_SHA256) { $buildArgs.NssmSha256 = $env:NSSM_SHA256 }
           & .\scripts\installer\build-installer.ps1 @buildArgs
 
       - name: Hash the installer

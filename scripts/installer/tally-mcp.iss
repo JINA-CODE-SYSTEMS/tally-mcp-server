@@ -5,13 +5,16 @@
 ; installed" to "service running" with a short wizard. Bundles:
 ;   - the prebuilt dist/ output (no client-side TS compile)
 ;   - scripts/ (deploy.ps1, tally-gui-agent-v2.ps1, TallyUI.dll, this installer's helpers)
-;   - portable Node.js (drop into installer-staging/node-portable/ before compile)
-;   - NSSM (drop nssm.exe into installer-staging/ before compile)
+;   - portable Node.js (installer-staging/node-portable/)
+;   - NSSM (installer-staging/nssm.exe)
+;   - cloudflared (installer-staging/cloudflared.exe)
 ;
 ; Build prerequisites (see build-installer.ps1 for the orchestrated flow):
-;   - Inno Setup 6+ (ISCC.exe on PATH)
+;   - Inno Setup 6+ (CI uses the pinned build from install-innosetup.ps1)
 ;   - npm install + npm run build run on the source tree
-;   - installer-staging/ populated with portable Node + NSSM
+;   - installer-staging/ populated by build-installer.ps1, which checks Node, NSSM and
+;     cloudflared against SHA-256 pins committed in that script. Compiling this .iss
+;     directly skips those checks - don't ship an installer built that way.
 ;
 ; This .iss is intentionally Inno-Setup-only — no WiX, no MSI. v1 ships an .exe
 ; for direct download. SCCM/GPO support can be added later if a client needs it.
