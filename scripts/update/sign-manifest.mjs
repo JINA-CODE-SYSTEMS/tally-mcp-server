@@ -18,7 +18,8 @@
  * with the same verification module the client uses; writes the envelope to --out and nothing else.
  *
  * It never touches the network (it imports no network module, and a test checks that), never writes a
- * private key anywhere, and has no option that skips a check. Needs `npm run build` first, for dist/.
+ * private key anywhere, and has no option that skips a check. --out is created exclusively up front and
+ * removed again if the run is refused. Needs `npm run build` first, for dist/.
  */
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -36,7 +37,19 @@ const { MANIFEST_PAYLOAD_TYPE, KEYS_PAYLOAD_TYPE, parseEnvelope, signEnvelope, a
 const { parseManifestPayload, parseKeySetPayload, verifyManifest } = await import(pathToFileURL(path.join(dist, 'verify.mjs')).href);
 const { UpdateVerificationError } = await import(pathToFileURL(path.join(dist, 'errors.mjs')).href);
 
+// --out is created exclusively (O_EXCL) before anything else happens, so nothing can be put in its
+// place between the check and the write; on any refusal the empty placeholder is removed again.
+let outFd = null;
+let outPath = null;
+function releaseOut() {
+  if (outFd === null) return;
+  try { fs.closeSync(outFd); } catch { /* already closed */ }
+  try { fs.unlinkSync(outPath); } catch { /* already gone */ }
+  outFd = null;
+}
+
 function fail(msg) {
+  releaseOut();
   console.error(`\nREFUSED: ${msg}\nNothing was written.`);
   process.exit(1);
 }
@@ -54,10 +67,15 @@ for (let i = 0; i < argv.length; i += 2) {
 }
 if (!!args['--payload'] === !!args['--envelope']) fail('give exactly one of --payload or --envelope');
 for (const f of ['--key', '--keys', '--out']) if (!args[f]) fail(`${f} is required`);
-const outPath = path.resolve(args['--out']);
-if (fs.existsSync(outPath)) fail(`${outPath} already exists; choose a new path`);
+const out = path.resolve(args['--out']);
 for (const f of ['--payload', '--envelope', '--key', '--keys']) {
-  if (args[f] && path.resolve(args[f]) === outPath) fail(`--out must not be the same file as ${f}`);
+  if (args[f] && path.resolve(args[f]) === out) fail(`--out must not be the same file as ${f}`);
+}
+try {
+  outFd = fs.openSync(out, 'wx');
+  outPath = out;
+} catch (e) {
+  fail(e.code === 'EEXIST' ? `${out} already exists; choose a new path` : `cannot create ${out}: ${e.message}`);
 }
 
 // ── Input ───────────────────────────────────────────────────────────────────────────────────────
@@ -81,7 +99,7 @@ async function readLine(question, { hidden = false } = {}) {
     process.stdin.resume();
     const onData = (data) => {
       for (const ch of data.toString('utf8')) {
-        if (ch === '\u0003') { process.stdin.setRawMode(false); process.stderr.write('\n'); process.exit(130); }
+        if (ch === '\u0003') { process.stdin.setRawMode(false); releaseOut(); process.stderr.write('\n'); process.exit(130); }
         if (ch === '\r' || ch === '\n') {
           process.stdin.off('data', onData);
           process.stdin.setRawMode(false);
@@ -187,7 +205,9 @@ try {
   }
 }
 
-fs.writeFileSync(outPath, envelope, { flag: 'wx' });
+for (let off = 0; off < envelope.length;) off += fs.writeSync(outFd, envelope, off);
+fs.closeSync(outFd);
+outFd = null;
 console.error(complete
   ? `\nSigned. The envelope verifies against keys.json version ${keySet.version}.\nWrote ${outPath}`
   : `\nSigned, but the release threshold (${keySet.release.threshold}) is not met yet. Pass ${outPath} to the next holder (--envelope).`);
