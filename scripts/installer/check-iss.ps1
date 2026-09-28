@@ -68,7 +68,7 @@ if (-not $InnoSetupPath) {
     }
 }
 if (-not $InnoSetupPath) {
-    throw "ISCC.exe not found. Install Inno Setup 6 (choco install innosetup) or pass -InnoSetupPath."
+    throw "ISCC.exe not found. Install Inno Setup 6 (scripts\installer\install-innosetup.ps1 installs the pinned version CI uses and prints its ISCC path) or pass -InnoSetupPath."
 }
 Write-Host "ISCC:       $InnoSetupPath"
 Write-Host "Checking:   $IssPath"

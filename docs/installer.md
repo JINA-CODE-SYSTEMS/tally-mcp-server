@@ -52,15 +52,72 @@ The installer is built on a Windows box with Inno Setup 6+ installed.
 ```
 
 That:
-- runs `npm install` + `npm run build` (so `dist/` is fresh)
+- runs `npm ci --ignore-scripts` + `npm run build` (so `dist/` is fresh, built from the lockfile,
+  with no dependency lifecycle scripts — none are needed; see the comment in the script)
 - compiles `scripts/TallyUI.dll` from `TallyUI.cs` (so the installer ships
   a prebuilt DLL — clients don't need `csc.exe`)
-- downloads portable Node.js + NSSM into `installer-staging/`
+- downloads portable Node.js, NSSM and `cloudflared` into `installer-staging/`,
+  each pinned to an exact version and SHA-256 (see below)
 - invokes `ISCC.exe` on `scripts/installer/tally-mcp.iss`
-- emits `dist-installer/TallyMCP-Setup-<version>.exe`
+- emits `dist-installer/Claudally-Setup-<version>.exe`
 
-For repeat builds, drop the `-DownloadDeps` flag — Node + NSSM will be
-reused from `installer-staging/`.
+For repeat builds, drop the `-DownloadDeps` flag — Node, NSSM and `cloudflared`
+will be reused from `installer-staging/` (and re-verified against their pins).
+
+### Pinned dependencies
+
+Every third-party binary the installer ships is pinned in the **"Pinned build inputs"** block at
+the top of `scripts/installer/build-installer.ps1`: an exact version, its download URL, and a
+committed SHA-256. The build fails — it does not warn — if a pin is missing or malformed, or if a
+downloaded *or hand-placed* file does not match. There is no parameter or CI variable to override
+a pin; changing one is a reviewed commit.
+
+| Input | Pinned | Checked |
+|-------|--------|---------|
+| Node.js portable (win-x64) | `build-installer.ps1` | the zip before it is expanded, then `node-portable\node.exe` |
+| NSSM | `build-installer.ps1` | the zip, then the staged `nssm.exe` (win64) |
+| `cloudflared` | `build-installer.ps1` | `cloudflared.exe` (versioned release URL, never `latest`) |
+| Inno Setup compiler (CI/release) | `install-innosetup.ps1` | the Inno Setup installer before it runs |
+
+**Offline / air-gapped builds.** Put the pinned files in `installer-staging/` by hand —
+`node-v<ver>-win-x64.zip`, `nssm-<ver>.zip`, and `cloudflared.exe` (the
+`cloudflared-windows-amd64.exe` release asset, renamed) — and run with `-DownloadDeps`. Files that are
+already present and match are used without touching the network; anything that doesn't match is
+rejected. A hand-populated `node-portable\` or `nssm.exe` is also accepted, as long as `node.exe` /
+`nssm.exe` match their pins (NSSM must be `win64\nssm.exe` from the pinned zip — the 2.24-101
+pre-release builds that Chocolatey/Scoop/winget ship will not match).
+
+#### Bumping a pinned dependency
+
+Change the version **and** the hash in the same commit, and record in the comment beside the pin
+where the hash came from and what you cross-checked it against. Never take a hash from the same
+download you are checking it against and call it verified — corroborate it:
+
+- **Node.js** — take the `node-v<ver>-win-x64.zip` and `win-x64/node.exe` lines from
+  `https://nodejs.org/dist/v<ver>/SHASUMS256.txt`, and verify that file's signature
+  (`SHASUMS256.txt.asc`) with `gpg --verify` against a releaser key listed in the
+  [nodejs/node README](https://github.com/nodejs/node#release-keys) (keys are in
+  [nodejs/release-keys](https://github.com/nodejs/release-keys)). Bump `package.json`'s
+  `engines.node` alongside, and read the Node notes above the pin first.
+- **cloudflared** — use a stable release from
+  [cloudflare/cloudflared releases](https://github.com/cloudflare/cloudflared/releases). The
+  release notes list a SHA256 for `cloudflared-windows-amd64.exe`; confirm it matches the asset
+  digest GitHub shows (`gh api repos/cloudflare/cloudflared/releases/tags/<ver> --jq '.assets[] | select(.name=="cloudflared-windows-amd64.exe") | .digest'`),
+  download the versioned asset, hash it, and check `Get-AuthenticodeSignature` reports a valid
+  signature from "Cloudflare, Inc.".
+- **NSSM** — nssm.cc publishes no SHA-256 and no signature, and `nssm.exe` is unsigned, so this is
+  the weakest link: hash the zip you download, then corroborate it with at least one independent
+  record made *before* you looked — the SHA-1 nssm.cc lists on its download page, and the checksum
+  in the Chocolatey `nssm` package for that exact zip (`chocolateyInstall.ps1` or
+  `legal/VERIFICATION.txt` in the `.nupkg`). Pin `win64\nssm.exe` from inside that zip as well. If
+  you cannot corroborate a new NSSM hash, do not bump.
+- **Inno Setup** — `scripts/installer/install-innosetup.ps1`. Take the SHA-256 GitHub shows for
+  the installer asset on [jrsoftware/issrc releases](https://github.com/jrsoftware/issrc/releases),
+  cross-check it against the Chocolatey `innosetup` package's `legal/VERIFICATION.txt`, and check
+  the Authenticode signature. Staying on 6.x matters: the scripts look for "Inno Setup 6".
+
+After bumping, run a full `build-installer.ps1 -DownloadDeps` locally: it prints each verified
+hash, and a mistyped pin fails there rather than in the release job.
 
 To iterate just on the wizard without rebuilding the project:
 
@@ -86,7 +143,8 @@ indices, interactivity, privilege boundaries, upgrade paths - is in
 | Path | Purpose |
 |------|---------|
 | `scripts/installer/tally-mcp.iss`       | Inno Setup script (sources, dirs, wizard, [Run] / [UninstallRun]) |
-| `scripts/installer/build-installer.ps1` | Build orchestrator (npm build → dep staging → ISCC) |
+| `scripts/installer/build-installer.ps1` | Build orchestrator (npm build → pinned, hash-verified dep staging → ISCC) |
+| `scripts/installer/install-innosetup.ps1` | Installs the pinned, hash-verified Inno Setup compiler (CI and release) |
 | `scripts/installer/firstrun-config.ps1` | Post-install: writes .env, registers service (+ optional `TallyMCPTunnel` cloudflared service) + agent task + tray task, starts them |
 | `scripts/installer/uninstall-cleanup.ps1` | Pre-uninstall: stops the service(s) incl. `TallyMCPTunnel`, removes NSSM entries, deletes both scheduled tasks |
 | `scripts/tray/tally-mcp-tray.ps1`       | Status tray icon (issue #20). WinForms NotifyIcon + polling loop. |
