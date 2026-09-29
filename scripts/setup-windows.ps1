@@ -492,6 +492,27 @@ if ($mode -eq 'local' -and -not $SkipClientConfig) {
     }
 }
 
+# --- Step 6b: The Claudally agent folder ------------------------------------------------------
+# The GUI agent's IPC files and the company vault live in %ProgramData%\Claudally\agent, which the
+# service (SYSTEM) and the agent user both need and nobody else may read (#230 follow-up; they used to
+# sit in Tally's data folder, whose lockdown shut other Windows accounts out of Tally). Created and
+# locked by SID with the same helper the installer uses. A folder planted there by another account,
+# or a junction, is refused, not used.
+$lockdownHelpers = Join-Path $PSScriptRoot 'installer\lockdown-helpers.ps1'
+if (-not (Test-Path -LiteralPath $lockdownHelpers)) {
+    Write-Host "[WARN] $lockdownHelpers not found - the agent folder was not set up; the GUI agent will not receive commands" -ForegroundColor Yellow
+} else {
+    . $lockdownHelpers
+    try {
+        $agentUserSid = _AccountSid $AgentTaskUser
+        $null = _EnsureAgentDir -AgentSid $agentUserSid
+        Write-Host "[OK] Agent folder $(_AgentDir) locked to SYSTEM, Administrators and $AgentTaskUser (by SID; verified)" -ForegroundColor Green
+    } catch {
+        Write-Host "[ERROR] Could not set up the agent folder: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "        The GUI agent will not receive commands until this is fixed and the script re-run." -ForegroundColor Red
+    }
+}
+
 # --- Step 7: Register the GUI agent as a Scheduled Task at logon ---
 # Why: tally-gui-agent-v2.ps1 must run in the user's interactive desktop session (not Session 0)
 # because it spawns and keystrokes into tally.exe. Manual launch survives only until the user

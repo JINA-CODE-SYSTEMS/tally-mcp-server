@@ -98,6 +98,8 @@ Source: "{#RepoRoot}\scripts\installer\stop-install-processes.ps1"; Flags: dontc
 ; from PrepareToInstall, so an upgrade that could not keep the existing settings is refused before
 ; anything is stopped or copied (#177).
 Source: "{#RepoRoot}\scripts\installer\firstrun-config.ps1"; Flags: dontcopy
+; ...and the lockdown helpers it dot-sources, extracted beside it (#230).
+Source: "{#RepoRoot}\scripts\installer\lockdown-helpers.ps1"; Flags: dontcopy
 Source: "{#RepoRoot}\package-lock.json"; DestDir: "{app}";        Flags: ignoreversion
 Source: "{#RepoRoot}\node_modules\*";  DestDir: "{app}\node_modules"; Flags: ignoreversion recursesubdirs createallsubdirs
 
@@ -115,6 +117,7 @@ Source: "{#RepoRoot}\scripts\TallyUI.cs";             DestDir: "{app}\scripts"; 
 Source: "{#RepoRoot}\scripts\deploy.ps1";             DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\setup-windows.ps1";      DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\installer\firstrun-config.ps1";    DestDir: "{app}\scripts\installer"; Flags: ignoreversion
+Source: "{#RepoRoot}\scripts\installer\lockdown-helpers.ps1";   DestDir: "{app}\scripts\installer"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\installer\stop-install-processes.ps1"; DestDir: "{app}\scripts\installer"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\installer\connect-client.ps1";        DestDir: "{app}\scripts\installer"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\installer\uninstall-cleanup.ps1";  DestDir: "{app}\scripts\installer"; Flags: ignoreversion
@@ -214,6 +217,15 @@ Type: files; Name: "{app}\.tunnel-token.preflight"
 ; Same for the .env lockdown probe (#230). Its twin in the Tally data folder is outside {app}; it too
 ; holds nothing, and the preflight shreds it straight away.
 Type: files; Name: "{app}\.tally-mcp-acl.preflight"
+; The GUI agent's IPC files, in the Claudally agent folder (#230 follow-up). A command file can hold a
+; company password for the few seconds of a call; none must outlive the install. The vault beside them
+; is uninstall-cleanup.ps1's business (it asks), so the folder goes only if that left it empty; the
+; same for its twin probe file and for %ProgramData%\Claudally itself.
+Type: files; Name: "{commonappdata}\Claudally\agent\_mcp_gui_*"
+Type: files; Name: "{commonappdata}\Claudally\agent\_mcp_screenshot*"
+Type: files; Name: "{commonappdata}\Claudally\agent\.tally-mcp-acl.preflight"
+Type: dirifempty; Name: "{commonappdata}\Claudally\agent"
+Type: dirifempty; Name: "{commonappdata}\Claudally"
 Type: filesandordirs; Name: "{app}\logs"
 Type: filesandordirs; Name: "{app}\node_modules"
 Type: filesandordirs; Name: "{app}\dist"
@@ -521,6 +533,7 @@ var
 begin
   Result := '';
   ExtractTemporaryFile('firstrun-config.ps1');
+  ExtractTemporaryFile('lockdown-helpers.ps1');
   Report := ExpandConstant('{tmp}\upgrade-preflight.txt');
   if not Exec('powershell.exe',
               '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}\firstrun-config.ps1') + '"' +

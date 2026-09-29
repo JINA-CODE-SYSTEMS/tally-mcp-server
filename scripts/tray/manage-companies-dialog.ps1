@@ -43,8 +43,9 @@ function Read-CompanyRegistry {
     return @{ schemaVersion = 1; companies = @(); legacyHints = $parsed }
 }
 
-# Atomic write of the registry. Creates the parent dir if missing (defensive for dev mode
-# where TALLY_DATA_PATH may not yet exist on disk).
+# Atomic write of the registry. The .tmp is created in the vault's own folder - normally the Claudally
+# agent folder, whose (OI)(CI) ACL (SYSTEM, Administrators, the agent user) it inherits - and renamed over
+# the vault, so the result carries that same list.
 function Write-CompanyRegistry {
     # Atomic write: write .tmp, then Move-Item -Force replaces the destination.
     # -ErrorAction Stop is critical: without it, Move-Item's non-terminating "access
@@ -54,7 +55,10 @@ function Write-CompanyRegistry {
     param([string]$Path, [hashtable]$Registry)
     $dir = Split-Path -Parent $Path
     if ($dir -and -not (Test-Path -LiteralPath $dir)) {
-        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        # Never created from here. The tray runs as the agent user, and a folder it made would carry the
+        # default %ProgramData% permissions - readable by every local account - which is no place for
+        # DPAPI machine-scope passwords. The installer creates and locks it (#230 follow-up).
+        throw "The folder for the company vault, $dir, does not exist. Run 'Reconfigure' from the Start Menu to create it."
     }
     $json = $Registry | ConvertTo-Json -Depth 8
     $tmp = "$Path.tmp"
@@ -126,7 +130,10 @@ function Invoke-LoadCompanyViaAgent {
         [string]$Password,
         [int]$TimeoutSec = 30
     )
-    $dataDir = Split-Path -Parent $RegistryPath
+    # The GUI agent's IPC folder: the Claudally agent folder, whatever TALLY_COMPANIES_CONFIG says about
+    # where the vault is (it used to be derived from the vault's folder, #230 follow-up).
+    $programData = if ($env:ProgramData) { $env:ProgramData } else { 'C:\ProgramData' }
+    $dataDir = Join-Path $programData 'Claudally\agent'
     $cmdFile = Join-Path $dataDir '_mcp_gui_command.json'
     $resFile = Join-Path $dataDir '_mcp_gui_result.json'
     $commandId = "tray-test-$(Get-Date -Format 'HHmmssfff')"

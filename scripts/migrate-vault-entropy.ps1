@@ -19,7 +19,9 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$RegistryPath = "$env:PUBLIC\TallyPrimeEditLog\data\.tally-mcp-companies.json",
+    # The vault lives in the Claudally agent folder since #230's follow-up. An install the new
+    # installer has not run over yet still has it in Tally's data folder; pass -RegistryPath for that.
+    [string]$RegistryPath = "$env:ProgramData\Claudally\agent\.tally-mcp-companies.json",
     [switch]$WhatIfOnly
 )
 

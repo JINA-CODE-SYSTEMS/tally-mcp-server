@@ -54,9 +54,11 @@
       - An existing tunnel service is re-registered with --token-file, the token file written from
         the TUNNEL_TOKEN in .env, and the registry copy scrubbed (#193). If the file cannot be
         locked down the tunnel is left unregistered and the run fails, so Setup exits 10.
-      - The NTFS lockdown of .env, the company vault and the IPC directory is re-applied, by SID.
-        If it cannot be, the run stops with an error (Setup exits 10); the preflight checks for
-        this first.
+      - The NTFS lockdown of .env and of the Claudally agent folder (%ProgramData%\Claudally\agent:
+        the company vault and the GUI agent's IPC files) is re-applied, by SID. A vault an earlier
+        version kept in Tally's data folder is moved there, and the permissions earlier versions
+        took away from Tally's data folder are given back. If a lockdown or the move cannot be done,
+        the run stops with an error (Setup exits 10); the preflight checks for this first.
     See docs/installer.md, "Unattended upgrade".
 
 .PARAMETER PreflightOnly
@@ -64,13 +66,17 @@
     if it can, 1 if not. The installer runs this before it stops or copies anything, so a refused
     upgrade leaves the running version untouched. The one thing it writes: scratch files holding no
     secret, to dry-run the lockdowns the upgrade will apply, each shredded again straight away -
-    .tally-mcp-acl.preflight in the install folder and in the Tally data folder (the .env and vault
-    lockdown, #230), and .tunnel-token.preflight when there is a tunnel to migrate (#193).
+    .tally-mcp-acl.preflight in the install folder and in the Claudally agent folder (or, if that
+    does not exist yet, the nearest folder above it) for the .env and vault lockdown (#230), and
+    .tunnel-token.preflight when there is a tunnel to migrate (#193). It also refuses an agent folder
+    it cannot trust (a junction, or one another account created), and a vault it would have to move
+    but cannot read.
 
 .NOTES
     Exit codes: 0 when everything was configured; non-zero (1) when anything failed - including a
-    lockdown of .env, the company vault or the IPC directory that could not be applied and verified
-    (the run stops there, #230), and a configured Cloudflare Tunnel that could not be registered
+    lockdown of .env or of the Claudally agent folder and vault that could not be applied and
+    verified, or a vault that could not be moved out of Tally's data folder (the run stops there,
+    #230), and a configured Cloudflare Tunnel that could not be registered
     (reported after the agent and tray are restarted). The installer reports a non-zero exit to the
     person installing it and, for a silent run, as Setup exit code 10.
 
@@ -274,136 +280,14 @@ function _GetTaskOrNull {
 }
 
 # --- NTFS lockdown, by SID (#193, #230) -----------------------------------------------------------
-# Defined here rather than beside the steps that use them because the -Upgrade preflight below
-# dry-runs them before the installer stops anything; see there.
-#
-# Every lockdown in this script names its principals by SID, never by name. 'Administrators' is
-# localised (Administratoren, Administrateurs, ...), and on a Windows whose language is not English
-# `icacls ... 'Administrators:F'` fails with "No mapping between account names and security IDs"
-# and changes NOTHING - so .env, the company vault and the IPC directory used to keep their
-# inherited ACL (BUILTIN\Users can read Program Files) behind a yellow warning (#230). The agent
-# user is resolved to its SID up front for the same reason, and so that an account that cannot be
-# resolved at all stops the step before a file is touched.
-$Script:SidSystem = 'S-1-5-18'
-$Script:SidAdmins = 'S-1-5-32-544'
-
-# Zero the bytes, then unlink: the same best-effort shred used for the credentials file and the
-# .oauth-*.json stores below, so a removed secret is not trivially recoverable from free space.
-# Returns $true when the file is gone afterwards.
-function _ShredFile([string]$Path) {
-    if (-not (Test-Path -LiteralPath $Path)) { return $true }
-    try {
-        $len = (Get-Item -LiteralPath $Path -Force).Length
-        if ($len -gt 0) { [System.IO.File]::WriteAllBytes($Path, (New-Object byte[] $len)) }
-    } catch {
-        # Best effort: a file that cannot be zeroed is still unlinked below, and the return value
-        # reports whether it is gone. Nothing to add here, so record that it was considered.
-        $null = $_
-    }
-    Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-    return (-not (Test-Path -LiteralPath $Path))
-}
-
-# The SID of a Windows account, or a throw that says which account could not be resolved.
-function _AccountSid([string]$Account) {
-    try {
-        return ([System.Security.Principal.NTAccount]$Account).Translate([System.Security.Principal.SecurityIdentifier]).Value
-    } catch {
-        $e = $_.Exception
-        if ($e.InnerException) { $e = $e.InnerException }
-        throw "the Windows account '$Account' does not resolve to a security identifier on this machine, so nothing can be granted to it ($($e.Message))"
-    }
-}
-
-# Runs icacls and returns its exit code, plus its output when it failed. With ErrorActionPreference
-# 'Continue' (local to this function): under the 'Stop' the main body uses, Windows PowerShell 5.1
-# turns a native command's stderr into a terminating error, so a failure would surface as a bare
-# "No mapping between account names..." record rather than a message saying which path and why.
-function _Icacls {
-    $ErrorActionPreference = 'Continue'
-    $out = @(& icacls @args 2>&1)
-    $code = $LASTEXITCODE
-    $text = ''
-    if ($code -ne 0) { $text = (($out | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) -join ' ') }
-    return [pscustomobject]@{ Code = $code; Text = $text }
-}
-
-# Restricts $Path to exactly SYSTEM, Administrators and $ExtraSids, then PROVES it with Get-Acl, or
-# throws. Never trusts an exit code alone: the whole of #230 was a lockdown whose failure was only
-# ever a return value. -Container adds (OI)(CI) so files created inside later inherit the same list;
-# -OwnerAdministrators also makes Administrators the owner (an owner can always rewrite the DACL).
-#
-# /grant:r only replaces entries for the principals it names, so an explicit entry for anyone else
-# (put there by hand, or by another program) would survive it and leave the "locked" path readable
-# or writable by that account. Such entries are removed, by SID, and named in the output - the
-# contract has always been "only these principals", and verify-deployment.ps1 fails the vault on
-# any other allow entry. Returns the display names of what was removed.
-function _LockDown {
-    param([string]$Path, [string[]]$ExtraSids = @(), [switch]$Container, [switch]$OwnerAdministrators)
-    $sids = @(@($Script:SidSystem, $Script:SidAdmins) + @($ExtraSids | Where-Object { $_ }) | Select-Object -Unique)
-    $flags = ''
-    if ($Container) { $flags = '(OI)(CI)' }
-    $grants = @($sids | ForEach-Object { "*${_}:${flags}F" })
-    $r = _Icacls $Path /inheritance:r /grant:r @grants
-    if ($r.Code -ne 0) { throw "icacls exit $($r.Code) while setting the ACL on ${Path}: $($r.Text)" }
-    if ($OwnerAdministrators) {
-        $r = _Icacls $Path /setowner "*$Script:SidAdmins"
-        if ($r.Code -ne 0) { throw "icacls exit $($r.Code) while setting the owner of ${Path}: $($r.Text)" }
-    }
-
-    $sidType = [System.Security.Principal.SecurityIdentifier]
-    $removed = @()
-    $foreign = @((Get-Acl -LiteralPath $Path).GetAccessRules($true, $true, $sidType) |
-                 Where-Object { -not $_.IsInherited -and $sids -notcontains $_.IdentityReference.Value } |
-                 ForEach-Object { $_.IdentityReference.Value } | Select-Object -Unique)
-    foreach ($f in $foreign) {
-        $r = _Icacls $Path /remove "*$f"
-        if ($r.Code -ne 0) { throw "icacls exit $($r.Code) while removing the entry for $f from ${Path}: $($r.Text)" }
-        $name = $f
-        try { $name = "$(([System.Security.Principal.SecurityIdentifier]$f).Translate([System.Security.Principal.NTAccount]).Value) ($f)" } catch { $null = $_ }
-        $removed += $name
-    }
-
-    # Prove it. Deny entries are ignored: they can only narrow access.
-    $acl = Get-Acl -LiteralPath $Path
-    if (-not $acl.AreAccessRulesProtected) { throw "inheritance is still enabled on $Path" }
-    $fullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
-    $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
-    $allows = @($acl.GetAccessRules($true, $true, $sidType) |
-                Where-Object { $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow })
-    foreach ($rule in $allows) {
-        if ($sids -notcontains $rule.IdentityReference.Value) { throw "$Path still grants access to $($rule.IdentityReference.Value)" }
-    }
-    foreach ($sid in $sids) {
-        $ok = @($allows | Where-Object {
-            $_.IdentityReference.Value -eq $sid -and
-            (($_.FileSystemRights -band $fullControl) -eq $fullControl) -and
-            ((-not $Container) -or (($_.InheritanceFlags -band $inherit) -eq $inherit))
-        })
-        if ($ok.Count -eq 0) { throw "the grant to $sid did not take effect on $Path" }
-    }
-    if ($OwnerAdministrators) {
-        $ownerSid = $acl.GetOwner($sidType).Value
-        if (@($Script:SidSystem, $Script:SidAdmins) -notcontains $ownerSid) { throw "the owner of $Path is $ownerSid, not Administrators" }
-    }
-    return , $removed
-}
-
-# Creates $Path EMPTY and locks it down before anything is written to it, or throws having written
-# nothing (and leaves no file behind). Until the lockdown it carries its folder's inherited ACL, so
-# it must hold nothing worth reading during that window. Starts from a fresh file: an old one could
-# carry entries of its own. Overwriting it afterwards keeps the DACL.
-function _NewLockedFile {
-    param([string]$Path, [string[]]$ExtraSids = @(), [switch]$OwnerAdministrators)
-    if (-not (_ShredFile $Path)) { throw "could not remove the existing $Path" }
-    [System.IO.File]::WriteAllBytes($Path, (New-Object byte[] 0))
-    try {
-        $null = _LockDown -Path $Path -ExtraSids $ExtraSids -OwnerAdministrators:$OwnerAdministrators
-    } catch {
-        $null = _ShredFile $Path
-        throw
-    }
-}
+# _ShredFile, _AccountSid, _LockDown, _NewLockedFile, _MoveSecretFileLocked, _ProbeLockDown,
+# _EnsureAgentDir and _RestoreTallyDataFolder live in lockdown-helpers.ps1, next to this script,
+# shared with setup-windows.ps1. Loaded here, before the -Upgrade preflight below, because the
+# preflight dry-runs them before the installer stops anything. (The installer extracts both files to
+# the same temporary folder for the preflight, and installs both into scripts\installer.)
+$_helpers = Join-Path $PSScriptRoot 'lockdown-helpers.ps1'
+if (-not (Test-Path -LiteralPath $_helpers)) { throw "Missing $_helpers - the installer ships it next to this script. Re-run the installer." }
+. $_helpers
 
 # The tunnel token (#193): readable by SYSTEM + Administrators only, owned by Administrators - the
 # descriptor cloudflared's own `service install` gives its token file. Not the agent user: nothing
@@ -413,21 +297,6 @@ function _WriteLockedTokenFile([string]$Path, [string]$Token) {
     # No BOM and no newline: cloudflared TrimSpace()s the contents, but a BOM is not whitespace and
     # would make the token unparseable.
     [System.IO.File]::WriteAllText($Path, $Token, (New-Object System.Text.UTF8Encoding($false)))
-}
-
-# Dry run of the .env / company-vault lockdown in $Dir, on a scratch file holding no secret, through
-# the same function the real step uses; shredded again whatever happens. For the -Upgrade preflight.
-# Returns '' on success or why it failed.
-function _ProbeLockDown([string]$Dir, [string]$AgentSid) {
-    $probe = Join-Path $Dir '.tally-mcp-acl.preflight'
-    $why = ''
-    try {
-        _NewLockedFile -Path $probe -ExtraSids @($AgentSid)
-    } catch {
-        $why = $_.Exception.Message
-    }
-    if (-not (_ShredFile $probe)) { $why = ("$why could not remove the probe file $probe afterwards.").Trim() }
-    return $why
 }
 
 # --- Unattended upgrade: resolve everything from what is already there (#177) --------------------
@@ -526,24 +395,42 @@ if ($Upgrade) {
             }
         }
 
-        # The .env, company-vault and IPC-directory lockdowns (#230). An upgrade re-applies all three
-        # and fails closed if it cannot - after the installer has stopped the service. So find out
-        # now: the agent user must resolve to a SID (every grant is by SID), and the lockdown is
-        # dry-run on a scratch file, holding no secret, in the install folder (.env) and in the Tally
-        # data folder (the vault, and the IPC directory it lives in). Only once nothing else has
-        # refused: the probes need a known agent user, and a refused run should write nothing.
+        # The .env lockdown, the Claudally agent folder and the vault's move into it (#230). An upgrade
+        # applies all of them and fails closed if it cannot - after the installer has stopped the
+        # service. So find out now, changing nothing that matters:
+        #   - the agent user must resolve to a SID (every grant is by SID);
+        #   - %ProgramData%\Claudally and its agent folder, if they already exist, must be ones we can
+        #     trust (not a junction, not planted by another account) - see _EnsureAgentDir;
+        #   - the lockdown is dry-run on a scratch file holding no secret, in the install folder (.env)
+        #     and where the agent folder will be (the vault and the IPC files);
+        #   - a vault still in Tally's data folder, from an earlier version, must be readable, since
+        #     the upgrade moves it.
+        # Only once nothing else has refused: the probes need a known agent user, and a refused run
+        # should write nothing.
         if ($_upgradeProblems.Count -eq 0) {
             $_agentSid = ''
             try { $_agentSid = _AccountSid $_upgradeAgentUser } catch { $_upgradeProblems += "$($_.Exception.Message). Run Reconfigure from the Start Menu to set a user that exists." }
             if ($_agentSid) {
-                $_dataDir = _Coalesce $_existingEnv['TALLY_DATA_PATH'] 'C:\Users\Public\TallyPrimeEditLog\data'
-                foreach ($_probeDir in @($InstallDir, $_dataDir)) {
-                    # A data folder that does not exist yet is created by the real step under its
-                    # parent's permissions; there is nothing to probe until then.
-                    if (-not (Test-Path -LiteralPath $_probeDir -PathType Container)) { continue }
-                    $_why = _ProbeLockDown $_probeDir $_agentSid
-                    if ($_why) {
-                        $_upgradeProblems += "the configuration files in ${_probeDir} cannot be locked down to SYSTEM, Administrators and '$_upgradeAgentUser' ($_why), and an upgrade will not leave them readable by other local accounts. Run Setup elevated, or check that folder's permissions."
+                foreach ($_folder in @((_ClaudallyDir), (_AgentDir))) {
+                    $_why = _UntrustedFolderReason -Path $_folder -TrustedOwnerSids @($Script:SidSystem, $Script:SidAdmins, $_agentSid)
+                    if ($_why) { $_upgradeProblems += "$_why. Delete it (from an elevated prompt) and run the update again." }
+                }
+                if ($_upgradeProblems.Count -eq 0) {
+                    # The nearest folder that exists on the way to the agent folder: the probe goes where
+                    # the real files will, or as close as it can get without creating anything.
+                    $_agentProbeDir = @((_AgentDir), (_ClaudallyDir), $env:ProgramData) | Where-Object { Test-Path -LiteralPath $_ -PathType Container } | Select-Object -First 1
+                    foreach ($_probeDir in @($InstallDir, $_agentProbeDir)) {
+                        if (-not $_probeDir) { continue }
+                        $_why = _ProbeLockDown $_probeDir $_agentSid
+                        if ($_why) {
+                            $_upgradeProblems += "files in ${_probeDir} cannot be locked down to SYSTEM, Administrators and '$_upgradeAgentUser' ($_why), and an upgrade will not leave the password, the vault or the GUI agent's commands readable by other local accounts. Run Setup elevated, or check that folder's permissions."
+                        }
+                    }
+                }
+                $_oldVault = Join-Path (_Coalesce $_existingEnv['TALLY_DATA_PATH'] 'C:\Users\Public\TallyPrimeEditLog\data') '.tally-mcp-companies.json'
+                if (Test-Path -LiteralPath $_oldVault) {
+                    try { $null = [System.IO.File]::ReadAllBytes($_oldVault) } catch {
+                        $_upgradeProblems += "the company vault at $_oldVault has to move to $(_AgentDir), but it cannot be read ($($_.Exception.Message)). Run Setup elevated, or check that file's permissions."
                     }
                 }
             }
@@ -988,29 +875,71 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     foreach ($r in @($removedAces)) { Write-Host "[WARN] Removed an extra permission entry for $r from $envFile" -ForegroundColor Yellow }
     Write-Host "[OK] Locked NTFS ACL on $envFile (SYSTEM + Administrators + $AgentTaskUser, by SID; verified)"
 
-    # --- 1b. Initialize + lock down the companies registry file -----------
-    # The registry stores DPAPI-encrypted passwords for the alias feature. We pre-create an empty
-    # file so the ACL is in place before anything sensitive is written, then strip inheritance and
-    # grant access only to SYSTEM (the MCP service) and Administrators (operator + tray when
-    # elevated). The DPAPI blob is defense-in-depth; the NTFS ACL is the real access boundary.
+    # --- 1b. The Claudally agent folder, and the files that live in it (#230) -------------------
+    # The GUI agent's IPC files and the company password vault used to live in TALLY_DATA_PATH -
+    # Tally's own data folder - and every version up to #230 locked that whole folder down to
+    # SYSTEM + Administrators + the agent user so they would not be world-readable. On a PC several
+    # Windows accounts share, that locked the others out of their Tally companies. They now live in a
+    # folder of ours, %ProgramData%\Claudally\agent, and Tally's folder is left alone (1d restores it).
     #
-    # icacls /inheritance:r removes inherited ACEs; /grant:r replaces (not adds) the named ACEs;
-    # every principal is named by SID (see _LockDown). Because the ACL is the real boundary (the
-    # DPAPI scope is LocalMachine), a failed lockdown stops the run, as for .env (#230), instead of
-    # warning and leaving the stored Tally passwords readable.
+    # The folder is created - or, on a re-run, taken back - locked by SID and verified BEFORE anything
+    # is written in it: SYSTEM + Administrators + the agent user, (OI)(CI) so the files the SYSTEM
+    # service creates there inherit the agent-user grant. (Without (OI)(CI) the GUI agent, which runs
+    # under a UAC-filtered token that drops Administrators, fails every read with "Access is denied" -
+    # observed in the field.) %ProgramData% lets any user create folders, so one planted there by
+    # another account, or a junction, is refused rather than used; see _EnsureAgentDir for why.
     #
-    # IMPORTANT: also grant the agent task user explicit Full Control. The tray scheduled task
-    # runs with -RunLevel Limited (non-elevated), which filters the Administrators group from
-    # the process token even when the user IS in Administrators. Without an explicit user grant,
-    # the Manage Companies dialog's Move-Item -Force silently fails on overwrite - the .tmp file
-    # gets written but never gets renamed to the real .json, so Save reports success and
-    # nothing actually persists.
-    $registryFile = Join-Path $TallyDataPath '.tally-mcp-companies.json'
-    if (-not (Test-Path -LiteralPath (Split-Path $registryFile))) {
-        New-Item -ItemType Directory -Force -Path (Split-Path $registryFile) | Out-Null
+    # Fails closed like .env (#230): an IPC folder other accounts can write to is a way to type
+    # keystrokes - stored company passwords included - into the accountant's Tally session.
+    $agentDir = _AgentDir
+    try {
+        $removedAces = _EnsureAgentDir -AgentSid $agentSid
+    } catch {
+        throw "The Claudally agent folder $agentDir could not be set up and locked down to SYSTEM, Administrators and ${AgentTaskUser}: $($_.Exception.Message) It holds the company password vault and the GUI agent's commands, so the run stops here."
     }
+    foreach ($r in @($removedAces)) { Write-Host "[WARN] Removed an extra permission entry for $r from $(_ClaudallyDir)" -ForegroundColor Yellow }
+    Write-Host "[OK] Locked NTFS ACL on $agentDir (SYSTEM + Administrators + $AgentTaskUser, by SID; verified)"
+
+    # --- 1c. The company password vault ----------------------------------------------------------
+    # DPAPI-encrypted Tally company passwords. The DPAPI scope is LocalMachine, so this file's ACL is
+    # the real boundary: SYSTEM (the service), Administrators, and the agent user - the tray runs with
+    # -RunLevel Limited, which filters Administrators out of its token, so without an explicit grant
+    # the Manage Companies dialog's save silently fails. A lockdown that fails stops the run.
+    #
+    # An earlier version kept the vault in Tally's data folder. It is MOVED here, without a readable
+    # copy at any point (_MoveSecretFileLocked): the new file is created empty and locked, the lock
+    # verified, the bytes written and read back, and only then is the old one shredded. The bytes are
+    # copied unchanged, so every stored password decrypts exactly as before (the DPAPI entropy is a
+    # fixed string, not the path). The pre-entropy backup migrate-vault-entropy.ps1 may have left
+    # next to it moves the same way; a half-written .tmp from the tray is shredded.
+    # (TALLY_COMPANIES_CONFIG, an expert override the server honours, is not managed here.)
+    $registryFile = Join-Path $agentDir '.tally-mcp-companies.json'
+    $oldVault = Join-Path $TallyDataPath '.tally-mcp-companies.json'
     $removedAces = @()
     try {
+        foreach ($suffix in @('', '.pre-entropy-backup')) {
+            $from = "$oldVault$suffix"
+            if (-not (Test-Path -LiteralPath $from)) { continue }
+            $to = "$registryFile$suffix"
+            if (Test-Path -LiteralPath $to) {
+                $same = [System.Linq.Enumerable]::SequenceEqual([byte[]][System.IO.File]::ReadAllBytes($from), [byte[]][System.IO.File]::ReadAllBytes($to))
+                if ($same) {
+                    if (-not (_ShredFile $from)) { throw "could not remove the old copy $from (the same file is already at $to)" }
+                    Write-Host "[OK] Removed the old copy of $from (already moved to $to)"
+                    continue
+                }
+                # Both exist and differ: the one here is what the server reads, so it stays; the old
+                # one still must not stay in Tally's folder, so it moves in beside it, under a name
+                # that says where it came from, for a human to reconcile.
+                $to = "$registryFile$suffix.from-tally-data-folder-$(Get-Date -Format 'yyyyMMddHHmmss')"
+                Write-Host "[WARN] $from differs from $registryFile$suffix; moving it to $to rather than overwriting either. Compare the two and keep the right one by hand." -ForegroundColor Yellow
+            }
+            _MoveSecretFileLocked -Source $from -Destination $to -ExtraSids @($agentSid)
+            Write-Host "[OK] Moved $from to $to (locked and verified before the old copy was shredded)"
+        }
+        $staleTmp = "$oldVault.tmp"
+        if ((Test-Path -LiteralPath $staleTmp) -and -not (_ShredFile $staleTmp)) { throw "could not remove the stale partial vault $staleTmp" }
+
         if (-not (Test-Path -LiteralPath $registryFile)) {
             # Locked before it holds anything, as for .env; if that fails no file is left behind.
             _NewLockedFile -Path $registryFile -ExtraSids @($agentSid)
@@ -1021,59 +950,39 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
             $removedAces = _LockDown -Path $registryFile -ExtraSids @($agentSid)
         }
     } catch {
-        throw "The company password vault $registryFile could not be locked down to SYSTEM, Administrators and ${AgentTaskUser}: $($_.Exception.Message). Its passwords are decryptable by any local account that can read it, so the run stops here."
+        throw "The company password vault $registryFile could not be moved or locked down to SYSTEM, Administrators and ${AgentTaskUser}: $($_.Exception.Message). Its passwords are decryptable by any local account that can read it, so the run stops here."
     }
     foreach ($r in @($removedAces)) { Write-Host "[WARN] Removed an extra permission entry for $r from $registryFile" -ForegroundColor Yellow }
     Write-Host "[OK] Locked NTFS ACL on $registryFile (SYSTEM + Administrators + $AgentTaskUser, by SID; verified)"
 
-    # --- 1c. Lock down the GUI-agent IPC directory ------------------------
-    # Security: the GUI agent and MCP server exchange commands via _mcp_gui_command.json /
-    # _mcp_gui_result.json in the Tally data dir. Those commands type credentials and drive
-    # keystrokes into the interactive Tally session, so the channel must NOT be world-writable.
-    # The default data dir (C:\Users\Public\...\data) grants BUILTIN\Users write by default, so
-    # any local user could drop a command file and inject keystrokes. Restrict the directory to
-    # SYSTEM + Administrators + the agent task user. The (OI)(CI) inheritance flags are REQUIRED and
-    # must be explicit: icacls does NOT reliably default to inheritable ACEs, so a bare "user:F" grants
-    # the FOLDER only. Without (OI)(CI) the transient IPC files the SYSTEM service creates here do not
-    # inherit the agent-user grant, and the GUI agent - which runs under a UAC-filtered (Limited) token
-    # that drops Administrators - fails every read with "Access is denied". (Observed in the field: a
-    # dir ACE of "tapanjain:(F)" instead of "tapanjain:(OI)(CI)(F)" left _mcp_gui_command.json granting
-    # only SYSTEM + Administrators, and load-company looped on Access-denied.) NOTE for reviewers: this
-    # changes the ACL of TALLY_DATA_PATH; validate Tally (interactive user = agent task user) still has
-    # access on multi-account / service-account deployments.
-    #
-    # Fails closed like .env and the vault (#230), for the same kind of reason: an IPC directory that
-    # every local user can write to is a way to type keystrokes - including stored company
-    # passwords - into the accountant's Tally session. Nothing here is worth that. By SID, and any
-    # explicit entry for another account is removed and named in the output (see _LockDown).
-    $ipcDir = Split-Path $registryFile
-    if (Test-Path -LiteralPath $ipcDir) {
-        try {
-            $removedAces = _LockDown -Path $ipcDir -ExtraSids @($agentSid) -Container
-        } catch {
-            throw "The GUI agent IPC directory $ipcDir could not be locked down to SYSTEM, Administrators and ${AgentTaskUser}: $($_.Exception.Message). Left as it is, other local accounts could send keystrokes to Tally through it, so the run stops here."
-        }
-        foreach ($r in @($removedAces)) { Write-Host "[WARN] Removed an extra permission entry for $r from $ipcDir" -ForegroundColor Yellow }
-        Write-Host "[OK] Locked NTFS ACL on IPC directory $ipcDir (SYSTEM + Administrators + $AgentTaskUser, by SID; verified)"
-
-        # Self-heal: clear any STALE IPC files left by a previous install/reconfigure. The MCP service
-        # overwrites _mcp_gui_command.json IN PLACE, so a file created under an older/narrower ACL (e.g.
-        # before this hardening, or by a reconfigure that ran as a different admin) KEEPS that stale ACL
-        # forever. The GUI agent runs under a UAC-filtered "Limited" token (no Administrators), so if the
-        # file lacks a direct grant to the agent user it fails with "Access is denied" and load-company
-        # silently breaks. Deleting them here means the service recreates them fresh (atomic temp+rename),
-        # inheriting the directory ACL we just set - so the operator never has to touch icacls by hand.
-        foreach ($ipcName in @('_mcp_gui_command.json', '_mcp_gui_result.json', '_mcp_screenshot.png')) {
-            $stale = Join-Path $ipcDir $ipcName
-            if (Test-Path -LiteralPath $stale) {
-                Remove-Item -LiteralPath $stale -Force -ErrorAction SilentlyContinue
-                if (-not (Test-Path -LiteralPath $stale)) {
-                    Write-Host "[OK] Cleared stale IPC file $ipcName (service recreates it with the correct ACL)"
-                } else {
-                    Write-Host "[WARN] Could not remove stale IPC file $stale - a running agent/service may hold it; it will be recreated on next command" -ForegroundColor Yellow
-                }
+    # Self-heal: clear STALE IPC files. In the agent folder, a file created under an older or narrower
+    # ACL keeps it (the service overwrites the command file in place), and the GUI agent's Limited
+    # token then gets "Access is denied"; deleting them lets the service recreate them under the
+    # folder's ACL. In Tally's data folder, where earlier versions kept them, they are shredded: a
+    # command file can hold a company password, and once 1d gives that folder its inherited
+    # permissions back, anything left there is readable by every account that can open the books.
+    foreach ($ipcFolder in @($agentDir, $TallyDataPath)) {
+        if (-not (Test-Path -LiteralPath $ipcFolder -PathType Container)) { continue }
+        $staleIpc = @(Get-ChildItem -LiteralPath $ipcFolder -Force -File -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Name -like '_mcp_gui_*' -or $_.Name -like '_mcp_screenshot*' })
+        foreach ($f in $staleIpc) {
+            if (_ShredFile $f.FullName) {
+                Write-Host "[OK] Removed stale IPC file $($f.FullName)"
+            } else {
+                Write-Host "[WARN] Could not remove stale IPC file $($f.FullName) - a running agent or service may hold it. Delete it by hand; it may hold a company password." -ForegroundColor Yellow
             }
         }
+    }
+
+    # --- 1d. Give Tally's data folder its permissions back ----------------------------------------
+    # Earlier versions disabled inheritance on TALLY_DATA_PATH and granted SYSTEM, Administrators and
+    # the agent user explicitly, which locked every other Windows account on the PC out of the books.
+    # Nothing of ours lives there any more, so undo it - exactly what that command did and nothing
+    # else, and nothing at all on a folder we never changed (_RestoreTallyDataFolder says how it
+    # tells). Repair, not setup: a failure here is a warning and the run carries on.
+    foreach ($line in @(_RestoreTallyDataFolder -Dir $TallyDataPath -AgentSid $agentSid)) {
+        if ($line -like 'WARN:*') { Write-Host "[WARN] $($line.Substring(5).Trim())" -ForegroundColor Yellow }
+        else { Write-Host "[OK] $line" }
     }
 
     # --- 2. Stop and remove any existing service (idempotent re-runs) ------
@@ -1618,6 +1527,7 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
     Write-Host "  Agent task:     $AgentTaskName"
     Write-Host "  Tray task:      $TrayTaskName"
     Write-Host "  .env:           $envFile"
+    Write-Host "  Agent folder:   $agentDir (company vault + GUI agent IPC)"
     Write-Host "  Logs:           $(Join-Path $InstallDir 'logs')"
     Write-Host ""
     Write-Host "Next steps:"
