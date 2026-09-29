@@ -1,6 +1,9 @@
 # Remote channel and pairing: threat model, protocol and library choice
 
-> **Status: Proposed, 2026-09-28. Two decisions are still with the owner ([§11](#11-questions-for-the-owner)).**
+> **Status: Accepted, 2026-09-29, by the owner (Tapan Jain, @jain-t), without independent review
+> (ADR 0001 D7).** Proposed 2026-09-28. The owner's answers to the three open questions are recorded
+> in [§11](#11-owner-decisions): CPace built from audited primitives (D-P1), symmetric per-device
+> keys (D-P2), and the pairing-code parameters as proposed (D-P3). Nothing here is implemented yet.
 >
 > This is phase **P1** of [ADR 0001](../adr/0001-remote-transport.md) (#219, part of #178). It
 > picks the channel and pairing protocols and the libraries that implement them, under the ADR's
@@ -10,9 +13,10 @@
 >
 > **The PAKE part does not fully meet D7 as written, and this document says so.** No audited CPace
 > or SPAKE2 implementation exists for Node, in JS or WASM ([§5.3](#53-pake)). D7 says that finding
-> goes back to the owner, not around them. The recommendation is CPace built strictly from audited
-> primitives and pinned by the draft's published test vectors. The one audited PAKE that does exist
-> (OPAQUE) is the alternative. The owner chooses: [§11](#11-questions-for-the-owner), Q1.
+> goes back to the owner, not around them. It did. **The owner chose CPace built strictly from
+> audited primitives, pinned by the draft's published test vectors, and accepted that the glue is
+> unaudited** ([§11](#11-owner-decisions), D-P1). The one audited PAKE that does exist (OPAQUE) was
+> the alternative and was not taken.
 >
 > **Scope limit (#178).** This public document gives properties, protocol names, libraries and
 > parameters where a reviewer needs them to judge a property. It does **not** give wire formats,
@@ -32,7 +36,7 @@
 | | Choice | Why, in one line |
 |---|---|---|
 | **Channel** | **TLS 1.3 from Node's own `node:tls`** (the OpenSSL bundled in Node 22), external-PSK mode with `psk_dhe_ke`, one 256-bit key per paired device, TLS 1.3 only, SHA-256 suites only | The most scrutinised protocol implementation there is. It is already inside the runtime we ship and adds no dependency. Every Noise implementation for Node is unaudited ([§5.1](#51-channel)) |
-| **Pairing (PAKE)** | **CPace, suite `CPACE-P256_XMD:SHA-256_SSWU_NU_-SHA256`** per draft-irtf-cfrg-cpace-21, initiator-responder mode, built on the public API of **`@noble/curves`** (audited), with hashing and HKDF from `node:crypto` | The CFRG's chosen balanced PAKE, and the case we have: both ends know a one-time code. The draft's test vectors pin every intermediate value. **No audited implementation exists, so this needs owner sign-off (Q1)** |
+| **Pairing (PAKE)** | **CPace, suite `CPACE-P256_XMD:SHA-256_SSWU_NU_-SHA256`** per draft-irtf-cfrg-cpace-21, initiator-responder mode, built on the public API of **`@noble/curves`** (audited), with hashing and HKDF from `node:crypto` | The CFRG's chosen balanced PAKE, and the case we have: both ends know a one-time code. The draft's test vectors pin every intermediate value. **No audited implementation exists; the owner accepted this (D-P1)** |
 | **Binding PAKE to channel** | CPace output → HKDF-SHA256 → TLS 1.3 external PSK for a pairing handshake. The TLS `Finished` messages are the key confirmation. The device key comes from the TLS exporter of that handshake | This is the integration the CPace draft itself names (§10.4–10.5: "explicit authentication … as e.g. done in the Finished messages in TLS1.3"). We write no confirmation or KDF construction of our own |
 | **Third-party code** | `@noble/curves` 2.4.0 and its one dependency `@noble/hashes` 2.4.0. MIT, pure JS, no install scripts, ~2.3 MB on disk, used **only while pairing** | Every session after pairing runs on `node:tls` alone |
 | **Keys at rest** | Host: DPAPI machine scope, app entropy, ACL for SYSTEM and Administrators **by SID**, fail closed (#230). Connector: DPAPI CurrentUser, app entropy, in the user's profile | The existing vault pattern, with #230's lessons applied from the start |
@@ -143,7 +147,7 @@ at pairing would give each device an *asymmetric* key. That matches the wording 
 either a third-party generator (for example `@peculiar/x509` and its ~10 dependencies, none
 audited) or DER written by hand. The first adds unaudited supply chain on the session path. The
 second is the home-grown framing of key material D7 forbids. External-PSK mode needs neither.
-What it costs, stated so the owner can weigh it (Q2):
+What it costs, as stated to the owner, who accepted it ([§11](#11-owner-decisions), D-P2):
 
 - **R2, symmetric device keys.** The host holds each device's key, not just a public half. The host
   table must therefore be kept secret as well as intact. It is: DPAPI machine scope plus an ACL,
@@ -157,7 +161,7 @@ What it costs, stated so the owner can weigh it (Q2):
 - **The device key is derived jointly, not generated on the device.** #221 asks that the device key
   be generated on the device and never leave it. In PSK mode it is never transmitted: both ends
   derive it from the pairing handshake's exporter. The host necessarily holds a copy. P2/P3
-  acceptance wording needs updating to match if Q2 is accepted.
+  acceptance wording was updated to match when D-P2 was decided.
 
 Choosing PSK mode now does not close the door. Certificate-based sessions can be added later over
 the same pairing (the pairing channel would carry the certificates instead of deriving a PSK)
@@ -211,9 +215,9 @@ Each candidate's own README says it is unaudited, or it is years out of date:
 | `pake-cpace`, `pakery-cpace` (Rust); `filippo.io/cpace` (Go) | CPace, old drafts or experimental | Unaudited |
 | **`@serenity-kit/opaque` 1.1.0** (WASM of Rust `opaque-ke` 4.0.0) | **OPAQUE, RFC 9807** | **Audited: 7ASecurity, Oct–Nov 2023** ([report](https://7asecurity.com/reports/pentest-report-opaque.pdf); version not stated in the report). The Rust core was audited by NCC Group in 2021 at 0.5.0 (OPAQUE draft-03), not the current line |
 
-That leaves two honest paths. Q1 asks the owner to choose.
+That left two honest paths. The owner chose Option A ([§11](#11-owner-decisions), D-P1).
 
-**Option A (recommended): CPace from audited primitives.** Suite
+**Option A (recommended, and chosen): CPace from audited primitives.** Suite
 `CPACE-P256_XMD:SHA-256_SSWU_NU_-SHA256`, from
 [draft-irtf-cfrg-cpace-21](https://www.ietf.org/archive/id/draft-irtf-cfrg-cpace-21.txt)
 (23 April 2026; IESG review completed, in the RFC Editor queue, not yet an RFC). Every group
@@ -257,9 +261,9 @@ and it needs no PAKE glue of ours. Against it:
 - It adds an 890 KB WASM blob built with a Rust toolchain we cannot reproduce or pin from our side.
 - It still needs the same TLS binding as Option A.
 
-Option A is recommended because the protocol fits the use, and every value it computes is checked
-against a published vector. Option B is recommended only if the owner reads D7 as requiring an
-audited *implementation* over a fitting *protocol*.
+Option A was recommended because the protocol fits the use, and every value it computes is checked
+against a published vector. Option B would have been the choice only if D7 were read as requiring
+an audited *implementation* over a fitting *protocol*. The owner did not read it that way (D-P1).
 
 **Rejected outright: Noise or TLS with the code as the PSK.** A low-entropy PSK lets anyone who
 completes one handshake test guesses offline. The Node docs say so, RFC 9257 says so, and it is
@@ -433,7 +437,7 @@ no secret appears in the registry or in `.env`.
 - An in-band rotation, deriving a fresh key from a new exporter label inside a live session, is a
   possible later addition. It would need its own review and is not in scope.
 - There is no expiry on device keys by default. The tray shows each device's "last connected"
-  time. P5 should offer to remove devices unseen for 90 days.
+  time. P5 offers, but never forces, removal of devices unseen for 90 days (D-P3).
 - DPAPI master keys rotate on Windows' own schedule, transparently.
 
 ### 8.4 Revocation
@@ -487,12 +491,12 @@ Stated so nobody mistakes this design for more than it is.
    draft's vectors, the negative tests and the P8 checklist make it smaller; they do not make it
    go away.
 2. **R2: symmetric device keys** ([§5.1](#51-channel)). The host table must stay secret, and a
-   stolen device key can impersonate the host to that device. Pending Q2.
+   stolen device key can impersonate the host to that device. Accepted by the owner (D-P2).
 3. **R3: relay-visible metadata.** IPs, timing, record sizes, rendezvous id, pairing versus session,
    and a stable opaque device id in each ClientHello. The relay can deny service. Customer text
    must say so, as the ADR requires.
 4. **R4: no audited CPace implementation.** Option A is our own composition of audited primitives.
-   Pending Q1.
+   Accepted by the owner (D-P1).
 5. **R5: DPAPI CurrentUser on the remote laptop** is only as strong as the user's Windows password
    and disk encryption, and gives nothing against same-user malware.
 6. **R6: JS is not constant-time.** Neither is it guaranteed that secrets are wiped from memory.
@@ -655,26 +659,60 @@ throwaway form. The product code must prove them again.
 
 ---
 
-## 11. Questions for the owner
+## 11. Owner decisions
 
-- **Q1: PAKE under D7.** No audited CPace or SPAKE2 implementation exists for Node. Choose one:
-  - **A (recommended)**: CPace-P256 built from `@noble/curves` public calls and `node:crypto`,
-    pinned by every draft-21 test vector, with the composition risk (R1, R4) accepted.
-  - **B**: OPAQUE through the audited `@serenity-kit/opaque`, used off-label for a one-time code,
-    with a larger WASM dependency.
-  - **C**: neither; revisit when an audited CPace appears.
+Decided by the owner on 2026-09-29, without independent review (ADR 0001 D7). The questions were
+put as Q1–Q3 in the proposal; each is recorded here as a decision, with its reasoning and what it
+leaves behind.
 
-  D7 says this decision is the owner's.
-- **Q2: symmetric per-device keys.** Accept TLS 1.3 external-PSK sessions, with a per-device key
-  held by both the host and the device (R2, R3)? That keeps the session path free of any
-  third-party code. The alternative is certificate-based sessions, which need an unaudited X.509
-  generator dependency. If accepted, the P2/P3 issues' wording ("device public keys", "generated on
-  the device") should be updated to match.
-- **Q3 (smaller): the parameters in [§7](#7-pairing-code).** Are 10 minutes, 3 attempts, and a
-  1-hour lockout after 3 dead codes acceptable? Should unused devices be offered for removal after
-  90 days?
+**D-P1 (was Q1): the PAKE is CPace built from audited primitives: option A.** No audited CPace or
+SPAKE2 implementation exists for Node ([§5.3](#53-pake)), so under D7 the choice came to the owner.
+The decision is CPace, suite `CPACE-P256_XMD:SHA-256_SSWU_NU_-SHA256`:
 
----
+- built only from `@noble/curves` public calls and `node:crypto`
+- strictly per draft-irtf-cfrg-cpace, pinned to the draft revision in the protocol version
+- verified against the draft's Appendix B.5 test vectors, including the B.5.11 invalid-point cases
+
+*Why:* the protocol fits the use (a balanced PAKE for a code both ends know), every intermediate
+value is pinned by a published vector, and the only third-party code is audited primitives.
+
+*Residual, accepted:* the glue is unaudited. That means the string handling and call order in CPace,
+and the HKDF and TLS binding. This is exactly the composition risk D7 names (R1, R4). The checklist
+in [§10](#10-internal-review-checklist-for-p8) sections A–C is how P8 keeps it small.
+
+*Not taken:* OPAQUE through `@serenity-kit/opaque`, which is audited but off-label for a one-time
+code and brings a large WASM blob (option B). Also not taken: waiting for an audited CPace (option C).
+
+**D-P2 (was Q2): symmetric per-device keys (TLS 1.3 external PSK), not certificates.**
+
+- Each device has a 256-bit key derived by both ends from the TLS exporter of the pairing session,
+  never transmitted.
+- The host keeps the device-key table DPAPI-protected (machine scope) with a locked, by-SID ACL
+  ([§8.2](#82-storage-at-rest)).
+- Revocation removes the device's entry.
+
+*Why:* it keeps the session path free of any third-party code. Certificates would need an unaudited
+X.509 generator or hand-written DER.
+
+*Residual, accepted:*
+
+- R2: the host table must stay secret, and a stolen device key can impersonate the host to that
+  device.
+- R3: the relay and LAN observers see an opaque, stable device id in each ClientHello.
+
+*Follow-up done:* the wording of #220 and #221 (and any other child issue that said "device public
+keys" or "generated on the device") was updated to match. Certificate-based sessions remain possible
+later over the same pairing ([§5.1](#51-channel)).
+
+**D-P3 (was Q3): the pairing-code parameters in [§7](#7-pairing-code), as proposed.**
+
+- A 10-minute code lifetime.
+- 3 attempts per code.
+- A 1-hour refusal of new codes after 3 dead codes within an hour.
+- Devices unseen for 90 days are **offered** for removal in the tray, not removed automatically.
+
+*Why:* this bounds online guessing at about 2.8 × 10⁻⁹ per code while leaving time to walk to the
+other machine, and removal stays a human decision.
 
 ## 12. References
 
