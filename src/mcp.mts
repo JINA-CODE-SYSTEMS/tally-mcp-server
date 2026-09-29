@@ -873,7 +873,7 @@ export type CompanyEntry = {
 // The on-disk shape of .tally-mcp-companies.json after the registry feature.
 // Old-shape files (a flat { folderId: hints } map) are migrated into `legacyHints` on read;
 // `companies` starts empty and is populated via the Manage Companies dashboard.
-// Path: <dataPath>/.tally-mcp-companies.json by default, or override via TALLY_COMPANIES_CONFIG env var.
+// Path: resolveCompanyVaultPath() - %ProgramData%\Claudally\agent\.tally-mcp-companies.json by default, or TALLY_COMPANIES_CONFIG.
 export type CompanyRegistry = {
   schemaVersion: 1;
   companies: CompanyEntry[];
@@ -1291,9 +1291,10 @@ export const BUILT_IN_ENTRY_ORDER: Record<string, EntryOrder> = {
 
 export function entryOrderConfigPath(): string {
   if (process.env.TALLY_ENTRY_ORDER_CONFIG) return process.env.TALLY_ENTRY_ORDER_CONFIG;
-  // Beside the company registry rather than in .env: this map is written repeatedly and holds
-  // user-defined type names, and TALLY_DATA_PATH is writable by the user on both deployment modes
-  // (a service install's .env sits under Program Files and needs an administrator).
+  // In TALLY_DATA_PATH rather than in .env: this map is written repeatedly and holds user-defined
+  // type names, and TALLY_DATA_PATH is writable by the user on both deployment modes (a service
+  // install's .env sits under Program Files and needs an administrator). It holds no secret, so it
+  // did not move to the agent folder with the company vault and the GUI agent's files.
   const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
   return path.join(dataPath, '.tally-mcp-entry-order.json');
 }
@@ -1519,11 +1520,34 @@ export type GuiAgentResponse = {
   raw: Record<string, any>;
 };
 
+// Where this server and the GUI agent exchange files (the IPC command/result files and screenshots),
+// and where the company vault lives: %ProgramData%\Claudally\agent. The installer creates it and
+// locks it to SYSTEM, Administrators and the agent user (scripts/installer/lockdown-helpers.ps1).
+//
+// It used to be TALLY_DATA_PATH - Tally's own data folder - and the installer locked that whole
+// folder down to keep these files private, which locked every other Windows account on a shared PC
+// out of their Tally companies (#230 follow-up). TALLY_DATA_PATH now only ever means "where Tally
+// keeps its data"; nothing of ours is written there. The location is derived, not configurable: the
+// installer, the agent, the tray and this server must all agree on it, and a setting that pointed an
+// elevated installer's lockdown at an arbitrary folder would be a way to re-permission that folder.
+// %ProgramData% resolves to the same place for the SYSTEM service and for a user's session.
+export function resolveAgentDir(env: NodeJS.ProcessEnv = process.env): string {
+  const programData = env.ProgramData || env.PROGRAMDATA || 'C:\\ProgramData';
+  return path.win32.join(programData, 'Claudally', 'agent');
+}
+
+// The company vault. TALLY_COMPANIES_CONFIG remains an expert override (the installer neither creates
+// nor locks a vault there); otherwise it is in the agent folder above.
+export function resolveCompanyVaultPath(env: NodeJS.ProcessEnv = process.env): string {
+  if (env.TALLY_COMPANIES_CONFIG) return env.TALLY_COMPANIES_CONFIG;
+  return path.win32.join(resolveAgentDir(env), '.tally-mcp-companies.json');
+}
+
 // How GUI actions reach a desktop session.
 //
 //   'ipc'        The MCP server runs as a Windows service in Session 0, which has no desktop, so it
 //                cannot spawn tally.exe or inject keystrokes. Commands are handed to a long-running
-//                companion agent through JSON files in TALLY_DATA_PATH.
+//                companion agent through JSON files in the agent folder (resolveAgentDir).
 //
 //   'in-session' The MCP server was spawned by the MCP client and is already running in the user's
 //                interactive session, where Tally is visible. Session 0 isolation does not apply, so
@@ -1568,13 +1592,13 @@ async function callGuiAgent(
   action: string,
   payload: Record<string, any>,
   timeoutSec: number,
-  dataPath: string,
+  agentDir: string,
   logs: string[]
 ): Promise<GuiAgentResponse | null> {
   if (guiTransportMode === 'in-session') {
-    return callGuiAgentInSession(action, payload, timeoutSec, dataPath, logs);
+    return callGuiAgentInSession(action, payload, timeoutSec, agentDir, logs);
   }
-  return callGuiAgentViaIpc(action, payload, timeoutSec, dataPath, logs);
+  return callGuiAgentViaIpc(action, payload, timeoutSec, agentDir, logs);
 }
 
 // Runs the agent script as a short-lived child in this process's own session.
@@ -1587,7 +1611,7 @@ async function callGuiAgentInSession(
   action: string,
   payload: Record<string, any>,
   timeoutSec: number,
-  dataPath: string,
+  agentDir: string,
   logs: string[]
 ): Promise<GuiAgentResponse | null> {
   const commandId = createGuiAgentCommandId(action);
@@ -1599,7 +1623,7 @@ async function callGuiAgentInSession(
     const child = spawn(
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath,
-       '-Once', '-WatchDir', dataPath],
+       '-Once', '-WatchDir', agentDir],
       { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
     );
 
@@ -1673,11 +1697,11 @@ async function callGuiAgentViaIpc(
   action: string,
   payload: Record<string, any>,
   timeoutSec: number,
-  dataPath: string,
+  agentDir: string,
   logs: string[]
 ): Promise<GuiAgentResponse | null> {
-  const commandFile = path.join(dataPath, '_mcp_gui_command.json');
-  const resultFile = path.join(dataPath, '_mcp_gui_result.json');
+  const commandFile = path.join(agentDir, '_mcp_gui_command.json');
+  const resultFile = path.join(agentDir, '_mcp_gui_result.json');
   const commandId = createGuiAgentCommandId(action);
 
   try { fs.unlinkSync(resultFile); } catch {}
@@ -1732,8 +1756,8 @@ export type GuiAgentPingResult = {
 
 // Lightweight ping to confirm the GUI agent is alive. Returns its version if reachable.
 // Used as a pre-flight in load-company so we never kill Tally without confirming we can bring it back.
-async function pingGuiAgent(dataPath: string, timeoutSec = 4, logs: string[] = []): Promise<GuiAgentPingResult> {
-  const resp = await callGuiAgent('ping', {}, timeoutSec, dataPath, logs);
+async function pingGuiAgent(agentDir: string, timeoutSec = 4, logs: string[] = []): Promise<GuiAgentPingResult> {
+  const resp = await callGuiAgent('ping', {}, timeoutSec, agentDir, logs);
   if (!resp || resp.status !== 'success') {
     return { alive: false, agentVersion: null, versionOk: false };
   }
@@ -2318,9 +2342,9 @@ Driving the Tally GUI (on by default; disabled only if the operator set ENABLE_G
 // Shared liveness probe used by both `status` and `get-context`. Retries each
 // probe so a single transient blip doesn't flip the reported state.
 async function probeLiveness(): Promise<{ tallyReachable: boolean; agentAlive: boolean }> {
-  const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+  const agentDir = resolveAgentDir();
   const tallyReachable = await probeWithRetry(() => pingTally());
-  const agentAlive = await probeWithRetry(async () => (await pingGuiAgent(tallyDataPath, 2)).alive, 2);
+  const agentAlive = await probeWithRetry(async () => (await pingGuiAgent(agentDir, 2)).alive, 2);
   return { tallyReachable, agentAlive };
 }
 
@@ -2355,9 +2379,9 @@ export async function getHttpStatusReport(): Promise<{
   tally: { reachable: boolean; loadedCompanies: string[] };
   build: { commit: string | null; builtAt: string | null };
 }> {
-  const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+  const agentDir = resolveAgentDir();
   const tallyReachable = await probeWithRetry(() => pingTally());
-  const agentPing = await pingGuiAgent(tallyDataPath, 2);
+  const agentPing = await pingGuiAgent(agentDir, 2);
   let loadedCompanies: string[] = [];
   if (tallyReachable) {
     try { loadedCompanies = await listLoadedCompanies(); } catch { /* leave empty */ }
@@ -2998,10 +3022,10 @@ export async function registerMcpServer(): Promise<McpServer> {
     'list-available-companies',
     {
       title: 'List Available Companies',
-      description: `discovers companies on disk with enough metadata to drive a load-company call without trial and error. Returns one row per digit-named folder under the Tally data directory, with: folderId, folderPath, displayName (extracted from Company.900 / Company.1800), hasData (whether any company metadata file was found), dataFilePath, requiresCredentials (null if unknown, true/false if a credential-hint config exists), knownUsername, notes. Handles both layouts: stock Tally Prime (<data>/<id>/Company.900) and Tally Prime Edit Log (<data>/<id>/<id>/Company.1800 — one level deeper). Recursively walks each folder up to depth 3 so an LLM doesn't get fooled into thinking nested-layout folders are empty. CREDENTIAL HINTS: optional config file at <dataPath>/.tally-mcp-companies.json (or override via TALLY_COMPANIES_CONFIG env var) maps folder id → { requiresCredentials, knownUsername, notes }. The config never stores passwords; it only signals "the human will need to supply credentials before load-company succeeds for this folder." Use this tool BEFORE load-company instead of trying random folder ids and waiting for failures.`,
+      description: `discovers companies on disk with enough metadata to drive a load-company call without trial and error. Returns one row per digit-named folder under the Tally data directory, with: folderId, folderPath, displayName (extracted from Company.900 / Company.1800), hasData (whether any company metadata file was found), dataFilePath, requiresCredentials (null if unknown, true/false if a credential-hint config exists), knownUsername, notes. Handles both layouts: stock Tally Prime (<data>/<id>/Company.900) and Tally Prime Edit Log (<data>/<id>/<id>/Company.1800 — one level deeper). Recursively walks each folder up to depth 3 so an LLM doesn't get fooled into thinking nested-layout folders are empty. CREDENTIAL HINTS: optional config file - the company vault, %ProgramData%\\Claudally\\agent\\.tally-mcp-companies.json (or override via TALLY_COMPANIES_CONFIG env var) - maps folder id → { requiresCredentials, knownUsername, notes }. The config never stores passwords; it only signals "the human will need to supply credentials before load-company succeeds for this folder." Use this tool BEFORE load-company instead of trying random folder ids and waiting for failures.`,
       inputSchema: {
         dataPath: z.string().optional().describe('override the data path to scan. By default, this is the value of TALLY_DATA_PATH env var; falls back to the documented Edit Log default. Pass an explicit path when scanning a backup folder or a secondary drive.'),
-        configPath: z.string().optional().describe('override the credentials-hint config path. Default is <dataPath>/.tally-mcp-companies.json (or TALLY_COMPANIES_CONFIG env if set).')
+        configPath: z.string().optional().describe('override the credentials-hint config path. Default is the company vault, %ProgramData%\\Claudally\\agent\\.tally-mcp-companies.json (or TALLY_COMPANIES_CONFIG env if set).')
       },
       annotations: {
         readOnlyHint: true,
@@ -3030,9 +3054,7 @@ export async function registerMcpServer(): Promise<McpServer> {
           auditLog('list-available-companies', args, 'error', Date.now() - start);
           return errorResult('PRECONDITION_FAILED', { message: `Data directory not found: ${tallyDataPath}`, retryable: false });
         }
-        const configPath = args.configPath
-          || process.env.TALLY_COMPANIES_CONFIG
-          || path.join(tallyDataPath, '.tally-mcp-companies.json');
+        const configPath = args.configPath || resolveCompanyVaultPath();
         // Confine an explicit configPath the same way (default/env-derived paths are trusted).
         if (args.configPath && !isPathWithinRoots(configPath, allowedRoots).ok) {
           auditLog('list-available-companies', args, 'denied', Date.now() - start);
@@ -3204,7 +3226,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       const tryGuiAgent = async (): Promise<'loaded' | 'handoff' | 'unavailable'> => {
         logs.push('[Strategy 3: GUI hand-off] Preparing...');
         try {
-          const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+          const agentDir = resolveAgentDir();
 
           // Check if Tally is running at all
           let tallyRunning = true;
@@ -3257,7 +3279,7 @@ export async function registerMcpServer(): Promise<McpServer> {
           // write _mcp_gui_command.json and poll for the result itself, which meant it bypassed
           // callGuiAgent() entirely — and would therefore have kept writing files nobody reads once
           // the in-session transport is active. Same behaviour, one code path, both transports.
-          const agentPing = await pingGuiAgent(tallyDataPath, 5, logs);
+          const agentPing = await pingGuiAgent(agentDir, 5, logs);
           if (!agentPing.alive) {
             logs.push(guiTransportNeedsVersionHandshake()
               ? '  GUI agent not running. Please start scripts/tally-gui-agent-v2.ps1 in the interactive desktop session.'
@@ -3339,7 +3361,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       description: `checks open-company readiness (paths, agent files, env flags, process status) and optionally includes the latest GUI agent result payload for troubleshooting.`,
       inputSchema: {
         includeRecentResult: z.boolean().optional().describe('include parsed contents of latest _mcp_gui_result.json if available'),
-        watchDir: z.string().optional().describe('optional explicit watch/data directory override')
+        watchDir: z.string().optional().describe('optional explicit GUI agent folder override (default: %ProgramData%\\Claudally\\agent)')
       },
       annotations: {
         readOnlyHint: true,
@@ -3349,10 +3371,12 @@ export async function registerMcpServer(): Promise<McpServer> {
     async (args) => {
       const start = Date.now();
       try {
-        const tallyDataPath = args.watchDir || process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        // The agent folder, not Tally's data folder (#230 follow-up); watchDir still overrides it for debugging.
+        const agentDir = args.watchDir || resolveAgentDir();
         const tallyExePath = process.env.TALLY_EXE_PATH || 'C:\\Program Files\\TallyPrimeEditLog\\tally.exe';
-        const commandFile = path.join(tallyDataPath, '_mcp_gui_command.json');
-        const resultFile = path.join(tallyDataPath, '_mcp_gui_result.json');
+        const commandFile = path.join(agentDir, '_mcp_gui_command.json');
+        const resultFile = path.join(agentDir, '_mcp_gui_result.json');
         const guiScriptPath = resolveScriptPath('tally-gui-agent-v2.ps1');
         const guiDllPath = resolveScriptPath('TallyUI.dll');
 
@@ -3360,6 +3384,8 @@ export async function registerMcpServer(): Promise<McpServer> {
           timestamp: new Date().toISOString(),
           tallyDataPath,
           tallyDataPathExists: fs.existsSync(tallyDataPath),
+          agentDir,
+          agentDirExists: fs.existsSync(agentDir),
           tallyExePath,
           tallyExeExists: fs.existsSync(tallyExePath),
           guiScriptPath,
@@ -3394,7 +3420,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         // Live probe of the GUI agent — separate from "is the script file present" since the agent could
         // be installed but not running (the most common Session 0 misconfiguration).
         const guiAgentLogs: string[] = [];
-        const agentPing = await pingGuiAgent(tallyDataPath, 4, guiAgentLogs);
+        const agentPing = await pingGuiAgent(agentDir, 4, guiAgentLogs);
         report.guiAgentResponding = agentPing.alive;
         report.guiAgentVersion = agentPing.agentVersion;
         report.guiAgentVersionRequired = REQUIRED_AGENT_VERSION;
@@ -3840,7 +3866,7 @@ export async function registerMcpServer(): Promise<McpServer> {
 
         // Pre-flight: confirm the GUI agent is alive BEFORE we kill Tally. If we kill without an agent
         // to bring it back, the box is left in a worse state than it started.
-        const agentWatchDir = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const agentWatchDir = resolveAgentDir();
         logs.push('  Pinging GUI agent (must be alive before we kill Tally)...');
         const agentPing = await pingGuiAgent(agentWatchDir, 4, logs);
         if (!agentPing.alive) {
@@ -3909,7 +3935,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         // Start Tally via the GUI agent IPC. The MCP service typically runs in Windows Session 0 (no desktop),
         // so it can't spawn GUI apps directly. The agent (tally-gui-agent-v2.ps1) runs in the interactive
         // user session and does the Start-Process on our behalf.
-        // The agent's watch directory comes from TALLY_DATA_PATH env (same as the agent's startup logic) —
+        // The agent's watch directory is the agent folder, derived the same way the agent derives it —
         // it must match what the agent is watching, NOT what tally.ini's Data= says (those can differ).
         logs.push(`  Starting Tally via GUI agent (${tallyExePath})...`);
         const agentResp = await callGuiAgent('start-tally', { exePath: tallyExePath, waitSec: 30 }, 35, agentWatchDir, logs);
@@ -5164,7 +5190,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         }
 
         const logs: string[] = [];
-        const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const agentDir = resolveAgentDir();
         // Alt+D, then Tally's Yes/No confirmation. The wait between matters: the prompt has to be up
         // before the confirm lands, or the "y" goes wherever focus happens to be.
         const keys = [
@@ -5173,7 +5199,7 @@ export async function registerMcpServer(): Promise<McpServer> {
           { action: 'key', value: 'y' },
           { action: 'wait', value: '1500' }
         ];
-        const resp = await callGuiAgent('sendkeys', { keys }, 45, dataPath, logs);
+        const resp = await callGuiAgent('sendkeys', { keys }, 45, agentDir, logs);
         if (!resp) {
           auditLog('gui-delete-voucher', args, 'error', Date.now() - start);
           return errorResult('AGENT_UNREACHABLE', { message: 'The GUI agent did not respond, so it is UNKNOWN whether the keystroke landed. Check the Day Book before retrying.', logs: logs.join('\n') });
@@ -5868,12 +5894,8 @@ export async function registerMcpServer(): Promise<McpServer> {
   );
 
   // --- Company registry tools (issue: alias-based fast loading) -----------------------------
-  // Resolves the registry path from env, with the same fallback the installer uses.
-  const resolveRegistryPath = (): string => {
-    if (process.env.TALLY_COMPANIES_CONFIG) return process.env.TALLY_COMPANIES_CONFIG;
-    const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
-    return path.join(dataPath, '.tally-mcp-companies.json');
-  };
+  // The vault: TALLY_COMPANIES_CONFIG, else the agent folder - where the installer creates and locks it.
+  const resolveRegistryPath = (): string => resolveCompanyVaultPath();
 
   mcpServer.registerTool(
     'list-configured-companies',
@@ -6042,7 +6064,7 @@ export async function registerMcpServer(): Promise<McpServer> {
           return errorResult('PRECONDITION_FAILED', { message: `tally.exe not found at ${tallyExePath}.`, remedy: 'Set TALLY_EXE_PATH in .env (via Reconfigure) if Tally lives elsewhere.', retryable: false });
         }
         // The service is in Session 0, so the launch must go through the interactive-session agent.
-        const agentWatchDir = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const agentWatchDir = resolveAgentDir();
         logs.push('  Pinging GUI agent (needed to launch Tally in the interactive session)...');
         const agentPing = await pingGuiAgent(agentWatchDir, 4, logs);
         if (!agentPing.alive) {
@@ -6133,14 +6155,14 @@ export async function registerMcpServer(): Promise<McpServer> {
           }
         }
 
-        const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const agentDir = resolveAgentDir();
         const timeoutSec = 30;
         // Self-healing unlock (#89 H-3): a keystroke miss is transient, so re-dispatch the whole
         // select-and-unlock up to N times (the agent re-keys + re-verifies each attempt) before
         // surrendering PASSWORD_REQUIRED — so a transient miss isn't reported like a wrong password.
         const maxRetries = Math.max(1, parseInt(process.env.UNLOCK_MAX_RETRIES || '3', 10) || 3);
         const { result: resp, attempts } = await retryForResult(
-          () => callGuiAgent('select-and-unlock-company', { companyId: entry.folderId, userName: entry.username ?? '', password: plaintextPassword }, timeoutSec, dataPath, logs),
+          () => callGuiAgent('select-and-unlock-company', { companyId: entry.folderId, userName: entry.username ?? '', password: plaintextPassword }, timeoutSec, agentDir, logs),
           (r) => !!r && r.status === 'success',
           maxRetries
         );
@@ -6245,7 +6267,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         }
 
         // Confirm the GUI agent is alive AND new enough to know the switch-company action.
-        const agentPing = await pingGuiAgent(tallyDataPath, 4, logs);
+        const agentPing = await pingGuiAgent(resolveAgentDir(), 4, logs);
         if (!agentPing.alive) {
           auditLog('switch-company', auditArgs, 'error', Date.now() - start);
           return errorResult('AGENT_UNREACHABLE', { logs: logs.join('\n') });
@@ -6263,7 +6285,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         // and re-verifies against Tally's XML server), so a single transient keystroke miss isn't fatal.
         const maxRetries = Math.max(1, parseInt(process.env.SWITCH_MAX_RETRIES || '2', 10) || 2);
         const { result: resp, attempts } = await retryForResult(
-          () => callGuiAgent('switch-company', { companyId: company.folderId, companyName: company.name, userName, password }, 30, tallyDataPath, logs),
+          () => callGuiAgent('switch-company', { companyId: company.folderId, companyName: company.name, userName, password }, 30, resolveAgentDir(), logs),
           (r) => !!r && r.status === 'success',
           maxRetries
         );
@@ -6315,18 +6337,18 @@ export async function registerMcpServer(): Promise<McpServer> {
         auditLog('gui-screenshot', {}, 'denied');
         return errorResult('PRECONDITION_FAILED', { message: 'GUI control is disabled.', remedy: 'Set ENABLE_GUI_CONTROL=true (and restart the service) to enable gui-screenshot / gui-send-keys.', retryable: false });
       }
-      const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+      const agentDir = resolveAgentDir();
       const logs: string[] = [];
       // Capture can intermittently fail (e.g. "window may be minimized") and succeed on an immediate
       // retry (#5) — retry up to 3× so a transient miss isn't surfaced as a hard error.
       const { result: resp } = await retryForResult(
-        () => callGuiAgent('screenshot', {}, 20, dataPath, logs),
+        () => callGuiAgent('screenshot', {}, 20, agentDir, logs),
         (r) => !!r && r.status === 'success',
         3, 300
       );
       // The agent writes the PNG BEFORE writing its result, so a credential/financial frame can be on
       // disk even on the timeout path. Always clean it up, whatever the outcome - never leave it behind.
-      const shot = path.join(dataPath, '_mcp_screenshot.png');
+      const shot = path.join(agentDir, '_mcp_screenshot.png');
       const cleanupShot = () => { try { fs.unlinkSync(shot); } catch {} };
       if (!resp) {
         cleanupShot();
@@ -6374,9 +6396,9 @@ export async function registerMcpServer(): Promise<McpServer> {
         auditLog('gui-send-keys', redacted, 'denied');
         return errorResult('PRECONDITION_FAILED', { message: 'No keys provided.', retryable: false });
       }
-      const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+      const agentDir = resolveAgentDir();
       const logs: string[] = [];
-      const resp = await callGuiAgent('sendkeys', { keys: args.keys }, 30, dataPath, logs);
+      const resp = await callGuiAgent('sendkeys', { keys: args.keys }, 30, agentDir, logs);
       if (!resp) {
         auditLog('gui-send-keys', redacted, 'error', Date.now() - start);
         return errorResult('AGENT_UNREACHABLE', { message: 'GUI agent did not respond. Is it running and is Tally open?', logs: logs.join('\n') });
@@ -6433,9 +6455,9 @@ export async function registerMcpServer(): Promise<McpServer> {
         // into the IPC and is never returned to the caller nor logged. This does NOT navigate — it
         // assumes the caller already confirmed (via gui-screenshot) the password prompt is focused.
         const keys = (entry.username ? `${entry.username}{ENTER}` : '') + plaintextPassword + '{ENTER}';
-        const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+        const agentDir = resolveAgentDir();
         const logs: string[] = [];
-        const resp = await callGuiAgent('sendkeys', { keys }, 15, dataPath, logs);
+        const resp = await callGuiAgent('sendkeys', { keys }, 15, agentDir, logs);
         plaintextPassword = ''; // drop the secret from locals ASAP
         if (!resp) {
           auditLog('unlock-stored-credentials', auditArgs, 'error', Date.now() - start);

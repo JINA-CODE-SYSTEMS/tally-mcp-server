@@ -95,6 +95,19 @@ New-Item -Path $ScratchReg -Force | Out-Null
 Remove-PSDrive -Name HKLM
 New-PSDrive -Name HKLM -PSProvider Registry -Root "HKEY_CURRENT_USER\Software\$ScratchRegName" -Scope Global | Out-Null
 
+# --- %ProgramData%, redirected ---------------------------------------------------------------------
+# The Claudally agent folder (the vault and the GUI agent's IPC files, #230) is %ProgramData%\
+# Claudally\agent, and firstrun-config.ps1 finds it through $env:ProgramData. For this session that
+# points at a scratch folder, so no case can create or re-permission anything under the real
+# C:\ProgramData. Assert-StandIns checks the redirect before every run; the finally block restores it.
+$RealProgramData = $env:ProgramData
+$FakeProgramData = Join-Path $work 'ProgramData'
+New-Item -ItemType Directory -Force -Path $FakeProgramData | Out-Null
+$env:ProgramData = $FakeProgramData
+$FakeAgentDir = Join-Path $FakeProgramData 'Claudally\agent'
+$FakeClaudallyDir = Join-Path $FakeProgramData 'Claudally'
+$RealClaudallyBefore = Test-Path -LiteralPath (Join-Path $RealProgramData 'Claudally')
+
 # State is global because these functions run inside firstrun-config.ps1's scope, where $script:
 # would mean that script, not this one.
 $global:FrcCalls    = New-Object System.Collections.ArrayList
@@ -206,16 +219,32 @@ function _FrcMatch([string]$Path, $Patterns) {
     return $false
 }
 
+#   Set-FrcAcl             starts a path from a given state instead: an owner another account holds
+#                          (a planted folder), or the protected shape an earlier installer left.
+# And, to prove a secret never sat in a readable file: every lockdown (/inheritance:r) records the
+# size the file had at that moment in $global:FrcLockedAtSize. 0 = nothing was in it yet.
+function _FrcDefaultAces {
+    $aces = New-Object System.Collections.ArrayList
+    foreach ($s in @('S-1-5-18', 'S-1-5-32-544')) { [void]$aces.Add(@{ Sid = $s; Rights = 'FA'; Inherit = $true; Inherited = $true }) }
+    [void]$aces.Add(@{ Sid = 'S-1-5-32-545'; Rights = 'FR'; Inherit = $true; Inherited = $true })
+    return , $aces
+}
+
 function _FrcAclOf([string]$Path) {
     $k = $Path.ToLowerInvariant()
     if (-not $global:FrcAcl.ContainsKey($k)) {
-        $aces = New-Object System.Collections.ArrayList
-        foreach ($s in @('S-1-5-18', 'S-1-5-32-544')) { [void]$aces.Add(@{ Sid = $s; Rights = 'FA'; Inherit = $true; Inherited = $true }) }
-        [void]$aces.Add(@{ Sid = 'S-1-5-32-545'; Rights = 'FR'; Inherit = $true; Inherited = $true })
+        $aces = _FrcDefaultAces
         foreach ($seed in @($global:FrcAclSeed[$Path])) { if ($seed) { [void]$aces.Add($seed) } }
         $global:FrcAcl[$k] = @{ Protected = $false; Owner = 'S-1-5-32-544'; Aces = $aces }
     }
     return $global:FrcAcl[$k]
+}
+
+function Set-FrcAcl {
+    param([string]$Path, [bool]$Protected = $false, [string]$Owner = 'S-1-5-32-544', [object[]]$Aces = $null)
+    $list = New-Object System.Collections.ArrayList
+    if ($null -eq $Aces) { $list = _FrcDefaultAces } else { foreach ($a in $Aces) { [void]$list.Add($a) } }
+    $global:FrcAcl[$Path.ToLowerInvariant()] = @{ Protected = $Protected; Owner = $Owner; Aces = $list }
 }
 
 function icacls {
@@ -240,8 +269,21 @@ function icacls {
     while ($i -lt $rest.Count) {
         $flag = $rest[$i]; $i++
         if ($flag -eq '/inheritance:r') {
+            $size = -1
+            if (Test-Path -LiteralPath $target -PathType Leaf) { $size = (Get-Item -LiteralPath $target -Force).Length }
+            if (-not $global:FrcLockedAtSize.ContainsKey($target.ToLowerInvariant())) { $global:FrcLockedAtSize[$target.ToLowerInvariant()] = $size }
             $new.Protected = $true
             $keep = @($new.Aces | Where-Object { -not $_.Inherited })
+            $new.Aces = New-Object System.Collections.ArrayList; foreach ($a in $keep) { [void]$new.Aces.Add($a) }
+        } elseif ($flag -eq '/inheritance:e') {
+            # What the parent passes down comes back: modelled as the default inherited entries.
+            $new.Protected = $false
+            if (-not @($new.Aces | Where-Object { $_.Inherited }).Count) { foreach ($a in (_FrcDefaultAces)) { [void]$new.Aces.Add($a) } }
+        } elseif ($flag -eq '/remove:g') {
+            $p = $rest[$i]; $i++
+            $sid = & $toSid $p
+            if (-not $sid) { $global:LASTEXITCODE = 1332; return "${p}: No mapping between account names and security IDs was done." }
+            $keep = @($new.Aces | Where-Object { $_.Inherited -or $_.Sid -ne $sid })
             $new.Aces = New-Object System.Collections.ArrayList; foreach ($a in $keep) { [void]$new.Aces.Add($a) }
         } elseif ($flag -eq '/grant:r') {
             while ($i -lt $rest.Count -and -not $rest[$i].StartsWith('/')) {
@@ -325,6 +367,9 @@ function Assert-StandIns {
     if ($root -ne "HKEY_CURRENT_USER\Software\$ScratchRegName") {
         throw "The HKLM: drive is not redirected to the scratch key (root is '$root'); refusing to run firstrun-config.ps1 against the real services registry."
     }
+    if ($env:ProgramData -ne $FakeProgramData) {
+        throw "`$env:ProgramData is '$env:ProgramData', not the scratch folder; refusing to run firstrun-config.ps1 against the real %ProgramData%."
+    }
 }
 Assert-StandIns
 
@@ -407,6 +452,17 @@ function Reset-Fakes {
     $global:FrcIcaclsFail = @()
     $global:FrcAclIgnore = @()
     $global:FrcIcaclsNames = New-Object System.Collections.ArrayList
+    $global:FrcLockedAtSize = @{}
+    # The fake %ProgramData%: emptied between cases. A junction a case planted is unlinked first,
+    # on its own, so the recursive delete below can never follow it into its target.
+    if (Test-Path -LiteralPath $FakeProgramData) {
+        foreach ($d in @((Join-Path $FakeProgramData 'Claudally\agent'), (Join-Path $FakeProgramData 'Claudally'))) {
+            if ((Test-Path -LiteralPath $d) -and ((Get-Item -LiteralPath $d -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                [System.IO.Directory]::Delete($d)
+            }
+        }
+        Get-ChildItem -LiteralPath $FakeProgramData -Force | Remove-Item -Recurse -Force
+    }
     Get-ChildItem -LiteralPath $ScratchReg -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
     $env:FRC_NSSM_LOG = Join-Path $work ('nssm-' + [guid]::NewGuid().ToString('n').Substring(0, 8) + '.log')
 }
@@ -528,7 +584,11 @@ try {
     Check (@(Calls 'Start-ScheduledTask' | Where-Object { $_.Target -in @($AgentTask, $TrayTask) }).Count -eq 2) 'agent and tray restarted'
     $grants = @(Calls 'icacls' | Where-Object { $_.Detail -match '/grant' })
     # (An upgrade re-runs the preflight's checks first, so the two probe files are locked down too.)
-    Check (@($grants | Where-Object { $_.Target -notlike '*.preflight' }).Count -eq 3 -and @($grants | Where-Object { $_.Detail -notmatch [regex]::Escape("*${AccountantSid}:") }).Count -eq 0) "ACL grants (.env, vault, IPC directory) go to '$Accountant' only, by SID"
+    # %ProgramData%\Claudally itself is SYSTEM + Administrators only; everything else also to the accountant.
+    $real = @($grants | Where-Object { $_.Target -notlike '*.preflight' })
+    Check ((@($real | ForEach-Object { $_.Target }) -join '|') -eq (@((Join-Path $root '.env'), $FakeClaudallyDir, $FakeAgentDir, (Join-Path $FakeAgentDir '.tally-mcp-companies.json')) -join '|') -and
+           @($grants | Where-Object { $_.Target -ne $FakeClaudallyDir -and $_.Detail -notmatch [regex]::Escape("*${AccountantSid}:") }).Count -eq 0) "ACL grants (.env, the agent folder, the vault) go to '$Accountant' only, by SID"
+    Check (@(Calls 'icacls' | Where-Object { $_.Target -like "$(Join-Path $root 'data')*" }).Count -eq 0) "Tally's data folder is not re-permissioned (it was never locked, so there is nothing to restore)"
     Check ($global:FrcIcaclsNames.Count -eq 0) 'no account is ever passed to icacls by name'
     Check (@(NssmLog).Count -eq 0) 'no service touched (local mode)'
     Check ($r.Output -match 'left exactly as it was') 'says .env was left as it was'
@@ -656,8 +716,9 @@ try {
     Check (@($global:FrcCalls | Where-Object { $_.Cmd -ne 'Get-ScheduledTask' -and $probeCalls -notcontains $_ }).Count -eq 0 -and
            @($probeCalls | Where-Object { $_.Target -notlike '*\.tally-mcp-acl.preflight' }).Count -eq 0) 'nothing changed (the only ACL calls are on the preflight probe files)'
     $probedIn = (@(Calls 'icacls' | Where-Object { $_.Detail -like '/inheritance:r*' } | ForEach-Object { Split-Path -Parent $_.Target }) -join '|')
-    Check ($probedIn -eq (@($root, (Join-Path $root 'data')) -join '|')) 'the .env / vault lockdown was dry-run in the install folder and in the Tally data folder'
-    Check (@(Get-ChildItem -LiteralPath $root -Recurse -Force -Filter '*.preflight').Count -eq 0) 'no probe file left behind'
+    Check ($probedIn -eq (@($root, $FakeProgramData) -join '|')) 'the lockdown was dry-run in the install folder and where the agent folder will go (%ProgramData%, as it does not exist yet) - not in Tally''s data folder'
+    Check (@(Get-ChildItem -LiteralPath $root, $FakeProgramData -Recurse -Force -Filter '*.preflight').Count -eq 0) 'no probe file left behind'
+    Check (-not (Test-Path -LiteralPath $FakeClaudallyDir)) 'the agent folder was not created (a preflight changes nothing)'
     Check (-not (Test-Path -LiteralPath (Join-Path $root 'logs\firstrun-config.log'))) 'no log written'
     Show-OnFailure $r
 
@@ -808,16 +869,16 @@ try {
     Reset-Fakes; $script:FailuresBefore = $script:Failures
     $root = New-FakeInstall -EnvText ''
     $dataDir = Join-Path $root 'data'
-    # An explicit entry someone added by hand: BUILTIN\Users may modify the Tally data folder.
-    $global:FrcAclSeed[$dataDir] = @(@{ Sid = 'S-1-5-32-545'; Rights = 'FA'; Inherit = $true; Inherited = $false })
     $r = Invoke-FreshRemote $root (New-CredentialsFile)
     Check ($null -eq $r.Error) 'completes without error'
     Check ($global:FrcIcaclsNames.Count -eq 0) 'no account was ever passed to icacls by name (every name would have failed here)'
     $fileAcl = "protected=True owner=S-1-5-32-544 $(@("S-1-5-18:FA", "S-1-5-32-544:FA", "${AccountantSid}:FA") | Sort-Object)"
     Check ((Get-FrcAclText (Join-Path $root '.env.tmp')) -eq $fileAcl) '.env (locked as .env.tmp before a byte was written, then renamed): SYSTEM, Administrators and the agent user only, inheritance off'
-    Check ((Get-FrcAclText (Join-Path $dataDir '.tally-mcp-companies.json')) -eq $fileAcl) 'company vault: SYSTEM, Administrators and the agent user only, inheritance off'
-    Check ((Get-FrcAclText $dataDir) -eq "protected=True owner=S-1-5-32-544 $(@("S-1-5-18:FA:OICI", "S-1-5-32-544:FA:OICI", "${AccountantSid}:FA:OICI") | Sort-Object)") 'IPC directory: the same three, inherited by what is created inside (OI)(CI)'
-    Check ($r.Output -match 'Removed an extra permission entry for .*S-1-5-32-545') 'the hand-added BUILTIN\Users entry on the data folder was removed, by SID, and named'
+    Check ((Get-FrcAclText $FakeClaudallyDir) -eq "protected=True owner=S-1-5-32-544 S-1-5-18:FA:OICI S-1-5-32-544:FA:OICI") '%ProgramData%\Claudally: SYSTEM and Administrators only, owned by Administrators (Users can no longer create anything in it)'
+    Check ((Get-FrcAclText $FakeAgentDir) -eq "protected=True owner=S-1-5-32-544 $(@("S-1-5-18:FA:OICI", "S-1-5-32-544:FA:OICI", "${AccountantSid}:FA:OICI") | Sort-Object)") 'agent folder: SYSTEM, Administrators and the agent user, (OI)(CI) so the IPC files inherit it, owned by Administrators'
+    Check ((Get-FrcAclText (Join-Path $FakeAgentDir '.tally-mcp-companies.json')) -eq $fileAcl) 'company vault, in the agent folder: SYSTEM, Administrators and the agent user only, inheritance off'
+    Check ($global:FrcLockedAtSize[(Join-Path $FakeAgentDir '.tally-mcp-companies.json').ToLowerInvariant()] -eq 0) 'the vault was locked while still empty'
+    Check (-not (Test-Path -LiteralPath (Join-Path $dataDir '.tally-mcp-companies.json')) -and @(Calls 'icacls' | Where-Object { $_.Target -like "$dataDir*" }).Count -eq 0) "nothing written to or re-permissioned in Tally's data folder"
     Check ((Get-FrcAclText (Join-Path $root '.tunnel-token')) -eq "protected=True owner=S-1-5-32-544 S-1-5-18:FA S-1-5-32-544:FA") 'tunnel token file: SYSTEM and Administrators only, owned by Administrators'
     $envText = Get-Content -Raw -LiteralPath (Join-Path $root '.env')
     Check ($envText -match [regex]::Escape("PASSWORD=`"$FreshPassword`"") -and $envText -match 'DEPLOYMENT_MODE=remote') '.env was written, with the password'
@@ -825,10 +886,10 @@ try {
     Show-OnFailure $r
 
     # ------------------------------------------------------------------------------------------
-    Write-Host "`n[12] The vault and the IPC directory fail closed too"
+    Write-Host "`n[12] The vault and the agent folder fail closed too"
     $otherFails = @(
-        @{ Name = 'vault: icacls exits 0 but nothing changed'; Ignore = @('*\.tally-mcp-companies.json'); Fail = @(); Match = 'company password vault .* could not be locked down'; Vault = $false }
-        @{ Name = 'IPC directory: icacls fails';               Ignore = @(); Fail = @('*\data'); Match = 'IPC directory .* could not be locked down'; Vault = $true }
+        @{ Name = 'vault: icacls exits 0 but nothing changed'; Ignore = @('*\.tally-mcp-companies.json'); Fail = @(); Match = 'company password vault .* could not be moved or locked down' }
+        @{ Name = 'agent folder: icacls fails';                Ignore = @(); Fail = @('*\Claudally\agent'); Match = 'Claudally agent folder .* could not be set up' }
     )
     foreach ($case in $otherFails) {
         Reset-Fakes; $script:FailuresBefore = $script:Failures
@@ -837,15 +898,15 @@ try {
         $r = Invoke-Firstrun @{ InstallDir = $root; Unattended = $true; AgentTaskUser = $Accountant }
         Check ($null -ne $r.Error -and "$($r.Error)" -match $case.Match) "$($case.Name): the run FAILS and names it"
         Check (@(Calls 'Register-ScheduledTask').Count -eq 0) "$($case.Name): nothing registered after it"
-        Check ((Test-Path -LiteralPath (Join-Path $root 'data\.tally-mcp-companies.json')) -eq $case.Vault) "$($case.Name): a vault exists only if it was locked down"
+        Check (-not (Test-Path -LiteralPath (Join-Path $FakeAgentDir '.tally-mcp-companies.json'))) "$($case.Name): no vault is left behind that was not locked down"
         Show-OnFailure $r
     }
 
     # ------------------------------------------------------------------------------------------
     Write-Host "`n[13] Upgrade: the preflight finds a lockdown that would fail before anything is stopped"
     $preflightCases = @(
-        @{ Name = 'the Tally data folder cannot be locked down'; Env = $localEnv; Fail = @('*\data\.tally-mcp-acl.preflight'); Match = 'cannot be locked down to SYSTEM, Administrators' }
-        @{ Name = 'the agent user does not resolve to a SID';   Env = ($localEnv -replace "(?m)^AGENT_TASK_USER=.*$", 'AGENT_TASK_USER="no-such-user-230"'); Fail = @(); Match = "'no-such-user-230' does not resolve" }
+        @{ Name = 'the agent folder cannot be locked down'; Env = $localEnv; Fail = @('*\ProgramData\.tally-mcp-acl.preflight'); Match = 'cannot be locked down to SYSTEM, Administrators' }
+        @{ Name = 'the agent user does not resolve to a SID'; Env = ($localEnv -replace "(?m)^AGENT_TASK_USER=.*$", 'AGENT_TASK_USER="no-such-user-230"'); Fail = @(); Match = "'no-such-user-230' does not resolve" }
     )
     foreach ($case in $preflightCases) {
         Reset-Fakes; $script:FailuresBefore = $script:Failures
@@ -856,7 +917,7 @@ try {
         Check ($r.ExitCode -eq 1 -and (Get-Content -Raw -LiteralPath $report) -match $case.Match) "$($case.Name): preflight refuses (Setup exits 7) and says why"
         Check (@(NssmLog).Count -eq 0 -and @(Calls 'Register-ScheduledTask').Count -eq 0 -and
                @(Calls 'icacls' | Where-Object { $_.Target -notlike '*.preflight' }).Count -eq 0) "$($case.Name): nothing stopped, registered or re-permissioned"
-        Check (@(Get-ChildItem -LiteralPath $root -Recurse -Force -Filter '*.preflight').Count -eq 0) "$($case.Name): no probe file left behind"
+        Check (@(Get-ChildItem -LiteralPath $root, $FakeProgramData -Recurse -Force -Filter '*.preflight').Count -eq 0) "$($case.Name): no probe file left behind"
         Show-OnFailure $r
     }
 
@@ -908,14 +969,182 @@ try {
         Show-OnFailure $r
     }
 
+
+    # ==========================================================================================
+    # Tally's data folder is Tally's (#237 owner decision): our files move out to
+    # %ProgramData%\Claudally\agent, the vault is migrated without a readable copy, and the
+    # permissions earlier versions took from Tally's folder are given back.
+    # ==========================================================================================
+    $DpapiHelper = Join-Path (Split-Path -Parent $PSScriptRoot) 'dpapi-helper.ps1'
+    function Invoke-Dpapi([string]$Action, [string]$Text) {
+        $out = $Text | & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $DpapiHelper -Action $Action
+        return ("$out").Trim()
+    }
+    $ace = { param($Sid, $Rights = 'FA') @{ Sid = $Sid; Rights = $Rights; Inherit = $true; Inherited = $false } }
+    $OtherTallyUser = 'S-1-5-21-1111-2222-3333-4444'    # another Windows account someone granted by hand
+    # What every installer up to #230 left on Tally's data folder: inheritance off, and SYSTEM,
+    # Administrators and the agent user with explicit Full Control (OI)(CI).
+    $oldInstallerShape = @((& $ace 'S-1-5-18'), (& $ace 'S-1-5-32-544'), (& $ace $AccountantSid))
+
+    # ------------------------------------------------------------------------------------------
+    Write-Host "`n[17] Upgrade moves the vault out of Tally's data folder with no readable copy, and it still decrypts"
+    Reset-Fakes; $script:FailuresBefore = $script:Failures
+    $root = New-FakeInstall -EnvText $legacyRemoteEnv
+    $dataDir = Join-Path $root 'data'
+    Add-FakeTask $AgentTask $Accountant $root
+    $global:FrcServices[$Service] = 'Running'
+    $companyPassword = 'Tally-company-pw-#17-not-real'
+    $blob = Invoke-Dpapi 'encrypt' $companyPassword
+    $oldVault = Join-Path $dataDir '.tally-mcp-companies.json'
+    $vaultJson = "{`"schemaVersion`":1,`"companies`":[{`"alias`":`"main`",`"folderId`":`"10000`",`"username`":`"owner`",`"passwordEnc`":`"$blob`"}]}"
+    [System.IO.File]::WriteAllText($oldVault, $vaultJson, (New-Object System.Text.UTF8Encoding $false))
+    [System.IO.File]::WriteAllText("$oldVault.pre-entropy-backup", 'pre-entropy-backup-bytes', (New-Object System.Text.UTF8Encoding $false))
+    [System.IO.File]::WriteAllText("$oldVault.tmp", $vaultJson, (New-Object System.Text.UTF8Encoding $false))
+    $stalePassword = 'stale-plaintext-pw-#17'
+    foreach ($n in @('_mcp_gui_command.json', '_mcp_gui_command.json.tmp.123.456', '_mcp_gui_result.json', '_mcp_screenshot.png')) {
+        [System.IO.File]::WriteAllText((Join-Path $dataDir $n), "{`"password`":`"$stalePassword`"}", (New-Object System.Text.UTF8Encoding $false))
+    }
+    $oldBytes = [System.IO.File]::ReadAllBytes($oldVault)
+    Set-FrcAcl -Path $dataDir -Protected $true -Aces (@($oldInstallerShape) + @((& $ace $OtherTallyUser 'FR')))
+    $before = Get-FileHashText (Join-Path $root '.env')
+    $r = Invoke-Firstrun @{ InstallDir = $root; Upgrade = $true; Unattended = $true }
+    Check ($null -eq $r.Error) 'completes without error'
+    $newVault = Join-Path $FakeAgentDir '.tally-mcp-companies.json'
+    Check ((Test-Path -LiteralPath $newVault) -and [System.Linq.Enumerable]::SequenceEqual([byte[]][System.IO.File]::ReadAllBytes($newVault), [byte[]]$oldBytes)) 'the vault is in the agent folder, byte for byte'
+    $moved = $null
+    try { $moved = (Get-Content -Raw -LiteralPath $newVault | ConvertFrom-Json).companies[0].passwordEnc } catch { $moved = $null }
+    Check ($moved -and (Invoke-Dpapi 'decrypt' $moved) -ceq $companyPassword) 'the stored company password still decrypts from the new location (DPAPI LocalMachine + the fixed entropy)'
+    Check ($global:FrcLockedAtSize[$newVault.ToLowerInvariant()] -eq 0) 'the new vault was locked while it was still empty: no readable copy at any point'
+    Check ((Get-FrcAclText $newVault) -eq "protected=True owner=S-1-5-32-544 $(@("S-1-5-18:FA", "S-1-5-32-544:FA", "${AccountantSid}:FA") | Sort-Object)") 'and is SYSTEM, Administrators and the agent user only'
+    Check (-not (Test-Path -LiteralPath $oldVault) -and -not (Test-Path -LiteralPath "$oldVault.tmp") -and -not (Test-Path -LiteralPath "$oldVault.pre-entropy-backup")) "the old vault, its partial .tmp and its pre-entropy backup are gone from Tally's folder"
+    Check ((Test-Path -LiteralPath "$newVault.pre-entropy-backup") -and ([System.IO.File]::ReadAllText("$newVault.pre-entropy-backup") -ceq 'pre-entropy-backup-bytes')) 'the pre-entropy backup moved the same way'
+    Check (@(Get-ChildItem -LiteralPath $dataDir -Force -File | Where-Object { $_.Name -like '_mcp_*' }).Count -eq 0) "the stale IPC files in Tally's folder are gone"
+    Check ((Find-Secret $root $stalePassword).Count -eq 0 -and (Find-Secret $root $blob).Count -eq 0) "neither the stale IPC password nor the vault's blob is left in any file under the install"
+    $m = _FrcAclOf $dataDir
+    $explicit = @($m.Aces | Where-Object { -not $_.Inherited } | ForEach-Object { $_.Sid } | Sort-Object)
+    Check (-not $m.Protected) "Tally's data folder inherits its permissions again"
+    Check (($explicit -join ',') -eq ((@($AccountantSid, $OtherTallyUser) | Sort-Object) -join ',')) "only the explicit SYSTEM and Administrators grants the old installer added were removed (inheritance gives them the same); the agent user's and the hand-added grant are kept"
+    Check ($r.Output -match 'Re-enabled permission inheritance on Tally data folder' -and $r.Output -match 'Removed the explicit Full Control entry for') 'says what it restored'
+    Check ((Get-FileHashText (Join-Path $root '.env')) -eq $before) '.env unchanged'
+    Show-OnFailure $r
+
+    # Both copies exist and differ: the one in the agent folder stays; the old one still leaves Tally's folder.
+    Reset-Fakes; $script:FailuresBefore = $script:Failures
+    $root = New-FakeInstall -EnvText $localEnv
+    $dataDir = Join-Path $root 'data'
+    Add-FakeTask $AgentTask $Accountant $root
+    New-Item -ItemType Directory -Force -Path $FakeAgentDir | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $FakeAgentDir '.tally-mcp-companies.json'), '{"schemaVersion":1,"companies":[],"which":"new"}')
+    [System.IO.File]::WriteAllText((Join-Path $dataDir '.tally-mcp-companies.json'), '{"schemaVersion":1,"companies":[],"which":"old"}')
+    $r = Invoke-Firstrun @{ InstallDir = $root; Upgrade = $true; Unattended = $true }
+    Check ($null -eq $r.Error) 'conflict: completes'
+    Check ((Get-Content -Raw -LiteralPath (Join-Path $FakeAgentDir '.tally-mcp-companies.json')) -match '"which":"new"') 'conflict: the vault the server reads is kept'
+    $aside = @(Get-ChildItem -LiteralPath $FakeAgentDir -Force -Filter '.tally-mcp-companies.json.from-tally-data-folder-*')
+    Check ($aside.Count -eq 1 -and (Get-Content -Raw -LiteralPath $aside[0].FullName) -match '"which":"old"' -and -not (Test-Path -LiteralPath (Join-Path $dataDir '.tally-mcp-companies.json'))) 'conflict: the old one is moved in beside it, locked, not left in Tally''s folder'
+    Check ($r.Output -match 'differs from') 'conflict: and says so'
+    Show-OnFailure $r
+
+    # The move fails part-way (the new file cannot be locked): the run stops, and the old vault is untouched.
+    Reset-Fakes; $script:FailuresBefore = $script:Failures
+    $root = New-FakeInstall -EnvText $localEnv
+    $dataDir = Join-Path $root 'data'
+    Add-FakeTask $AgentTask $Accountant $root
+    [System.IO.File]::WriteAllText((Join-Path $dataDir '.tally-mcp-companies.json'), $vaultJson)
+    $oldHash = Get-FileHashText (Join-Path $dataDir '.tally-mcp-companies.json')
+    Set-FrcAcl -Path $dataDir -Protected $true -Aces $oldInstallerShape
+    $global:FrcAclIgnore = @('*\Claudally\agent\.tally-mcp-companies.json')
+    $r = Invoke-Firstrun @{ InstallDir = $root; Upgrade = $true; Unattended = $true }
+    Check ($null -ne $r.Error -and "$($r.Error)" -match 'could not be moved or locked down') 'failed move: the run FAILS (Setup exits 10)'
+    Check ((Get-FileHashText (Join-Path $dataDir '.tally-mcp-companies.json')) -eq $oldHash) 'failed move: the old vault is exactly as it was - nothing lost'
+    Check (-not (Test-Path -LiteralPath (Join-Path $FakeAgentDir '.tally-mcp-companies.json'))) 'failed move: no unlocked copy left in the agent folder'
+    Check ((_FrcAclOf $dataDir).Protected) "failed move: Tally's folder is not opened up while the vault is still in it"
+    Show-OnFailure $r
+
+    # ------------------------------------------------------------------------------------------
+    Write-Host "`n[18] Tally's data folder is only restored when it carries the old installer's fingerprint"
+    Reset-Fakes; $script:FailuresBefore = $script:Failures
+    $root = New-FakeInstall -EnvText $localEnv
+    $dataDir = Join-Path $root 'data'
+    Add-FakeTask $AgentTask $Accountant $root
+    $r = Invoke-Firstrun @{ InstallDir = $root; Upgrade = $true; Unattended = $true }
+    Check ($null -eq $r.Error -and $r.Output -match 'already inherits its permissions; nothing to restore') 'never changed: a no-op, and says so'
+    Check (@(Calls 'icacls' | Where-Object { $_.Target -eq $dataDir }).Count -eq 0) 'never changed: no icacls call on it at all'
+    Show-OnFailure $r
+
+    Reset-Fakes; $script:FailuresBefore = $script:Failures
+    $root = New-FakeInstall -EnvText $localEnv
+    $dataDir = Join-Path $root 'data'
+    Add-FakeTask $AgentTask $Accountant $root
+    # Protected, but by someone else: SYSTEM and a named accountant, no Administrators entry.
+    Set-FrcAcl -Path $dataDir -Protected $true -Aces @((& $ace 'S-1-5-18'), (& $ace $OtherTallyUser))
+    $r = Invoke-Firstrun @{ InstallDir = $root; Upgrade = $true; Unattended = $true }
+    Check ($null -eq $r.Error) 'someone else''s shape: the run completes'
+    Check ($r.Output -match 'not in the shape an earlier version of this installer left it') 'someone else''s shape: a warning, with the fix command'
+    Check (@(Calls 'icacls' | Where-Object { $_.Target -eq $dataDir }).Count -eq 0 -and (_FrcAclOf $dataDir).Protected) 'someone else''s shape: left exactly as it is'
+    Show-OnFailure $r
+
+    # ------------------------------------------------------------------------------------------
+    Write-Host "`n[19] A folder planted in %ProgramData% is refused, not used; our own is taken back"
+    $junctionTarget = Join-Path $work 'junction-target'
+    $plantedCases = @(
+        @{ Name = 'agent folder owned by another account'; Plant = { New-Item -ItemType Directory -Force -Path $FakeAgentDir | Out-Null; Set-FrcAcl -Path $FakeAgentDir -Owner $OtherTallyUser }; Match = 'owned by' }
+        @{ Name = 'Claudally folder owned by another account'; Plant = { New-Item -ItemType Directory -Force -Path $FakeClaudallyDir | Out-Null; Set-FrcAcl -Path $FakeClaudallyDir -Owner $OtherTallyUser }; Match = 'owned by' }
+        @{ Name = 'agent folder is a junction'; Plant = {
+                New-Item -ItemType Directory -Force -Path $junctionTarget, $FakeClaudallyDir | Out-Null
+                Set-Content -LiteralPath (Join-Path $junctionTarget 'marker.txt') -Value 'untouched'
+                New-Item -ItemType Junction -Path $FakeAgentDir -Target $junctionTarget | Out-Null }; Match = 'junction or symbolic link' }
+    )
+    foreach ($case in $plantedCases) {
+        Reset-Fakes; $script:FailuresBefore = $script:Failures
+        $root = New-FakeInstall -EnvText ''
+        & $case.Plant
+        $r = Invoke-Firstrun @{ InstallDir = $root; Unattended = $true; AgentTaskUser = $Accountant }
+        Check ($null -ne $r.Error -and "$($r.Error)" -match $case.Match) "$($case.Name): the run FAILS and says why"
+        Check (@(Calls 'icacls' | Where-Object { $_.Target -like "$FakeClaudallyDir*" -or $_.Target -like "$junctionTarget*" }).Count -eq 0) "$($case.Name): nothing under it (or behind it) re-permissioned"
+        Check (-not (Test-Path -LiteralPath (Join-Path $FakeAgentDir '.tally-mcp-companies.json')) -and @(Get-ChildItem -LiteralPath $junctionTarget -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'marker.txt' }).Count -eq 0) "$($case.Name): nothing written into it"
+        Check (@(Calls 'Register-ScheduledTask').Count -eq 0) "$($case.Name): nothing registered"
+        Show-OnFailure $r
+    }
+
+    # The same, found by the preflight before an upgrade stops anything.
+    Reset-Fakes; $script:FailuresBefore = $script:Failures
+    $root = New-FakeInstall -EnvText $localEnv
+    Add-FakeTask $AgentTask $Accountant $root
+    New-Item -ItemType Directory -Force -Path $FakeAgentDir | Out-Null
+    Set-FrcAcl -Path $FakeAgentDir -Owner $OtherTallyUser
+    $report = Join-Path $work 'preflight-planted.txt'
+    $r = Invoke-Firstrun @{ InstallDir = $root; Upgrade = $true; PreflightOnly = $true; ReportFile = $report }
+    Check ($r.ExitCode -eq 1 -and (Get-Content -Raw -LiteralPath $report) -match 'owned by') 'preflight refuses a planted agent folder (Setup exits 7)'
+    Check (@(Calls 'icacls').Count -eq 0) 'and touches nothing, not even a probe'
+    Show-OnFailure $r
+
+    # Ours, from a dev box: the agent user's tray created it. Taken back: owner Administrators, list reset.
+    Reset-Fakes; $script:FailuresBefore = $script:Failures
+    $root = New-FakeInstall -EnvText ''
+    New-Item -ItemType Directory -Force -Path $FakeAgentDir | Out-Null
+    Set-FrcAcl -Path $FakeAgentDir -Owner $AccountantSid -Aces @((& $ace $AccountantSid), (& $ace 'S-1-5-32-545' 'FR'))
+    $r = Invoke-Firstrun @{ InstallDir = $root; Unattended = $true; AgentTaskUser = $Accountant }
+    Check ($null -eq $r.Error) 'agent user''s own folder: completes'
+    Check (@(Calls 'icacls' | Where-Object { $_.Target -eq $FakeAgentDir -and $_.Detail -eq '/setowner *S-1-5-32-544' }).Count -eq 1 -and (_FrcAclOf $FakeAgentDir).Owner -eq 'S-1-5-32-544') 'agent user''s own folder: taken back (owner Administrators)'
+    Check ($r.Output -match 'Removed an extra permission entry for .*S-1-5-32-545') 'agent user''s own folder: the extra BUILTIN\Users entry removed, and named'
+    Show-OnFailure $r
+
     # ------------------------------------------------------------------------------------------
     Write-Host "`n[16] Nothing outside the scratch folders was touched"
     Check ((Get-DefaultDataState) -eq $DefaultDataBefore) "the real default Tally data folder ($DefaultDataPath) was not created or changed"
+    Check ((Test-Path -LiteralPath (Join-Path $RealProgramData 'Claudally')) -eq $RealClaudallyBefore) 'the real %ProgramData%\Claudally was not created or removed'
 }
 finally {
     Remove-Item Env:\FRC_NSSM_LOG -ErrorAction SilentlyContinue
+    $env:ProgramData = $RealProgramData
+    # Unlink any junction a case planted before the recursive delete, so it cannot follow one.
+    foreach ($d in @($FakeAgentDir, $FakeClaudallyDir)) {
+        if ((Test-Path -LiteralPath $d) -and ((Get-Item -LiteralPath $d -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            [System.IO.Directory]::Delete($d)
+        }
+    }
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Variable -Scope Global -Name FrcCalls, FrcTasks, FrcServices, FrcAcl, FrcAclSeed, FrcIcaclsFail, FrcAclIgnore, FrcIcaclsNames -ErrorAction SilentlyContinue
+    Remove-Variable -Scope Global -Name FrcCalls, FrcTasks, FrcServices, FrcAcl, FrcAclSeed, FrcIcaclsFail, FrcAclIgnore, FrcIcaclsNames, FrcLockedAtSize -ErrorAction SilentlyContinue
     # Put the real HKLM: drive back, then drop the scratch key.
     Remove-PSDrive -Name HKLM -ErrorAction SilentlyContinue
     New-PSDrive -Name HKLM -PSProvider Registry -Root 'HKEY_LOCAL_MACHINE' -Scope Global | Out-Null
