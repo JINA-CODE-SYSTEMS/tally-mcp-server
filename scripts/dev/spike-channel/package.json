@@ -1,0 +1,17 @@
+{
+  "name": "spike-channel",
+  "private": true,
+  "version": "0.0.0",
+  "description": "THROWAWAY SPIKE for #219 (ADR 0001 P1). Not product code, not built, not shipped, not in the installer. See README.md.",
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "spike": "node spike.mjs"
+  },
+  "dependencies": {
+    "@noble/curves": "2.4.0"
+  }
+}
