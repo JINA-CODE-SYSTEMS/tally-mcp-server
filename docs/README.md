@@ -142,7 +142,7 @@ Copy `.env.example` to `.env` and configure:
 | `TALLY_DATA_PATH` | `C:\Users\Public\TallyPrime\data` | Tally data directory (for `list-companies`) |
 | `TALLY_EXE_PATH` | `C:\Program Files\TallyPrime\tally.exe` | Tally executable path |
 | `TALLY_INI_PATH` | `C:\Program Files\TallyPrimeEditLog\tally.ini` | Path to tally.ini (used by `load-company`) |
-| `TALLY_COMPANIES_CONFIG` | `<TALLY_DATA_PATH>/.tally-mcp-companies.json` | Optional credential-hint config for `list-available-companies`. See "Optional credential-hint config" below. |
+| `TALLY_COMPANIES_CONFIG` | `%ProgramData%\Claudally\agent\.tally-mcp-companies.json` | The company vault (stored company passwords and credential hints). By default in the Claudally agent folder, which the installer creates and locks to SYSTEM, Administrators and the agent user; before #230's follow-up it lived in `TALLY_DATA_PATH`, and an upgrade moves it. Set this only to keep it elsewhere: the installer does not create or lock a vault there. See "Optional credential-hint config" below. |
 | `TALLY_EDITION` | `silver` | `silver` or `gold`. Drives `load-company` semantics — see [Editions](#editions) below. |
 | `TALLY_DEBUG_XML` | *(unset)* | Set to `1` to enable the `tally-raw-xml-probe` tool for protocol RE. Leave unset in production. |
 | `PORT` | `3000` | HTTP server port |
@@ -309,7 +309,7 @@ Detailed setup guides:
 | `open-company` | Legacy multi-strategy loader (**[experimental — see #1](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/1)**) |
 | `open-company-debug` | Reports server config, agent liveness, agent version, edition, and Tally XML reachability |
 
-**Optional credential-hint config** (used by `list-available-companies`): drop a `.tally-mcp-companies.json` into the Tally data path (or set `TALLY_COMPANIES_CONFIG` to point elsewhere) with the shape:
+**Optional credential-hint config** (used by `list-available-companies`): it is read from the company vault, `%ProgramData%\Claudally\agent\.tally-mcp-companies.json` (or `TALLY_COMPANIES_CONFIG`), in the shape:
 
 ```json
 {

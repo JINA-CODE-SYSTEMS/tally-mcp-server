@@ -92,8 +92,9 @@ try {
 
 # 0b. Stored Tally company passwords (#172 E1).
 #
-# The vault lives OUTSIDE the install directory - by default C:\Users\Public\TallyPrimeEditLog\data -
-# so neither this script nor Inno's [UninstallDelete] has ever touched it. Uninstalling therefore
+# The vault lives OUTSIDE the install directory - in the Claudally agent folder,
+# %ProgramData%\Claudally\agent (before #230's follow-up: Tally's data folder, TALLY_DATA_PATH) - so
+# neither this script nor Inno's [UninstallDelete] used to touch it. Uninstalling therefore
 # left DPAPI-encrypted Tally passwords on disk, protected by an NTFS ACL that nothing maintains any
 # more. DPAPI at LocalMachine scope means any local account that can READ that file can decrypt it,
 # so that ACL was the whole protection.
@@ -102,45 +103,45 @@ try {
 # without this product, which argues for removing them - but they are also passwords a human typed
 # and may want back after a reinstall, which argues for keeping them. The uninstaller poses the
 # question and defaults to removing.
+# The agent folder, derived the way the installer, the server and the tray derive it.
+$programDataDir = if ($env:ProgramData) { $env:ProgramData } else { 'C:\ProgramData' }
+$agentDirNow = Join-Path $programDataDir 'Claudally\agent'
 if ($RemoveVault) {
     try {
-        $vaultPath = ''
+        # Where it is now, and - for an install that was never reconfigured by a version that moves
+        # it - where it used to be, in Tally's data folder.
         $envFile = Join-Path $InstallDir '.env'
+        $dataPath = ''
         if (Test-Path -LiteralPath $envFile) {
             $dataLine = Select-String -LiteralPath $envFile -Pattern '^\s*TALLY_DATA_PATH\s*=' -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($dataLine) {
-                $dataPath = ($dataLine.Line -split '=', 2)[1].Trim().Trim('"')
-                if ($dataPath) { $vaultPath = Join-Path $dataPath '.tally-mcp-companies.json' }
-            }
+            if ($dataLine) { $dataPath = ($dataLine.Line -split '=', 2)[1].Trim().Trim('"') }
         }
-        if (-not $vaultPath) { $vaultPath = Join-Path $env:PUBLIC 'TallyPrimeEditLog\data\.tally-mcp-companies.json' }
+        if (-not $dataPath) { $dataPath = Join-Path $env:PUBLIC 'TallyPrimeEditLog\data' }
+        $vaultPaths = @((Join-Path $agentDirNow '.tally-mcp-companies.json'), (Join-Path $dataPath '.tally-mcp-companies.json'))
 
-        if (Test-Path -LiteralPath $vaultPath) {
-            # Overwrite before unlinking: the file holds encrypted credentials, and a plain delete
-            # leaves them recoverable from free space.
-            try {
-                $len = (Get-Item -LiteralPath $vaultPath).Length
-                if ($len -gt 0) { [System.IO.File]::WriteAllBytes($vaultPath, (New-Object byte[] $len)) }
-            } catch { }
-            Remove-Item -LiteralPath $vaultPath -Force -ErrorAction SilentlyContinue
-            # The pre-entropy backup, if a migration ever ran, holds the OLD weakly-protected blobs.
-            $vaultBackup = "$vaultPath.pre-entropy-backup"
-            if (Test-Path -LiteralPath $vaultBackup) {
+        $found = $false
+        foreach ($vaultPath in $vaultPaths) {
+            # The vault, the pre-entropy backup migrate-vault-entropy.ps1 may have left (it holds the
+            # OLD, weakly-protected blobs), and a half-written .tmp from the tray.
+            foreach ($f in @($vaultPath, "$vaultPath.pre-entropy-backup", "$vaultPath.tmp")) {
+                if (-not (Test-Path -LiteralPath $f)) { continue }
+                $found = $true
+                # Overwrite before unlinking: the file holds encrypted credentials, and a plain delete
+                # leaves them recoverable from free space.
                 try {
-                    $len2 = (Get-Item -LiteralPath $vaultBackup).Length
-                    if ($len2 -gt 0) { [System.IO.File]::WriteAllBytes($vaultBackup, (New-Object byte[] $len2)) }
-                } catch { }
-                Remove-Item -LiteralPath $vaultBackup -Force -ErrorAction SilentlyContinue
+                    $len = (Get-Item -LiteralPath $f -Force).Length
+                    if ($len -gt 0) { [System.IO.File]::WriteAllBytes($f, (New-Object byte[] $len)) }
+                } catch { $null = $_ }
+                Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
+                Write-Host "[OK] Saved Tally company passwords shredded and removed ($f)"
             }
-            Write-Host "[OK] Saved Tally company passwords shredded and removed"
-        } else {
-            Write-Host "[*] No saved company passwords found"
         }
+        if (-not $found) { Write-Host "[*] No saved company passwords found" }
     } catch {
         Write-Host "[WARN] Company vault removal raised: $_"
     }
 } else {
-    Write-Host "[*] Saved Tally company passwords KEPT at the operator's request"
+    Write-Host "[*] Saved Tally company passwords KEPT at the operator's request, in $agentDirNow"
     Write-Host "    They stay readable only to SYSTEM, Administrators and the agent account, and are"
     Write-Host "    useless on any other machine (DPAPI is bound to this one)."
 }
