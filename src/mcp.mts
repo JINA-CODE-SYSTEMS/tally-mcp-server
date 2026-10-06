@@ -6,10 +6,11 @@ import path from 'node:path';
 import { z } from 'zod';
 import { cacheTable, executeSQL, validateSQL } from './database.mjs';
 import { handlePull, handlePush, jsonToTSV, pingTally, postTallyXML, pushXml, resolveGSTLedgers } from './tally.mjs';
-import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, buildAlterVoucherXml, applyPatchToBlock, alterWouldBlankVoucher, blockHasLedgerEntries, deriveRemoteId, findRemoteIdCollisions, voucherBalance, orderEntries, type EntryOrder, isDateInOpenPeriod, findMissingMasters, canonicalizeVoucherMasters, referencedLedgers, decodeXmlEntities, escapeXml, xmlName, type VoucherEntry, type VoucherInput, type VoucherPatch } from './voucher.mjs';
+import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, buildAlterVoucherXml, applyPatchToBlock, alterWouldBlankVoucher, blockHasLedgerEntries, deriveRemoteId, findRemoteIdCollisions, voucherBalance, orderEntries, type EntryOrder, isDateInOpenPeriod, findMissingMasters, canonicalizeVoucherMasters, masterKey, resolveMasterNames, referencedLedgers, decodeXmlEntities, escapeXml, xmlName, type VoucherEntry, type VoucherInput, type VoucherPatch } from './voucher.mjs';
 import { MASTER_TAGS, MASTER_COLLECTION_TYPES, planMasterNameRepairs, buildRenameMasterXml, verifyRename, buildMasterNamesCollectionXml, parseMasterNamesFromCollection } from './master.mjs';
 import type { ModelPushResponse } from './models.mjs';
 import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
+import { normalizePartyFields, validatePartyFields, planPartyUpdate, changesFromPlan, buildPartyAlterXml, verifyPartyFields, type PartyRow } from './party.mjs';
 
 // Load .env from the install directory by ABSOLUTE path (next to dist/), never relative to the
 // process working directory. Under NSSM the service cwd happens to equal the install directory, so
@@ -2800,6 +2801,17 @@ async function fetchMasterNames(collection: string, company?: string): Promise<s
   } catch { return []; }
 }
 
+// Every Sundry Debtor / Creditor with its party details (the party-details report), for reading a party's
+// current details before an update and checking them after a write.
+async function readPartyRows(company?: string): Promise<{ rows?: PartyRow[]; error?: string }> {
+  const p = new Map<string, string>([['partyType', 'all']]);
+  if (company) p.set('targetCompany', company);
+  const resp = await pull('party-details', p);
+  if (resp.error) return { error: resp.error };
+  // No parties at all comes back as no data rather than an empty list.
+  return { rows: Array.isArray(resp.data) ? resp.data : [] };
+}
+
 // Fetches the active/target company's open period for the OUT_OF_PERIOD check. Tolerant: null on error.
 async function fetchPeriodForWrite(company?: string): Promise<{ fyFrom: string | null; fyTo: string | null; booksFrom: string | null } | null> {
   try {
@@ -4415,6 +4427,41 @@ export async function registerMcpServer(): Promise<McpServer> {
     }
   );
 
+  // TallyPrime 3.0+ keeps mailing and GST registration details as dated sub-lists (LedMailingDetails /
+  // LedGSTRegDetails, last entry = current) and party bank details in PaymentDetails (first entry taken);
+  // the template falls back to the flat pre-3.0 ledger methods when those sub-lists are absent.
+  mcpServer.registerTool(
+    'party-details',
+    {
+      title: 'Party Details',
+      description: `fetches master details of party ledgers (Sundry Debtors and/or Sundry Creditors, including their sub-groups) with fields party_name, party_type (Sundry Debtors / Sundry Creditors), group_name, mailing_name, address (lines joined with commas), state, country, pincode, pan, gst_registration_type, gstin, place_of_supply, other_territory_assessee, common_party, transporter, transporter_id, bank_account_holder, bank_account_number, bank_ifsc, bank_name, bank_branch. other_territory_assessee / common_party / transporter are Yes / No and together with place_of_supply and transporter_id make up the ledger's additional GST details. Empty values mean the field is not set on the ledger. returns output cached in DuckDB in-memory table (specified in tableID property). Use query-database tool to run SQL queries against that table for further analysis`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified'),
+        partyType: z.enum(['all', 'debtors', 'creditors']).optional().describe('which parties to fetch: debtors = Sundry Debtors, creditors = Sundry Creditors, all = both (default)'),
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      let inputParams = new Map<string, string>([['partyType', args.partyType ?? 'all']]);
+      if (args.targetCompany) {
+        inputParams.set('targetCompany', args.targetCompany);
+      }
+      const resp = await pull('party-details', inputParams);
+      const tableId = await cacheTable('party-details', resp.data);
+      if (resp.error) {
+        return errorResult('UNKNOWN', { message: resp.error });
+      }
+      else {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId, count: rowCount(resp.data) }) }]
+        };
+      }
+    }
+  );
+
   mcpServer.registerTool(
     'locate-voucher',
     {
@@ -5517,13 +5564,18 @@ export async function registerMcpServer(): Promise<McpServer> {
     'create-ledger',
     {
       title: 'Create Ledger',
-      description: `creates a new GL ledger master in Tally Prime. Parent group must exactly match an existing group in Tally — validate using list-master tool with collection as group before calling. Returns success status`,
+      description: `creates a new GL ledger master in Tally Prime. Parent group must exactly match an existing group in Tally — validate using list-master tool with collection as group before calling. For a party ledger (under Sundry Debtors / Sundry Creditors) the mailing details, PAN and GST details can be set at creation — e.g. from an invoice; PAN must match characters 3-12 of the GSTIN when both are given. Those party details are read back after the write and any field Tally did not store is reported under partyVerification. To add details to a party that ALREADY exists, use update-party-details instead. Returns success status`,
       inputSchema: {
         targetCompany: z.string().optional().describe('optional company name. leave it blank or skip this to choose for default company'),
         name: z.string().describe('ledger name to create'),
         parentGroup: z.string().describe('exact parent group name — validate using list-master tool with collection as group'),
         openingBalance: z.number().optional().describe('optional opening balance. negative = debit, positive = credit'),
         mailingName: z.string().optional().describe('optional mailing name / display name'),
+        address: z.array(z.string()).optional().describe('optional party address, one entry per line (without state / pincode, which have their own fields)'),
+        state: z.string().optional().describe('optional party state, as Tally spells it (e.g. Maharashtra)'),
+        country: z.string().optional().describe('optional party country (e.g. India)'),
+        pincode: z.string().optional().describe('optional party pincode'),
+        pan: z.string().optional().describe('optional party PAN / income-tax number (AAAAA9999A)'),
         gstRegistrationType: z.enum(['Regular', 'Composition', 'Unregistered', 'Consumer', 'Unknown']).optional().describe('optional GST registration type for party ledgers'),
         gstin: z.string().optional().describe('optional GSTIN number for party ledgers'),
         gstDutyHead: z.enum(['CGST', 'SGST', 'UTGST', 'IGST', 'Cess']).optional().describe('for a GST TAX ledger under "Duties & Taxes" (e.g. Output CGST): sets Type of duty = GST + the GST duty head, so gstr1-summary / gstr2-summary classify CGST/SGST/IGST correctly. Without it, tax ledgers post amounts but statutory GST returns stay empty (#135). NOTE: sales/purchase-ledger GST details (HSN/rate/nature) are not set here yet.'),
@@ -5546,20 +5598,28 @@ export async function registerMcpServer(): Promise<McpServer> {
         return errorResult('PRECONDITION_FAILED', { message: 'Ledger name cannot be empty.', retryable: false });
       }
 
+      const party = normalizePartyFields({
+        mailingName: args.mailingName, address: args.address, state: args.state, country: args.country,
+        pincode: args.pincode, pan: args.pan, gstRegistrationType: args.gstRegistrationType, gstin: args.gstin,
+      });
+      const { errors, warnings } = validatePartyFields(party);
+      if (errors.length) {
+        auditLog('create-ledger', args, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: `${errors.join(' ')} Nothing was created.`, retryable: false });
+      }
+
       let inputParams = new Map<string, any>([
         ['name', args.name],
         ['parentGroup', args.parentGroup]
       ]);
       if (args.targetCompany) inputParams.set('targetCompany', args.targetCompany);
       if (args.openingBalance !== undefined) inputParams.set('openingBalance', args.openingBalance);
-      if (args.mailingName) inputParams.set('mailingName', args.mailingName);
-      if (args.gstRegistrationType) inputParams.set('gstRegistrationType', args.gstRegistrationType);
-      if (args.gstin) inputParams.set('gstin', args.gstin);
+      for (const [k, v] of Object.entries(party)) inputParams.set(k, v);
       if (args.gstDutyHead) inputParams.set('gstDutyHead', args.gstDutyHead);
 
       if (args.dryRun) {
         auditLog('create-ledger', args, 'dryrun', Date.now() - start);
-        return dryRunEcho('ledger', inputParams);
+        return dryRunEcho('ledger', inputParams, warnings.length ? { warnings } : undefined);
       }
       const resp = await push('ledger', inputParams);
       if (!resp.success) {
@@ -5567,8 +5627,24 @@ export async function registerMcpServer(): Promise<McpServer> {
         return errorResult('UNKNOWN', { message: resp.error || 'Failed to create ledger.' });
       }
       auditLog('create-ledger', args, 'success', Date.now() - start);
+
+      // Party details only count once Tally has been seen to store them (see party.mts).
+      let partyVerification: object | undefined;
+      const { mailingName: _m, ...detailFields } = party;
+      if (Object.keys(detailFields).length) {
+        const read = await readPartyRows(args.targetCompany);
+        const row = read.rows?.find(r => masterKey(String(r.party_name ?? '')) === masterKey(args.name));
+        if (read.error) partyVerification = { verified: false, note: `Created, but the party details could not be read back to check them: ${read.error}` };
+        else if (!row) partyVerification = { verified: false, note: 'Created, but the ledger is not under Sundry Debtors / Sundry Creditors, so its party details were not read back.' };
+        else {
+          const mismatches = verifyPartyFields(row, party);
+          partyVerification = mismatches.length
+            ? { verified: false, mismatches, note: 'Tally created the ledger but did not store these party details as sent. Tell the user which fields to enter by hand in Tally.' }
+            : { verified: true };
+        }
+      }
       return {
-        content: [{ type: 'text', text: JSON.stringify({ success: true, created: resp.created }) }]
+        content: [{ type: 'text', text: JSON.stringify({ success: true, created: resp.created, ...(warnings.length ? { warnings } : {}), ...(partyVerification ? { partyVerification } : {}) }) }]
       };
     }
   );
@@ -5619,6 +5695,133 @@ export async function registerMcpServer(): Promise<McpServer> {
       auditLog('set-ledger-gst', args, 'success', Date.now() - start);
       return {
         content: [{ type: 'text', text: JSON.stringify({ success: true, altered: resp.altered ?? resp.created, ledger: args.name, gstDutyHead: args.gstDutyHead }) }]
+      };
+    }
+  );
+
+  mcpServer.registerTool(
+    'update-party-details',
+    {
+      title: 'Update Party Details',
+      description: `Adds mailing / PAN / GST details to an EXISTING party ledger (under Sundry Debtors or Sundry Creditors) by ALTERing it — typically details read off an invoice. Pick the right party: on a purchase invoice it is the SELLER (a Sundry Creditor), on a sales invoice the BUYER (a Sundry Debtor); never the company's own details. Each field is compared with what Tally already holds: a blank field is filled, an equal one is left alone, and a DIFFERENT one is reported as a conflict and NOT written unless overwrite is true. Always call with dryRun first, show the user the plan (fills and conflicts), and only set overwrite after the user has confirmed each conflicting value. PAN must match characters 3-12 of the GSTIN when both are given. After the write the ledger is read back: verified=false with mismatches means Tally did not store those fields — relay that to the user rather than reporting success. Refused when READONLY_MODE=true. To create a new party with these details, use create-ledger.`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name. leave blank to use the active company'),
+        name: z.string().describe('name of the existing party ledger (validate with search-master / party-details first)'),
+        mailingName: z.string().optional().describe('mailing name as printed on the invoice'),
+        address: z.array(z.string()).optional().describe('address, one entry per line (without state / pincode, which have their own fields)'),
+        state: z.string().optional().describe('state, as Tally spells it (e.g. Maharashtra)'),
+        country: z.string().optional().describe('country (e.g. India)'),
+        pincode: z.string().optional().describe('pincode'),
+        pan: z.string().optional().describe('PAN / income-tax number (AAAAA9999A)'),
+        gstRegistrationType: z.enum(['Regular', 'Composition', 'Unregistered', 'Consumer', 'Unknown']).optional().describe('GST registration type'),
+        gstin: z.string().optional().describe('GSTIN / UIN'),
+        overwrite: z.boolean().optional().describe('replace fields that already hold a DIFFERENT value. Only after the user has confirmed the new values; default false fills blanks only'),
+        dryRun: z.boolean().optional().describe('if true, return the plan WITHOUT writing to Tally'),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      const tool = 'update-party-details';
+      if (process.env.READONLY_MODE === 'true') {
+        auditLog(tool, args, 'denied');
+        return errorResult('READONLY');
+      }
+      if (!args.name || args.name.trim() === '') {
+        auditLog(tool, args, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: 'Ledger name cannot be empty.', retryable: false });
+      }
+      const proposed = normalizePartyFields(args);
+      if (!Object.keys(proposed).length) {
+        auditLog(tool, args, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: 'No details given. Supply at least one of mailingName, address, state, country, pincode, pan, gstRegistrationType, gstin.', retryable: false });
+      }
+      const { errors, warnings } = validatePartyFields(proposed);
+      if (errors.length) {
+        auditLog(tool, args, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: `${errors.join(' ')} Nothing was changed.`, retryable: false });
+      }
+      const company = args.targetCompany;
+
+      // The ALTER must carry the exact stored name: Tally matches it byte-for-byte, and an ALTER that matches
+      // nothing can create a new ledger instead. No master list means no way to know, so refuse.
+      const known = await fetchMasterNames('ledger', company);
+      if (!known.length) {
+        auditLog(tool, args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: 'Could not read the ledger list from Tally, so the party could not be matched. Nothing was changed.', retryable: true });
+      }
+      const res = resolveMasterNames([args.name], known);
+      if (res.ambiguous.length) {
+        auditLog(tool, args, 'denied');
+        return errorResult('MASTER_NOT_FOUND', {
+          message: `Ambiguous ledger name ${JSON.stringify(args.name)} → ${res.ambiguous[0]!.candidates.map(c => JSON.stringify(c)).join(' | ')}. Nothing was changed.`,
+          remedy: 'Pass the name exactly as stored (the candidates are JSON-quoted to show the difference).',
+          retryable: false,
+        });
+      }
+      const storedName = res.resolved.get(args.name);
+      if (storedName === undefined) {
+        auditLog(tool, args, 'denied');
+        return errorResult('MASTER_NOT_FOUND', { message: `No ledger named "${args.name}". Nothing was changed.`, remedy: 'Find the party with search-master, or create it with create-ledger.', retryable: false });
+      }
+
+      const before = await readPartyRows(company);
+      if (before.error || !before.rows) {
+        auditLog(tool, args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: `Could not read the party's current details: ${before.error ?? 'no data'}. Nothing was changed.`, retryable: true });
+      }
+      const current = before.rows.find(r => masterKey(String(r.party_name ?? '')) === masterKey(storedName));
+      if (!current) {
+        auditLog(tool, args, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: `"${args.name}" is not under Sundry Debtors or Sundry Creditors, so it is not a party ledger. Nothing was changed.`, retryable: false });
+      }
+
+      const plan = planPartyUpdate(current, proposed, args.overwrite === true);
+      const changes = changesFromPlan(plan, proposed);
+      const conflicts = plan.filter(p => p.action === 'conflict');
+      const summary = {
+        ledger: storedName, plan,
+        ...(conflicts.length ? { conflictNote: `${conflicts.length} field(s) already hold a different value in Tally and were left as they are. Ask the user which value is right; call again with overwrite=true only for values they confirm.` } : {}),
+        ...(warnings.length ? { warnings } : {}),
+      };
+      if (!Object.keys(changes).length) {
+        auditLog(tool, args, args.dryRun ? 'dryrun' : 'success', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify({ ...(args.dryRun ? { dryRun: true } : {}), written: false, reason: 'nothing to change', ...summary }, null, 2) }] };
+      }
+      if (args.dryRun) {
+        auditLog(tool, args, 'dryrun', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify({ dryRun: true, wouldWrite: changes, ...summary }, null, 2) }] };
+      }
+
+      const resp = await pushXml(buildPartyAlterXml(storedName, changes, company));
+      if (!resp.success) {
+        auditLog(tool, args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: resp.error || 'Tally rejected the update.' });
+      }
+
+      const after = await readPartyRows(company);
+      if (after.error || !after.rows) {
+        auditLog(tool, args, 'success', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify({ success: true, verified: false, note: `Tally accepted the update, but it could not be read back to check it: ${after.error ?? 'no data'}. Ask the user to check the ledger in Tally.`, written: changes, ...summary }, null, 2) }] };
+      }
+      // An ALTER that missed its target can create a new master instead; a grown party list is the tell.
+      if (after.rows.length > before.rows.length) {
+        auditLog(tool, args, 'error', Date.now() - start);
+        return errorResult('UNKNOWN', { message: `Tally reported success but the number of party ledgers went from ${before.rows.length} to ${after.rows.length}, so it may have created a new ledger instead of updating "${storedName}". Ask the user to check the party list in Tally.`, retryable: false });
+      }
+      const row = after.rows.find(r => masterKey(String(r.party_name ?? '')) === masterKey(storedName));
+      const mismatches = verifyPartyFields(row, changes);
+      auditLog(tool, args, mismatches.length ? 'error' : 'success', Date.now() - start);
+      return {
+        content: [{ type: 'text', text: JSON.stringify({
+          success: mismatches.length === 0, verified: mismatches.length === 0, written: changes,
+          ...(mismatches.length ? { mismatches, note: 'Tally accepted the update but did not store these fields as sent. Tell the user which fields to enter by hand in Tally.' } : {}),
+          ...summary,
+        }, null, 2) }]
       };
     }
   );
