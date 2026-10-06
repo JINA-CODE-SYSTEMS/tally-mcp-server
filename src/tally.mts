@@ -521,7 +521,7 @@ export function handlePush(templateName: string, inputParams: Map<string, any>):
                 }
 
                 // skip optional fields that are not provided
-                if (_value === undefined || _value === null || _value === '')
+                if (_value === undefined || _value === null || _value === '' || (Array.isArray(_value) && _value.length === 0))
                     continue;
 
                 // check regex validation
@@ -546,6 +546,8 @@ export function handlePush(templateName: string, inputParams: Map<string, any>):
                 }
                 else if (typeof _value == 'string' && iType == 'string')
                     lstInputs.set(iName, _value);
+                else if (Array.isArray(_value) && iType == 'array' && _value.every(v => typeof v == 'string'))
+                    lstInputs.set(iName, _value); // list of strings, e.g. address lines
                 else {
                     retval.error = `Parameter ${iName} not found or contains invalid value [${_value}]`;
                     return resolve(retval);

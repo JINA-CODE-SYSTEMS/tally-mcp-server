@@ -1,0 +1,140 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ENVELOPE>
+    <HEADER>
+        <VERSION>1</VERSION>
+        <TALLYREQUEST>Export</TALLYREQUEST>
+        <TYPE>Data</TYPE>
+        <ID>MyTallyLiveReport</ID>
+    </HEADER>
+    <BODY>
+        <DESC>
+            <STATICVARIABLES>
+                <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+                <nunjuck>if targetCompany</nunjuck>
+                <SVCURRENTCOMPANY>{{targetCompany | escape}}</SVCURRENTCOMPANY>
+                <nunjuck>endif</nunjuck>
+            </STATICVARIABLES>
+            <TDL>
+                <TDLMESSAGE>
+                    <REPORT NAME="MyTallyLiveReport">
+                        <FORMS>MyForm</FORMS>
+                    </REPORT>
+                    <FORM NAME="MyForm">
+                        <PARTS>MyPart01</PARTS>
+                        <XMLTAG>DATA</XMLTAG>
+                    </FORM>
+                    <PART NAME="MyPart01">
+                        <LINES>MyLine01</LINES>
+                        <REPEAT>MyLine01 : MyCollection</REPEAT>
+                        <SCROLLED>Vertical</SCROLLED>
+                    </PART>
+                    <LINE NAME="MyLine01">
+                        <FIELDS>FldName,FldPartyType,FldGroup,FldMailingName,FldAddress,FldState,FldCountry,FldPincode,FldPAN,FldGSTRegType,FldGSTIN,FldPlaceOfSupply,FldOtherTerritory,FldCommonParty,FldTransporter,FldTransporterId,FldBankHolder,FldBankAccount,FldBankIFSC,FldBankName,FldBankBranch</FIELDS>
+                        <XMLTAG>ROW</XMLTAG>
+                    </LINE>
+                    <FIELD NAME="FldName">
+                        <SET>$Name</SET>
+                        <XMLTAG>F01</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldPartyType">
+                        <SET>if $$IsBelongsTo:$$GroupSundryDebtors then "Sundry Debtors" else "Sundry Creditors"</SET>
+                        <XMLTAG>F02</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldGroup">
+                        <SET>$Parent</SET>
+                        <XMLTAG>F03</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldMailingName">
+                        <SET>if @@McpHasMail then $$CollectionField:$MailingName:@@McpMailN:LedMailingDetails else (if $$IsEmpty:$MailingName then $Name else $MailingName)</SET>
+                        <XMLTAG>F04</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldAddress">
+                        <SET>if @@McpHasMail then $$CollectionField:($$FullList:Address:$Address):@@McpMailN:LedMailingDetails else $$FullList:Address:$Address</SET>
+                        <XMLTAG>F05</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldState">
+                        <SET>if @@McpHasMail then $$CollectionField:$State:@@McpMailN:LedMailingDetails else $LedStateName</SET>
+                        <XMLTAG>F06</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldCountry">
+                        <SET>if @@McpHasMail then $$CollectionField:$Country:@@McpMailN:LedMailingDetails else $CountryName</SET>
+                        <XMLTAG>F07</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldPincode">
+                        <SET>if @@McpHasMail then $$CollectionField:$PinCode:@@McpMailN:LedMailingDetails else $PinCode</SET>
+                        <XMLTAG>F08</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldPAN">
+                        <SET>$IncomeTaxNumber</SET>
+                        <XMLTAG>F09</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldGSTRegType">
+                        <SET>if @@McpHasGST then $$CollectionField:$GSTRegistrationType:@@McpGSTN:LedGSTRegDetails else $GSTRegistrationType</SET>
+                        <XMLTAG>F10</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldGSTIN">
+                        <SET>if @@McpHasGST then $$CollectionField:$GSTIN:@@McpGSTN:LedGSTRegDetails else $PartyGSTIN</SET>
+                        <XMLTAG>F11</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldPlaceOfSupply">
+                        <SET>if @@McpHasGST then $$CollectionField:$PlaceOfSupply:@@McpGSTN:LedGSTRegDetails else ""</SET>
+                        <XMLTAG>F12</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldOtherTerritory">
+                        <SET>if (if @@McpHasGST then $$CollectionField:$IsOthTerritoryAssessee:@@McpGSTN:LedGSTRegDetails else $IsOthTerritoryAssessee) then "Yes" else "No"</SET>
+                        <XMLTAG>F13</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldCommonParty">
+                        <SET>if (if @@McpHasGST then $$CollectionField:$IsCommonParty:@@McpGSTN:LedGSTRegDetails else $IsCommonParty) then "Yes" else "No"</SET>
+                        <XMLTAG>F14</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldTransporter">
+                        <SET>if (if @@McpHasGST then $$CollectionField:$IsTransporter:@@McpGSTN:LedGSTRegDetails else $IsTransporter) then "Yes" else "No"</SET>
+                        <XMLTAG>F15</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldTransporterId">
+                        <SET>if @@McpHasGST then $$CollectionField:$TransporterID:@@McpGSTN:LedGSTRegDetails else $TransporterID</SET>
+                        <XMLTAG>F16</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldBankHolder">
+                        <SET>if @@McpHasPay then $$CollectionField:$PaymentFavouring:1:PaymentDetails else $BankAccHolderName</SET>
+                        <XMLTAG>F17</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldBankAccount">
+                        <SET>if @@McpHasPay then $$CollectionField:$AccountNumber:1:PaymentDetails else $BankDetails</SET>
+                        <XMLTAG>F18</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldBankIFSC">
+                        <SET>if @@McpHasPay then $$CollectionField:$IFSCode:1:PaymentDetails else $IFSCode</SET>
+                        <XMLTAG>F19</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldBankName">
+                        <SET>if @@McpHasPay then $$CollectionField:$BankName:1:PaymentDetails else $BankingConfigBank</SET>
+                        <XMLTAG>F20</XMLTAG>
+                    </FIELD>
+                    <FIELD NAME="FldBankBranch">
+                        <SET>if @@McpHasPay then $$CollectionField:$BranchName:1:PaymentDetails else $BranchName</SET>
+                        <XMLTAG>F21</XMLTAG>
+                    </FIELD>
+                    <COLLECTION NAME="MyCollection">
+                        <TYPE>Ledger</TYPE>
+                        <FILTER>McpPartyFilter</FILTER>
+                        <FETCH>MailingName,Address,LedStateName,CountryName,PinCode,IncomeTaxNumber,GSTRegistrationType,PartyGSTIN,LedMailingDetails,LedGSTRegDetails,PaymentDetails,BankDetails,IFSCode,BankingConfigBank,BranchName,BankAccHolderName</FETCH>
+                    </COLLECTION>
+                    <SYSTEM TYPE="Formulae" NAME="McpMailN">$$NumItems:LedMailingDetails</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="McpHasMail">@@McpMailN > 0</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="McpGSTN">$$NumItems:LedGSTRegDetails</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="McpHasGST">@@McpGSTN > 0</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="McpHasPay">$$NumItems:PaymentDetails > 0</SYSTEM>
+                    <nunjuck>if partyType == 'debtors'</nunjuck>
+                    <SYSTEM TYPE="Formulae" NAME="McpPartyFilter">$$IsBelongsTo:$$GroupSundryDebtors</SYSTEM>
+                    <nunjuck>elif partyType == 'creditors'</nunjuck>
+                    <SYSTEM TYPE="Formulae" NAME="McpPartyFilter">$$IsBelongsTo:$$GroupSundryCreditors</SYSTEM>
+                    <nunjuck>else</nunjuck>
+                    <SYSTEM TYPE="Formulae" NAME="McpPartyFilter">$$IsBelongsTo:$$GroupSundryDebtors OR $$IsBelongsTo:$$GroupSundryCreditors</SYSTEM>
+                    <nunjuck>endif</nunjuck>
+                </TDLMESSAGE>
+            </TDL>
+        </DESC>
+    </BODY>
+</ENVELOPE>

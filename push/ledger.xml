@@ -24,6 +24,25 @@
                         <nunjuck>if mailingName</nunjuck>
                         <MAILINGNAME>{{mailingName | escape}}</MAILINGNAME>
                         <nunjuck>endif</nunjuck>
+                        <nunjuck>if address and address.length</nunjuck>
+                        <ADDRESS.LIST TYPE="String">
+                            <nunjuck>for line in address</nunjuck>
+                            <ADDRESS>{{line | escape}}</ADDRESS>
+                            <nunjuck>endfor</nunjuck>
+                        </ADDRESS.LIST>
+                        <nunjuck>endif</nunjuck>
+                        <nunjuck>if state</nunjuck>
+                        <LEDSTATENAME>{{state | escape}}</LEDSTATENAME>
+                        <nunjuck>endif</nunjuck>
+                        <nunjuck>if country</nunjuck>
+                        <COUNTRYNAME>{{country | escape}}</COUNTRYNAME>
+                        <nunjuck>endif</nunjuck>
+                        <nunjuck>if pincode</nunjuck>
+                        <PINCODE>{{pincode | escape}}</PINCODE>
+                        <nunjuck>endif</nunjuck>
+                        <nunjuck>if pan</nunjuck>
+                        <INCOMETAXNUMBER>{{pan | escape}}</INCOMETAXNUMBER>
+                        <nunjuck>endif</nunjuck>
                         <nunjuck>if gstRegistrationType</nunjuck>
                         <GSTREGISTRATIONTYPE>{{gstRegistrationType | escape}}</GSTREGISTRATIONTYPE>
                         <nunjuck>endif</nunjuck>

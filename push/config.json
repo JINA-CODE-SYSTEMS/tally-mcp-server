@@ -65,6 +65,33 @@
                     "required": false
                 },
                 {
+                    "name": "address",
+                    "datatype": "array",
+                    "required": false
+                },
+                {
+                    "name": "state",
+                    "datatype": "string",
+                    "required": false
+                },
+                {
+                    "name": "country",
+                    "datatype": "string",
+                    "required": false
+                },
+                {
+                    "name": "pincode",
+                    "datatype": "string",
+                    "required": false
+                },
+                {
+                    "name": "pan",
+                    "datatype": "string",
+                    "required": false,
+                    "validation_regex": "^([A-Z]{5}[0-9]{4}[A-Z])?$",
+                    "validation_message": "Invalid PAN format"
+                },
+                {
                     "name": "gstRegistrationType",
                     "datatype": "string",
                     "required": false,

@@ -331,6 +331,7 @@ The config never stores passwords — only the hint that one is needed, so calle
 | `ledger-balance` | Closing balance of a single ledger as on date |
 | `ledger-account` | Voucher-level ledger statement with GST breakup |
 | `bills-outstanding` | Outstanding receivables / payables with overdue days |
+| `party-details` | Sundry Debtor / Creditor masters: address, state, pincode, PAN, GSTIN, additional GST and bank details |
 
 ### Inventory
 
@@ -372,7 +373,8 @@ The config never stores passwords — only the hint that one is needed, so calle
 |------|-------------|
 | `create-voucher` | Create vouchers (Sales, Purchase, Payment, Receipt, Journal, etc.) |
 | `create-gst-voucher` | Create GST-compliant vouchers with auto tax ledger allocation |
-| `create-ledger` | Create a new GL ledger master |
+| `create-ledger` | Create a new GL ledger master (party ledgers can carry address, state, pincode, PAN, GSTIN) |
+| `update-party-details` | Fill in missing address / PAN / GST details on an existing party (e.g. from an invoice); reports conflicts instead of overwriting, then reads the ledger back to confirm |
 | `create-stock-item` | Create a new stock item master |
 
 > Write tools are disabled when `READONLY_MODE=true`.
