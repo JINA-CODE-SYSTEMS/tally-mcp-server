@@ -72,6 +72,28 @@ test('config projection drops params a template does not declare', () => {
   assert.equal(/should-vanish/.test(out), false);
 });
 
+// Party details on create: routed through the config.json projection, so it fails if address / state /
+// country / pincode / pan ever fall out of the ledger template's declared inputs.
+test('party ledger create carries address lines, state, country, pincode and PAN', () => {
+  const out = renderViaConfig('ledger', {
+    name: 'ACME TRADERS', parentGroup: 'Sundry Debtors',
+    address: ['12 Example Lane & Annexe', 'Industrial Estate'],
+    state: 'Maharashtra', country: 'India', pincode: '400099', pan: 'ABCDE1234F',
+    gstRegistrationType: 'Regular', gstin: '27ABCDE1234F1Z5',
+  });
+  assert.match(out, /<ADDRESS\.LIST TYPE="String">\s*<ADDRESS>12 Example Lane &amp; Annexe<\/ADDRESS>\s*<ADDRESS>Industrial Estate<\/ADDRESS>\s*<\/ADDRESS\.LIST>/);
+  assert.match(out, /<LEDSTATENAME>Maharashtra<\/LEDSTATENAME>/);
+  assert.match(out, /<COUNTRYNAME>India<\/COUNTRYNAME>/);
+  assert.match(out, /<PINCODE>400099<\/PINCODE>/);
+  assert.match(out, /<INCOMETAXNUMBER>ABCDE1234F<\/INCOMETAXNUMBER>/);
+  assert.match(out, /<PARTYGSTIN>27ABCDE1234F1Z5<\/PARTYGSTIN>/);
+});
+
+test('ledger without party details emits no party tags (existing ledgers unchanged)', () => {
+  const out = renderViaConfig('ledger', { name: 'Cash', parentGroup: 'Cash-in-Hand', address: [] });
+  assert.equal(/ADDRESS|LEDSTATENAME|COUNTRYNAME|PINCODE|INCOMETAXNUMBER/.test(out), false);
+});
+
 // set-ledger-gst (#135): ALTER an existing tax ledger to stamp its GST duty head, routed through
 // the config.json projection exactly as the live tool does.
 test('ledger-gst ALTERs the ledger with TAXTYPE=GST + GSTDUTYHEAD', () => {

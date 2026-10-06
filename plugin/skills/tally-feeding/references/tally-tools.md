@@ -31,6 +31,7 @@ Read-only — safe to run during Phase 2 discovery and Phase 5 verification. Dat
 | `stock-item-balance` | `itemName`, `toDate` | One item's balance. |
 | `stock-item-account` | `itemName`, `fromDate`, `toDate` | One item's movement. |
 | `bills-outstanding` | `toDate` | Receivables/payables ageing. |
+| `party-details` | `partyType` (all / debtors / creditors) | Party master details — address, PAN, GSTIN, bank. |
 | `gst-voucher-details` | `fromDate`, `toDate` | GST voucher-level detail — sample to learn posting style. |
 | `stock-item-gst` | — | Per-item GST (HSN, rate). |
 | `gst-hsn-summary` | `fromDate`, `toDate` | HSN-wise summary. |
@@ -51,8 +52,25 @@ Creates a ledger master.
 | `parentGroup` | string, required | Exact parent group — validate with `list-master collection=group`. |
 | `openingBalance` | number, optional | Negative = debit, positive = credit. |
 | `mailingName` | string, optional | Display / mailing name. |
+| `address` | string[], optional | Party address, one entry per line. |
+| `state`, `country`, `pincode` | string, optional | Party mailing details. |
+| `pan` | string, optional | Party PAN — must match characters 3-12 of `gstin` when both are given. |
 | `gstRegistrationType` | enum, optional | `Regular` \| `Composition` \| `Unregistered` \| `Consumer` \| `Unknown` (for party ledgers). |
 | `gstin` | string, optional | GSTIN for party ledgers — never fabricate. |
+
+Party details are read back after the write; `partyVerification.verified=false` lists fields Tally did not store.
+
+### `update-party-details`
+Fills in details on an EXISTING Sundry Debtor / Creditor — typically read off an invoice (the seller on a purchase invoice, the buyer on a sales invoice).
+
+| Param | Type | Notes |
+|-------|------|-------|
+| `name` | string, required | Existing party ledger. |
+| `mailingName`, `address`, `state`, `country`, `pincode`, `pan`, `gstRegistrationType`, `gstin` | optional | Same meaning as on `create-ledger`. |
+| `overwrite` | boolean, optional | Replace fields that already hold a DIFFERENT value. Default false: blanks are filled, differences come back as `conflict` and are not written. Set only after the user confirms each value. |
+| `dryRun` | boolean, optional | Return the plan without writing. Always run first and show the user. |
+
+After the write the ledger is read back; `verified=false` with `mismatches` means Tally did not store those fields — tell the user, don't report success.
 
 ### `create-stock-item`
 Creates a stock item master.

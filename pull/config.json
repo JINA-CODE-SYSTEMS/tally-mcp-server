@@ -1184,6 +1184,127 @@
                     }
                 ]
             }
+        },
+        {
+            "name": "party-details",
+            "input": [
+                {
+                    "name": "partyType",
+                    "datatype": "string",
+                    "validation_regex": "^(all|debtors|creditors)$",
+                    "validation_message": "Invalid value for partyType. Valid values: all | debtors | creditors"
+                }
+            ],
+            "output": {
+                "datatype": "array",
+                "fields": [
+                    {
+                        "identifier": "F01",
+                        "name": "party_name",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F02",
+                        "name": "party_type",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F03",
+                        "name": "group_name",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F04",
+                        "name": "mailing_name",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F05",
+                        "name": "address",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F06",
+                        "name": "state",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F07",
+                        "name": "country",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F08",
+                        "name": "pincode",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F09",
+                        "name": "pan",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F10",
+                        "name": "gst_registration_type",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F11",
+                        "name": "gstin",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F12",
+                        "name": "place_of_supply",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F13",
+                        "name": "other_territory_assessee",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F14",
+                        "name": "common_party",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F15",
+                        "name": "transporter",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F16",
+                        "name": "transporter_id",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F17",
+                        "name": "bank_account_holder",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F18",
+                        "name": "bank_account_number",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F19",
+                        "name": "bank_ifsc",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F20",
+                        "name": "bank_name",
+                        "datatype": "string"
+                    },
+                    {
+                        "identifier": "F21",
+                        "name": "bank_branch",
+                        "datatype": "string"
+                    }
+                ]
+            }
         }
     ]
 }
