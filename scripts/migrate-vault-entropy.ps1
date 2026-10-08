@@ -19,7 +19,9 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$RegistryPath = "$env:PUBLIC\TallyPrimeEditLog\data\.tally-mcp-companies.json",
+    # The vault lives in the Claudally agent folder since #230's follow-up. An install the new
+    # installer has not run over yet still has it in Tally's data folder; pass -RegistryPath for that.
+    [string]$RegistryPath = "$env:ProgramData\Claudally\agent\.tally-mcp-companies.json",
     [switch]$WhatIfOnly
 )
 
@@ -63,7 +65,7 @@ if ($WhatIfOnly) { Write-Host '[what-if] no file written'; exit 0 }
 if ($migrated -eq 0) { Write-Host 'nothing to write'; exit 0 }
 
 # Capture the vault's ACL BEFORE replacing it. firstrun-config.ps1 hardens this file with
-# `icacls /inheritance:r /grant:r SYSTEM:F Administrators:F <agent user>:F`, and a tmp-plus-rename
+# `icacls /inheritance:r /grant:r *S-1-5-18:F *S-1-5-32-544:F *<agent user SID>:F`, and a tmp-plus-rename
 # silently discards that: the replacement is a NEW file, so it inherits from the parent directory
 # instead of carrying the file's own explicit, inheritance-blocked ACL.
 #

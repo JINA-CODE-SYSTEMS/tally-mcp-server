@@ -98,6 +98,8 @@ Source: "{#RepoRoot}\scripts\installer\stop-install-processes.ps1"; Flags: dontc
 ; from PrepareToInstall, so an upgrade that could not keep the existing settings is refused before
 ; anything is stopped or copied (#177).
 Source: "{#RepoRoot}\scripts\installer\firstrun-config.ps1"; Flags: dontcopy
+; ...and the lockdown helpers it dot-sources, extracted beside it (#230).
+Source: "{#RepoRoot}\scripts\installer\lockdown-helpers.ps1"; Flags: dontcopy
 Source: "{#RepoRoot}\package-lock.json"; DestDir: "{app}";        Flags: ignoreversion
 Source: "{#RepoRoot}\node_modules\*";  DestDir: "{app}\node_modules"; Flags: ignoreversion recursesubdirs createallsubdirs
 
@@ -115,6 +117,7 @@ Source: "{#RepoRoot}\scripts\TallyUI.cs";             DestDir: "{app}\scripts"; 
 Source: "{#RepoRoot}\scripts\deploy.ps1";             DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\setup-windows.ps1";      DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\installer\firstrun-config.ps1";    DestDir: "{app}\scripts\installer"; Flags: ignoreversion
+Source: "{#RepoRoot}\scripts\installer\lockdown-helpers.ps1";   DestDir: "{app}\scripts\installer"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\installer\stop-install-processes.ps1"; DestDir: "{app}\scripts\installer"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\installer\connect-client.ps1";        DestDir: "{app}\scripts\installer"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\installer\uninstall-cleanup.ps1";  DestDir: "{app}\scripts\installer"; Flags: ignoreversion
@@ -178,17 +181,14 @@ Name: "{group}\Reconfigure {#MyAppName}"; Filename: "powershell.exe"; Parameters
 Name: "{group}\Connect Claude to Tally"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\connect-client.ps1"" -InstallDir ""{app}"""; WorkingDir: "{app}"; Comment: "Point Claude Desktop at this Tally server (run as the person who uses Claude)"
 Name: "{group}\Uninstall {#MyAppName}";  Filename: "{uninstallexe}"
 
-[Run]
-; --- 1. First-run wizard: writes .env from collected wizard inputs and registers the NSSM service ---
-; Not on an unattended upgrade (a silent run over an existing install, or /UPDATE): that has no
-; wizard answers to pass, only defaults, and passed values win over .env. It runs
-; firstrun-config.ps1 -Upgrade from CurStepChanged instead, so its exit code reaches the caller
-; (see GetCustomSetupExitCode and docs/installer.md, "Unattended upgrade").
-Filename: "powershell.exe"; Check: not IsUpgradeRun; \
-  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"" -ServiceName ""{#MyServiceName}"" -AgentTaskName ""{#MyAgentTaskName}"" -TrayTaskName ""{#MyTrayTaskName}"" -TunnelServiceName ""{#MyTunnelServiceName}"" -CredentialsFile ""{code:GetCredentialsFilePath}"" -TallyEdition ""{code:GetWizardEdition}"" -TallyExePath ""{code:GetWizardExePath}"" -TallyDataPath ""{code:GetWizardDataPath}"" -TallyIniPath ""{code:GetWizardIniPath}"" -McpDomain ""{code:GetWizardDomain}"" -TunnelToken ""{code:GetWizardTunnelToken}"" -AgentTaskUser ""{code:GetWizardAgentUser}"" -EnableGuiControl ""{code:GetWizardGuiControl}"" -EntryOrder ""{code:GetWizardEntryOrder}"" -DeploymentMode ""{code:GetWizardMode}"" -Unattended"; \
-  WorkingDir: "{app}"; \
-  StatusMsg: "Configuring service and writing .env..."; \
-  Flags: runhidden waituntilterminated
+; No [Run] section. The first-run configuration (firstrun-config.ps1: writes .env, locks it, the
+; company vault and the IPC directory down, registers the service and the tasks) used to be a [Run]
+; entry, and [Run] discards the exit code - so a configuration that failed, including a .env
+; lockdown that could not be applied (#230) or a tunnel that could not be registered (#229), still
+; ended in "Setup has finished" and exit code 0. It runs from CurStepChanged(ssPostInstall) now, for
+; an unattended upgrade (-Upgrade) and for every other run alike, and a failure is shown to the
+; person installing and returned as Setup exit code 10 (see GetCustomSetupExitCode and
+; docs/installer.md, "Unattended upgrade").
 
 [UninstallRun]
 ; --- Cleanup BEFORE Inno deletes files: stop service, remove NSSM entry, remove scheduled task ---
@@ -214,6 +214,18 @@ Type: files; Name: "{app}\.tunnel-token"
 ; The unattended-upgrade preflight's lockdown probe (#177). Holds no secret and is shredded as soon as
 ; it is written; listed only so a preflight killed mid-probe cannot leave it behind.
 Type: files; Name: "{app}\.tunnel-token.preflight"
+; Same for the .env lockdown probe (#230). Its twin in the Tally data folder is outside {app}; it too
+; holds nothing, and the preflight shreds it straight away.
+Type: files; Name: "{app}\.tally-mcp-acl.preflight"
+; The GUI agent's IPC files, in the Claudally agent folder (#230 follow-up). A command file can hold a
+; company password for the few seconds of a call; none must outlive the install. The vault beside them
+; is uninstall-cleanup.ps1's business (it asks), so the folder goes only if that left it empty; the
+; same for its twin probe file and for %ProgramData%\Claudally itself.
+Type: files; Name: "{commonappdata}\Claudally\agent\_mcp_gui_*"
+Type: files; Name: "{commonappdata}\Claudally\agent\_mcp_screenshot*"
+Type: files; Name: "{commonappdata}\Claudally\agent\.tally-mcp-acl.preflight"
+Type: dirifempty; Name: "{commonappdata}\Claudally\agent"
+Type: dirifempty; Name: "{commonappdata}\Claudally"
 Type: filesandordirs; Name: "{app}\logs"
 Type: filesandordirs; Name: "{app}\node_modules"
 Type: filesandordirs; Name: "{app}\dist"
@@ -238,7 +250,10 @@ var
   // Unattended upgrade (#177). Decided once, in PrepareToInstall, and then only read.
   UpgradeDecided: Boolean;
   UpgradeRunCached: Boolean;
-  UpgradeExitCode: Integer;
+  // firstrun-config.ps1's outcome (#229, #230): see CurStepChanged and GetCustomSetupExitCode.
+  ConfigExitCode: Integer;
+  ConfigFailed: Boolean;
+  ConfigError: String;
 
 // ---------------------------------------------------------------------------------------------
 // UNATTENDED UPGRADE (#177)
@@ -507,7 +522,8 @@ end;
 // Runs THIS version's firstrun-config.ps1 -Upgrade -PreflightOnly against the existing install
 // before anything is stopped or copied. It changes nothing; it only answers "can an unattended
 // upgrade keep every setting?" - and when it cannot (no recorded agent user, .env and the agent task
-// disagree, the recorded user is SYSTEM, ...) Setup stops here, leaving the running version exactly
+// disagree, the recorded user is SYSTEM, a .env / vault / token-file lockdown that would fail, ...)
+// Setup stops here, leaving the running version exactly
 // as it was, with the reason in the Setup log. Returns '' to proceed.
 function RunUpgradePreflight(): String;
 var
@@ -517,6 +533,7 @@ var
 begin
   Result := '';
   ExtractTemporaryFile('firstrun-config.ps1');
+  ExtractTemporaryFile('lockdown-helpers.ps1');
   Report := ExpandConstant('{tmp}\upgrade-preflight.txt');
   if not Exec('powershell.exe',
               '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}\firstrun-config.ps1') + '"' +
@@ -812,7 +829,14 @@ procedure CurPageChanged(CurPageID: Integer);
 begin
   if CurPageID = wpFinished then
   begin
-    if IsLocalMode() then
+    // Never "installed and running" over a configuration that failed (#229, #230).
+    if ConfigFailed then
+      WizardForm.FinishedLabel.Caption :=
+        'Claudally''s files were installed, but configuring it FAILED, so it is not set up yet.' + #13#10 + #13#10 +
+        ConfigError + #13#10 + #13#10 +
+        'Details are in the logs folder of the install directory (firstrun-config.log). Fix the ' +
+        'cause, then run "Reconfigure {#MyAppName}" from the Start Menu as administrator.'
+    else if IsLocalMode() then
       WizardForm.FinishedLabel.Caption :=
         'Claudally is installed on this computer. Two things left, both one-time:' + #13#10 + #13#10 +
         '1. TURN ON TALLY''S DATA CONNECTION. Tally comes with it switched off, and Claude cannot ' +
@@ -836,63 +860,6 @@ begin
         'and Port to 9000, then press Ctrl+A.' + #13#10 + #13#10 +
         'Then point your MCP client at the public address you entered. The tray icon near the clock ' +
         'shows whether the service and tunnel are healthy.';
-  end;
-end;
-
-procedure CurStepChanged(CurStep: TSetupStep);
-var
-  CredsPath, Json, Password, Escaped: string;
-  Code: Integer;
-begin
-  // Unattended upgrade: reconfigure from the existing install, not from the wizard. Run here with
-  // Exec rather than from [Run] because [Run] discards the exit code, and the update task has to
-  // know when the new files are in place but the reconfiguration failed - that is its cue to roll
-  // back. See GetCustomSetupExitCode. ExecAndLogOutput (with no callback) copies the script's
-  // output into the Setup log, so one /LOG file tells support the whole story.
-  if (CurStep = ssPostInstall) and IsUpgradeRun() then
-  begin
-    try
-      if not ExecAndLogOutput('powershell.exe',
-                  '-ExecutionPolicy Bypass -NoProfile -NonInteractive -File "' + ExpandConstant('{app}\scripts\installer\firstrun-config.ps1') + '"' +
-                  ' -InstallDir "' + ExpandConstant('{app}') + '" -ServiceName "{#MyServiceName}" -AgentTaskName "{#MyAgentTaskName}"' +
-                  ' -TrayTaskName "{#MyTrayTaskName}" -TunnelServiceName "{#MyTunnelServiceName}" -Upgrade -Unattended',
-                  ExpandConstant('{app}'), SW_SHOWNORMAL, ewWaitUntilTerminated, Code, nil) then
-        Code := -1;
-    except
-      Log('Could not run firstrun-config.ps1 -Upgrade: ' + GetExceptionMessage);
-      Code := -1;
-    end;
-    if Code <> 0 then
-    begin
-      UpgradeExitCode := 10;
-      Log('firstrun-config.ps1 -Upgrade failed (exit code ' + IntToStr(Code) + '); see ' +
-          ExpandConstant('{app}\logs\firstrun-config.log') + '. Setup will exit with code 10.');
-    end
-    else
-      Log('firstrun-config.ps1 -Upgrade completed; existing settings kept.');
-  end;
-
-  // Local mode never writes a credentials file. firstrun-config.ps1 shreds one if it finds it,
-  // but the stronger guarantee is that no password is ever produced to be shredded. Nor does an
-  // upgrade, which keeps whatever password .env already holds.
-  if (CurStep = ssInstall) and (not IsLocalMode()) and (not IsUpgradeRun()) then
-  begin
-    CredsPath := GetCredentialsFilePath('');
-    Password := RemotePage.Values[0];
-    // Minimal JSON-string escaping: backslash and double-quote only.
-    // Pascal Script's StringChange is a procedure that mutates a var argument in place
-    // (it does NOT return a string), so we copy first and then mutate the copy.
-    Escaped := Password;
-    StringChange(Escaped, '\', '\\');
-    StringChange(Escaped, '"', '\"');
-    Json := '{"password":"' + Escaped + '"}';
-    if not SaveStringToFile(CredsPath, Json, False) then
-    begin
-      // Suppressible: this is reachable in a silent run (remote mode, once #192 restores it).
-      Log('Failed to write installer credentials file at ' + CredsPath + '.');
-      SuppressibleMsgBox('Failed to write installer credentials file at ' + CredsPath + '. Install cannot continue.', mbError, MB_OK, IDOK);
-      Abort;
-    end;
   end;
 end;
 
@@ -945,12 +912,14 @@ begin
     Result := 'false';
 end;
 
-// 10 = the files were installed but firstrun-config.ps1 -Upgrade failed, so services and tasks may
-// be stopped. Only an unattended upgrade sets it. Inno's own codes (1-8) cover everything else,
+// 10 = the files were installed but firstrun-config.ps1 failed, so the install is not configured and
+// services and tasks may be stopped. Set by an unattended upgrade (the updater's cue to roll back)
+// and, since #229/#230, by any other run too - a new install or an interactive one - so a deployment
+// tool sees the failure instead of a clean exit. Inno's own codes (1-8) cover everything else,
 // including 7 for an upgrade or silent install refused in PrepareToInstall before anything changed.
 function GetCustomSetupExitCode(): Integer;
 begin
-  Result := UpgradeExitCode;
+  Result := ConfigExitCode;
 end;
 
 function GetWizardEdition(Param: string): string;
@@ -959,4 +928,116 @@ begin
     Result := 'gold'
   else
     Result := 'silver';
+end;
+
+// Keeps the last "ERROR: ..." line firstrun-config.ps1 prints (its catch block writes exactly one),
+// so a failure can be shown to the person installing, not only buried in the log.
+procedure FirstrunOutputLine(const S: String; const Error, FirstLine: Boolean);
+begin
+  if Pos('ERROR: ', S) = 1 then
+    ConfigError := Copy(S, 8, Length(S) - 7);
+end;
+
+// Runs the installed firstrun-config.ps1 and returns its exit code (-1 if it could not be started).
+// ExecAndLogOutput copies the script's output into the Setup log, so one /LOG file tells support the
+// whole story. Not from [Run]: [Run] discards the exit code, and before #229/#230 that is how a
+// failed configuration - a .env left readable, a tunnel left down - still ended in "Setup has
+// finished" and exit code 0.
+function RunFirstrunConfig(const Params: String): Integer;
+var
+  Code: Integer;
+begin
+  ConfigError := '';
+  try
+    if not ExecAndLogOutput('powershell.exe',
+                '-ExecutionPolicy Bypass -NoProfile -NonInteractive -File "' + ExpandConstant('{app}\scripts\installer\firstrun-config.ps1') + '"' +
+                ' -InstallDir "' + ExpandConstant('{app}') + '" -ServiceName "{#MyServiceName}" -AgentTaskName "{#MyAgentTaskName}"' +
+                ' -TrayTaskName "{#MyTrayTaskName}" -TunnelServiceName "{#MyTunnelServiceName}" ' + Params,
+                ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, Code, @FirstrunOutputLine) then
+      Code := -1;
+  except
+    Log('Could not run firstrun-config.ps1: ' + GetExceptionMessage);
+    Code := -1;
+  end;
+  Result := Code;
+end;
+
+// The wizard's answers, as firstrun-config.ps1 parameters. What the [Run] entry used to pass.
+function WizardConfigParams(): String;
+begin
+  Result := '-CredentialsFile "' + GetCredentialsFilePath('') + '"' +
+            ' -TallyEdition "' + GetWizardEdition('') + '"' +
+            ' -TallyExePath "' + GetWizardExePath('') + '"' +
+            ' -TallyDataPath "' + GetWizardDataPath('') + '"' +
+            ' -TallyIniPath "' + GetWizardIniPath('') + '"' +
+            ' -McpDomain "' + GetWizardDomain('') + '"' +
+            ' -TunnelToken "' + GetWizardTunnelToken('') + '"' +
+            ' -AgentTaskUser "' + GetWizardAgentUser('') + '"' +
+            ' -EnableGuiControl "' + GetWizardGuiControl('') + '"' +
+            ' -EntryOrder "' + GetWizardEntryOrder('') + '"' +
+            ' -DeploymentMode "' + GetWizardMode('') + '"' +
+            ' -Unattended';
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  CredsPath, Json, Password, Escaped, Msg: string;
+  Code: Integer;
+begin
+  // Configure the install, once the files are in place. An unattended upgrade reconfigures from the
+  // existing install, not from the wizard (-Upgrade: every setting comes from .env); every other run
+  // passes the wizard's answers. Either way a non-zero exit is a failed configuration: Setup exits 10
+  // (see GetCustomSetupExitCode), which for an upgrade is the update task's cue to roll back, and a
+  // person installing is told - with the script's own error - rather than shown "finished".
+  if CurStep = ssPostInstall then
+  begin
+    WizardForm.StatusLabel.Caption := 'Configuring service and writing .env...';
+    if IsUpgradeRun() then
+      Code := RunFirstrunConfig('-Upgrade -Unattended')
+    else
+      Code := RunFirstrunConfig(WizardConfigParams());
+    if Code <> 0 then
+    begin
+      ConfigExitCode := 10;
+      ConfigFailed := True;
+      Log('firstrun-config.ps1 failed (exit code ' + IntToStr(Code) + '); see ' +
+          ExpandConstant('{app}\logs\firstrun-config.log') + '. Setup will exit with code 10.');
+      if not IsUpgradeRun() then
+      begin
+        Msg := 'Claudally''s files were installed, but configuring it failed, so it is not set up.';
+        if ConfigError <> '' then
+          Msg := Msg + #13#10#13#10 + ConfigError;
+        Msg := Msg + #13#10#13#10 + 'Details are in ' + ExpandConstant('{app}\logs\firstrun-config.log') +
+               '. Fix the cause, then run "Reconfigure {#MyAppName}" from the Start Menu as administrator.';
+        SuppressibleMsgBox(Msg, mbError, MB_OK, IDOK);
+      end;
+    end
+    else if IsUpgradeRun() then
+      Log('firstrun-config.ps1 -Upgrade completed; existing settings kept.')
+    else
+      Log('firstrun-config.ps1 completed.');
+  end;
+
+  // Local mode never writes a credentials file. firstrun-config.ps1 shreds one if it finds it,
+  // but the stronger guarantee is that no password is ever produced to be shredded. Nor does an
+  // upgrade, which keeps whatever password .env already holds.
+  if (CurStep = ssInstall) and (not IsLocalMode()) and (not IsUpgradeRun()) then
+  begin
+    CredsPath := GetCredentialsFilePath('');
+    Password := RemotePage.Values[0];
+    // Minimal JSON-string escaping: backslash and double-quote only.
+    // Pascal Script's StringChange is a procedure that mutates a var argument in place
+    // (it does NOT return a string), so we copy first and then mutate the copy.
+    Escaped := Password;
+    StringChange(Escaped, '\', '\\');
+    StringChange(Escaped, '"', '\"');
+    Json := '{"password":"' + Escaped + '"}';
+    if not SaveStringToFile(CredsPath, Json, False) then
+    begin
+      // Suppressible: this is reachable in a silent run (remote mode, once #192 restores it).
+      Log('Failed to write installer credentials file at ' + CredsPath + '.');
+      SuppressibleMsgBox('Failed to write installer credentials file at ' + CredsPath + '. Install cannot continue.', mbError, MB_OK, IDOK);
+      Abort;
+    end;
+  end;
 end;

@@ -51,7 +51,7 @@ if (-not $ShowConsole) {
 # against an agent older than its required minimum (issue #15 - version handshake).
 # Format: MAJOR.MINOR.PATCH. Bump MINOR on any new IPC action or response field;
 # bump PATCH on internal fixes that callers can ignore.
-$Script:AgentVersion = "1.8.0"
+$Script:AgentVersion = "1.9.0"
 
 # --- Single-instance guard ---------------------------------------------------------------------
 # Only ONE *watch-mode* agent may run. Multiple watchers race on the command/result files and each
@@ -78,8 +78,20 @@ if (-not $Once) {
     }
 }
 
+# Where the IPC files (and screenshots) go: the Claudally agent folder, %ProgramData%\Claudally\agent,
+# which the installer creates and locks to SYSTEM, Administrators and the agent user. Not Tally's data
+# folder any more: keeping them there meant locking Tally's own folder down, which shut every other
+# Windows account out of the books (#230 follow-up). Derived, never read from TALLY_DATA_PATH, so the
+# agent and the server always agree - this task used to fall back to the default Tally path while the
+# service read TALLY_DATA_PATH from .env, and on a custom data path the two never met.
 if (-not $WatchDir) {
-    $WatchDir = if ($env:TALLY_DATA_PATH) { $env:TALLY_DATA_PATH } else { "C:\Users\Public\TallyPrimeEditLog\data" }
+    $programData = if ($env:ProgramData) { $env:ProgramData } else { 'C:\ProgramData' }
+    $WatchDir = Join-Path $programData 'Claudally\agent'
+}
+if (-not $Once -and -not (Test-Path -LiteralPath $WatchDir -PathType Container)) {
+    # Never created here: a folder this account made would carry the default %ProgramData% permissions,
+    # readable by every local user, and the installer would then refuse to adopt it.
+    Write-Host "[WARN] The agent folder $WatchDir does not exist. Run the installer (or Reconfigure) to create it; commands cannot arrive until then."
 }
 
 $CommandFile = Join-Path $WatchDir "_mcp_gui_command.json"
