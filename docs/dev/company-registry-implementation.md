@@ -81,10 +81,12 @@ The MCP service is Node/TypeScript, DPAPI is Windows-only and easiest from Power
 In [scripts/installer/firstrun-config.ps1](../../scripts/installer/firstrun-config.ps1), after the JSON file is created, set ACL:
 
 ```powershell
-icacls "<path>" /inheritance:r /grant:r "SYSTEM:F" "Administrators:F"
+icacls "<path>" /inheritance:r /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F" "*<agent user SID>:F"
 ```
 
-This is the real access control. DPAPI is just defense-in-depth.
+This is the real access control. DPAPI is just defense-in-depth. Grant by SID, never by name: the
+group names are localised, and on a non-English Windows the name form fails and changes nothing
+(#230). The installer verifies the result with `Get-Acl` and stops if it did not take.
 
 ### Verification
 - Add an old-shape JSON file, start the service, confirm it migrates to new shape.
