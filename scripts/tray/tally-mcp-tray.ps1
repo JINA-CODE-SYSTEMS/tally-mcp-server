@@ -163,9 +163,21 @@ function Test-ClientConfigured {
     }
 }
 
+# The company vault: %ProgramData%\Claudally\agent\.tally-mcp-companies.json, the folder the installer
+# creates and locks to SYSTEM, Administrators and the agent user - or TALLY_COMPANIES_CONFIG from .env,
+# the expert override the server also honours. It used to sit in TALLY_DATA_PATH, Tally's own data
+# folder, which the installer then had to lock down, shutting other Windows accounts out of Tally
+# (#230 follow-up). TALLY_DATA_PATH is not consulted.
+function Get-CompanyVaultPath {
+    $override = Read-EnvValue -EnvPath (Join-Path $InstallDir '.env') -Key 'TALLY_COMPANIES_CONFIG'
+    if ($override) { return $override }
+    $programData = if ($env:ProgramData) { $env:ProgramData } else { 'C:\ProgramData' }
+    return (Join-Path $programData 'Claudally\agent\.tally-mcp-companies.json')
+}
+
 # Write (replace or append) a single KEY=VALUE in .env, preserving all other lines. Writes in place
 # rather than tmp+rename: firstrun-config.ps1 grants the agent user FullControl on the .env FILE
-# (icacls ${AgentTaskUser}:F) but not the Program Files directory, so we can rewrite the file but not
+# (icacls *<agent user SID>:F) but not the Program Files directory, so we can rewrite the file but not
 # create a sibling .tmp there. Used by the "Allow Claude to control Tally" toggle.
 function Set-EnvValue {
     param([string]$EnvPath, [string]$Key, [string]$Value)
@@ -456,10 +468,7 @@ function Invoke-StatusPoll {
     # registry. Used by the "Reload last company" menu item. Silently empty if
     # the registry file is missing, malformed, or no entries have ever been tested.
     try {
-        $envFile = Join-Path $InstallDir '.env'
-        $dataPath = Read-EnvValue -EnvPath $envFile -Key 'TALLY_DATA_PATH'
-        if (-not $dataPath) { $dataPath = 'C:\Users\Public\TallyPrimeEditLog\data' }
-        $regPath = Join-Path $dataPath '.tally-mcp-companies.json'
+        $regPath = Get-CompanyVaultPath
         if (Test-Path -LiteralPath $regPath) {
             $raw = (Get-Content -LiteralPath $regPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue) -replace '^\uFEFF', ''
             if ($raw) {
@@ -672,10 +681,8 @@ $miOpenLogs.Add_Click({
 # scenarios where you need to email someone the file, or hand-edit a stray entry.
 $miOpenRegistry = $menu.Items.Add('Open registry file')
 $miOpenRegistry.Add_Click({
-    $envFile = Join-Path $InstallDir '.env'
-    $dataPath = Read-EnvValue -EnvPath $envFile -Key 'TALLY_DATA_PATH'
-    if (-not $dataPath) { $dataPath = 'C:\Users\Public\TallyPrimeEditLog\data' }
-    $regPath = Join-Path $dataPath '.tally-mcp-companies.json'
+    $regPath = Get-CompanyVaultPath
+    $dataPath = Split-Path -Parent $regPath
     if (Test-Path -LiteralPath $regPath) {
         Start-Process -FilePath 'explorer.exe' -ArgumentList "/select,`"$regPath`""
     } elseif (Test-Path -LiteralPath $dataPath) {
@@ -683,7 +690,7 @@ $miOpenRegistry.Add_Click({
         [System.Windows.Forms.MessageBox]::Show($msg, 'TallyMCP', 'OK', 'Information') | Out-Null
         Start-Process -FilePath 'explorer.exe' -ArgumentList $dataPath
     } else {
-        [System.Windows.Forms.MessageBox]::Show("Registry data folder not found: $dataPath", 'TallyMCP', 'OK', 'Warning') | Out-Null
+        [System.Windows.Forms.MessageBox]::Show("The agent folder does not exist: $dataPath`nRun Reconfigure from the Start Menu to create it.", 'TallyMCP', 'OK', 'Warning') | Out-Null
     }
 })
 
@@ -834,10 +841,7 @@ $miReloadLast.Enabled = $false
 $miReloadLast.Add_Click({
     if (-not $State.LastLoadedAlias) { return }
     $alias = $State.LastLoadedAlias
-    $envFile = Join-Path $InstallDir '.env'
-    $dataPath = Read-EnvValue -EnvPath $envFile -Key 'TALLY_DATA_PATH'
-    if (-not $dataPath) { $dataPath = 'C:\Users\Public\TallyPrimeEditLog\data' }
-    $regPath = Join-Path $dataPath '.tally-mcp-companies.json'
+    $regPath = Get-CompanyVaultPath
     $dpapi   = Join-Path $InstallDir 'scripts\dpapi-helper.ps1'
     if (-not (Get-Command Read-CompanyRegistry -ErrorAction SilentlyContinue) -or
         -not (Get-Command Invoke-LoadCompanyViaAgent -ErrorAction SilentlyContinue)) {
@@ -877,12 +881,9 @@ $miManageCompanies.Add_Click({
         [System.Windows.Forms.MessageBox]::Show("Manage Companies dialog script not loaded.`nExpected: $ManageDialogPath", 'TallyMCP', 'OK', 'Warning') | Out-Null
         return
     }
-    # Resolve registry + DPAPI helper paths from InstallDir. Falls back to the install-time
-    # default if TALLY_DATA_PATH is unset; the dialog itself handles a missing file gracefully.
-    $envFile = Join-Path $InstallDir '.env'
-    $dataPath = Read-EnvValue -EnvPath $envFile -Key 'TALLY_DATA_PATH'
-    if (-not $dataPath) { $dataPath = 'C:\Users\Public\TallyPrimeEditLog\data' }
-    $registryPath = Join-Path $dataPath '.tally-mcp-companies.json'
+    # Resolve the vault (the agent folder, or TALLY_COMPANIES_CONFIG) and the DPAPI helper. The
+    # dialog itself handles a missing file gracefully.
+    $registryPath = Get-CompanyVaultPath
     $dpapiHelper  = Join-Path $InstallDir 'scripts\dpapi-helper.ps1'
     if (-not (Test-Path -LiteralPath $dpapiHelper)) {
         [System.Windows.Forms.MessageBox]::Show("DPAPI helper not found at: $dpapiHelper`nReinstall TallyMCP to restore.", 'TallyMCP', 'OK', 'Warning') | Out-Null

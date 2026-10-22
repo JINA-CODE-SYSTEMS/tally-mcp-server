@@ -15,7 +15,7 @@
     SUPPOSED to have a service and a listening port, and painting that red would train operators
     to ignore the output.
 
-    Each check reports one of five statuses:
+    Each check reports one of six statuses:
       PASS     looked, and the property holds
       FAIL     looked, and found something wrong (or the check broke in a way that is itself a fault)
       UNKNOWN  could NOT look - most often because this run is not elevated and the thing to inspect
@@ -24,6 +24,9 @@
                (usually: re-run as Administrator).
       NA       the property is not claimed in this mode, so there is nothing to verify
       INFO     an observation that never affects the verdict
+      WARN     looked, and found something worth fixing that does not weaken this install's own
+               security (Tally's data folder still has the permissions an older installer gave it).
+               Surfaced in the summary; never changes the verdict or the exit code
     UNKNOWN exists so that "we could not look" is never reported as "we looked and it was clean"
     (a PASS), without painting a correct install red (a FAIL) for a non-admin user. The overall
     verdict is FAIL if any check FAILed, else UNKNOWN if any check is UNKNOWN, else PASS.
@@ -34,10 +37,22 @@
       3. No NSSM service      - the service AND its SCM registry key are gone
       4. No OAuth artefacts   - .oauth-clients.json / .oauth-tokens.json / PASSWORD in .env
       5. No outbound tunnel   - cloudflared process, tunnel service, or a token that revives it
+                                (including a machine-wide TUNNEL_TOKEN environment variable)
       6. Tunnel token storage - remote mode with a tunnel: the token is in no service registry key
-                                and its file is readable by SYSTEM + Administrators only (#193)
+                                (AppEnvironmentExtra or AppEnvironment) and no machine-wide
+                                environment variable, and its file is readable by SYSTEM +
+                                Administrators only (#193)
       7. Company vault ACL    - the entire boundary for stored Tally passwords; BOTH modes
-      8. Tally reachability   - INFORMATIONAL only; never affects the verdict
+      8. .env, agent folder   - .env and %ProgramData%\Claudally\agent (the vault + the GUI agent's
+         and Tally's folder     IPC files) are locked to SYSTEM, Administrators and the agent user,
+                                the folder owned by Administrators (#230); none of our files is left
+                                in Tally's data folder (FAIL), whose inheritance an older installer
+                                disabled (WARN); BOTH modes
+      9. Tally reachability   - INFORMATIONAL only; never affects the verdict
+
+    Every ACL check compares principals by SID, never by display name: 'Administrators' is
+    localised (Administratoren, Administrateurs, ...), and a name match would misjudge a
+    non-English Windows.
 
     NEVER PRINTS SECRETS. Secret-valued .env keys are tested for PRESENCE through a separate
     function that cannot return the value (Test-EnvKeyPresent), so there is no code path where a
@@ -81,7 +96,7 @@
 
 .NOTES
     Exit codes:
-      0  PASS - every check passed, or was NA / INFO
+      0  PASS - every check passed, or was NA / INFO / WARN
       1  FAIL - at least one check FAILed (wins over UNKNOWN)
       2  ERROR - could not run at all (InstallDir missing)
       3  UNKNOWN - nothing FAILed, but at least one check could not look. Exit 0 instead with
@@ -90,8 +105,9 @@
     A CI gate that should break only on real failures either passes -AllowUnknown, or treats
     exit 1 and 2 as failure and 3 as a warning.
 
-    -Json output is schemaVersion 2: status and verdict can be UNKNOWN, counts carry an 'unknown'
-    field, and the payload records the exitCode it chose (schemaVersion 1 had no UNKNOWN).
+    -Json output is schemaVersion 3: a check's status can also be WARN, and counts carry a 'warn'
+    field (the verdict is still PASS / FAIL / UNKNOWN). schemaVersion 2 added UNKNOWN, the 'unknown'
+    count and the exitCode the payload records; schemaVersion 1 had neither.
 
     Windows PowerShell 5.1 compatible ON PURPOSE - customers have 5.1, not pwsh 7. So: no ternary,
     no ?? / ?., no `class`, no -Parallel. Verify any edit with the 5.1 parser, not just by running
@@ -111,7 +127,7 @@ param(
 )
 
 # Continue, not Stop: a verification tool that aborts on the first surprise reports nothing about
-# the other seven checks. Each check owns its own try/catch and turns an unexpected error into a FAIL
+# the other checks. Each check owns its own try/catch and turns an unexpected error into a FAIL
 # for that check alone (fail closed - see Invoke-Check). An UNEXPECTED error stays a FAIL, not an
 # UNKNOWN: UNKNOWN is reserved for the specific, understood cases where this run lacked the access
 # to look, each of which names the remedy. An exception nobody anticipated has no such remedy.
@@ -127,7 +143,7 @@ if (-not (Test-Path -LiteralPath $InstallDir)) {
         # -Json is the support-ticket contract: the caller pipes this into ConvertFrom-Json. Emitting
         # a human sentence here broke that for the one case where support most needs the detail.
         (New-Object psobject -Property ([ordered]@{
-            schemaVersion = 2
+            schemaVersion = 3
             tool          = 'scripts/verify-deployment.ps1'
             issue         = 172
             generatedAt   = (Get-Date).ToString('o')
@@ -146,12 +162,20 @@ if (-not (Test-Path -LiteralPath $InstallDir)) {
 $EnvFile = Join-Path $InstallDir '.env'
 # Where firstrun-config.ps1 keeps the Cloudflare Tunnel token for cloudflared's --token-file (#193).
 $TunnelTokenFile = Join-Path $InstallDir '.tunnel-token'
+# The Claudally agent folder: the company vault and the GUI agent's IPC files, locked to SYSTEM,
+# Administrators and the agent user (#230 follow-up). Derived exactly as the installer, the server,
+# the agent and the tray derive it. They used to live in Tally's data folder (TALLY_DATA_PATH).
+$ProgramDataDir = if ($env:ProgramData) { $env:ProgramData } else { 'C:\ProgramData' }
+$AgentDir = Join-Path $ProgramDataDir 'Claudally\agent'
+# Our files that must no longer be in Tally's data folder.
+$OurFilesInTallyFolder = @('.tally-mcp-companies.json', '.tally-mcp-companies.json.pre-entropy-backup', '.tally-mcp-companies.json.tmp',
+                           '_mcp_gui_command.json', '_mcp_gui_result.json', '_mcp_screenshot.png')
 
 # ---------------------------------------------------------------------------
 # Can we actually READ .env? Existence is not the question - readability is.
 #
-# The installer locks .env down itself: `icacls <.env> /inheritance:r /grant:r 'SYSTEM:F'
-# 'Administrators:F' "<AgentTaskUser>:F"` (firstrun-config.ps1:397). So for any Windows account that
+# The installer locks .env down itself: `icacls <.env> /inheritance:r /grant:r *S-1-5-18:F
+# *S-1-5-32-544:F *<AgentTaskUser SID>:F` (firstrun-config.ps1, by SID since #230). So for any Windows account that
 # is not SYSTEM, an Administrator, or AGENT_TASK_USER, .env is present but unreadable - Test-Path
 # says $true and every Get-Content returns nothing.
 #
@@ -719,6 +743,24 @@ Invoke-Check -Id 'no-oauth' -Name 'No OAuth password or persisted tokens' -Body 
 }
 
 # ---------------------------------------------------------------------------
+# A machine-wide TUNNEL_TOKEN environment variable (#229 follow-up). Used by checks 5 and 6.
+# Returns absent | present | denied - never the value.
+# ---------------------------------------------------------------------------
+$MachineEnvKeyPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+function Get-MachineTunnelTokenState {
+    try {
+        $key = Get-Item -LiteralPath $MachineEnvKeyPath -ErrorAction Stop
+    } catch [System.Security.SecurityException] {
+        return 'denied'
+    } catch [System.UnauthorizedAccessException] {
+        return 'denied'
+    }
+    $v = $key.GetValue('TUNNEL_TOKEN', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    if ($null -ne $v -and "$v".Trim()) { return 'present' }
+    return 'absent'
+}
+
+# ---------------------------------------------------------------------------
 # 5. No outbound tunnel
 # ---------------------------------------------------------------------------
 Invoke-Check -Id 'no-tunnel' -Name 'No outbound tunnel' -Body {
@@ -764,16 +806,27 @@ Invoke-Check -Id 'no-tunnel' -Name 'No outbound tunnel' -Body {
     if ($tokenFilePresent) { $tokenFileText = 'present' }
     $evidence += "${TunnelTokenFile}: $tokenFileText - existence only; the file is never opened"
 
+    $machineToken = Get-MachineTunnelTokenState
+    $machineText = 'not set'
+    if ($machineToken -eq 'present') { $machineText = 'SET (value not read or printed)' }
+    elseif ($machineToken -eq 'denied') { $machineText = 'could not be read by this account' }
+    $evidence += "machine-wide TUNNEL_TOKEN environment variable: $machineText"
+
     $problems = @()
     if ($tunnelSvc)           { $problems += "the '$TunnelServiceName' service exists (status $($tunnelSvc.Status))" }
     elseif ($tunnelReg)       { $problems += "the '$TunnelServiceName' service registry key survives, so its removal is only pending" }
     if ($cfProcs.Count -gt 0) { $problems += "cloudflared.exe is running" }
     if ($tokenSet)            { $problems += "TUNNEL_TOKEN is still set in .env, so the next Reconfigure would bring the tunnel back" }
     if ($tokenFilePresent)    { $problems += "$TunnelTokenFile still holds a tunnel token, a live credential local mode never uses" }
+    if ($machineToken -eq 'present') { $problems += "a machine-wide TUNNEL_TOKEN environment variable is set - a tunnel credential every local account can read (remove it from an elevated PowerShell with [Environment]::SetEnvironmentVariable('TUNNEL_TOKEN', `$null, 'Machine'); the installer leaves it, since something else may use it)" }
 
     if ($problems.Count -gt 0) {
         New-Check -Id 'no-tunnel' -Name 'No outbound tunnel' -Status 'FAIL' `
             -Reason "A tunnel to a third party is configured or running: $($problems -join '; '). Local mode puts nobody in the data path. Clear the tunnel token via the installer's Reconfigure shortcut, which also tears the service down." `
+            -Evidence $evidence | Out-Null
+    } elseif ($machineToken -eq 'denied') {
+        New-Check -Id 'no-tunnel' -Name 'No outbound tunnel' -Status 'UNKNOWN' `
+            -Reason "No tunnel service, process or token was found, but the machine-wide environment could not be read, so a TUNNEL_TOKEN there could not be ruled out. Re-run this script as Administrator." `
             -Evidence $evidence | Out-Null
     } else {
         New-Check -Id 'no-tunnel' -Name 'No outbound tunnel' -Status 'PASS' `
@@ -816,6 +869,9 @@ $BroadSids = @{
 # ---------------------------------------------------------------------------
 function Get-NssmServiceParameters {
     # Returns State = absent | denied | read, plus what this check needs from the Parameters key.
+    # NSSM keeps a service's environment in two REG_MULTI_SZ values: AppEnvironmentExtra (added to
+    # the inherited environment - where installers before #193 put the token) and AppEnvironment
+    # (which replaces it). A TUNNEL_TOKEN in either overrides --token-file, so both are read.
     param([string]$Name)
     $keyPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$Name\Parameters"
     $r = New-Object psobject -Property ([ordered]@{
@@ -823,6 +879,7 @@ function Get-NssmServiceParameters {
         State         = 'absent'
         EnvEntries    = 0
         EnvHasToken   = $false
+        EnvTokenIn    = @()
         AppParameters = ''
     })
     $key = $null
@@ -836,12 +893,16 @@ function Get-NssmServiceParameters {
         $r.State = 'denied'; return $r
     }
     $r.State = 'read'
-    $envExtra = @($key.GetValue('AppEnvironmentExtra'))
-    foreach ($entry in $envExtra) {
-        if ($null -eq $entry -or "$entry" -eq '') { continue }
-        $r.EnvEntries++
-        # Name test only, and only a NON-EMPTY value counts as a token. The value is never stored.
-        if ("$entry" -match '^\s*TUNNEL_TOKEN\s*=\s*\S') { $r.EnvHasToken = $true }
+    foreach ($valueName in @('AppEnvironmentExtra', 'AppEnvironment')) {
+        foreach ($entry in @($key.GetValue($valueName))) {
+            if ($null -eq $entry -or "$entry" -eq '') { continue }
+            $r.EnvEntries++
+            # Name test only, and only a NON-EMPTY value counts as a token. The value is never stored.
+            if ("$entry" -match '^\s*TUNNEL_TOKEN\s*=\s*\S') {
+                $r.EnvHasToken = $true
+                if ($r.EnvTokenIn -notcontains $valueName) { $r.EnvTokenIn += $valueName }
+            }
+        }
     }
     $ap = $key.GetValue('AppParameters')
     if ($ap) { $r.AppParameters = "$ap" }
@@ -872,12 +933,27 @@ Invoke-Check -Id 'tunnel-token-storage' -Name 'Tunnel token kept out of the serv
             $unknowns += "the '$svcName' service registry key could not be read"
         } else {
             if ($p.EnvHasToken) {
-                $evidence += "$($p.KeyPath): AppEnvironmentExtra has $($p.EnvEntries) entries, one of them TUNNEL_TOKEN (value not read or printed)"
-                $problems += "the '$svcName' service still carries TUNNEL_TOKEN in its registry environment, where BUILTIN\Users can read it"
+                $evidence += "$($p.KeyPath): the service environment (AppEnvironmentExtra + AppEnvironment) has $($p.EnvEntries) entries, including TUNNEL_TOKEN in $($p.EnvTokenIn -join ' and ') (value not read or printed)"
+                $problems += "the '$svcName' service still carries TUNNEL_TOKEN in its registry environment ($($p.EnvTokenIn -join ', ')), where BUILTIN\Users can read it and where it overrides the token file"
             } else {
-                $evidence += "$($p.KeyPath): AppEnvironmentExtra has $($p.EnvEntries) entries, none of them TUNNEL_TOKEN"
+                $evidence += "$($p.KeyPath): the service environment (AppEnvironmentExtra + AppEnvironment) has $($p.EnvEntries) entries, none of them TUNNEL_TOKEN"
             }
         }
+    }
+
+    # --- A machine-wide TUNNEL_TOKEN environment variable --------------------------------------
+    # Every service inherits the machine environment, and cloudflared gives TUNNEL_TOKEN there
+    # precedence over --token-file - so this silently overrides the file, and every local account can
+    # read it. The installer reports it but deliberately does not delete it (see firstrun-config.ps1).
+    $machineToken = Get-MachineTunnelTokenState
+    if ($machineToken -eq 'present') {
+        $evidence += "${MachineEnvKeyPath}: TUNNEL_TOKEN is set machine-wide (value not read or printed)"
+        $problems += "a machine-wide TUNNEL_TOKEN environment variable is set: every local account can read it, and cloudflared uses it instead of the token file"
+    } elseif ($machineToken -eq 'denied') {
+        $evidence += "${MachineEnvKeyPath}: this account may not read it"
+        $unknowns += "the machine-wide environment could not be read, so a TUNNEL_TOKEN there could not be ruled out"
+    } else {
+        $evidence += "${MachineEnvKeyPath}: no TUNNEL_TOKEN"
     }
     if ($tunnelParams -and $tunnelParams.State -eq 'read') {
         # '--token-file' must not be mistaken for '--token <value>': require whitespace or '=' after it.
@@ -969,8 +1045,12 @@ Invoke-Check -Id 'tunnel-token-storage' -Name 'Tunnel token kept out of the serv
 
     $name = 'Tunnel token kept out of the service registry'
     if ($problems.Count -gt 0) {
+        $machineFix = ''
+        if ($machineToken -eq 'present') {
+            $machineFix = " Remove the machine-wide variable yourself (Reconfigure leaves it, since something else may use it): from an elevated PowerShell, [Environment]::SetEnvironmentVariable('TUNNEL_TOKEN', `$null, 'Machine')."
+        }
         New-Check -Id 'tunnel-token-storage' -Name $name -Status 'FAIL' `
-            -Reason "The Cloudflare Tunnel token is not stored the way it should be: $($problems -join '; '). Run the installer's Reconfigure shortcut as Administrator - it writes the token to a file only SYSTEM and Administrators can read and removes it from the registry. If other people use this machine, also ask your Jina admin to rotate the tunnel token: the copy found here may already have been read." `
+            -Reason "The Cloudflare Tunnel token is not stored the way it should be: $($problems -join '; '). Run the installer's Reconfigure shortcut as Administrator - it writes the token to a file only SYSTEM and Administrators can read and removes it from the service registry.$machineFix If other people use this machine, also ask your Jina admin to rotate the tunnel token: the copy found here may already have been read." `
             -Evidence $evidence | Out-Null
     } elseif (-not $tunnelConfigured) {
         New-Check -Id 'tunnel-token-storage' -Name $name -Status 'NA' `
@@ -995,15 +1075,19 @@ Invoke-Check -Id 'tunnel-token-storage' -Name 'Tunnel token kept out of the serv
 # 7. Company vault ACL
 #
 # THE MOST IMPORTANT FAIL THIS SCRIPT CAN REPORT, and it applies in BOTH modes. The vault
-# (<TALLY_DATA_PATH>\.tally-mcp-companies.json) holds DPAPI-protected Tally company passwords, and
+# (%ProgramData%\Claudally\agent\.tally-mcp-companies.json; in TALLY_DATA_PATH before #230's
+# follow-up) holds DPAPI-protected Tally company passwords, and
 # the DPAPI scope is LocalMachine (scripts\dpapi-helper.ps1:32) - so any local principal that can
 # READ the file can also DECRYPT it. The entropy value is a public literal in this repo and is
 # world-readable in Program Files (scripts\migrate-vault-entropy.ps1 says as much in its own
 # summary). The NTFS ACL is therefore not defence in depth here; it is the entire boundary.
 #
 # Expected state: inheritance disabled, and allow-ACEs for exactly SYSTEM, BUILTIN\Administrators
-# and AGENT_TASK_USER - what firstrun-config.ps1 sets with
-#   icacls <file> /inheritance:r /grant:r 'SYSTEM:F' 'Administrators:F' "${AgentTaskUser}:F"
+# and AGENT_TASK_USER - what firstrun-config.ps1 sets, by SID (#230), with
+#   icacls <file> /inheritance:r /grant:r *S-1-5-18:F *S-1-5-32-544:F *<agent user's SID>:F
+# Installers before #230 named the groups ('Administrators:F'), which on a non-English Windows
+# failed and left the file with its inherited ACL - exactly what the inheritance test below catches.
+# Every comparison here is by SID, so a localised Windows is judged the same as an English one.
 # ---------------------------------------------------------------------------
 Invoke-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' -Body {
     $vaultPath = Get-EnvValue 'TALLY_COMPANIES_CONFIG'
@@ -1011,27 +1095,24 @@ Invoke-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' 
     if ($vaultPath) {
         $vaultNote = 'vault path overridden by TALLY_COMPANIES_CONFIG in .env'
     } else {
-        $dataPath = Get-EnvValue 'TALLY_DATA_PATH'
-        if (-not $dataPath) {
-            $dataPath  = 'C:\Users\Public\TallyPrimeEditLog\data'
-            $vaultNote = "TALLY_DATA_PATH is not set in .env, so this used the installer default $dataPath"
-        }
-        # Same default as src\mcp.mts:5186 and the tray (scripts\tray\tally-mcp-tray.ps1:270).
-        $vaultPath = Join-Path $dataPath '.tally-mcp-companies.json'
+        # The agent folder - the same default as resolveCompanyVaultPath() in src\mcp.mts and
+        # Get-CompanyVaultPath in the tray. (A vault still in Tally's data folder, where versions
+        # before #230's follow-up kept it, is reported by check 8.)
+        $vaultPath = Join-Path $AgentDir '.tally-mcp-companies.json'
     }
     # An unreadable .env looks exactly like one with no overrides, so the default above may not be
     # where this install keeps its vault at all. Say so rather than claiming the keys are "not set",
     # and remember it: a vault NOT found at the default is then "did not know where to look".
     $vaultLocationUnknown = ($EnvExists -and -not $EnvReadable)
     if ($vaultLocationUnknown) {
-        $vaultNote = ".env could not be read by this account, so any TALLY_DATA_PATH / TALLY_COMPANIES_CONFIG / AGENT_TASK_USER setting in it is unknown; this looked only at the installer default location"
+        $vaultNote = ".env could not be read by this account, so any TALLY_COMPANIES_CONFIG / AGENT_TASK_USER setting in it is unknown; this looked only at the installer default location"
     }
 
-    # Is the default installer data path in play? Only then may the FAIL text talk about what
-    # C:\Users\Public grants - see the inheritance problem below, which used to assert that
-    # parenthetical about every vault regardless of where the vault actually lived.
-    $DefaultDataPath = 'C:\Users\Public\TallyPrimeEditLog\data'
-    $onDefaultPath = ($vaultPath -like ($DefaultDataPath + '\*'))
+    # In the agent folder the vault may legitimately INHERIT its list: the tray's Manage Companies
+    # saves with a .tmp-and-rename there, and the new file takes the folder's (OI)(CI) entries -
+    # the same three accounts, on a folder of ours that check 8 verifies. Anywhere else, inheriting
+    # means carrying whatever someone else's folder grants.
+    $inAgentDir = [string]::Equals((Split-Path -Parent $vaultPath).TrimEnd('\'), $AgentDir.TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)
 
     # ONE probe, and it must tell "not there" apart from "there, but you may not look".
     #
@@ -1039,8 +1120,8 @@ Invoke-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' 
     # the error stream that lands in the middle of a report aimed at a non-technical reader. Taking
     # that $false as "absent" was the worst bug this check could carry: a vault locked down exactly
     # as intended is INVISIBLE to every account that is not SYSTEM, an Administrator or
-    # AGENT_TASK_USER - the installer also strips inheritance on the whole data directory
-    # (firstrun-config.ps1:452), so such an account cannot even list the parent - and the check
+    # AGENT_TASK_USER - the installer also protects the agent folder the vault lives in
+    # (lockdown-helpers.ps1, _EnsureAgentDir), so such an account cannot even list the parent - and the check
     # then told precisely the customer whose ACL was working that "there is no company vault on
     # this machine, so no Tally passwords are stored". A false all-clear on the one boundary
     # protecting stored Tally passwords.
@@ -1068,10 +1149,10 @@ Invoke-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' 
         $ev += "running as: $($Identity.Name) (elevated: $IsElevated)"
         if ($IsElevated) {
             # An Administrator being locked out is genuinely anomalous: the installer always grants
-            # BUILTIN\Administrators Full Control (firstrun-config.ps1:428), so this ACL is wrong in
+            # BUILTIN\Administrators Full Control (lockdown-helpers.ps1), so this ACL is wrong in
             # a way this run cannot even describe. Fail closed.
             New-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' -Status 'FAIL' `
-                -Reason "The company vault exists but even this elevated run is denied permission to read its ACL. The installer always grants Administrators Full Control, so something has rewritten this file's permissions and the protection of the stored Tally passwords cannot be established at all. Take ownership and reset it: takeown /f `"$vaultPath`" then icacls `"$vaultPath`" /inheritance:r /grant:r 'SYSTEM:F' 'Administrators:F'" `
+                -Reason "The company vault exists but even this elevated run is denied permission to read its ACL. The installer always grants Administrators Full Control, so something has rewritten this file's permissions and the protection of the stored Tally passwords cannot be established at all. Take ownership and reset it: takeown /f `"$vaultPath`" then icacls `"$vaultPath`" /inheritance:r /grant:r *S-1-5-18:F *S-1-5-32-544:F (SYSTEM and Administrators by SID, which works in every Windows language), then run the installer's Reconfigure to add the agent account back." `
                 -Evidence $ev | Out-Null
         } else {
             # UNKNOWN. Not a FAIL: this is what a correctly locked-down vault looks like from an
@@ -1134,15 +1215,12 @@ Invoke-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' 
     $offenders = @()
     $broadOffenders = @()
     if (-not $acl.AreAccessRulesProtected) {
-        # Only name C:\Users\Public when the vault is actually under it. The parenthetical used to
-        # be unconditional, so a vault on a custom TALLY_DATA_PATH was failed with a sentence about
-        # a folder that had nothing to do with it - evidence a customer can disprove in one command,
-        # after which they stop believing the rest of the report.
-        $inheritProblem = "inheritance is still enabled, so the vault carries whatever its parent folder ($(Split-Path -Parent $vaultPath)) grants rather than a deliberate list"
-        if ($onDefaultPath) {
-            $inheritProblem = "$inheritProblem - and on the installer's default data path under C:\Users\Public that means BUILTIN\Users can write"
+        if ($inAgentDir) {
+            # Every entry is still checked one by one below, inherited or not.
+            $evidence += "the vault inherits from the agent folder $AgentDir (expected after a save from Manage Companies; that folder's own list is check 8)"
+        } else {
+            $problems += "inheritance is still enabled, so the vault carries whatever its parent folder ($(Split-Path -Parent $vaultPath)) grants rather than a deliberate list"
         }
-        $problems += $inheritProblem
     }
 
     foreach ($rule in $acl.Access) {
@@ -1207,9 +1285,14 @@ Invoke-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' 
         # The remedy must not revoke the agent account. Without it the tray and the GUI agent lose
         # access to the vault and company loading stops working, so an operator who pastes this
         # blindly would trade a permissions finding for a broken install.
-        $expectGrant = "'SYSTEM:F' 'Administrators:F'"
+        # By SID: 'Administrators' is localised, and on a non-English Windows the name form of this
+        # command fails and changes nothing (#230) - the very failure that leaves a vault like this.
+        $expectGrant = "*S-1-5-18:F *S-1-5-32-544:F"
         $grantNote = ''
-        if ($agentUser) {
+        if ($agentSid) {
+            $expectGrant = "$expectGrant *${agentSid}:F"
+            $grantNote = " (the last SID is $agentUser)"
+        } elseif ($agentUser) {
             $expectGrant = "$expectGrant '${agentUser}:F'"
         } else {
             $grantNote = " Add the agent account to that command as well ('<user>:F') - it is the account the tray and GUI agent run as, and omitting it will stop company loading working."
@@ -1219,7 +1302,7 @@ Invoke-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' 
             -Evidence $evidence | Out-Null
     } elseif ($indeterminate) {
         New-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' -Status 'PASS' `
-            -Reason "Inheritance is disabled and no broad group can reach the vault." `
+            -Reason "$(if ($acl.AreAccessRulesProtected) { 'Inheritance is disabled' } else { 'It inherits from the agent folder' }) and no broad group can reach the vault." `
             -Evidence $evidence -Caveat $caveat | Out-Null
     } else {
         $who = 'SYSTEM and Administrators'
@@ -1229,13 +1312,232 @@ Invoke-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' 
             $locCaveat = "This is the vault at the installer's default location. This account cannot read .env, so if the install is configured to keep its vault somewhere else, that one was not checked. Re-run as Administrator to be sure."
         }
         New-Check -Id 'vault-acl' -Name 'Company vault ACL (stored Tally passwords)' -Status 'PASS' `
-            -Reason "Inheritance is disabled and only $who can reach the vault." `
+            -Reason "$(if ($acl.AreAccessRulesProtected) { 'Inheritance is disabled and only' } else { 'It inherits from the agent folder, and only' }) $who can reach the vault." `
             -Evidence $evidence -Caveat $locCaveat | Out-Null
     }
 }
 
 # ---------------------------------------------------------------------------
-# 8. Tally reachability - INFORMATIONAL
+# 8. .env, the agent folder, and Tally's data folder (#230) - BOTH modes
+#
+# The installer restricts two things to SYSTEM, Administrators and AGENT_TASK_USER:
+#   .env                          holds PASSWORD (remote) and TUNNEL_TOKEN (tunnel installs);
+#   %ProgramData%\Claudally\agent the company vault and the GUI agent's IPC files: whoever can write
+#                                 a command file there can type keystrokes - stored company
+#                                 passwords included - into Tally. Also owned by Administrators:
+#                                 %ProgramData% lets any user create folders, so an owner that is
+#                                 not SYSTEM or Administrators means someone else made it.
+# Installers before #230 named the groups ('Administrators:F'), which on a non-English Windows
+# failed, changed nothing and left .env with its inherited ACL, readable by BUILTIN\Users under
+# Program Files. Every comparison is by SID, never by display name, so a localised Windows is judged
+# exactly like an English one. UNKNOWN when this account may not read the ACL (which is also what a
+# correct lockdown looks like to an account outside it).
+#
+# And Tally's data folder, which is Tally's, not ours. Versions before #230's follow-up kept the vault
+# and the IPC files there and locked the whole folder down, which shut every other Windows account on
+# the PC out of the books. Any of our files still there is a FAIL (the upgrade moves them); inheritance
+# still disabled is a WARN, with the command that restores it.
+# ---------------------------------------------------------------------------
+$AgentUserForAcl = ''
+$AgentSidForAcl  = $null
+if ($EnvReadable) { $AgentUserForAcl = Get-EnvValue 'AGENT_TASK_USER' }
+if ($AgentUserForAcl) {
+    try {
+        $AgentSidForAcl = (New-Object System.Security.Principal.NTAccount($AgentUserForAcl)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        $AgentSidForAcl = $null
+    }
+}
+
+function Invoke-LockdownAclCheck {
+    param([string]$Id, [string]$Name, [string]$Path, [string]$What, [string]$Exposure, [switch]$Container, [switch]$CheckOwner)
+    $sidType = [System.Security.Principal.SecurityIdentifier]
+    $acl = $null
+    $denied = $false
+    try {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    } catch [System.UnauthorizedAccessException] {
+        $denied = $true
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        $acl = $null
+    }
+    $evidence = @("${What}: $Path", "running as: $($Identity.Name) (elevated: $IsElevated)")
+
+    if ($denied) {
+        $evidence += 'reading its ACL from this account failed with Access Denied'
+        if ($IsElevated) {
+            New-Check -Id $Id -Name $Name -Status 'FAIL' `
+                -Reason "Even this elevated run may not read the permissions of the $What, and the installer always grants Administrators Full Control - so something has rewritten them and its protection cannot be established. Run the installer's Reconfigure as Administrator." `
+                -Evidence $evidence | Out-Null
+        } else {
+            New-Check -Id $Id -Name $Name -Status 'UNKNOWN' `
+                -Reason "This Windows account may not read the permissions of the $What. That is what a correct lockdown looks like from an account outside it, so it is not a fault - but it is not a verification either. Re-run this script as Administrator." `
+                -Evidence $evidence | Out-Null
+        }
+        return
+    }
+    if ($null -eq $acl) {
+        New-Check -Id $Id -Name $Name -Status 'NA' `
+            -Reason "There is no $What at $Path, so there are no permissions to check here." `
+            -Evidence $evidence | Out-Null
+        return
+    }
+
+    $allowed = @{ 'S-1-5-18' = 'NT AUTHORITY\SYSTEM'; 'S-1-5-32-544' = 'BUILTIN\Administrators' }
+    if ($AgentSidForAcl) { $allowed[$AgentSidForAcl] = "$AgentUserForAcl (AGENT_TASK_USER)" }
+    $problems = @()
+    $unidentified = @()
+    $explicitForeign = @()
+    if ($acl.AreAccessRulesProtected) {
+        $evidence += 'inheritance: disabled (the ACL is protected, as it should be)'
+    } else {
+        $evidence += 'inheritance: ENABLED'
+        $problems += "it inherits whatever its parent folder grants instead of the installer's list - the state an installer before #230 left behind on a non-English Windows"
+    }
+    if ($CheckOwner) {
+        $ownerSid = ''
+        try { $ownerSid = $acl.GetOwner($sidType).Value } catch { $ownerSid = "$($acl.Owner)" }
+        if (@('S-1-5-18', 'S-1-5-32-544') -contains $ownerSid) {
+            $evidence += "owner: $($allowed[$ownerSid])"
+        } else {
+            $evidence += "owner: $($acl.Owner) (sid $ownerSid)"
+            $problems += "it is owned by $($acl.Owner), not SYSTEM or Administrators - an owner can rewrite its permissions at will, and a folder in %ProgramData% owned by someone else may have been planted there"
+        }
+    }
+    foreach ($rule in $acl.GetAccessRules($true, $true, $sidType)) {
+        $sid = $rule.IdentityReference.Value
+        $display = $sid
+        try { $display = $rule.IdentityReference.Translate([System.Security.Principal.NTAccount]).Value } catch { $display = $sid }
+        $origin = 'explicit'
+        if ($rule.IsInherited) { $origin = 'inherited' }
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
+            $evidence += "deny entry (not a finding): $display : $($rule.FileSystemRights)"
+            continue
+        }
+        if ($allowed.ContainsKey($sid)) {
+            $evidence += "expected: $($allowed[$sid]) : $($rule.FileSystemRights) [$origin]"
+            continue
+        }
+        if (-not $rule.IsInherited -and $explicitForeign -notcontains $sid) { $explicitForeign += $sid }
+        if ($BroadSids.ContainsKey($sid)) {
+            $evidence += "UNEXPECTED: $($BroadSids[$sid]) : $($rule.FileSystemRights) [$origin] (sid $sid)"
+            $problems += "$($BroadSids[$sid]) - a group that in practice means every local account - holds $($rule.FileSystemRights)"
+            continue
+        }
+        $evidence += "UNEXPECTED: $display : $($rule.FileSystemRights) [$origin] (sid $sid)"
+        $unidentified += "$display : $($rule.FileSystemRights)"
+    }
+    # As for the vault: an extra principal is only a proven finding when the agent account is known.
+    $caveat = ''
+    if ($unidentified.Count -gt 0) {
+        if ($AgentSidForAcl) {
+            $problems += "unexpected allow entries: $($unidentified -join '; ')"
+        } else {
+            $caveat = "AGENT_TASK_USER is not known to this run (not recorded, not resolvable, or .env unreadable), so it cannot confirm that '$($unidentified -join '; ')' is the agent account the installer granted. Nothing here is known to be wrong, but this is weaker than a clean pass."
+        }
+    }
+
+    if ($problems.Count -gt 0) {
+        $flags = ''
+        if ($Container) { $flags = '(OI)(CI)' }
+        $agentGrant = " '<the agent account>:${flags}F'"
+        if ($AgentSidForAcl) { $agentGrant = " *${AgentSidForAcl}:${flags}F" }
+        elseif ($AgentUserForAcl) { $agentGrant = " '${AgentUserForAcl}:${flags}F'" }
+        # /grant:r leaves explicit entries for anyone it does not name, so those need a /remove.
+        $removeText = ''
+        foreach ($s in $explicitForeign) { $removeText += ", then: icacls `"$Path`" /remove *$s" }
+        New-Check -Id $Id -Name $Name -Status 'FAIL' `
+            -Reason "The $What is not locked down: $($problems -join '; '). $Exposure Run the installer's Reconfigure as Administrator, or fix it from an elevated prompt with: icacls `"$Path`" /inheritance:r /grant:r *S-1-5-18:${flags}F *S-1-5-32-544:${flags}F$agentGrant$removeText (by SID, which works in every Windows language)." `
+            -Evidence $evidence | Out-Null
+    } else {
+        $who = 'SYSTEM and Administrators'
+        if ($AgentSidForAcl) { $who = "SYSTEM, Administrators and $AgentUserForAcl" }
+        New-Check -Id $Id -Name $Name -Status 'PASS' `
+            -Reason "Inheritance is disabled and only $who can reach the $What." `
+            -Evidence $evidence -Caveat $caveat | Out-Null
+    }
+}
+
+Invoke-Check -Id 'env-acl' -Name 'Configuration file ACL (.env)' -Body {
+    Invoke-LockdownAclCheck -Id 'env-acl' -Name 'Configuration file ACL (.env)' -Path $EnvFile -What 'configuration file (.env)' `
+        -Exposure 'It holds the OAuth password in remote mode and the tunnel token on a tunnel install, so any account that can read it has them.'
+}
+
+Invoke-Check -Id 'agent-dir-acl' -Name 'Agent folder ACL (vault + GUI agent IPC)' -Body {
+    Invoke-LockdownAclCheck -Id 'agent-dir-acl' -Name 'Agent folder ACL (vault + GUI agent IPC)' -Path $AgentDir -What 'Claudally agent folder' -Container -CheckOwner `
+        -Exposure "It holds the company vault and the GUI agent's command files: any account that can read it can decrypt the stored Tally passwords, and any that can write a command file there can send keystrokes into the Tally session. If it is owned by an account you do not recognise, delete the folder and run Reconfigure, which recreates it."
+}
+
+Invoke-Check -Id 'tally-data-folder' -Name "Tally's data folder left to Tally" -Body {
+    $name = "Tally's data folder left to Tally"
+    if ($EnvExists -and -not $EnvReadable) {
+        New-Check -Id 'tally-data-folder' -Name $name -Status 'UNKNOWN' `
+            -Reason "This account cannot read .env, so where this install's Tally data folder is (TALLY_DATA_PATH) is unknown and it could not be checked. Re-run this script as Administrator." `
+            -Evidence @("config file: $EnvFile (unreadable from this account)") | Out-Null
+        return
+    }
+    $dataPath = Get-EnvValue 'TALLY_DATA_PATH'
+    if (-not $dataPath) { $dataPath = 'C:\Users\Public\TallyPrimeEditLog\data' }
+    $evidence = @("Tally data folder: $dataPath")
+    if (-not (Test-Path -LiteralPath $dataPath -PathType Container)) {
+        New-Check -Id 'tally-data-folder' -Name $name -Status 'NA' `
+            -Reason "There is no Tally data folder at $dataPath, so there is nothing of ours to find in it." `
+            -Evidence $evidence | Out-Null
+        return
+    }
+
+    # Our files that must have left it. Names only; nothing is opened.
+    $leftovers = @()
+    $denied = $false
+    foreach ($n in $OurFilesInTallyFolder) {
+        $p = Join-Path $dataPath $n
+        try {
+            $null = Get-Item -LiteralPath $p -Force -ErrorAction Stop
+            $leftovers += $n
+        } catch [System.UnauthorizedAccessException] {
+            $denied = $true
+        } catch [System.Management.Automation.ItemNotFoundException] {
+            $null = $_
+        }
+    }
+    foreach ($f in @(Get-ChildItem -LiteralPath $dataPath -Force -File -Filter '_mcp_gui_*' -ErrorAction SilentlyContinue)) {
+        if ($leftovers -notcontains $f.Name) { $leftovers += $f.Name }
+    }
+
+    # Inheritance: earlier installers turned it off on the whole folder.
+    $inheritanceOff = $false
+    $aclDenied = $false
+    try {
+        $inheritanceOff = (Get-Acl -LiteralPath $dataPath -ErrorAction Stop).AreAccessRulesProtected
+    } catch [System.UnauthorizedAccessException] {
+        $aclDenied = $true
+    }
+    if ($aclDenied) { $evidence += 'its permissions could not be read from this account' }
+    elseif ($inheritanceOff) { $evidence += 'inheritance: DISABLED - other Windows accounts may be shut out of the Tally companies in it' }
+    else { $evidence += 'inheritance: enabled (as Tally set it up)' }
+
+    if ($leftovers.Count -gt 0) {
+        $evidence += "still there: $($leftovers -join ', ')"
+        New-Check -Id 'tally-data-folder' -Name $name -Status 'FAIL' `
+            -Reason "Files of ours are still in Tally's data folder: $($leftovers -join ', '). The company vault and a GUI agent command file can hold company passwords, and this folder is readable by the Windows accounts that use Tally. Run the installer's Reconfigure as Administrator: it moves the vault to $AgentDir (locked before the move, old copy shredded) and shreds the rest." `
+            -Evidence $evidence | Out-Null
+    } elseif ($inheritanceOff) {
+        New-Check -Id 'tally-data-folder' -Name $name -Status 'WARN' `
+            -Reason "Nothing of ours is left in Tally's data folder, but its permission inheritance is still disabled - which is what versions before #230's follow-up did to it, and it can shut other Windows accounts on this PC out of their Tally companies. Reconfigure restores it if it recognises its own change; otherwise, from an elevated prompt: icacls `"$dataPath`" /inheritance:e" `
+            -Evidence $evidence | Out-Null
+    } elseif ($denied -or $aclDenied) {
+        New-Check -Id 'tally-data-folder' -Name $name -Status 'UNKNOWN' `
+            -Reason "Not everything in Tally's data folder could be looked at from this account. Re-run this script as Administrator." `
+            -Evidence $evidence | Out-Null
+    } else {
+        New-Check -Id 'tally-data-folder' -Name $name -Status 'PASS' `
+            -Reason "None of our files are in Tally's data folder, and it inherits its permissions as Tally set it up." `
+            -Evidence $evidence | Out-Null
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 9. Tally reachability - INFORMATIONAL
 #
 # Deliberately not pass/fail. Tally being closed is a normal weekday-evening state, not a security
 # defect, and a red line here would swamp the four claims this script exists to prove.
@@ -1290,6 +1592,8 @@ $failCount    = @($Checks | Where-Object { $_.status -eq 'FAIL'    }).Count
 $unknownCount = @($Checks | Where-Object { $_.status -eq 'UNKNOWN' }).Count
 $naCount      = @($Checks | Where-Object { $_.status -eq 'NA'      }).Count
 $infoCount    = @($Checks | Where-Object { $_.status -eq 'INFO'    }).Count
+$warnCount    = @($Checks | Where-Object { $_.status -eq 'WARN'    }).Count
+$warnNames    = @($Checks | Where-Object { $_.status -eq 'WARN' } | ForEach-Object { $_.name })
 $caveated     = @($Checks | Where-Object { $_.caveat })
 $unknownNames = @($Checks | Where-Object { $_.status -eq 'UNKNOWN' } | ForEach-Object { $_.name })
 
@@ -1308,7 +1612,7 @@ elseif ($verdict -eq 'UNKNOWN' -and -not $AllowUnknown) { $exitCode = 3 }
 
 if ($Json) {
     $payload = New-Object psobject -Property ([ordered]@{
-        schemaVersion  = 2
+        schemaVersion  = 3
         tool           = 'scripts/verify-deployment.ps1'
         issue          = 172
         generatedAt    = (Get-Date).ToString('o')
@@ -1326,6 +1630,7 @@ if ($Json) {
             unknown = $unknownCount
             na      = $naCount
             info    = $infoCount
+            warn    = $warnCount
         }))
         checks         = @($Checks)
     })
@@ -1374,6 +1679,7 @@ foreach ($c in $Checks) {
     elseif ($c.status -eq 'UNKNOWN') { $colour = 'Yellow' }
     elseif ($c.status -eq 'NA')   { $colour = 'DarkGray' }
     elseif ($c.status -eq 'INFO') { $colour = 'Cyan' }
+    elseif ($c.status -eq 'WARN') { $colour = 'Yellow' }
     # PadRight(7) = len('UNKNOWN'), so the check names still line up in one column.
     Write-Host ("[" + $c.status.PadRight(7) + "] " + $c.name) -ForegroundColor $colour
     if ($c.reason) { Write-Wrapped -Text $c.reason }
@@ -1387,7 +1693,7 @@ foreach ($c in $Checks) {
 # "not applicable" is not always about the mode: the vault check reports NA when there is no vault at
 # all. Appending "to <mode> mode" unconditionally mislabelled that, so name the mode only in the
 # sentence's own clause below.
-$summary = "$passCount passed, $failCount failed, $unknownCount unknown, $naCount not applicable"
+$summary = "$passCount passed, $failCount failed, $unknownCount unknown, $warnCount warning(s), $naCount not applicable"
 $elevateHint = ''
 if (-not $IsElevated) {
     $elevateHint = " This run is not elevated, which is the usual cause: re-run this script as Administrator and those checks will get an actual answer."
@@ -1417,6 +1723,10 @@ if ($verdict -eq 'PASS') {
     if ($unknownCount -gt 0) {
         Write-Wrapped -Indent '' -Text "In addition, $unknownCount check(s) could not look at what they were asked to verify ($($unknownNames -join '; ')), so they are UNKNOWN rather than passed.$elevateHint"
     }
+}
+if ($warnCount -gt 0) {
+    Write-Host ""
+    Write-Wrapped -Indent '' -Text "$warnCount warning(s) ($($warnNames -join '; ')): nothing there weakens this install's own security, so they do not change the verdict or the exit code - but each WARN above is worth fixing and says how."
 }
 if ($caveated.Count -gt 0) {
     Write-Host ""
