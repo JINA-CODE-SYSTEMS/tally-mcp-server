@@ -6,7 +6,14 @@
 > ([threat model, status](update-channel-threat-model.md)). The owner's answers to the open
 > questions are in [§13](#13-owner-decisions) and are reflected throughout.
 >
-> Design only. Nothing here is implemented, no key has been generated, and the example values
+> **Implementation status:** the verification core (§6 steps 1, 2, 4 and 5; the size and hash check
+> of steps 7 and 9; and the step 8 policy check) is in `src/update/`, with the offline signing script
+> of §10 step 7 in `scripts/update/sign-manifest.mjs`. Points it had to settle are in
+> [§6.1](#61-clarifications-made-by-the-implementation). Fetching, the scheduled task, download,
+> apply and rollback are not built yet. The pinned root is still empty, so nothing verifies in
+> production until the root ceremony.
+>
+> Otherwise design only: no key has been generated, and the example values
 > below (hashes, key ids, URLs under `/update/`) are placeholders. The reasoning for every decision
 > is in the companion threat model, [update-channel-threat-model.md](update-channel-threat-model.md);
 > this document is the *what*, that one is the *why*. Threat ids (A1–A14) refer to its §4.
@@ -301,6 +308,44 @@ record.
    it open with write sharing denied until the installer process has started.
 10. **Apply** ([§7.4](#74-behaviour-per-deployment-mode)), **health-check**, then either record the
     new version as known-good or **roll back** ([§7.5](#75-rollback-to-known-good)).
+
+### 6.1 Clarifications made by the implementation
+
+The verification core (`src/update/`) had to settle points the steps above leave open. Each one
+fails closed; none is configurable.
+
+- **First run.** With no trusted key set, the pinned root stands in as "version 0". The first key set
+  offered may have any `version`, provided the pinned root's threshold signed it (and its own root's,
+  if different). Every later one must be exactly previous + 1. A client installed before a root
+  rotation therefore walks `keys/1.json` onwards; one installed after it can start at `keys.json`.
+- **"Equal only if byte-identical"** compares the signed payload bytes, not the envelope, for both
+  documents. The same payload with its signatures reordered, or with one more signature, is the same
+  document.
+- **Unknown fields are rejected** everywhere: in the envelope, in every object of both payloads and
+  in each signature entry. v1 has no extension points; a new field is a `v2` document (§4.1).
+  Missing fields are rejected too; `advisory` is present as `null` when there is none.
+- **One encoding per value.** Payloads must be valid UTF-8 JSON with no byte-order mark, no
+  duplicate object keys (compared after unescaping), and numbers only as plain integers within
+  2^53 − 1 (`1.0` and `1e0` are refused). Base64 must be standard, padded and canonical. Timestamps
+  are exactly `YYYY-MM-DDTHH:MM:SSZ`. Key ids and SHA-256 values are lowercase hex. URLs must be
+  in their canonical form (`new URL(s).href === s`).
+- **Manifest lifetime.** The client refuses a manifest whose `expires` is not after `issued`, or is
+  more than 45 days after it. A manifest valid for longer would widen the freeze window.
+- **Keys.** A key may not be both a root key and a release key. `revoked_keyids` applies to root keys
+  as well as release keys. Each role's threshold must be at least 1 and no more than its key count
+  (for root, its non-revoked key count). The same key id listed twice in a role is refused.
+- **The Authenticode latch.** Once the latch is set, a key set with `authenticode.required = false`
+  is **rejected**, not silently overridden (§11: "latch cleared by a later key set" must reject).
+  `required = true` with an empty `signers` list is malformed.
+- **Stored state is re-checked.** On every run the key set held in state must still parse and carry
+  its own root's threshold (true of every key set this module adopts). If it does not, the result is
+  an `internal` failure (damaged state), not a verification failure.
+- **Surfacing ([§8](#8-failure-surfacing)).** An expired manifest is reported as *stale* (amber), not
+  as *verification failed*. Oversized metadata and a body that is not a DSSE envelope count as
+  *transport* failures. "Revocation status unavailable" defers the run whether or not Authenticode is
+  required, and never counts as a pass.
+- **Policy.** An unrecognised `UPDATE_POLICY` value, including the dropped `notify`, `off` and
+  `all-auto`, resolves to `security-only`. Security updates are unaffected.
 
 ---
 
