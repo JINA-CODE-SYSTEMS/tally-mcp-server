@@ -58,7 +58,7 @@
                         <FILTER>FilterNature</FILTER>
                     </COLLECTION>
                     <nunjuck>set regExp = r/(r|R|receivable|Receivable|RECEIVABLE)/g</nunjuck>
-                    <nunjuck>if regExp.test('{nature}')</nunjuck>
+                    <nunjuck>if regExp.test(nature)</nunjuck>
                     <SYSTEM TYPE="Formulae" NAME="FilterNature">$$IsEqual:($_PrimaryGroup:Group:($Parent:Ledger:$Parent)):"Sundry Debtors"</SYSTEM>
                     <nunjuck>else</nunjuck>
                     <SYSTEM TYPE="Formulae" NAME="FilterNature">$$IsEqual:($_PrimaryGroup:Group:($Parent:Ledger:$Parent)):"Sundry Creditors"</SYSTEM>
