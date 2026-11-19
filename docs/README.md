@@ -149,7 +149,7 @@ Copy `.env.example` to `.env` and configure:
 | `MCP_DOMAIN` | `http://localhost:3000` | Public-facing URL |
 | `BIND_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` only behind reverse proxy) |
 | `CORS_ORIGINS` | *(defaults to MCP_DOMAIN)* | Comma-separated allowed origins |
-| `READONLY_MODE` | `false` | Set `true` to disable all write tools |
+| `READONLY_MODE` | `false` | Set `true` to disable everything that can change Tally data: all write tools, `gui-send-keys` (free-form keystrokes), `repair-master-names` with `confirm`, and any `tally-raw-xml-probe` request other than a plain Export. `gui-screenshot` and the fixed company-loading tools stay available |
 | `ADMIN_SECRET` | | Secret for manual client registration (`Authorization: Bearer …` on `/register`). On its own it does **not** close registration — see the next row |
 | `REQUIRE_ADMIN_SECRET_FOR_REGISTRATION` | `false` | `true`: `/register` accepts only requests carrying `ADMIN_SECRET` (registration is closed if no secret is set). Claude and VS Code register themselves without credentials, so leave this `false` unless you register every client by hand |
 | `OAUTH_REDIRECT_SCHEMES` | | Extra app redirect schemes to accept at registration, comma-separated (built in: `vscode`, `vscode-insiders`, `cursor`, `claude`). `https://` and `http://localhost` / `127.0.0.1` are always accepted; script and file schemes never are |
@@ -167,7 +167,7 @@ Copy `.env.example` to `.env` and configure:
 | `GIT_COMMIT` / `BUILD_TIME` | *(unset)* | Optional build info surfaced in `/status` `build.commit` / `build.builtAt`. |
 | **GUI Agent (open-company)** | | |
 | `OPEN_COMPANY_GUI_TIMEOUT_SEC` | `180` | GUI agent timeout in seconds (min 90) |
-| `ENABLE_GUI_CONTROL` | `true` | Exposes `gui-screenshot` / `gui-send-keys`, the supervised look-then-act loop. Set `false` for XML-only boxes. |
+| `ENABLE_GUI_CONTROL` | `true` | Exposes `gui-screenshot` / `gui-send-keys`, the supervised look-then-act loop. Set `false` for XML-only boxes. With `READONLY_MODE=true`, `gui-send-keys` is refused and only `gui-screenshot` remains. |
 | `ENTRY_ORDER` | *(unset)* | Blanket fallback: `credit-first` or `debit-first`. Resolution order is **user's per-type answer → user's blanket default → this key → built-in defaults → ask**. Purchase / Sales / Receipt / Payment ship with defaults (party line leads, as Tally prompts); any other type with no answer is **refused on write** so the user is asked rather than defaulted. Display only; the posting is identical either way. |
 | `TALLY_ENTRY_ORDER_CONFIG` | `<dataPath>/.tally-mcp-entry-order.json` | Where per-voucher-type entry order is recorded. |
 | `UPDATE_CHECK` | `true` | Tray asks GitHub once a day whether a newer release exists and says so. Downloads and runs nothing. The only outbound call a local install makes; set `false` to stop it. |
@@ -379,7 +379,7 @@ The config never stores passwords — only the hint that one is needed, so calle
 | `update-party-details` | Fill in missing address / PAN / GST details on an existing party (e.g. from an invoice); reports conflicts instead of overwriting, then reads the ledger back to confirm |
 | `create-stock-item` | Create a new stock item master |
 
-> Write tools are disabled when `READONLY_MODE=true`.
+> Write tools are disabled when `READONLY_MODE=true`, and so is `gui-send-keys` — keystrokes can change data just as a write tool can.
 
 ### Analytics
 

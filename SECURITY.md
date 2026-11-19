@@ -23,7 +23,7 @@ This server bridges AI assistants with Tally Prime ERP (financial data). Key con
 - **XML injection prevention** — All parameters HTML-escaped before Tally XML injection
 - **Rate limiting** — 10 req/min on authentication endpoints
 - **Audit logging** — All tool invocations logged with sensitive fields redacted
-- **Read-only mode** — `READONLY_MODE=true` disables all write tools
+- **Read-only mode** — `READONLY_MODE=true` disables all write tools, free-form GUI keystrokes (`gui-send-keys`) and non-Export raw XML requests
 
 See [docs/security-assessment.md](docs/security-assessment.md) for the full threat model.
 
