@@ -679,7 +679,7 @@ Invoke-Check -Id 'no-oauth' -Name 'No OAuth password or persisted tokens' -Body 
         return
     }
 
-    # Paths per src\server.mts:134 and :138 - __dirname is dist\ and the code joins '..', so both
+    # Paths per src\http-app.mts (stateDir, passed by src\server.mts) - __dirname is dist\ and the code joins '..', so both
     # land in the install root next to .env.
     $clientsFile = Join-Path $InstallDir '.oauth-clients.json'
     $tokensFile  = Join-Path $InstallDir '.oauth-tokens.json'
