@@ -29,12 +29,19 @@ test('only a single plain Export request is a read', () => {
   ]) assert.equal(isReadOnlyTallyRequest(xml), false, xml);
 });
 
-test('raw XML probe: writes need allowWrite, and READONLY_MODE refuses them regardless', () => {
+test('raw XML probe: writes need allowWrite, and READONLY_MODE refuses the probe entirely', () => {
   const debug = { TALLY_DEBUG_XML: '1' };
   const readonly = { TALLY_DEBUG_XML: '1', READONLY_MODE: 'true' };
 
   assert.deepEqual(rawXmlProbeGate(envelope('Export'), undefined, debug), { allowed: true, write: false });
-  assert.deepEqual(rawXmlProbeGate(envelope('Export'), undefined, readonly), { allowed: true, write: false });
+  // Even an Export: inline TDL in a raw envelope cannot be shown to be side-effect free.
+  for (const xml of [envelope('Export'), envelope('Export Data')]) {
+    for (const allowWrite of [undefined, true]) {
+      const gate = rawXmlProbeGate(xml, allowWrite, readonly);
+      assert.equal(gate.allowed, false);
+      assert.equal((gate as any).code, 'READONLY');
+    }
+  }
   assert.deepEqual(rawXmlProbeGate(envelope('Import Data'), true, debug), { allowed: true, write: true });
 
   for (const xml of [envelope('Import Data'), envelope('Import'), envelope('Alter'), envelope('Delete'), envelope('Mystery'), '<ENVELOPE/>']) {
@@ -94,9 +101,12 @@ test('the registered tools enforce READONLY_MODE', async () => {
       assert.match(probe.text, /"code":\s*"READONLY"/, xml);
     }
 
-    // A plain Export passes the gate (and then fails only because no Tally is listening).
-    const read = await call('tally-raw-xml-probe', { xml: envelope('Export') });
-    assert.doesNotMatch(read.text, /"code":\s*"(READONLY|PRECONDITION_FAILED)"/);
+    const exportInReadonly = await call('tally-raw-xml-probe', { xml: envelope('Export') });
+    assert.match(exportInReadonly.text, /"code":\s*"READONLY"/);
+
+    const order = await call('set-entry-order', { order: 'credit-first', voucherType: 'Receipt' });
+    assert.equal(order.isError, true);
+    assert.match(order.text, /"code":\s*"READONLY"/);
 
     const repair = await call('repair-master-names', { confirm: true });
     assert.equal(repair.isError, true);
@@ -106,6 +116,9 @@ test('the registered tools enforce READONLY_MODE', async () => {
     process.env.READONLY_MODE = 'false';
     const noOptIn = await call('tally-raw-xml-probe', { xml: envelope('Import Data') });
     assert.match(noOptIn.text, /"code":\s*"PRECONDITION_FAILED"/);
+    // ...and a plain Export passes the gate (then fails only because no Tally is listening).
+    const read = await call('tally-raw-xml-probe', { xml: envelope('Export') });
+    assert.doesNotMatch(read.text, /"code":\s*"(READONLY|PRECONDITION_FAILED)"/);
   } finally {
     for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
     Object.assign(process.env, saved);

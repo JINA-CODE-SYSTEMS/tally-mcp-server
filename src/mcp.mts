@@ -632,7 +632,7 @@ export function isReadOnlyTallyRequest(xml: string): boolean {
 }
 
 // Decides whether the raw XML probe may post an envelope. Order matters: READONLY_MODE is an
-// operator decision and wins over the caller's allowWrite flag.
+// operator decision and wins over everything the caller sends.
 export function rawXmlProbeGate(
   xml: string,
   allowWrite: boolean | undefined,
@@ -641,11 +641,14 @@ export function rawXmlProbeGate(
   if (env.TALLY_DEBUG_XML !== '1') {
     return { allowed: false, code: 'PRECONDITION_FAILED', message: 'Raw XML probe is disabled.', remedy: 'Set TALLY_DEBUG_XML=1 in the server env to enable raw XML probes.' };
   }
+  // READONLY_MODE refuses the probe altogether, Export included: a raw envelope can carry inline
+  // TDL, and what caller-written TDL does when Tally evaluates it cannot be proven read-only from
+  // the verb. The wrapped read tools build their own XML and remain available.
+  if (env.READONLY_MODE === 'true') {
+    return { allowed: false, code: 'READONLY', message: 'The raw XML probe is disabled in READONLY_MODE: a raw envelope (even an Export) can carry TDL whose effects cannot be verified as read-only.', remedy: 'Use the wrapped read tools, or unset READONLY_MODE on the server to use the probe.' };
+  }
   if (isReadOnlyTallyRequest(xml)) return { allowed: true, write: false };
   const verb = parseTallyRequestVerb(xml);
-  if (env.READONLY_MODE === 'true') {
-    return { allowed: false, code: 'READONLY', message: `Refusing TALLYREQUEST "${verb ?? '(none)'}" — the server is in READONLY_MODE and only a plain Export envelope is a read.`, remedy: 'Unset READONLY_MODE on the server to allow writes.' };
-  }
   if (allowWrite !== true) {
     return { allowed: false, code: 'PRECONDITION_FAILED', message: `Refusing TALLYREQUEST "${verb ?? '(none)'}" — this probe is read-only by default and only a single, plain "Export" request is treated as a read.`, remedy: 'If you genuinely intend a write (Import/Alter/Delete), re-call with allowWrite: true.' };
   }
@@ -3510,6 +3513,11 @@ export async function registerMcpServer(): Promise<McpServer> {
     },
     async (args) => {
       const start = Date.now();
+      // Only affects how this server WRITES vouchers, and persists a setting; neither belongs in read-only mode.
+      if (process.env.READONLY_MODE === 'true') {
+        auditLog('set-entry-order', args, 'denied', Date.now() - start);
+        return errorResult('READONLY');
+      }
       try {
         const cfgPath = entryOrderConfigPath();
         const updated = applyEntryOrderChoice(readEntryOrderConfig(cfgPath), args.order, args.voucherType);
@@ -3678,7 +3686,7 @@ export async function registerMcpServer(): Promise<McpServer> {
     'tally-raw-xml-probe',
     {
       title: 'Tally Raw XML Probe (debug only)',
-      description: `Posts a raw XML envelope to the Tally XML server and returns the raw response — bypasses all wrapper logic. Used for protocol reverse-engineering and undocumented verb discovery. NOT for normal use; the wrapped tools (list-master, trial-balance, etc.) construct XML safely. Disabled unless TALLY_DEBUG_XML=1 is set in the server env. Read-only by default: anything other than a single plain Export request (Import Data/Alter/Delete, an unknown or missing verb) is refused unless allowWrite=true is passed explicitly, and is always refused when READONLY_MODE=true.`,
+      description: `Posts a raw XML envelope to the Tally XML server and returns the raw response — bypasses all wrapper logic. Used for protocol reverse-engineering and undocumented verb discovery. NOT for normal use; the wrapped tools (list-master, trial-balance, etc.) construct XML safely. Disabled unless TALLY_DEBUG_XML=1 is set in the server env. Read-only by default: anything other than a single plain Export request (Import Data/Alter/Delete, an unknown or missing verb) is refused unless allowWrite=true is passed explicitly. The whole tool is refused when READONLY_MODE=true.`,
       inputSchema: {
         xml: z.string().describe('raw XML envelope to POST to the Tally XML server. Standard structure: <ENVELOPE><HEADER>...</HEADER><BODY>...</BODY></ENVELOPE>.'),
         label: z.string().optional().describe('optional label included in the audit log so probes can be correlated to experiment notes (e.g. "H1-import-variant").'),
