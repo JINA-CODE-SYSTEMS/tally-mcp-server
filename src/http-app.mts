@@ -38,6 +38,8 @@ export interface HttpAppOptions {
   /** Per-IP limit on the auth endpoints (AUTH_RATE_LIMIT_MAX / AUTH_RATE_LIMIT_WINDOW_MS). */
   authRateLimitMax?: number;
   authRateLimitWindowMs?: number;
+  /** OAUTH_MAX_CLIENTS: cap on registered clients; idle ones are evicted first. Default 500. */
+  maxClients?: number;
 }
 
 export interface HttpApp {
@@ -181,6 +183,17 @@ const cleanupTimer = setInterval(() => {
 }, parseIntEnv(process.env.TOKEN_CLEANUP_INTERVAL_MS, 60000)); // default every minute
 cleanupTimer.unref(); // housekeeping only — the listening socket is what keeps the process alive
 
+// Clients that hold something worth keeping: a live token or a pending authorization code.
+const maxClients = Math.max(1, options.maxClients ?? parseIntEnv(process.env.OAUTH_MAX_CLIENTS, 500));
+const clientsInUse = (): Set<string> => {
+  const now = Date.now();
+  const inUse = new Set<string>();
+  for (const t of accessTokens.values()) if (t.expires_at > now) inUse.add(t.client_id);
+  for (const t of refreshTokens.values()) if (t.expires_at > now) inUse.add(t.client_id);
+  for (const c of authorizationCodes.values()) if (c.expires_at > now) inUse.add(c.client_id);
+  return inUse;
+};
+
 // Every MCP route authenticates through this one function, so the three verbs cannot drift apart.
 const authenticate = (req: express.Request): store.AccessToken | undefined =>
   store.validateBearerToken(req.headers['authorization'], accessTokens);
@@ -304,7 +317,7 @@ const handleOAuthAuthorizationServer = (req: express.Request, res: express.Respo
       response_types_supported: ['code'],
       response_modes_supported: ['query'],
       grant_types_supported: ['authorization_code', 'refresh_token'],
-      token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post'],
+      token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
       code_challenge_methods_supported: ['S256']
     }
   );
@@ -356,24 +369,40 @@ app.post('/register', authRateLimiter, (req, res) => {
     return res.status(400).json(registration);
   }
 
+  // Keep the registry bounded: drop the oldest clients that never signed in before refusing.
+  const before = registeredClients.size;
+  if (!store.makeRoomForClient(registeredClients, maxClients, clientsInUse())) {
+    console.error(`[register] refused: ${registeredClients.size} registered clients are all in use (OAUTH_MAX_CLIENTS=${maxClients})`);
+    return res.status(503).header('Retry-After', '3600').json({
+      error: 'temporarily_unavailable',
+      error_description: 'Too many registered clients'
+    });
+  }
+  if (registeredClients.size < before) {
+    console.log(`[register] evicted ${before - registeredClients.size} idle client(s) to stay within OAUTH_MAX_CLIENTS=${maxClients}`);
+  }
+
   const clientId = generateSecureToken(16);
-  const clientSecret = generateSecureToken(32);
-  const { client_name: clientName, redirect_uris: redirectUris } = registration;
+  const { client_name: clientName, redirect_uris: redirectUris, token_endpoint_auth_method: authMethod } = registration;
+  // A public client is issued no secret; everyone else must present theirs at /token.
+  const clientSecret = authMethod === 'none' ? '' : generateSecureToken(32);
 
   registeredClients.set(clientId, {
     client_id: clientId,
     client_name: clientName,
     client_secret: clientSecret,
-    redirect_uris: redirectUris
+    redirect_uris: redirectUris,
+    token_endpoint_auth_method: authMethod
   });
   saveClients();
 
-  console.log(`[register] New client registered: ${clientId} (${JSON.stringify(clientName)})`);
+  console.log(`[register] New client registered: ${clientId} (${JSON.stringify(clientName)}, ${authMethod})`);
   res.status(200).json({
     client_id: clientId,
     client_name: clientName,
-    client_secret: clientSecret,
-    redirect_uris: redirectUris
+    ...(clientSecret ? { client_secret: clientSecret } : {}),
+    redirect_uris: redirectUris,
+    token_endpoint_auth_method: authMethod
   });
 });
 
@@ -485,27 +514,18 @@ app.post('/token', authRateLimiter, (req, res) => {
   const grantType = req.body['grant_type'];
   const code = req.body['code'];
   const redirectUri = req.body['redirect_uri'];
-  let clientId = req.body['client_id'];
-  let clientSecret_provided: string | undefined = req.body['client_secret'];
   const codeVerifier = req.body['code_verifier'];
 
-  if(!clientId) {
-    //check for client authentication in Authorization header
-    const authHeader = req.headers['authorization'] as string | undefined;
-    if (!authHeader || !authHeader.startsWith('Basic ')) {
-      return res.status(401).json({
-        error: 'invalid_client',
-        error_description: 'No client authentication provided'
-      });
-    }
-    const base64Credentials = authHeader.split(' ')[1];
-    const credentials = Buffer.from(base64Credentials, 'base64').toString('utf-8');
-    const [authClientId, authClientSecret] = credentials.split(':');
-    clientId = authClientId;
-    clientSecret_provided = authClientSecret;
+  // Client authentication: secret in the body, or in a Basic header (see parseClientCredentials).
+  const credentials = store.parseClientCredentials(req.body, req.headers['authorization']);
+  if ('error' in credentials) {
+    return res.status(401).json({
+      error: 'invalid_client',
+      error_description: credentials.error
+    });
   }
+  const clientId = credentials.clientId;
 
-  // Verify client_secret
   const registeredClient = store.findClient(clientId, registeredClients);
   if (!registeredClient) {
     return res.status(401).json({
@@ -513,7 +533,9 @@ app.post('/token', authRateLimiter, (req, res) => {
       error_description: 'Unknown client'
     });
   }
-  if (clientSecret_provided && !safeCompare(clientSecret_provided, registeredClient.client_secret)) {
+  // A confidential client must present its secret; a public one (registered with
+  // token_endpoint_auth_method "none") has none and relies on PKCE.
+  if (!store.authenticateClient(registeredClient, credentials.clientSecret)) {
     return res.status(401).json({
       error: 'invalid_client',
       error_description: 'Invalid client secret'

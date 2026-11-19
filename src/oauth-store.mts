@@ -12,7 +12,13 @@ export interface RegisteredClient {
   client_name: string;
   client_secret: string;
   redirect_uris: string[];
+  // How the client authenticates at /token. 'none' is a public client (PKCE only, no secret).
+  // Absent on records written before this field existed — see authenticateClient.
+  token_endpoint_auth_method?: TokenEndpointAuthMethod;
 }
+
+export type TokenEndpointAuthMethod = 'none' | 'client_secret_basic' | 'client_secret_post';
+const TOKEN_ENDPOINT_AUTH_METHODS: readonly string[] = ['none', 'client_secret_basic', 'client_secret_post'];
 
 export interface AuthorizationCode {
   code: string;
@@ -41,7 +47,9 @@ const isRecord = (v: unknown): v is Record<string, unknown> =>
 export function isRegisteredClient(v: unknown): v is RegisteredClient {
   return isRecord(v)
     && typeof v.client_id === 'string' && v.client_id.length > 0
-    && typeof v.client_secret === 'string' && v.client_secret.length > 0
+    && typeof v.client_secret === 'string'
+    && (v.client_secret.length > 0 || v.token_endpoint_auth_method === 'none')
+    && (v.token_endpoint_auth_method === undefined || TOKEN_ENDPOINT_AUTH_METHODS.includes(v.token_endpoint_auth_method as string))
     && Array.isArray(v.redirect_uris) && v.redirect_uris.every(u => typeof u === 'string');
 }
 
@@ -234,6 +242,7 @@ export function describeRedirectTarget(uri: string): string {
 export interface RegistrationRequest {
   client_name: string;
   redirect_uris: string[];
+  token_endpoint_auth_method: TokenEndpointAuthMethod;
 }
 
 export function parseRegistration(body: unknown, customSchemes: string[] = DEFAULT_REDIRECT_SCHEMES): RegistrationRequest | { error: string; error_description: string } {
@@ -253,7 +262,13 @@ export function parseRegistration(body: unknown, customSchemes: string[] = DEFAU
   // Display only, and self-reported: strip control characters and bound the length.
   const rawName = typeof b.client_name === 'string' ? b.client_name : '';
   const client_name = rawName.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 100) || 'Unnamed Client';
-  return { client_name, redirect_uris: [...new Set(uris as string[])] };
+  // RFC 7591: the default is client_secret_basic. A client that wants to be public says 'none'.
+  const requested = b.token_endpoint_auth_method;
+  if (requested !== undefined && (typeof requested !== 'string' || !TOKEN_ENDPOINT_AUTH_METHODS.includes(requested))) {
+    return { error: 'invalid_client_metadata', error_description: 'token_endpoint_auth_method must be none, client_secret_basic or client_secret_post' };
+  }
+  const token_endpoint_auth_method = (requested as TokenEndpointAuthMethod | undefined) ?? 'client_secret_basic';
+  return { client_name, redirect_uris: [...new Set(uris as string[])], token_endpoint_auth_method };
 }
 
 const PKCE_CHALLENGE = /^[A-Za-z0-9_-]{43,128}$/; // base64url SHA-256 is exactly 43; allow the RFC 7636 range
@@ -314,3 +329,73 @@ export function checkRegistrationAuth(
 
 export const escapeHtml = (s: string): string => s
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+// ---- Client authentication at /token -------------------------------------------------------------
+
+// Reads the client's credentials from the request: client_secret_post (body) and/or
+// client_secret_basic (Authorization header). If both name a client they must agree.
+export function parseClientCredentials(
+  body: unknown,
+  authHeader: unknown,
+): { clientId: string; clientSecret: string | undefined } | { error: string } {
+  const b = isRecord(body) ? body : {};
+  let clientId = typeof b.client_id === 'string' && b.client_id ? b.client_id : undefined;
+  let clientSecret = typeof b.client_secret === 'string' && b.client_secret ? b.client_secret : undefined;
+  if (b.client_secret !== undefined && typeof b.client_secret !== 'string') return { error: 'Malformed client_secret' };
+
+  const basic = typeof authHeader === 'string' ? /^Basic ([A-Za-z0-9+/=_-]+)$/.exec(authHeader) : null;
+  if (basic) {
+    const decoded = Buffer.from(basic[1], 'base64').toString('utf-8');
+    const colon = decoded.indexOf(':');
+    if (colon < 0) return { error: 'Malformed Basic credentials' };
+    // RFC 6749 §2.3.1: both parts are form-urlencoded before being base64-encoded.
+    const decode = (v: string) => { try { return decodeURIComponent(v.replace(/\+/g, ' ')); } catch { return v; } };
+    const headerId = decode(decoded.slice(0, colon));
+    const headerSecret = decode(decoded.slice(colon + 1));
+    if (clientId !== undefined && clientId !== headerId) return { error: 'Conflicting client credentials' };
+    if (clientSecret !== undefined && headerSecret && clientSecret !== headerSecret) return { error: 'Conflicting client credentials' };
+    clientId = headerId;
+    if (headerSecret) clientSecret = headerSecret;
+  }
+  if (!clientId) return { error: 'No client authentication provided' };
+  return { clientId, clientSecret };
+}
+
+// Whether the presented secret authenticates this client.
+//   public client ('none')          no secret exists; PKCE and the refresh token are its credentials.
+//   confidential client             the secret is REQUIRED and must match.
+//   record without the field        registered before the method was recorded, when the secret was
+//                                   checked only if sent. Kept that way so live sessions survive an
+//                                   upgrade; a wrong secret is still rejected. Such a client becomes
+//                                   strict the next time it registers.
+export function authenticateClient(client: RegisteredClient, clientSecret: string | undefined): boolean {
+  const matches = (): boolean => {
+    if (!clientSecret || !client.client_secret) return false;
+    const a = Buffer.from(clientSecret, 'utf-8');
+    const b = Buffer.from(client.client_secret, 'utf-8');
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  };
+  if (client.token_endpoint_auth_method === 'none') return true;
+  if (client.token_endpoint_auth_method === undefined) return clientSecret === undefined ? true : matches();
+  return matches();
+}
+
+// ---- Bounded client registry ---------------------------------------------------------------------
+
+// Registration is open, so the registry must not grow without limit. When it is full, the oldest
+// clients that hold nothing — no live access or refresh token, no pending authorization code — are
+// dropped to make room. Only someone who knows PASSWORD can make a client "in use", so a flood of
+// throwaway registrations evicts itself and never a client that has actually signed in.
+// Returns false when the registry is full of in-use clients and nothing could be freed.
+export function makeRoomForClient(
+  clients: Map<string, RegisteredClient>,
+  maxClients: number,
+  inUse: Set<string>,
+): boolean {
+  if (clients.size < maxClients) return true;
+  for (const id of clients.keys()) { // Map iteration is insertion order: oldest first
+    if (clients.size < maxClients) break;
+    if (!inUse.has(id)) clients.delete(id);
+  }
+  return clients.size < maxClients;
+}

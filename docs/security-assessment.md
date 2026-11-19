@@ -147,7 +147,7 @@ These threats come **through the AI itself**, not from network attackers.
 | Auth on GET/DELETE `/mcp` | ✅ Done — bearer token validated |
 | CORS configured | ✅ Done — `CORS_ORIGINS` env var |
 | DNS rebinding protection | ✅ Done — enabled in transport |
-| Client secret verification | ✅ Done — `/token` verifies `client_secret` |
+| Client secret verification | ✅ Done — `/token` requires and verifies `client_secret` for confidential clients; clients registered with `token_endpoint_auth_method: none` are public and rely on PKCE. Clients registered before the method was recorded are verified only when they send a secret, until they re-register |
 | Separate refresh tokens | ✅ Done |
 | Rate limiting | ✅ Done — 10 req/min on auth endpoints |
 | Bind to 127.0.0.1 | ✅ Done — `BIND_HOST` env var, defaults to `127.0.0.1` |

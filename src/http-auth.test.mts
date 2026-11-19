@@ -554,3 +554,117 @@ test('wrong admin secrets on /register back off globally without blocking open r
     await h.close();
   }
 });
+
+// ---- Client authentication at /token, and a bounded client registry ---------------------------------
+
+// Registers a client and gets as far as an authorization code.
+async function registerAndAuthorize(base: string, registration: Record<string, unknown> = {}) {
+  const client = await (await postJson(`${base}/register`, { client_name: 'c', redirect_uris: [REDIRECT], ...registration })).json() as any;
+  const { verifier, challenge } = pkce();
+  const auth = await (await postJson(`${base}/authorize`, {
+    client_id: client.client_id, redirect_uri: REDIRECT, code_challenge: challenge, code_challenge_method: 'S256', password: PASSWORD,
+  })).json() as any;
+  const exchange = { grant_type: 'authorization_code', code: auth.code, redirect_uri: REDIRECT, client_id: client.client_id, code_verifier: verifier };
+  return { client, exchange };
+}
+
+test('a confidential client must present its secret at /token; a wrong or missing one is refused', async () => {
+  const h = await start();
+  try {
+    const { client, exchange } = await registerAndAuthorize(h.base);
+    assert.equal(client.token_endpoint_auth_method, 'client_secret_basic');
+    assert.ok(client.client_secret);
+
+    assert.equal((await postJson(`${h.base}/token`, exchange)).status, 401, 'no secret');
+    assert.equal((await postJson(`${h.base}/token`, { ...exchange, client_secret: 'wrong' })).status, 401);
+    assert.equal((await postJson(`${h.base}/token`, { ...exchange, client_secret: ['x'] })).status, 401);
+    const badBasic = Buffer.from(`${client.client_id}:wrong`).toString('base64');
+    assert.equal((await postJson(`${h.base}/token`, exchange, { Authorization: `Basic ${badBasic}` })).status, 401);
+    const otherId = Buffer.from(`someone-else:${client.client_secret}`).toString('base64');
+    assert.equal((await postJson(`${h.base}/token`, exchange, { Authorization: `Basic ${otherId}` })).status, 401, 'conflicting ids');
+
+    // The code survived the refused attempts and is redeemable with the secret in a Basic header,
+    // with client_id also present in the body (a combination real clients send).
+    const basic = Buffer.from(`${client.client_id}:${client.client_secret}`).toString('base64');
+    const ok = await postJson(`${h.base}/token`, exchange, { Authorization: `Basic ${basic}` });
+    assert.equal(ok.status, 200);
+    const tokens = await ok.json() as any;
+
+    // Refresh needs the secret too.
+    const refresh = { grant_type: 'refresh_token', client_id: client.client_id, refresh_token: tokens.refresh_token };
+    assert.equal((await postJson(`${h.base}/token`, refresh)).status, 401);
+    assert.equal((await postJson(`${h.base}/token`, { ...refresh, client_secret: client.client_secret })).status, 200);
+  } finally {
+    await h.close();
+  }
+});
+
+test('a client registered as public gets no secret and authenticates with PKCE alone', async () => {
+  const h = await start();
+  try {
+    const { client, exchange } = await registerAndAuthorize(h.base, { token_endpoint_auth_method: 'none' });
+    assert.equal(client.token_endpoint_auth_method, 'none');
+    assert.equal('client_secret' in client, false);
+
+    assert.equal((await postJson(`${h.base}/token`, { ...exchange, code_verifier: 'not-the-verifier' })).status, 400, 'PKCE still enforced');
+    const ok = await postJson(`${h.base}/token`, exchange);
+    assert.equal(ok.status, 200);
+
+    const bad = await postJson(`${h.base}/register`, { redirect_uris: [REDIRECT], token_endpoint_auth_method: 'private_key_jwt' });
+    assert.equal(bad.status, 400);
+    assert.equal((await bad.json() as any).error, 'invalid_client_metadata');
+
+    const meta = await (await fetch(`${h.base}/.well-known/oauth-authorization-server`)).json() as any;
+    assert.deepEqual(meta.token_endpoint_auth_methods_supported, ['client_secret_basic', 'client_secret_post', 'none']);
+  } finally {
+    await h.close();
+  }
+});
+
+test('clients persisted before the auth method was recorded keep working, but never with a wrong secret', () => {
+  const legacy: store.RegisteredClient = { client_id: 'old', client_name: 'n', client_secret: 's3cret', redirect_uris: [REDIRECT] };
+  assert.equal(store.isRegisteredClient(legacy), true);
+  assert.equal(store.authenticateClient(legacy, undefined), true);
+  assert.equal(store.authenticateClient(legacy, 's3cret'), true);
+  assert.equal(store.authenticateClient(legacy, 'wrong'), false);
+
+  const confidential = { ...legacy, token_endpoint_auth_method: 'client_secret_post' as const };
+  assert.equal(store.authenticateClient(confidential, undefined), false);
+  assert.equal(store.authenticateClient(confidential, ''), false);
+  assert.equal(store.authenticateClient(confidential, 's3cret'), true);
+
+  // A record cannot claim to be confidential with an empty secret, or carry an unknown method.
+  assert.equal(store.isRegisteredClient({ ...legacy, client_secret: '' }), false);
+  assert.equal(store.isRegisteredClient({ ...legacy, client_secret: '', token_endpoint_auth_method: 'none' }), true);
+  assert.equal(store.isRegisteredClient({ ...legacy, token_endpoint_auth_method: 'whatever' }), false);
+});
+
+test('the client registry is bounded: idle clients are evicted first, signed-in clients are kept', async () => {
+  const h = await start(undefined, { maxClients: 3 });
+  try {
+    const { client: signedIn, exchange } = await registerAndAuthorize(h.base);
+    assert.equal((await postJson(`${h.base}/token`, { ...exchange, client_secret: signedIn.client_secret })).status, 200);
+
+    // A flood of registrations that never sign in.
+    const flood: string[] = [];
+    for (let i = 0; i < 8; i++) {
+      const res = await postJson(`${h.base}/register`, { client_name: `flood-${i}`, redirect_uris: [REDIRECT] });
+      assert.equal(res.status, 200);
+      flood.push((await res.json() as any).client_id);
+    }
+    const stored = JSON.parse(fs.readFileSync(path.join(h.dir, '.oauth-clients.json'), 'utf-8'));
+    assert.equal(Object.keys(stored).length, 3);
+    assert.ok(stored[signedIn.client_id], 'the client holding tokens survives');
+    assert.deepEqual(Object.keys(stored).filter(id => id !== signedIn.client_id), flood.slice(-2), 'the newest idle clients remain');
+  } finally {
+    await h.close();
+  }
+
+  // Full of in-use clients: refuse rather than evict someone who is signed in.
+  const clients = new Map<string, store.RegisteredClient>(['a', 'b'].map(id =>
+    [id, { client_id: id, client_name: id, client_secret: 's', redirect_uris: [REDIRECT] }]));
+  assert.equal(store.makeRoomForClient(clients, 2, new Set(['a', 'b'])), false);
+  assert.equal(clients.size, 2);
+  assert.equal(store.makeRoomForClient(clients, 2, new Set(['b'])), true);
+  assert.deepEqual([...clients.keys()], ['b']);
+});
