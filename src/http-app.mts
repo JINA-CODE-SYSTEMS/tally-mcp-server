@@ -10,6 +10,7 @@ import path from 'node:path';
 import { registerMcpServer, getHttpStatusReport, isStatusEndpointEnabled } from './mcp.mjs';
 import { parseIntEnv } from './utility.mjs';
 import * as store from './oauth-store.mjs';
+import { FailedAttemptBackoff, parseTrustProxy, type BackoffOptions } from './auth-backoff.mjs';
 
 // The Express application for remote (HTTP) mode: MCP transport + the OAuth endpoints in front of it.
 // Building it is free of process-level side effects (no dotenv, no listen, no exit) so it can be
@@ -30,6 +31,13 @@ export interface HttpAppOptions {
   requireAdminSecretForRegistration?: boolean;
   /** OAUTH_REDIRECT_SCHEMES: extra private-use redirect schemes, comma-separated. */
   redirectSchemes?: string;
+  /** TRUST_PROXY, raw. Unset trusts X-Forwarded-For from loopback proxies only. See auth-backoff.mts. */
+  trustProxy?: string;
+  /** Global failed-password backoff tuning (AUTH_BACKOFF_*). */
+  authBackoff?: BackoffOptions;
+  /** Per-IP limit on the auth endpoints (AUTH_RATE_LIMIT_MAX / AUTH_RATE_LIMIT_WINDOW_MS). */
+  authRateLimitMax?: number;
+  authRateLimitWindowMs?: number;
 }
 
 export interface HttpApp {
@@ -42,7 +50,11 @@ export function createHttpApp(options: HttpAppOptions): HttpApp {
 const mcpDomain = options.mcpDomain;
 const __dirname = options.stateDir;
 const app = express();
-app.set('trust proxy', 1); // Trust first proxy (nginx/caddy)
+// Whose X-Forwarded-For to believe. Default: only a proxy on this machine (tunnel / reverse proxy);
+// a client connecting directly cannot choose the address the rate limiter sees.
+const trustProxy = parseTrustProxy(options.trustProxy);
+app.set('trust proxy', trustProxy);
+console.log(`[security] trust proxy: ${trustProxy === false ? 'off' : trustProxy}`);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -73,14 +85,26 @@ app.use(cors({
 
 // Rate limiting on auth endpoints
 const authRateLimiter = rateLimit({
-  windowMs: parseIntEnv(process.env.AUTH_RATE_LIMIT_WINDOW_MS, 60000),
-  max: parseIntEnv(process.env.AUTH_RATE_LIMIT_MAX, 10),
+  windowMs: options.authRateLimitWindowMs ?? parseIntEnv(process.env.AUTH_RATE_LIMIT_WINDOW_MS, 60000),
+  max: options.authRateLimitMax ?? parseIntEnv(process.env.AUTH_RATE_LIMIT_MAX, 10),
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests, try again later' }
 });
 
 const authPassword = options.password;
+
+// Failed-attempt backoff shared by ALL clients, one per secret. The per-IP limiter above slows a
+// single address; these bound guessing that is spread across many (or spoofed) addresses.
+const passwordBackoff = new FailedAttemptBackoff(options.authBackoff);
+const adminSecretBackoff = new FailedAttemptBackoff(options.authBackoff);
+const tooManyAttempts = (res: express.Response, retryAfterMs: number) => {
+  const seconds = Math.max(1, Math.ceil(retryAfterMs / 1000));
+  return res.status(429).header('Retry-After', String(seconds)).json({
+    error: 'Too many failed attempts, try again later',
+    retry_after: seconds,
+  });
+};
 
 // Optional ADMIN_SECRET — if set, can be used to validate manual client registration
 const adminSecret = options.adminSecret || '';
@@ -313,7 +337,16 @@ app.post('/register', authRateLimiter, (req, res) => {
   // PASSWORD on /authorize, plus the redirect-URI policy below, which decides where an authorization
   // code can ever be sent. Set REQUIRE_ADMIN_SECRET_FOR_REGISTRATION=true to accept only requests
   // carrying `Authorization: Bearer <ADMIN_SECRET>` (clients must then be registered by hand).
+  const presentsSecret = typeof req.headers['authorization'] === 'string' && adminSecret !== '';
+  if (presentsSecret) {
+    const wait = adminSecretBackoff.retryAfterMs();
+    if (wait > 0) return tooManyAttempts(res, wait);
+  }
   const gate = store.checkRegistrationAuth(req.headers['authorization'], adminSecret, registrationRequiresSecret);
+  if (presentsSecret) {
+    if (gate.ok) adminSecretBackoff.recordSuccess();
+    else adminSecretBackoff.recordFailure();
+  }
   if (!gate.ok) {
     return res.status(gate.status).json({ error: gate.error });
   }
@@ -368,8 +401,18 @@ app.post('/authorize', authRateLimiter, (req, res) => {
     return res.status(400).json(params);
   }
 
+  // Global backoff: while a lockout window is open the password is not evaluated at all, whatever
+  // address the request claims to come from.
+  const wait = passwordBackoff.retryAfterMs();
+  if (wait > 0) {
+    console.log(`[authorize] refused: failed-attempt backoff active (${Math.ceil(wait / 1000)}s)`);
+    return tooManyAttempts(res, wait);
+  }
+
   // Validate client credentials
   let isValidated = safeCompare(password, authPassword);
+  if (isValidated) passwordBackoff.recordSuccess();
+  else passwordBackoff.recordFailure();
   console.log(`[authorize] client_id=${params.client.client_id}, password_match=${isValidated}`);
 
   if (isValidated) {

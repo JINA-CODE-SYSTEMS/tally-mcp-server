@@ -55,6 +55,12 @@ const { app } = createHttpApp({
   corsOrigins: process.env.CORS_ORIGINS,
   requireAdminSecretForRegistration: /^(1|true)$/i.test((process.env.REQUIRE_ADMIN_SECRET_FOR_REGISTRATION || '').trim()),
   redirectSchemes: process.env.OAUTH_REDIRECT_SCHEMES,
+  trustProxy: process.env.TRUST_PROXY,
+  authBackoff: {
+    freeAttempts: parseIntEnv(process.env.AUTH_BACKOFF_FREE_ATTEMPTS, 5),
+    baseMs: parseIntEnv(process.env.AUTH_BACKOFF_BASE_MS, 1000),
+    maxMs: parseIntEnv(process.env.AUTH_BACKOFF_MAX_MS, 60000),
+  },
 });
 
 // Bind to 127.0.0.1 — use reverse proxy for external access

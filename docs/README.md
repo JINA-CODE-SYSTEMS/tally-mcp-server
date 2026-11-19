@@ -155,7 +155,11 @@ Copy `.env.example` to `.env` and configure:
 | `OAUTH_REDIRECT_SCHEMES` | | Extra app redirect schemes to accept at registration, comma-separated (built in: `vscode`, `vscode-insiders`, `cursor`, `claude`). `https://` and `http://localhost` / `127.0.0.1` are always accepted; script and file schemes never are |
 | **Auth & Rate Limiting** | | |
 | `AUTH_RATE_LIMIT_WINDOW_MS` | `60000` | Rate limit window in ms (1 minute) |
-| `AUTH_RATE_LIMIT_MAX` | `10` | Max auth attempts per window |
+| `AUTH_RATE_LIMIT_MAX` | `10` | Max auth attempts per window, per client IP |
+| `TRUST_PROXY` | *(loopback)* | Whose `X-Forwarded-For` to believe when working out the client IP. Default trusts only a proxy on the same machine (cloudflared, nginx, caddy). `false` for direct/LAN serving; a hop count, or a comma-separated list of IPs/CIDRs, for a reverse proxy on another host |
+| `AUTH_BACKOFF_FREE_ATTEMPTS` | `5` | Wrong passwords (from anyone, any IP) allowed before the global backoff starts |
+| `AUTH_BACKOFF_BASE_MS` | `1000` | First lockout after that; doubles with each further failure |
+| `AUTH_BACKOFF_MAX_MS` | `60000` | Longest lockout. While locked, sign-in attempts get `429` and the password is not checked |
 | `AUTH_CODE_EXPIRY_MS` | `600000` | Authorization code TTL in ms (10 minutes) |
 | `ACCESS_TOKEN_EXPIRY_SEC` | `3600` | Access token TTL in seconds (1 hour) |
 | `TOKEN_CLEANUP_INTERVAL_MS` | `60000` | Expired token cleanup interval in ms |

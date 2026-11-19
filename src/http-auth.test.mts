@@ -7,6 +7,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { createHttpApp, type HttpAppOptions } from './http-app.mjs';
 import * as store from './oauth-store.mjs';
+import { FailedAttemptBackoff, parseTrustProxy } from './auth-backoff.mjs';
 
 // Bearer tokens, refresh tokens, client ids and authorization codes are attacker-chosen strings.
 // None of them may ever resolve to something that was not stored — in particular not to a member
@@ -16,7 +17,7 @@ const INHERITED_NAMES = ['__proto__', 'constructor', 'toString', 'valueOf', 'has
 const PASSWORD = 'correct horse battery staple';
 const REDIRECT = 'http://127.0.0.1:53999/callback';
 
-interface Harness { base: string; dir: string; close: () => Promise<void>; }
+interface Harness { base: string; dir: string; app: import('express').Express; close: () => Promise<void>; }
 
 // Starts the real Express app on an ephemeral port with its state in a throwaway directory.
 // `seed` runs before the app loads its state files, so a test can plant a pre-existing store.
@@ -33,7 +34,7 @@ async function start(seed?: (dir: string) => void, options: Partial<HttpAppOptio
   const { app, close } = createHttpApp({ password: PASSWORD, mcpDomain: base, stateDir: dir, ...options });
   handler = app;
   return {
-    base, dir,
+    base, dir, app,
     close: async () => {
       close();
       server.closeAllConnections();
@@ -435,4 +436,121 @@ test('authorize.html carries the consent placeholders the server fills in', () =
   assert.match(html, /%%REDIRECT_TARGET%%/);
   assert.equal(store.describeRedirectTarget('https://claude.ai/api/mcp/auth_callback'), 'claude.ai');
   assert.equal(store.describeRedirectTarget('cursor://anysphere.cursor-retrieval/oauth/callback'), 'cursor:// (application link)');
+});
+
+// ---- Rate limiting that cannot be sidestepped by choosing an address ---------------------------------
+
+test('TRUST_PROXY parsing: loopback-only by default, never blanket trust', () => {
+  assert.equal(parseTrustProxy(undefined), 'loopback');
+  assert.equal(parseTrustProxy(''), 'loopback');
+  for (const off of ['false', 'FALSE', '0', 'off', 'none']) assert.equal(parseTrustProxy(off), false, off);
+  assert.equal(parseTrustProxy('2'), 2);
+  assert.equal(parseTrustProxy('true'), 1);
+  assert.equal(parseTrustProxy('10.0.0.5, 192.168.0.0/24'), '10.0.0.5,192.168.0.0/24');
+  assert.equal(parseTrustProxy('loopback, uniquelocal'), 'loopback,uniquelocal');
+  assert.equal(parseTrustProxy('not a proxy; rm -rf'), 'loopback');
+});
+
+test('by default X-Forwarded-For is believed only from a proxy on this machine', async () => {
+  const h = await start();
+  try {
+    // Express compiles the setting into this predicate over the connecting peer's address.
+    const trusts = (h.app.get('trust proxy fn') as (addr: string, hop: number) => boolean);
+    assert.equal(trusts('127.0.0.1', 0), true);
+    assert.equal(trusts('::1', 0), true);
+    for (const direct of ['192.168.1.50', '10.0.0.7', '172.16.4.4', '203.0.113.9', 'fe80::1']) {
+      assert.equal(trusts(direct, 0), false, `${direct} must not be able to set its own client address`);
+    }
+  } finally {
+    await h.close();
+  }
+});
+
+test('a direct client cannot evade the per-IP auth limiter by varying X-Forwarded-For', async () => {
+  // TRUST_PROXY=false models direct serving (the test client is itself on loopback).
+  const h = await start(undefined, { trustProxy: 'false', authRateLimitMax: 3 });
+  try {
+    const statuses: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      const res = await postJson(`${h.base}/register`, { redirect_uris: [REDIRECT] }, { 'X-Forwarded-For': `198.51.100.${i + 1}` });
+      statuses.push(res.status);
+    }
+    assert.deepEqual(statuses, [200, 200, 200, 429, 429, 429]);
+  } finally {
+    await h.close();
+  }
+});
+
+test('FailedAttemptBackoff: free attempts, doubling lockout up to a cap, reset on success or quiet', () => {
+  let now = 1_000_000;
+  const b = new FailedAttemptBackoff({ freeAttempts: 3, baseMs: 1000, maxMs: 8000, resetAfterMs: 60_000, now: () => now });
+  for (let i = 0; i < 3; i++) { assert.equal(b.retryAfterMs(), 0); b.recordFailure(); }
+  assert.equal(b.retryAfterMs(), 0, 'the free attempts do not lock');
+  const delays: number[] = [];
+  for (let i = 0; i < 6; i++) {
+    b.recordFailure();
+    delays.push(b.retryAfterMs());
+    now += b.retryAfterMs(); // wait the window out, then fail again
+    assert.equal(b.retryAfterMs(), 0);
+  }
+  assert.deepEqual(delays, [1000, 2000, 4000, 8000, 8000, 8000]);
+
+  b.recordSuccess();
+  b.recordFailure();
+  assert.equal(b.retryAfterMs(), 0, 'success clears the count');
+
+  for (let i = 0; i < 5; i++) b.recordFailure();
+  assert.ok(b.retryAfterMs() > 0);
+  now += 60_000;
+  assert.equal(b.retryAfterMs(), 0);
+  b.recordFailure();
+  assert.equal(b.retryAfterMs(), 0, 'a quiet period clears the count');
+});
+
+test('repeated wrong passwords lock /authorize for everyone, whatever address they claim', async () => {
+  // Loopback proxy trusted (the default): every request below appears to come from a new address,
+  // so the per-IP limiter never trips. Only the global backoff stands in the way.
+  const h = await start(undefined, { authBackoff: { freeAttempts: 3, baseMs: 400, maxMs: 400 } });
+  try {
+    const client = await (await postJson(`${h.base}/register`, { redirect_uris: [REDIRECT] })).json() as any;
+    const { challenge } = pkce();
+    let n = 0;
+    const attempt = (password: string) => postJson(`${h.base}/authorize`,
+      { client_id: client.client_id, redirect_uri: REDIRECT, code_challenge: challenge, code_challenge_method: 'S256', password },
+      { 'X-Forwarded-For': `198.51.100.${++n}` });
+
+    for (let i = 0; i < 4; i++) assert.equal((await attempt(`guess-${i}`)).status, 401);
+
+    // Locked: even the correct password is not evaluated, and no code is issued.
+    const locked = await attempt(PASSWORD);
+    assert.equal(locked.status, 429);
+    assert.ok(Number(locked.headers.get('retry-after')) >= 1);
+    assert.equal((await locked.json() as any).code, undefined);
+    assert.equal((await attempt('another-guess')).status, 429);
+
+    await new Promise(resolve => setTimeout(resolve, 450));
+    const ok = await attempt(PASSWORD);
+    assert.equal(ok.status, 200);
+    assert.ok((await ok.json() as any).code);
+
+    // Success cleared the count: a single typo afterwards does not lock.
+    assert.equal((await attempt('typo')).status, 401);
+    assert.equal((await attempt(PASSWORD)).status, 200);
+  } finally {
+    await h.close();
+  }
+});
+
+test('wrong admin secrets on /register back off globally without blocking open registration', async () => {
+  const h = await start(undefined, { adminSecret: 'admin-secret', authBackoff: { freeAttempts: 2, baseMs: 60_000, maxMs: 60_000 } });
+  try {
+    const body = { redirect_uris: [REDIRECT] };
+    for (let i = 0; i < 3; i++) {
+      assert.equal((await postJson(`${h.base}/register`, body, { Authorization: `Bearer wrong-${i}` })).status, 403);
+    }
+    assert.equal((await postJson(`${h.base}/register`, body, { Authorization: 'Bearer admin-secret' })).status, 429);
+    assert.equal((await postJson(`${h.base}/register`, body)).status, 200, 'header-less dynamic registration is unaffected');
+  } finally {
+    await h.close();
+  }
 });
