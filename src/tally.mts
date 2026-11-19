@@ -288,6 +288,32 @@ function formatTDLParameter(v: any): string | undefined {
     return undefined;
 }
 
+// A pull template places some string parameters inside a TDL string literal, e.g.
+//   $LedgerName = "{ledgerName}"
+// XML-escaping protects the XML layer only: Tally's XML parser turns &quot; back into a double
+// quote before the formula is read, so a quote in the value would end the literal and the rest of
+// the value would be read as formula. There is no escape for a quote inside a TDL literal that this
+// code can rely on, so such a value is refused rather than sent. Control characters are refused
+// for the same reason (a line break also ends the formula).
+//
+// Returns the name of the first offending parameter, or undefined when the request is safe.
+export function findUnsafeTdlLiteralParam(tmplXML: string, params: Map<string, any>): string | undefined {
+    for (const [name, value] of params) {
+        if (typeof value !== 'string' || !/["\u0000-\u001f\u007f]/.test(value)) continue;
+        const placeholder = `{${name}}`;
+        for (const line of tmplXML.split('\n')) {
+            let from = 0;
+            for (let at = line.indexOf(placeholder, from); at !== -1; at = line.indexOf(placeholder, from)) {
+                // inside a literal when an odd number of quotes precede it on the line (attribute quotes pair up)
+                const quotesBefore = line.slice(0, at).split('"').length - 1;
+                if (quotesBefore % 2 === 1) return name;
+                from = at + placeholder.length;
+            }
+        }
+    }
+    return undefined;
+}
+
 // Builds the outgoing XML for a pull report from its template and the caller's parameters.
 //
 // A pull template mixes two notations: nunjucks (`{{ var }}`, `<nunjuck>…</nunjuck>`) and plain
@@ -406,6 +432,11 @@ function extractReport(reportConfig: m.ModelPullReportInfo, reportInputParams: M
             }
 
             let tmplXML = fs.readFileSync(path.join(__dirname, `../pull/${reportConfig.name}.xml`), 'utf-8'); //load XML template
+            const unsafeParam = findUnsafeTdlLiteralParam(tmplXML, reportInputParams);
+            if (unsafeParam) {
+                retval.error = `Parameter ${unsafeParam} contains a double quote or a control character, which cannot be used to look a record up by name. Use list-master / search to find the record, or query it another way.`;
+                return;
+            }
             let respContent = await sendTally(renderPullRequest(tmplXML, reportInputParams));
 
             if (!respContent) {

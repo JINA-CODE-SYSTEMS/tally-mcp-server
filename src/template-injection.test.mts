@@ -3,7 +3,7 @@ import test from 'node:test';
 import fs from 'node:fs';
 import path from 'node:path';
 import nunjucks from 'nunjucks';
-import { renderPullRequest, renderTallyTemplate } from './tally.mjs';
+import { findUnsafeTdlLiteralParam, renderPullRequest, renderTallyTemplate } from './tally.mjs';
 import { utility } from './utility.mjs';
 
 // Caller-supplied strings (ledger / item names, voucher type and number, reference, company) must
@@ -12,10 +12,8 @@ import { utility } from './utility.mjs';
 
 const pullDir = path.join(import.meta.dirname, '..', 'pull');
 const pushDir = path.join(import.meta.dirname, '..', 'push');
-// Only reports that ship a template (config.json also declares `item-ledger`, which has none).
 const pullConfig: { name: string; input: { name: string; datatype: string }[] }[] =
-  JSON.parse(fs.readFileSync(path.join(pullDir, 'config.json'), 'utf-8')).reports
-    .filter((r: { name: string }) => fs.existsSync(path.join(pullDir, `${r.name}.xml`)));
+  JSON.parse(fs.readFileSync(path.join(pullDir, 'config.json'), 'utf-8')).reports;
 const pushConfig: { name: string; input: { name: string; datatype: string }[] }[] =
   JSON.parse(fs.readFileSync(path.join(pushDir, 'config.json'), 'utf-8')).templates;
 const pullTemplate = (name: string) => fs.readFileSync(path.join(pullDir, `${name}.xml`), 'utf-8');
@@ -176,6 +174,62 @@ test('push templates: expressions in caller values are data, not template source
       assert.equal((globalThis as any).__tdlProbe, undefined, `${template.name}: expression was executed`);
       assert.ok(!/>49</.test(out), `${template.name}: expression was evaluated`);
       assert.ok(appearsAsLiteral(out, hostile), `${template.name}: value must appear as escaped literal text`);
+    }
+  }
+});
+
+test('every declared pull report and push template has its XML file', () => {
+  for (const report of pullConfig) assert.ok(fs.existsSync(path.join(pullDir, `${report.name}.xml`)), `pull/${report.name}.xml`);
+  for (const template of pushConfig) assert.ok(fs.existsSync(path.join(pushDir, `${template.name}.xml`)), `push/${template.name}.xml`);
+});
+
+// ---- TDL string literals -----------------------------------------------------------------------------
+// XML-escaping is undone by Tally's XML parser before the formula is read, so a double quote in a
+// value placed inside a TDL "…" literal would close the literal. Such values are refused.
+
+test('a double quote or control character is refused where the value sits inside a TDL literal', () => {
+  const literalParams: [string, string][] = [
+    ['ledger-balance', 'ledgerName'], ['ledger-account', 'ledgerName'],
+    ['stock-item-balance', 'itemName'], ['stock-item-account', 'itemName'],
+    ['voucher-lookup', 'voucherType'], ['voucher-lookup', 'voucherNumber'],
+    ['find-voucher-by-reference', 'reference'],
+  ];
+  for (const [reportName, param] of literalParams) {
+    const report = pullConfig.find(r => r.name === reportName)!;
+    for (const bad of ['Cash" OR $$IsLedger:"x', '"', 'line\nbreak', 'tab\there', 'nul\u0000']) {
+      const params = paramsFor(report, 'plain');
+      params.set(param, bad);
+      assert.equal(findUnsafeTdlLiteralParam(pullTemplate(reportName), params), param, `${reportName}.${param} ${JSON.stringify(bad)}`);
+    }
+    for (const fine of ["O'Brien & Sons", 'A/c (HDFC) [OD] 100%', 'Café — नमस्ते', 'Braces {x} $1 <tag>']) {
+      assert.equal(findUnsafeTdlLiteralParam(pullTemplate(reportName), paramsFor(report, fine)), undefined, `${reportName} ${fine}`);
+    }
+  }
+});
+
+test('quotes are still allowed where the value is XML text, not a TDL literal', () => {
+  // targetCompany is rendered into <SVCURRENTCOMPANY>…</SVCURRENTCOMPANY>, an XML text node.
+  for (const report of pullConfig) {
+    const params = paramsFor(report, 'plain');
+    params.set('targetCompany', 'A "Quoted" Company');
+    assert.equal(findUnsafeTdlLiteralParam(pullTemplate(report.name), params), undefined, report.name);
+  }
+  assert.equal(findUnsafeTdlLiteralParam('<A B="c">{name}</A>', new Map([['name', 'say "hi"']])), undefined);
+  assert.equal(findUnsafeTdlLiteralParam('<A B="c">$X = "{name}"</A>', new Map([['name', 'say "hi"']])), 'name');
+});
+
+test('every string placeholder inside a TDL formula is quoted, or restricted by a validation regex', () => {
+  const config: { name: string; input: { name: string; datatype: string; validation_regex?: string }[] }[] =
+    JSON.parse(fs.readFileSync(path.join(pullDir, 'config.json'), 'utf-8')).reports;
+  for (const report of config) {
+    const lines = pullTemplate(report.name).split('\n').filter(l => /<(SYSTEM|SET|FILTER|TYPE|CHILDOF)\b/.test(l));
+    for (const input of report.input.filter(i => i.datatype === 'string' && !i.validation_regex)) {
+      for (const line of lines) {
+        for (const m of line.matchAll(new RegExp(`\\{${input.name}\\}`, 'g'))) {
+          const quotesBefore = line.slice(0, m.index).split('"').length - 1;
+          assert.equal(quotesBefore % 2, 1, `${report.name}: {${input.name}} must sit inside a quoted literal: ${line.trim()}`);
+        }
+      }
     }
   }
 });
