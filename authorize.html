@@ -62,6 +62,24 @@
             background-color: #6c757d;
             cursor: not-allowed;
         }
+        .consent {
+            margin-bottom: 20px;
+            padding: 12px 14px;
+            background-color: #f1f6fd;
+            border: 1px solid #c9dcf5;
+            border-radius: 4px;
+            color: #333;
+            font-size: 14px;
+            overflow-wrap: anywhere;
+        }
+        .consent p {
+            margin: 0 0 8px 0;
+        }
+        .consent .hint {
+            margin-bottom: 0;
+            color: #666;
+            font-size: 12px;
+        }
         .error {
             color: #dc3545;
             margin-top: 10px;
@@ -78,6 +96,11 @@
     <div class="container">
         <h1>Authenticate</h1>
         <form id="authForm">
+            <div class="consent">
+                <p><strong id="clientName">%%CLIENT_NAME%%</strong> is asking for access to your Tally data.</p>
+                <p>After you sign in, you will be sent to:<br><strong id="redirectTarget">%%REDIRECT_TARGET%%</strong></p>
+                <p class="hint">The application name is supplied by the application itself. Only continue if you started this sign-in and recognise the destination above.</p>
+            </div>
             <div class="form-group">
                 <label for="clientId">Client ID:</label>
                 <input type="text" id="clientId" name="clientId" readonly>

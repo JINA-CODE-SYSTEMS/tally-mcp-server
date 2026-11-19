@@ -141,7 +141,7 @@ These threats come **through the AI itself**, not from network attackers.
 | Encrypted tunnel to Tally (VPN/SSH) | ⬜ Infra |
 | SQL restricted to read-only | ✅ Done — `validateSQL()` + `enable_external_access=false` |
 | Real password set (not default) | ✅ Done — startup fails if `PASSWORD` missing |
-| `/register` requires auth | ✅ Done — `ADMIN_SECRET` bearer token required |
+| `/register` requires auth | ⚠️ Opt-in — open by default for dynamic client registration (redirect URIs are validated; `PASSWORD` on `/authorize` is the gate). Set `REQUIRE_ADMIN_SECRET_FOR_REGISTRATION=true` to require the `ADMIN_SECRET` bearer token |
 | Write tools have approval workflow | ✅ Done — `destructiveHint` + `READONLY_MODE` env var |
 | Audit logging | ✅ Done — all write tools + `query-database` |
 | Auth on GET/DELETE `/mcp` | ✅ Done — bearer token validated |

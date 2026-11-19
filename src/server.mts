@@ -53,6 +53,8 @@ const { app } = createHttpApp({
   mcpDomain,
   stateDir: path.join(__dirname, '..'),
   corsOrigins: process.env.CORS_ORIGINS,
+  requireAdminSecretForRegistration: /^(1|true)$/i.test((process.env.REQUIRE_ADMIN_SECRET_FOR_REGISTRATION || '').trim()),
+  redirectSchemes: process.env.OAUTH_REDIRECT_SCHEMES,
 });
 
 // Bind to 127.0.0.1 — use reverse proxy for external access

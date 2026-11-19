@@ -5,6 +5,7 @@ import express from 'express';
 import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import { registerMcpServer, getHttpStatusReport, isStatusEndpointEnabled } from './mcp.mjs';
 import { parseIntEnv } from './utility.mjs';
@@ -25,6 +26,10 @@ export interface HttpAppOptions {
   stateDir: string;
   /** Comma-separated CORS allow-list (CORS_ORIGINS); defaults to mcpDomain. */
   corsOrigins?: string;
+  /** REQUIRE_ADMIN_SECRET_FOR_REGISTRATION: /register only with the admin secret. Default false. */
+  requireAdminSecretForRegistration?: boolean;
+  /** OAUTH_REDIRECT_SCHEMES: extra private-use redirect schemes, comma-separated. */
+  redirectSchemes?: string;
 }
 
 export interface HttpApp {
@@ -88,6 +93,14 @@ const safeCompare = (a: unknown, b: unknown): boolean => {
   if (bufA.length !== bufB.length) return false;
   return crypto.timingSafeEqual(bufA, bufB);
 };
+
+// Registration policy (see /register).
+const registrationRequiresSecret = options.requireAdminSecretForRegistration === true;
+const redirectSchemes = store.parseRedirectSchemes(options.redirectSchemes);
+if (adminSecret && !registrationRequiresSecret) {
+  console.log('[oauth] ADMIN_SECRET is set but client registration is open (dynamic registration). ' +
+    'Set REQUIRE_ADMIN_SECRET_FOR_REGISTRATION=true to require it.');
+}
 
 const clientsFilePath = path.join(__dirname, '.oauth-clients.json');
 // Bearer + refresh secrets are persisted so a server restart / redeploy doesn't drop live sessions
@@ -295,24 +308,24 @@ app.get('/status', async (_req: express.Request, res: express.Response) => {
 
 
 app.post('/register', authRateLimiter, (req, res) => {
-  // Admin secret is optional — VS Code dynamic client registration (RFC 7591) sends no auth.
-  // Rate limiting protects against abuse. Real security gate is PASSWORD on /authorize.
-  const authHeader = req.headers['authorization'] as string | undefined;
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    const providedSecret = authHeader.split(' ')[1];
-    if (!safeCompare(providedSecret, adminSecret)) {
-      return res.status(403).json({ error: 'Invalid admin secret' });
-    }
+  // Dynamic client registration (RFC 7591). Claude and VS Code register themselves without any
+  // credential, so registration is open by default and is NOT what protects the server: the gate is
+  // PASSWORD on /authorize, plus the redirect-URI policy below, which decides where an authorization
+  // code can ever be sent. Set REQUIRE_ADMIN_SECRET_FOR_REGISTRATION=true to accept only requests
+  // carrying `Authorization: Bearer <ADMIN_SECRET>` (clients must then be registered by hand).
+  const gate = store.checkRegistrationAuth(req.headers['authorization'], adminSecret, registrationRequiresSecret);
+  if (!gate.ok) {
+    return res.status(gate.status).json({ error: gate.error });
+  }
+
+  const registration = store.parseRegistration(req.body, redirectSchemes);
+  if ('error' in registration) {
+    return res.status(400).json(registration);
   }
 
   const clientId = generateSecureToken(16);
   const clientSecret = generateSecureToken(32);
-  const clientName = req.body['client_name'] || 'Unnamed Client';
-  const redirectUris = req.body['redirect_uris'] || [];
-
-  if (!Array.isArray(redirectUris) || redirectUris.length === 0) {
-    return res.status(400).json({ error: 'redirect_uris must be a non-empty array' });
-  }
+  const { client_name: clientName, redirect_uris: redirectUris } = registration;
 
   registeredClients.set(clientId, {
     client_id: clientId,
@@ -322,7 +335,7 @@ app.post('/register', authRateLimiter, (req, res) => {
   });
   saveClients();
 
-  console.log(`[register] New client registered: ${clientId} (${clientName})`);
+  console.log(`[register] New client registered: ${clientId} (${JSON.stringify(clientName)})`);
   res.status(200).json({
     client_id: clientId,
     client_name: clientName,
@@ -332,35 +345,47 @@ app.post('/register', authRateLimiter, (req, res) => {
 });
 
 app.post('/authorize', authRateLimiter, (req, res) => {
-  const clientId = req.body['client_id'];
-  const redirectUri = req.body['redirect_uri'];
-  const codeChallenge = req.body['code_challenge'];
-  const codeChallengeMethod = req.body['code_challenge_method'];
-  const password = req.body['password'];
+  const body = (typeof req.body === 'object' && req.body !== null) ? req.body : {};
+  const password = body['password'];
 
-  if (!clientId || !password) {
-    console.log(`[authorize] Missing client_id or password. client_id=${clientId ? 'present' : 'missing'}, password=${password ? 'present' : 'missing'}`);
+  if (typeof body['client_id'] !== 'string' || !body['client_id'] || typeof password !== 'string' || !password) {
+    console.log(`[authorize] Missing client_id or password. client_id=${body['client_id'] ? 'present' : 'missing'}, password=${password ? 'present' : 'missing'}`);
     return res.status(400).json({ error: 'Missing client_id or password' });
+  }
+
+  // The page that posts here was only served after these same checks passed, but this endpoint is
+  // reachable directly: a code is only ever minted for a registered client, bound to one of ITS
+  // redirect URIs, with an S256 challenge. Checked before the password so a malformed request
+  // learns nothing about it.
+  const params = store.validateAuthorizeParams({
+    client_id: body['client_id'],
+    redirect_uri: body['redirect_uri'],
+    code_challenge: body['code_challenge'],
+    code_challenge_method: body['code_challenge_method'],
+  }, registeredClients);
+  if ('error' in params) {
+    console.log(`[authorize] rejected: ${params.error_description}`);
+    return res.status(400).json(params);
   }
 
   // Validate client credentials
   let isValidated = safeCompare(password, authPassword);
-  console.log(`[authorize] client_id=${clientId}, password_match=${isValidated}`);
+  console.log(`[authorize] client_id=${params.client.client_id}, password_match=${isValidated}`);
 
   if (isValidated) {
     // Generate authorization code
     const code = generateSecureToken(32);
-    
+
     authorizationCodes.set(code, {
       code,
-      client_id: clientId,
-      redirect_uri: redirectUri,
-      code_challenge: codeChallenge,
-      code_challenge_method: codeChallengeMethod,
+      client_id: params.client.client_id,
+      redirect_uri: params.redirect_uri,
+      code_challenge: params.code_challenge,
+      code_challenge_method: 'S256',
       expires_at: Date.now() + parseIntEnv(process.env.AUTH_CODE_EXPIRY_MS, 600000) // default 10 minutes
     });
     res.status(200).json({ status: isValidated, code });
-    
+
   }
   else {
     res.status(401).json({ status: isValidated, code: undefined });
@@ -369,15 +394,11 @@ app.post('/authorize', authRateLimiter, (req, res) => {
 });
 
 app.get('/authorize', async (req, res) => {
-  const clientId = req.query.client_id as string;
-  const redirectUri = req.query.redirect_uri as string;
-  const codeChallenge = req.query.code_challenge as string;
-  const codeChallengeMethod = req.query.code_challenge_method as string;
-  const responseType = req.query.response_type as string;
-  const state = req.query.state as string;
+  const responseType = req.query.response_type;
+  const state = req.query.state;
 
   // Validate required parameters
-  if (!clientId || !redirectUri || !codeChallenge || !responseType || !state) {
+  if (!req.query.client_id || !req.query.redirect_uri || !req.query.code_challenge || !responseType || !state) {
     return res.status(400).json({
       error: 'invalid_request',
       error_description: 'Missing required parameters'
@@ -391,32 +412,29 @@ app.get('/authorize', async (req, res) => {
     });
   }
 
-  if (codeChallengeMethod !== 'S256') {
-    return res.status(400).json({
-      error: 'invalid_request',
-      error_description: 'Only S256 code challenge method is supported'
-    });
+  const params = store.validateAuthorizeParams({
+    client_id: req.query.client_id,
+    redirect_uri: req.query.redirect_uri,
+    code_challenge: req.query.code_challenge,
+    code_challenge_method: req.query.code_challenge_method,
+  }, registeredClients);
+  console.log(`[authorize GET] client_id=${typeof req.query.client_id === 'string' ? req.query.client_id : '(invalid)'}, ok=${!('error' in params)}`);
+  if ('error' in params) {
+    return res.status(400).json(params);
   }
 
-  // Validate client
-  const client = store.findClient(clientId, registeredClients);
-  console.log(`[authorize GET] client_id=${clientId}, found=${!!client}`);
-  if (!client) {
-    return res.status(400).json({
-      error: 'invalid_client',
-      error_description: 'Unknown client_id'
-    });
+  // Tell the person what they are approving: who is asking (self-reported at registration) and,
+  // more importantly, where the sign-in will be sent. Both are HTML-escaped into text positions.
+  let page: string;
+  try {
+    page = fs.readFileSync(path.join(__dirname, 'authorize.html'), 'utf-8');
+  } catch {
+    return res.status(500).json({ error: 'server_error', error_description: 'Authorization page is unavailable' });
   }
-
-  // Validate redirect URI
-  if (!client.redirect_uris.includes(redirectUri)) {
-    return res.status(400).json({
-      error: 'invalid_request',
-      error_description: 'Invalid redirect_uri'
-    });
-  }
-
-  res.status(200).header('Content-Type', 'text/html').sendFile(path.join(__dirname, 'authorize.html'));
+  page = page
+    .replace(/%%CLIENT_NAME%%/g, () => store.escapeHtml(params.client.client_name))
+    .replace(/%%REDIRECT_TARGET%%/g, () => store.escapeHtml(store.describeRedirectTarget(params.redirect_uri)));
+  res.status(200).header('Content-Type', 'text/html; charset=utf-8').header('Cache-Control', 'no-store').send(page);
 });
 
 app.post('/token', authRateLimiter, (req, res) => {

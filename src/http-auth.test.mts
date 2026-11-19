@@ -5,7 +5,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { createHttpApp } from './http-app.mjs';
+import { createHttpApp, type HttpAppOptions } from './http-app.mjs';
 import * as store from './oauth-store.mjs';
 
 // Bearer tokens, refresh tokens, client ids and authorization codes are attacker-chosen strings.
@@ -20,7 +20,7 @@ interface Harness { base: string; dir: string; close: () => Promise<void>; }
 
 // Starts the real Express app on an ephemeral port with its state in a throwaway directory.
 // `seed` runs before the app loads its state files, so a test can plant a pre-existing store.
-async function start(seed?: (dir: string) => void): Promise<Harness> {
+async function start(seed?: (dir: string) => void, options: Partial<HttpAppOptions> = {}): Promise<Harness> {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tally-mcp-http-'));
   fs.copyFileSync(path.join(import.meta.dirname, '../authorize.html'), path.join(dir, 'authorize.html'));
   seed?.(dir);
@@ -30,7 +30,7 @@ async function start(seed?: (dir: string) => void): Promise<Harness> {
   const port = (server.address() as { port: number }).port;
   const base = `http://127.0.0.1:${port}`;
   process.env.AUTH_RATE_LIMIT_MAX = '1000';
-  const { app, close } = createHttpApp({ password: PASSWORD, mcpDomain: base, stateDir: dir });
+  const { app, close } = createHttpApp({ password: PASSWORD, mcpDomain: base, stateDir: dir, ...options });
   handler = app;
   return {
     base, dir,
@@ -250,4 +250,189 @@ test('/token rejects inherited names as client id, refresh token and authorizati
   } finally {
     await h.close();
   }
+});
+
+// ---- OAuth flow hardening ------------------------------------------------------------------------
+
+const pkce = () => {
+  const verifier = crypto.randomBytes(32).toString('base64url');
+  return { verifier, challenge: crypto.createHash('sha256').update(verifier).digest('base64url') };
+};
+
+test('redirect URI policy: https, loopback http and known app schemes only', () => {
+  for (const ok of [
+    'https://claude.ai/api/mcp/auth_callback',
+    'https://vscode.dev/redirect',
+    'http://localhost:33418/callback',
+    'http://127.0.0.1:33418/',
+    'http://[::1]:8080/cb',
+    'vscode://vscode.github-authentication/did-authenticate',
+    'cursor://anysphere.cursor-retrieval/oauth/user-tally/callback',
+  ]) assert.equal(store.isAllowedRedirectUri(ok), true, ok);
+
+  for (const bad of [
+    'javascript:alert(1)', 'JavaScript://x/%0aalert(1)', 'data:text/html,x', 'vbscript:x', 'file:///etc/passwd', 'blob:https://x/y',
+    'http://example.com/cb', 'http://localhost.example.com/cb', 'http://127.0.0.1.example.com/cb', 'http://192.168.1.10/cb',
+    'https://user:pw@example.com/cb', 'https://example.com/cb#frag', 'myapp://cb', 'ftp://example.com/x',
+    ' https://example.com/cb', 'https://exa mple.com/cb', '/relative', '', 'not a url', undefined, null, 5, {}, ['https://example.com/cb'],
+  ]) assert.equal(store.isAllowedRedirectUri(bad), false, JSON.stringify(bad));
+
+  // Operators can add an app scheme, but never a script-capable one.
+  const schemes = store.parseRedirectSchemes('windsurf, javascript, data:, https, bad scheme');
+  assert.equal(store.isAllowedRedirectUri('windsurf://callback', schemes), true);
+  assert.equal(store.isAllowedRedirectUri('javascript:alert(1)', schemes), false);
+  assert.equal(store.isAllowedRedirectUri('data:text/html,x', schemes), false);
+  assert.equal(store.isAllowedRedirectUri('http://example.com/', schemes), false);
+});
+
+test('/register validates redirect_uris and still allows unauthenticated dynamic registration', async () => {
+  const h = await start();
+  try {
+    for (const redirect_uris of [
+      undefined, [], 'https://example.com/cb', ['javascript:alert(1)'], ['data:text/html,x'], ['http://example.com/cb'],
+      ['https://example.com/ok', 'javascript:alert(1)'], [42], Array(11).fill('https://example.com/cb'),
+    ]) {
+      const res = await postJson(`${h.base}/register`, { client_name: 'x', redirect_uris });
+      assert.equal(res.status, 400, JSON.stringify(redirect_uris));
+      assert.equal((await res.json() as any).error, 'invalid_redirect_uri');
+    }
+    assert.equal(fs.existsSync(path.join(h.dir, '.oauth-clients.json')), false, 'a rejected registration stores nothing');
+
+    // What Claude / VS Code send: no Authorization header at all.
+    const ok = await postJson(`${h.base}/register`, {
+      client_name: 'Claude', redirect_uris: ['https://claude.ai/api/mcp/auth_callback', 'http://127.0.0.1:33418/'],
+    });
+    assert.equal(ok.status, 200);
+    const body = await ok.json() as any;
+    assert.ok(body.client_id && body.client_secret);
+    assert.deepEqual(body.redirect_uris, ['https://claude.ai/api/mcp/auth_callback', 'http://127.0.0.1:33418/']);
+
+    // client_name is display-only: non-strings and control characters do not get stored.
+    const odd = await (await postJson(`${h.base}/register`, { client_name: { a: 1 }, redirect_uris: [REDIRECT] })).json() as any;
+    assert.equal(odd.client_name, 'Unnamed Client');
+    const long = await (await postJson(`${h.base}/register`, { client_name: 'A\u0000B\n' + 'x'.repeat(500), redirect_uris: [REDIRECT] })).json() as any;
+    assert.equal(long.client_name.length, 100);
+    assert.doesNotMatch(long.client_name, /[\u0000-\u001f]/);
+  } finally {
+    await h.close();
+  }
+});
+
+test('registration and ADMIN_SECRET: open by default, mandatory when configured so', async () => {
+  const body = { client_name: 'c', redirect_uris: [REDIRECT] };
+  const bearer = (s: string) => ({ Authorization: `Bearer ${s}` });
+
+  const open = await start(undefined, { adminSecret: 'admin-secret' });
+  try {
+    assert.equal((await postJson(`${open.base}/register`, body)).status, 200, 'no header: dynamic registration');
+    assert.equal((await postJson(`${open.base}/register`, body, bearer('admin-secret'))).status, 200);
+    assert.equal((await postJson(`${open.base}/register`, body, bearer('wrong'))).status, 403, 'a wrong secret is never ignored');
+  } finally {
+    await open.close();
+  }
+
+  const strict = await start(undefined, { adminSecret: 'admin-secret', requireAdminSecretForRegistration: true });
+  try {
+    assert.equal((await postJson(`${strict.base}/register`, body)).status, 401);
+    assert.equal((await postJson(`${strict.base}/register`, body, { Authorization: 'Basic admin-secret' })).status, 401);
+    assert.equal((await postJson(`${strict.base}/register`, body, bearer('wrong'))).status, 403);
+    assert.equal((await postJson(`${strict.base}/register`, body, bearer('admin-secret'))).status, 200);
+  } finally {
+    await strict.close();
+  }
+
+  // Required but no secret configured: registration is closed, not open.
+  const closed = await start(undefined, { requireAdminSecretForRegistration: true });
+  try {
+    assert.equal((await postJson(`${closed.base}/register`, body)).status, 403);
+    assert.equal((await postJson(`${closed.base}/register`, body, bearer(''))).status, 403);
+    assert.equal((await postJson(`${closed.base}/register`, body, bearer('anything'))).status, 403);
+  } finally {
+    await closed.close();
+  }
+});
+
+test('POST /authorize issues a code only for a registered client, its own redirect URI, and S256', async () => {
+  const h = await start();
+  try {
+    const client = await (await postJson(`${h.base}/register`, { client_name: 'Test', redirect_uris: [REDIRECT] })).json() as any;
+    const other = await (await postJson(`${h.base}/register`, { client_name: 'Other', redirect_uris: ['https://other.example/cb'] })).json() as any;
+    const { challenge } = pkce();
+    const good = { client_id: client.client_id, redirect_uri: REDIRECT, code_challenge: challenge, code_challenge_method: 'S256', password: PASSWORD };
+
+    // Every one of these carries the CORRECT password and must still be refused without a code.
+    const refused: [string, Record<string, unknown>][] = [
+      ['unknown client', { ...good, client_id: 'never-registered' }],
+      ['inherited-name client', { ...good, client_id: '__proto__' }],
+      ['non-string client', { ...good, client_id: ['x'] }],
+      ['unregistered redirect', { ...good, redirect_uri: 'https://attacker.example/cb' }],
+      ["another client's redirect", { ...good, redirect_uri: 'https://other.example/cb' }],
+      ['redirect prefix trick', { ...good, redirect_uri: REDIRECT + '/../x' }],
+      ['missing redirect', { ...good, redirect_uri: undefined }],
+      ['plain PKCE', { ...good, code_challenge_method: 'plain' }],
+      ['no PKCE method', { ...good, code_challenge_method: undefined }],
+      ['no challenge', { ...good, code_challenge: undefined }],
+      ['malformed challenge', { ...good, code_challenge: 'short' }],
+    ];
+    for (const [label, body] of refused) {
+      const res = await postJson(`${h.base}/authorize`, body);
+      assert.equal(res.status, 400, label);
+      assert.equal((await res.json() as any).code, undefined, label);
+    }
+    assert.ok(other.client_id);
+
+    const wrongPw = await postJson(`${h.base}/authorize`, { ...good, password: 'nope' });
+    assert.equal(wrongPw.status, 401);
+    assert.equal((await wrongPw.json() as any).code, undefined);
+    assert.equal((await postJson(`${h.base}/authorize`, { ...good, password: { $ne: '' } })).status, 400);
+
+    const ok = await postJson(`${h.base}/authorize`, good);
+    assert.equal(ok.status, 200);
+    assert.ok((await ok.json() as any).code);
+  } finally {
+    await h.close();
+  }
+});
+
+test('GET /authorize shows the client name and redirect host, escaped, and rejects bad requests', async () => {
+  const h = await start();
+  try {
+    const name = '<img src=x onerror=alert(1)> & "Co"';
+    const client = await (await postJson(`${h.base}/register`, { client_name: name, redirect_uris: [REDIRECT] })).json() as any;
+    const { challenge } = pkce();
+    const query = (over: Record<string, string> = {}) => new URLSearchParams({
+      client_id: client.client_id, redirect_uri: REDIRECT, code_challenge: challenge, code_challenge_method: 'S256',
+      response_type: 'code', state: 'xyz', ...over,
+    }).toString();
+
+    const page = await fetch(`${h.base}/authorize?${query()}`);
+    assert.equal(page.status, 200);
+    assert.match(page.headers.get('content-type') || '', /text\/html/);
+    assert.equal(page.headers.get('cache-control'), 'no-store');
+    const html = await page.text();
+    assert.ok(html.includes('&lt;img src=x onerror=alert(1)&gt; &amp; &quot;Co&quot;'), 'client name shown, HTML-escaped');
+    assert.ok(!html.includes('<img src=x'), 'client name must not be injected as markup');
+    assert.ok(html.includes('>127.0.0.1:53999<'), 'redirect host shown');
+    assert.ok(!html.includes('%%'), 'no unfilled placeholder');
+
+    const overrides: Record<string, string>[] = [
+      { client_id: 'unknown' }, { client_id: 'constructor' }, { redirect_uri: 'https://attacker.example/cb' },
+      { code_challenge_method: 'plain' }, { code_challenge: 'short' }, { response_type: 'token' },
+    ];
+    for (const over of overrides) {
+      const res = await fetch(`${h.base}/authorize?${query(over)}`);
+      assert.equal(res.status, 400, JSON.stringify(over));
+      assert.doesNotMatch(await res.text(), /<form/);
+    }
+  } finally {
+    await h.close();
+  }
+});
+
+test('authorize.html carries the consent placeholders the server fills in', () => {
+  const html = fs.readFileSync(path.join(import.meta.dirname, '../authorize.html'), 'utf-8');
+  assert.match(html, /%%CLIENT_NAME%%/);
+  assert.match(html, /%%REDIRECT_TARGET%%/);
+  assert.equal(store.describeRedirectTarget('https://claude.ai/api/mcp/auth_callback'), 'claude.ai');
+  assert.equal(store.describeRedirectTarget('cursor://anysphere.cursor-retrieval/oauth/callback'), 'cursor:// (application link)');
 });

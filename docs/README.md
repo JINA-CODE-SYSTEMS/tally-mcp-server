@@ -150,7 +150,9 @@ Copy `.env.example` to `.env` and configure:
 | `BIND_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` only behind reverse proxy) |
 | `CORS_ORIGINS` | *(defaults to MCP_DOMAIN)* | Comma-separated allowed origins |
 | `READONLY_MODE` | `false` | Set `true` to disable all write tools |
-| `ADMIN_SECRET` | | Optional secret for manual client registration |
+| `ADMIN_SECRET` | | Secret for manual client registration (`Authorization: Bearer …` on `/register`). On its own it does **not** close registration — see the next row |
+| `REQUIRE_ADMIN_SECRET_FOR_REGISTRATION` | `false` | `true`: `/register` accepts only requests carrying `ADMIN_SECRET` (registration is closed if no secret is set). Claude and VS Code register themselves without credentials, so leave this `false` unless you register every client by hand |
+| `OAUTH_REDIRECT_SCHEMES` | | Extra app redirect schemes to accept at registration, comma-separated (built in: `vscode`, `vscode-insiders`, `cursor`, `claude`). `https://` and `http://localhost` / `127.0.0.1` are always accepted; script and file schemes never are |
 | **Auth & Rate Limiting** | | |
 | `AUTH_RATE_LIMIT_WINDOW_MS` | `60000` | Rate limit window in ms (1 minute) |
 | `AUTH_RATE_LIMIT_MAX` | `10` | Max auth attempts per window |
