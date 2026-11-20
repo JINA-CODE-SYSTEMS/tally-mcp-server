@@ -22,8 +22,11 @@ const xml = fs.readFileSync(path.join(import.meta.dirname, '..', 'pull', 'vouche
 
 test('voucher-lookup TDL filters by voucher number AND type and fetches MasterID + Reference', () => {
   assert.match(xml, /<TYPE>Voucher<\/TYPE>/);
-  assert.match(xml, /FilterNumber">\$VoucherNumber = "\{voucherNumber\}"/);
-  assert.match(xml, /FilterType">\$VoucherTypeName = "\{voucherType\}"/);
+  // the values are passed as Tally variables, never pasted into the formula (see template-injection.test)
+  assert.match(xml, /<MCPVOUCHERNUMBER>\{voucherNumber\}<\/MCPVOUCHERNUMBER>/);
+  assert.match(xml, /<MCPVOUCHERTYPE>\{voucherType\}<\/MCPVOUCHERTYPE>/);
+  assert.match(xml, /FilterNumber">\$VoucherNumber = ##MCPVoucherNumber</);
+  assert.match(xml, /FilterType">\$VoucherTypeName = ##MCPVoucherType</);
   assert.match(xml, /<SET>\$MasterID<\/SET>/);
   assert.match(xml, /<SET>\$Reference<\/SET>/);
   assert.match(xml, /<SVFROMDATE>\{fromDate\}<\/SVFROMDATE>/);

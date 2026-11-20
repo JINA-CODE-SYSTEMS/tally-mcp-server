@@ -10,6 +10,7 @@
         <DESC>
             <STATICVARIABLES>
                 <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+                <MCPLEDGERNAME>{ledgerName}</MCPLEDGERNAME>
                 <SVTODATE>{toDate}</SVTODATE>
                 <nunjuck>if targetCompany</nunjuck>
                 <SVCURRENTCOMPANY>{{targetCompany | escape}}</SVCURRENTCOMPANY>
@@ -41,7 +42,7 @@
                         <TYPE>Ledger</TYPE>
                         <FILTER>FltrLedgerName</FILTER>
                     </COLLECTION>
-                    <SYSTEM TYPE="Formulae" NAME="FltrLedgerName">$$IsEqual:$Name:"{ledgerName}"</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="FltrLedgerName">$$IsEqual:$Name:##MCPLedgerName</SYSTEM>
                 </TDLMESSAGE>
             </TDL>
         </DESC>

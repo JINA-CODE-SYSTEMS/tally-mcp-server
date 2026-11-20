@@ -17,7 +17,9 @@ test('find-voucher-by-reference is declared with master_id first + identity fiel
 const xml = fs.readFileSync(path.join(import.meta.dirname, '..', 'pull', 'find-voucher-by-reference.xml'), 'utf-8');
 
 test('filters on $Reference equality and fetches MasterID', () => {
-  assert.match(xml, /FilterReference">\$Reference = "\{reference\}"/);
+  // the value is passed as a Tally variable, never pasted into the formula (see template-injection.test)
+  assert.match(xml, /<MCPREFERENCE>\{reference\}<\/MCPREFERENCE>/);
+  assert.match(xml, /FilterReference">\$Reference = ##MCPReference</);
   assert.match(xml, /<SET>\$MasterID<\/SET>/);
   assert.match(xml, /<TYPE>Voucher<\/TYPE>/);
 });

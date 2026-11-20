@@ -74,7 +74,7 @@ test('the reported cases: ledger name, item name, voucher type/number and refere
       params.set(param, hostile);
       const out = renderPullRequest(pullTemplate(reportName), params);
       assert.equal((globalThis as any).__tdlProbe, undefined);
-      assert.ok(out.includes(`"${utility.String.escapeHTML(hostile)}"`), `${reportName}.${param} must be quoted literal text`);
+      assert.ok(out.includes(`>${utility.String.escapeHTML(hostile)}</MCP`), `${reportName}.${param} must be XML text in its own variable`);
       assert.ok(!/"49"|= 49/.test(out));
     }
   }
@@ -185,25 +185,60 @@ test('every declared pull report and push template has its XML file', () => {
 
 // ---- TDL string literals -----------------------------------------------------------------------------
 // XML-escaping is undone by Tally's XML parser before the formula is read, so a double quote in a
-// value placed inside a TDL "…" literal would close the literal. Such values are refused.
+// value placed inside a TDL "…" literal would close the literal. The lookup templates therefore pass
+// the value as a Tally variable (<MCPLEDGERNAME>…</MCPLEDGERNAME> in STATICVARIABLES, read back as
+// ##MCPLedgerName), where it is XML text and a quote is only data. findUnsafeTdlLiteralParam stays
+// as the backstop for any template that does put a placeholder inside a literal.
 
-test('a double quote or control character is refused where the value sits inside a TDL literal', () => {
-  const literalParams: [string, string][] = [
-    ['ledger-balance', 'ledgerName'], ['ledger-account', 'ledgerName'],
-    ['stock-item-balance', 'itemName'], ['stock-item-account', 'itemName'],
-    ['voucher-lookup', 'voucherType'], ['voucher-lookup', 'voucherNumber'],
-    ['find-voucher-by-reference', 'reference'],
-  ];
-  for (const [reportName, param] of literalParams) {
+const lookupParams: [string, string, string][] = [
+  ['ledger-balance', 'ledgerName', 'MCPLedgerName'], ['ledger-account', 'ledgerName', 'MCPLedgerName'],
+  ['stock-item-balance', 'itemName', 'MCPItemName'], ['stock-item-account', 'itemName', 'MCPItemName'],
+  ['voucher-lookup', 'voucherType', 'MCPVoucherType'], ['voucher-lookup', 'voucherNumber', 'MCPVoucherNumber'],
+  ['find-voucher-by-reference', 'reference', 'MCPReference'],
+];
+
+test('lookup values travel as a Tally variable, so a name containing a double quote can be looked up', () => {
+  for (const [reportName, param, variable] of lookupParams) {
     const report = pullConfig.find(r => r.name === reportName)!;
-    for (const bad of ['Cash" OR $$IsLedger:"x', '"', 'line\nbreak', 'tab\there', 'nul\u0000']) {
+    const tmpl = pullTemplate(reportName);
+    const tag = variable.toUpperCase();
+    assert.ok(tmpl.includes(`<${tag}>{${param}}</${tag}>`), `${reportName}: ${param} must be set as <${tag}>`);
+    assert.ok(tmpl.includes(`##${variable}`), `${reportName}: formulas must read ##${variable}`);
+    assert.equal(tmpl.split(`{${param}}`).length - 1, 1, `${reportName}: {${param}} must appear only in the variable`);
+    const staticVars = tmpl.slice(tmpl.indexOf('<STATICVARIABLES>'), tmpl.indexOf('</STATICVARIABLES>'));
+    assert.ok(staticVars.includes(`<${tag}>`), `${reportName}: <${tag}> must sit in STATICVARIABLES`);
+
+    for (const value of ['12" Pipe', 'Cash" OR $$IsLedger:"x', '"']) {
       const params = paramsFor(report, 'plain');
-      params.set(param, bad);
-      assert.equal(findUnsafeTdlLiteralParam(pullTemplate(reportName), params), param, `${reportName}.${param} ${JSON.stringify(bad)}`);
+      params.set(param, value);
+      assert.equal(findUnsafeTdlLiteralParam(tmpl, params), undefined, `${reportName}.${param} ${JSON.stringify(value)}`);
+      const out = renderPullRequest(tmpl, params);
+      assert.ok(out.includes(`<${tag}>${utility.String.escapeHTML(value)}</${tag}>`), `${reportName}.${param} must be escaped XML text`);
+      // the value appears nowhere else: nothing of it reaches a formula
+      assert.equal(out.split(utility.String.escapeHTML(value)).length - 1, value === '"' ? out.split('&quot;').length - 1 : 1);
     }
-    for (const fine of ["O'Brien & Sons", 'A/c (HDFC) [OD] 100%', 'Café — नमस्ते', 'Braces {x} $1 <tag>']) {
-      assert.equal(findUnsafeTdlLiteralParam(pullTemplate(reportName), paramsFor(report, fine)), undefined, `${reportName} ${fine}`);
+  }
+});
+
+test('no pull template places a {param} placeholder inside a quoted TDL literal', () => {
+  for (const file of fs.readdirSync(pullDir).filter(f => f.endsWith('.xml'))) {
+    for (const line of fs.readFileSync(path.join(pullDir, file), 'utf-8').split('\n')) {
+      for (const m of line.matchAll(/\{[A-Za-z_][A-Za-z0-9_]*\}/g)) {
+        if (line[m.index - 1] === '{') continue; // nunjucks {{ var }}
+        const quotesBefore = line.slice(0, m.index).split('"').length - 1;
+        assert.equal(quotesBefore % 2, 0, `${file}: ${m[0]} sits inside a quoted literal: ${line.trim()}`);
+      }
     }
+  }
+});
+
+test('the backstop still refuses a quote or control character inside a quoted literal', () => {
+  const tmpl = '<SYSTEM TYPE="Formulae" NAME="F">$Name = "{name}"</SYSTEM>';
+  for (const bad of ['Cash" OR $$IsLedger:"x', '"', 'line\nbreak', 'tab\there', 'nul\u0000']) {
+    assert.equal(findUnsafeTdlLiteralParam(tmpl, new Map([['name', bad]])), 'name', JSON.stringify(bad));
+  }
+  for (const fine of ["O'Brien & Sons", 'A/c (HDFC) [OD] 100%', 'Café — नमस्ते', 'Braces {x} $1 <tag>']) {
+    assert.equal(findUnsafeTdlLiteralParam(tmpl, new Map([['name', fine]])), undefined, fine);
   }
 });
 

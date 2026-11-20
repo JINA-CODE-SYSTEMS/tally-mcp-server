@@ -288,13 +288,16 @@ function formatTDLParameter(v: any): string | undefined {
     return undefined;
 }
 
-// A pull template places some string parameters inside a TDL string literal, e.g.
+// A caller string must never sit inside a TDL string literal such as
 //   $LedgerName = "{ledgerName}"
 // XML-escaping protects the XML layer only: Tally's XML parser turns &quot; back into a double
 // quote before the formula is read, so a quote in the value would end the literal and the rest of
-// the value would be read as formula. There is no escape for a quote inside a TDL literal that this
-// code can rely on, so such a value is refused rather than sent. Control characters are refused
-// for the same reason (a line break also ends the formula).
+// the value would be read as formula. The pull templates avoid the literal altogether: the value is
+// set as a Tally variable in STATICVARIABLES (<MCPLEDGERNAME>{ledgerName}</MCPLEDGERNAME>) and the
+// formula reads ##MCPLedgerName, so the value is only ever XML text.
+//
+// This check is the backstop for a template that does quote a placeholder: a value with a double
+// quote or a control character (a line break also ends the formula) is refused rather than sent.
 //
 // Returns the name of the first offending parameter, or undefined when the request is safe.
 export function findUnsafeTdlLiteralParam(tmplXML: string, params: Map<string, any>): string | undefined {
