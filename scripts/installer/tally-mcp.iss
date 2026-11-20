@@ -44,12 +44,7 @@
 ; climbs two levels to reach the repo root. SourcePath itself is provided by Inno.
 ; Both roots are overridable from the command line (ISCC /DRepoRoot=...). The release build
 ; leaves them alone; CI points them at a tree of stub files so the Pascal Script and the
-; [Setup]/[Files]/[InstallDelete]
-; The Start Menu item was renamed to "Connect your AI assistant to Tally"; an upgrade would otherwise
-; leave the old shortcut beside the new one.
-Type: files; Name: "{group}\Connect Claude to Tally.lnk"
-
-[Run] sections are compiled on every PR without first downloading a
+; [Setup]/[Files]/[Run] sections are compiled on every PR without first downloading a
 ; portable Node, NSSM and cloudflared. See scripts/installer/check-iss.ps1.
 #ifndef RepoRoot
   #define RepoRoot       "..\\.."
@@ -183,6 +178,11 @@ Name: "{group}\{#MyAppName} Logs";       Filename: "{app}\logs"
 Name: "{group}\Reconfigure {#MyAppName}"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"""; WorkingDir: "{app}"
 Name: "{group}\Connect your AI assistant to Tally"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\connect-client.ps1"" -InstallDir ""{app}"""; WorkingDir: "{app}"; Comment: "Point Claude Desktop at this Tally server (run as the person who uses the AI assistant)"
 Name: "{group}\Uninstall {#MyAppName}";  Filename: "{uninstallexe}"
+
+[InstallDelete]
+; The Start Menu item was renamed to "Connect your AI assistant to Tally"; an upgrade would otherwise
+; leave the old shortcut beside the new one.
+Type: files; Name: "{group}\Connect Claude to Tally.lnk"
 
 [Run]
 ; --- 1. First-run wizard: writes .env from collected wizard inputs and registers the NSSM service ---
