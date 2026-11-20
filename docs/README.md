@@ -250,6 +250,18 @@ To add the entry by hand instead (File → Settings → Developer):
 }
 ```
 
+### Local (Cursor)
+
+If Cursor is installed for the Windows user, the installer and **Connect your AI assistant to Tally** also add the server to Cursor's global `~/.cursor/mcp.json`, merging beside any servers already there. Cursor is skipped, and nothing is created, when it is not installed. Close every Cursor window and reopen it to see the tools.
+
+### Command-line tools (Claude Code, Codex CLI, Gemini CLI)
+
+These are connected with each tool's own command, which **Connection details for other AI apps...** prints ready to paste with this install's paths filled in. Their config files are not edited for you: they hold the tool's other settings and the vendors document the command.
+
+### Cloud assistants (Claude, ChatGPT, Copilot Studio, Gemini, Le Chat)
+
+When Remote Access gives the server a public `https://` address, **Connection details for other AI apps...** also lists the click path for adding it in each product's settings, with a link to the vendor's own instructions. All five sign in through the server's OAuth page. Gemini Enterprise is not supported: it needs a client ID and secret entered by an administrator.
+
 ### Any other AI app or custom agent
 
 For an MCP client the installer has no auto-connect for (an agent you built, an agent framework, another AI app), right-click the tray icon and choose **Connection details for other AI apps...**. It shows, and copies to the clipboard:

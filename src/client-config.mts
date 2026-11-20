@@ -219,7 +219,18 @@ export interface ClientTarget {
   jsonc: boolean;
   buildEntry(launch: LaunchSpec): Record<string, unknown>;
   resolvePath(ctx: TargetContext): PathResult;
+  /**
+   * The folder whose existence says the app is on this machine for this user. When a target has
+   * one and it is missing, `apply` skips the target rather than creating a config (and a folder)
+   * for an app that is not there. Claude Desktop has none on purpose: pre-writing its config is
+   * what makes "install Claude later" work (#172). Removal ignores this - a stale entry is cleaned
+   * up wherever the file exists.
+   */
+  appFolder?(ctx: TargetContext): string | undefined;
 }
+
+/** The name for our entry wherever we choose it: the generic block, Cursor, the command-line tools. No spaces, no underscores. */
+export const GENERIC_SERVER_NAME = 'tally-prime';
 
 export const CLIENT_TARGETS: ClientTarget[] = [
   {
@@ -255,6 +266,34 @@ export const CLIENT_TARGETS: ClientTarget[] = [
     }
   },
   {
+    id: 'cursor',
+    label: 'Cursor',
+    serversKey: 'mcpServers',
+    serverName: GENERIC_SERVER_NAME,
+    // Cursor's docs do not say comments are legal in this file, so it is treated as strict JSON.
+    jsonc: false,
+    // Cursor's field table lists "type": "stdio" for a local server while its own examples leave
+    // it out; writing it satisfies both readings. (cursor.com/docs/context/mcp, November 2026)
+    buildEntry: (launch) => ({
+      type: 'stdio',
+      command: launch.command,
+      args: [...launch.args],
+      ...(launch.env ? { env: { ...launch.env } } : {})
+    }),
+    // The GLOBAL file, ~/.cursor/mcp.json: "tools available everywhere". The per-project
+    // .cursor/mcp.json is not ours to guess at, for the same reason as VS Code's workspace file.
+    resolvePath: (ctx) => {
+      const p = ctx.p ?? path;
+      const home = ctx.home ?? os.homedir();
+      if (!home) return { ok: false, reason: 'cannot locate the home directory for the Cursor config' };
+      return { ok: true, file: p.join(home, '.cursor', 'mcp.json') };
+    },
+    appFolder: (ctx) => {
+      const home = ctx.home ?? os.homedir();
+      return home ? (ctx.p ?? path).join(home, '.cursor') : undefined;
+    }
+  },
+  {
     id: 'vscode',
     label: 'VS Code (workspace)',
     serversKey: 'servers',
@@ -279,6 +318,9 @@ export const CLIENT_TARGETS: ClientTarget[] = [
   }
 ];
 
+/** Targets configured once per user, as opposed to per workspace folder (VS Code). */
+export const USER_LEVEL_TARGETS = ['claude-desktop', 'cursor'];
+
 export function targetById(id: string): ClientTarget | undefined {
   return CLIENT_TARGETS.find(t => t.id === id);
 }
@@ -297,8 +339,164 @@ export function localLaunchSpec(installRoot: string, nodeExe: string = process.e
 // stdio launch line, and (when the install serves HTTP) the URL. `show` prints both so they can be
 // pasted wherever that client keeps its MCP servers. Read-only: it writes nothing anywhere.
 
-/** The name used for our entry in the generic block; the same one docs/README.md gives for VS Code. */
-export const GENERIC_SERVER_NAME = 'tally-prime';
+
+/**
+ * Command-line AI tools. Each has its own "add a server" command, and that is what we print rather
+ * than editing its file, for reasons specific to each (vendor docs and source, checked November 2026):
+ *   - Claude Code keeps user servers in ~/.claude.json, next to account details and per-project
+ *     trust decisions. It rewrites that file itself while running, and its docs say not to edit it;
+ *   - Codex keeps them in ~/.codex/config.toml, shared with the desktop app and IDE extension. This
+ *     module merges JSON only, and a TOML rewrite would drop the user's comments;
+ *   - Gemini CLI's settings.json legally carries comments, which the JSON round-trip here would delete.
+ * The command is the path each vendor documents, and it leaves the rest of the file to its owner.
+ *
+ * "tally-prime" satisfies all three naming rules: no spaces (Claude Code, Codex) and no
+ * underscores (Gemini exposes tools as mcp_<server>_<tool> and misparses them).
+ */
+export interface CliTool {
+  id: string;
+  label: string;
+  /** The words before the launch line; the quoted command and arguments are appended. */
+  prefix: string;
+  note: string;
+  docs: string;
+}
+
+export const CLI_TOOLS: CliTool[] = [
+  {
+    id: 'claude-code',
+    label: 'Claude Code',
+    // --scope user: the default scope is "local", which would tie the server to one folder.
+    prefix: `claude mcp add --scope user --transport stdio ${GENERIC_SERVER_NAME} --`,
+    note: 'Start a new Claude Code session afterwards.',
+    docs: 'https://code.claude.com/docs/en/mcp',
+  },
+  {
+    id: 'codex',
+    label: 'OpenAI Codex CLI (also used by the Codex desktop app and IDE extension)',
+    prefix: `codex mcp add ${GENERIC_SERVER_NAME} --`,
+    note: 'Start a new Codex session afterwards (restart the app or extension if you use those).',
+    docs: 'https://learn.chatgpt.com/docs/extend/mcp',
+  },
+  {
+    id: 'gemini-cli',
+    label: 'Google Gemini CLI',
+    // -s user: the default scope is "project", which fails when run from the home folder.
+    prefix: `gemini mcp add -s user ${GENERIC_SERVER_NAME}`,
+    note: 'Start a new Gemini CLI session afterwards. Running it again replaces the earlier entry.',
+    docs: 'https://github.com/google-gemini/gemini-cli/blob/main/docs/tools/mcp-server.md',
+  },
+];
+
+/** One shell word. Double quotes work in cmd, PowerShell and POSIX shells; a path cannot contain one on Windows. */
+export function shellQuote(word: string): string {
+  return /^[A-Za-z0-9_\-.:\\/]+$/.test(word) ? word : `"${word.replace(/(["$`])/g, '\\$1')}"`;
+}
+
+/** The full command line that registers this install with a command-line tool. */
+export function cliToolCommand(tool: CliTool, launch: LaunchSpec): string {
+  return [tool.prefix, shellQuote(launch.command), ...launch.args.map(shellQuote)].join(' ');
+}
+
+/**
+ * Cloud assistants run on the vendor's servers, so no file on this PC can connect them: the user
+ * adds our URL in the product's own settings. These are the click paths, taken from each vendor's
+ * documentation (checked November 2026; `docs` is where to look when a menu has moved). `{url}` is
+ * replaced with this install's address. Plain ASCII, like everything `show` prints.
+ *
+ * All five sign in with OAuth and register themselves (dynamic client registration), which is what
+ * this server offers. Gemini Enterprise is absent on purpose: it needs a client id and secret typed
+ * in by an administrator, which a self-registering server does not issue.
+ */
+export interface CloudAssistant {
+  id: string;
+  label: string;
+  /** Which accounts can add a custom server, in the vendor's terms. */
+  who: string;
+  steps: string[];
+  docs: string;
+}
+
+export const CLOUD_ASSISTANTS: CloudAssistant[] = [
+  {
+    id: 'claude',
+    label: 'Claude (claude.ai and Claude Desktop)',
+    who: 'All plans. On Team and Enterprise an Owner adds it under Organization settings > Connectors.',
+    steps: [
+      'Go to Customize > Connectors, click "Add", then "Add custom connector".',
+      'Enter a name and {url}, then click "Continue".',
+      'Keep the detected sign-in settings, click "Add", then "Connect" and sign in.',
+      'In a chat, click "+" > Connectors and switch it on.',
+    ],
+    docs: 'https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp',
+  },
+  {
+    id: 'chatgpt',
+    label: 'ChatGPT (web)',
+    who: 'Business, Enterprise and Edu workspaces (an admin may need to allow it). Pro accounts can connect but only read.',
+    steps: [
+      'Open chatgpt.com/plugins, click the plus button, then "Add custom MCP server".',
+      'Enter a name, and under Connection paste {url} as the Server URL.',
+      'Choose OAuth, tick "I understand and want to continue", then click "Create as a plugin".',
+      'Install the plugin and sign in when prompted. ChatGPT asks you to confirm any action that changes data.',
+    ],
+    docs: 'https://developers.openai.com/apps-sdk/deploy/connect-chatgpt',
+  },
+  {
+    id: 'copilot-studio',
+    label: 'Microsoft Copilot Studio',
+    who: 'Whoever builds the agent. People then use the published agent; they do not add the server themselves.',
+    steps: [
+      'Open your agent and go to Tools > "Add a tool" > "New tool" > "Model Context Protocol".',
+      'Enter a server name, a short description, and {url} as the Server URL.',
+      'Choose "OAuth 2.0" with type "Dynamic discovery", then click "Create" and "Next".',
+      'Select "Create a new connection", sign in, then "Add to agent".',
+    ],
+    docs: 'https://learn.microsoft.com/en-us/microsoft-copilot-studio/mcp-add-existing-server-to-agent',
+  },
+  {
+    id: 'gemini',
+    label: 'Google Gemini app',
+    who: 'Personal Google accounts in the US, 18 or older, in English. Work and school accounts cannot add one.',
+    steps: [
+      'On gemini.google.com open Settings > Connected Apps (it may sit under Personal Intelligence).',
+      'Under "Custom apps", choose "Add a custom app" and enter {url}.',
+      'Click "Next" and sign in when asked.',
+      'In a chat, type @ and pick the app. Gemini asks you to confirm before it changes anything.',
+    ],
+    docs: 'https://support.google.com/gemini/answer/17209137',
+  },
+  {
+    id: 'le-chat',
+    label: 'Mistral Le Chat',
+    who: 'The account owner or an administrator.',
+    steps: [
+      'Open the Connectors page, click "+ Add Connector", and switch to the "Custom MCP Connector" tab.',
+      'Enter a connector name (no spaces) and {url} as the Server URL.',
+      'Click "Connect" and complete the sign-in when prompted.',
+      'Le Chat asks for approval when it uses a tool; "Always allow" can be set per function under My Connectors.',
+    ],
+    docs: 'https://docs.mistral.ai/le-chat/knowledge-integrations/connectors/mcp-connectors',
+  },
+];
+
+/**
+ * Why a cloud assistant could not reach `url`, or null when nothing rules it out. Their requests
+ * come from the vendor's network, so the address must be https and must not be this PC or the LAN.
+ * This only rules addresses OUT: a public-looking name can still be unreachable, and nothing here
+ * connects to it.
+ */
+export function cloudUnreachableReason(url: string): string | null {
+  let u: URL;
+  try { u = new URL(url); } catch { return 'the address is not a valid URL'; }
+  if (u.protocol !== 'https:') return 'the address is not https://';
+  const host = u.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  const privateV4 = /^(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host);
+  const privateV6 = host === '::1' || /^f[cd][0-9a-f]{2}:/.test(host) || /^fe[89ab][0-9a-f]:/.test(host);
+  if (host === 'localhost' || host.endsWith('.localhost') || privateV4 || privateV6) return 'the address points at this PC or the local network';
+  if (host.endsWith('.local') || (!host.includes('.') && !host.includes(':'))) return 'the address is a local network name';
+  return null;
+}
 
 export interface ConnectionDetails {
   /** For a client on this machine: it starts the server itself and talks over stdin/stdout. */
@@ -306,7 +504,13 @@ export interface ConnectionDetails {
   /** The stdio entry in the `mcpServers` shape most clients and agent frameworks accept. */
   mcpServers: Record<string, unknown>;
   /** For a client elsewhere (a cloud assistant, another machine). Null when this install serves no HTTP. */
-  http: { url: string; transport: 'streamable-http'; auth: 'oauth2.1' } | null;
+  http: {
+    url: string; transport: 'streamable-http'; auth: 'oauth2.1';
+    /** Null when a cloud assistant could reach this address; otherwise why not. An agent on this PC or LAN is unaffected. */
+    cloudUnreachable: string | null;
+    /** True when the address names a port other than 443, which Claude's connectors do not accept. */
+    nonStandardPort: boolean;
+  } | null;
   /** Why `http` is null, in words the tray can show. */
   httpUnavailable?: string;
 }
@@ -329,7 +533,10 @@ export function connectionDetails(launch: LaunchSpec, env: Record<string, string
     return { stdio, mcpServers, http: null,
       httpUnavailable: 'No server address is configured (MCP_DOMAIN is not set in .env). Set up Remote Access (tray > Reconfigure) to get a URL.' };
   }
-  return { stdio, mcpServers, http: { url: `${domain}/mcp`, transport: 'streamable-http', auth: 'oauth2.1' } };
+  const url = `${domain}/mcp`;
+  const port = (() => { try { return new URL(url).port; } catch { return ''; } })();
+  return { stdio, mcpServers, http: { url, transport: 'streamable-http', auth: 'oauth2.1',
+    cloudUnreachable: cloudUnreachableReason(url), nonStandardPort: port !== '' && port !== '443' } };
 }
 
 /** The same details as text a person can paste from. Plain ASCII: it goes through a Windows console and the clipboard. */
@@ -348,7 +555,10 @@ export function formatConnectionDetails(d: ConnectionDetails): string {
     `     Command   : ${d.stdio.command}`,
     ...d.stdio.args.map((a, i) => `     Argument ${i + 1}: ${a}`),
     '   Some apps name the top-level key differently (VS Code uses "servers" and also needs "type": "stdio").',
+    '',    '   Command-line tools: run one command in a terminal instead of editing a file.',
     '',
+    ...CLI_TOOLS.flatMap(t => [`   ${t.label}`, `     ${cliToolCommand(t, d.stdio)}`, `     ${t.note}`, `     Help: ${t.docs}`, '']),
+
     '2. NETWORK - for a cloud assistant, or an agent on another machine (HTTP)',
     '',
   ];
@@ -357,7 +567,23 @@ export function formatConnectionDetails(d: ConnectionDetails): string {
       `   URL       : ${d.http.url}`,
       '   Transport : Streamable HTTP',
       '   Sign-in   : OAuth 2.1. The app registers itself and opens the sign-in page; enter this server\'s password.',
-      '   An app on another network can only reach this URL if it is a public address.');
+      '',
+      '3. CLOUD ASSISTANTS - add the URL in the product\'s own settings',
+      '');
+    if (d.http.cloudUnreachable) {
+      lines.push(
+        `   Not available with this address: ${d.http.cloudUnreachable}.`,
+        '   Cloud assistants connect from the vendor\'s servers, so they need a public https:// address.',
+        '   Set one up under Remote Access (tray > Reconfigure). An agent on this PC or network can use the URL above as it is.');
+    } else {
+      if (d.http.nonStandardPort) lines.push('   Note: Claude only connects to the standard https port (443); this address names another port.', '');
+      for (const a of CLOUD_ASSISTANTS) {
+        lines.push(`   ${a.label}`, `     Who can add it: ${a.who}`,
+          ...a.steps.map((step, i) => `     ${i + 1}. ${step.replace('{url}', d.http!.url)}`),
+          `     Help: ${a.docs}`, '');
+      }
+      lines.push('   Menus move; if a step does not match, the Help link is the vendor\'s current page.');
+    }
   } else {
     lines.push(`   Not available. ${d.httpUnavailable ?? ''}`.trimEnd());
   }
@@ -729,6 +955,8 @@ export interface CliOptions {
    * which hand-rolled JSON editing in PowerShell would have thrown away.
    */
   appdata?: string;
+  /** Override for the home directory, for targets that live under it (Cursor). Same purpose as --appdata. */
+  home?: string;
   /**
    * Refuse to remove an entry unless it actually points INSIDE --install-root.
    *
@@ -780,22 +1008,28 @@ export function parseCliArgs(argv: string[]): CliOptions {
     else if (a === '--target') opts.targets.push(value(a));
     else if (a === '--workspace') opts.workspace = value(a);
     else if (a === '--appdata') opts.appdata = value(a);
+    else if (a === '--home') opts.home = value(a);
     else if (a === '--require-install-root') opts.requireInstallRoot = true;
     else if (a === '--install-root') opts.installRoot = value(a);
     else if (a === '--node') opts.nodeExe = value(a);
     else if (a.startsWith('-')) throw new Error(`unknown option: ${a}`);
     else throw new Error(`unexpected argument: ${a}`);
   }
-  const unknown = opts.targets.filter(t => t !== 'all' && !targetById(t));
+  const unknown = opts.targets.filter(t => t !== 'all' && t !== 'apps' && !targetById(t));
   if (unknown.length > 0) throw new Error(`unknown target: ${unknown.join(', ')}`);
   if (opts.targets.length === 0 || opts.targets.includes('all')) opts.targets = CLIENT_TARGETS.map(t => t.id);
+  // 'apps': every target with one per-user config, i.e. all but the workspace-scoped ones. This is
+  // what the installer and the tray connect, so a new desktop app is picked up without touching them.
+  else if (opts.targets.includes('apps')) {
+    opts.targets = [...new Set(opts.targets.flatMap(t => t === 'apps' ? USER_LEVEL_TARGETS : [t]))];
+  }
   return opts;
 }
 
 const CLI_COMMANDS = ['detect', 'status', 'apply', 'remove', 'show'];
 
-const USAGE = 'usage: node dist/client-config.mjs <detect|status|apply|remove|show> [--target claude-desktop|vscode|all]'
-  + ' [--workspace DIR] [--appdata DIR] [--require-install-root] [--install-root DIR] [--node PATH] [--json] [--dry-run] [--allow-comment-loss]\n';
+const USAGE = 'usage: node dist/client-config.mjs <detect|status|apply|remove|show> [--target claude-desktop|cursor|vscode|apps|all]'
+  + ' [--workspace DIR] [--appdata DIR] [--home DIR] [--require-install-root] [--install-root DIR] [--node PATH] [--json] [--dry-run] [--allow-comment-loss]\n';
 
 export function runCli(argv: string[]): number {
   let opts: CliOptions;
@@ -823,17 +1057,27 @@ export function runCli(argv: string[]): number {
   for (const id of opts.targets) {
     const target = targetById(id);
     if (!target) { process.stderr.write(`unknown target: ${id}\n`); exit = Math.max(exit, 1); continue; }
-    const resolved = target.resolvePath({
+    const ctx: TargetContext = {
       workspace: opts.workspace,
+      home: opts.home,
       // Only override when asked: an empty --appdata must not blank out the real one.
       env: opts.appdata ? { ...process.env, APPDATA: opts.appdata } : undefined,
-    });
+    };
+    const resolved = target.resolvePath(ctx);
     if (!resolved.ok) { report.push({ target: id, skipped: resolved.reason }); continue; }
     const file = resolved.file;
+    // An app that is not on this machine gets no config written for it. `detect` and `remove` still
+    // look: detect reports what is there, and remove must be able to clean up after an uninstall.
+    const appFolder = target.appFolder?.(ctx);
+    const installed = appFolder === undefined || fs.existsSync(appFolder);
+    if (!installed && (opts.command === 'apply' || opts.command === 'status')) {
+      report.push({ target: id, skipped: `${target.label} does not appear to be installed for this user (no ${appFolder})`, notInstalled: true });
+      continue;
+    }
     const entry = target.buildEntry(launch);
     try {
       if (opts.command === 'detect') {
-        report.push({ target: id, file, exists: fs.existsSync(file) });
+        report.push({ target: id, file, exists: fs.existsSync(file), ...(appFolder !== undefined ? { installed } : {}) });
         continue;
       }
       // `status` is `apply --dry-run`: same parse, same ownership test, no write. One code path, so

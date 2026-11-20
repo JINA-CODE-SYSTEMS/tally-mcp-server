@@ -56,6 +56,7 @@ test('Claude Desktop entries carry no "type" key; VS Code entries require type=s
 test('the target list is data, and each target names the key it merges into', () => {
   assert.deepEqual(CLIENT_TARGETS.map(t => [t.id, t.serversKey]), [
     ['claude-desktop', 'mcpServers'],
+    ['cursor', 'mcpServers'],
     ['vscode', 'servers']
   ]);
 });
@@ -471,7 +472,7 @@ test('a bare invocation defaults to the read-only command', () => {
   const o = parseCliArgs([]);
   assert.equal(o.command, 'status');
   assert.equal(o.dryRun, false);
-  assert.deepEqual(o.targets, ['claude-desktop', 'vscode']);
+  assert.deepEqual(o.targets, ['claude-desktop', 'cursor', 'vscode']);
 });
 
 test('flags parse, and --target all expands to every target', () => {
@@ -787,7 +788,9 @@ test('connectionDetails: a remote install gives the /mcp URL; no address means n
   ]) {
     for (const mode of ['remote', '', undefined]) { // an install predating the key is a remote one
       const d = showModule.connectionDetails(launch, { DEPLOYMENT_MODE: mode, MCP_DOMAIN: domain });
-      assert.deepEqual(d.http, { url, transport: 'streamable-http', auth: 'oauth2.1' }, `${domain} / ${mode}`);
+      assert.equal(d.http!.url, url, `${domain} / ${mode}`);
+      assert.equal(d.http!.transport, 'streamable-http');
+      assert.equal(d.http!.auth, 'oauth2.1');
       assert.match(showModule.formatConnectionDetails(d), new RegExp(`URL       : ${url.replace(/[.]/g, '\\.')}\n`));
     }
   }
@@ -824,4 +827,149 @@ test('CLI: show prints the details from the install .env, writes nothing, and ne
 
   assert.deepEqual(fs.readdirSync(root), ['.env'], 'show must not create anything in the install');
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('cloud assistants: a public https address lists each product with the URL filled in', () => {
+  const launch = localLaunchSpec(INSTALL, NODE, path.win32);
+  const d = showModule.connectionDetails(launch, { DEPLOYMENT_MODE: 'remote', MCP_DOMAIN: 'https://books.example.com' });
+  assert.equal(d.http!.cloudUnreachable, null);
+  assert.equal(d.http!.nonStandardPort, false);
+  const text = showModule.formatConnectionDetails(d);
+  assert.match(text, /3\. CLOUD ASSISTANTS/);
+  for (const a of showModule.CLOUD_ASSISTANTS) {
+    assert.ok(text.includes(a.label), a.label);
+    assert.ok(text.includes(a.docs), a.docs);
+    assert.equal(a.steps.filter((step: string) => step.includes('{url}')).length, 1, `${a.id}: exactly one step carries the URL`);
+    assert.match(a.docs, /^https:\/\//);
+  }
+  assert.equal(text.includes('{url}'), false, 'no unfilled placeholder');
+  assert.equal(text.split('https://books.example.com/mcp').length - 1, 1 + showModule.CLOUD_ASSISTANTS.length);
+  assert.equal(/[^\x00-\x7f]/.test(text), false, 'plain ASCII');
+  assert.deepEqual(showModule.CLOUD_ASSISTANTS.map((a: { id: string }) => a.id), ['claude', 'chatgpt', 'copilot-studio', 'gemini', 'le-chat']);
+});
+
+test('cloud assistants: an address they cannot reach gets an explanation, not instructions', () => {
+  const launch = localLaunchSpec(INSTALL, NODE, path.win32);
+  const unreachable: [string, RegExp][] = [
+    ['http://books.example.com', /not https/],
+    ['https://localhost:3000', /this PC or the local network/],
+    ['https://127.0.0.1', /this PC or the local network/],
+    ['https://192.168.1.20', /this PC or the local network/],
+    ['https://10.0.0.5:8443', /this PC or the local network/],
+    ['https://172.20.1.1', /this PC or the local network/],
+    ['https://[::1]:3000', /this PC or the local network/],
+    ['https://tally-pc', /local network name/],
+    ['https://tally-pc.local', /local network name/],
+  ];
+  for (const [domain, why] of unreachable) {
+    const d = showModule.connectionDetails(launch, { DEPLOYMENT_MODE: 'remote', MCP_DOMAIN: domain });
+    assert.match(d.http!.cloudUnreachable!, why, domain);
+    const text = showModule.formatConnectionDetails(d);
+    assert.match(text, /URL       : /, 'the URL is still shown: an agent on this PC or LAN can use it');
+    assert.match(text, /Not available with this address/);
+    assert.equal(text.includes('ChatGPT'), false, domain);
+  }
+  for (const domain of ['https://172.32.0.1', 'https://books.example.com', 'https://x.trycloudflare.com']) {
+    assert.equal(showModule.cloudUnreachableReason(`${domain}/mcp`), null, domain);
+  }
+  // A non-standard port is reachable in general, but Claude will not use it.
+  const d = showModule.connectionDetails(launch, { DEPLOYMENT_MODE: 'remote', MCP_DOMAIN: 'https://books.example.com:8443' });
+  assert.equal(d.http!.cloudUnreachable, null);
+  assert.equal(d.http!.nonStandardPort, true);
+  assert.match(showModule.formatConnectionDetails(d), /standard https port \(443\)/);
+  assert.equal(showModule.connectionDetails(launch, { DEPLOYMENT_MODE: 'remote', MCP_DOMAIN: 'https://books.example.com:443' }).http!.nonStandardPort, false);
+});
+
+test('command-line tools: each gets its documented add command with the launch line quoted', () => {
+  const launch = localLaunchSpec(INSTALL, NODE, path.win32);
+  const node = '"C:\\Program Files\\nodejs\\node.exe"';
+  const entry = '"C:\\Program Files\\Tally MCP Server\\dist\\index.mjs"';
+  const byId = (id: string) => showModule.CLI_TOOLS.find((t: { id: string }) => t.id === id)!;
+  assert.equal(showModule.cliToolCommand(byId('claude-code'), launch), `claude mcp add --scope user --transport stdio tally-prime -- ${node} ${entry}`);
+  assert.equal(showModule.cliToolCommand(byId('codex'), launch), `codex mcp add tally-prime -- ${node} ${entry}`);
+  assert.equal(showModule.cliToolCommand(byId('gemini-cli'), launch), `gemini mcp add -s user tally-prime ${node} ${entry}`);
+
+  const text = showModule.formatConnectionDetails(showModule.connectionDetails(launch, { DEPLOYMENT_MODE: 'local' }));
+  for (const t of showModule.CLI_TOOLS) {
+    assert.ok(text.includes(showModule.cliToolCommand(t, launch)), t.id);
+    assert.ok(text.includes(t.docs), t.docs);
+  }
+  // Available in local mode too: these are local stdio clients and need no URL.
+  assert.match(text, /Not available\. This install is in local mode/);
+  assert.equal(/[^\x00-\x7f]/.test(text), false, 'plain ASCII');
+  // The name must satisfy every tool's rule: no spaces (Claude Code, Codex), no underscores (Gemini).
+  assert.match(showModule.GENERIC_SERVER_NAME, /^[A-Za-z0-9-]+$/);
+});
+
+test('shellQuote: bare when safe, quoted when it has spaces, with shell metacharacters escaped', () => {
+  assert.equal(showModule.shellQuote('C:\\node\\node.exe'), 'C:\\node\\node.exe');
+  assert.equal(showModule.shellQuote('/usr/bin/node'), '/usr/bin/node');
+  assert.equal(showModule.shellQuote('C:\\Program Files\\node.exe'), '"C:\\Program Files\\node.exe"');
+  assert.equal(showModule.shellQuote('/opt/my $app/`x`/"q"'), '"/opt/my \\$app/\\`x\\`/\\"q\\""');
+  assert.equal(showModule.shellQuote(''), '""');
+});
+
+// --- Cursor: a per-user app that is connected only when it is actually installed ---
+
+const CURSOR = targetById('cursor')!;
+
+test('Cursor: the global mcp.json under the home folder, with the entry shape its docs give', () => {
+  assert.deepEqual(CURSOR.resolvePath({ home: 'C:\\Users\\asha', p: path.win32 }), { ok: true, file: 'C:\\Users\\asha\\.cursor\\mcp.json' });
+  assert.deepEqual(CURSOR.resolvePath({ home: '/home/asha', p: path.posix }), { ok: true, file: '/home/asha/.cursor/mcp.json' });
+  assert.equal(CURSOR.appFolder!({ home: 'C:\\Users\\asha', p: path.win32 }), 'C:\\Users\\asha\\.cursor');
+  const launch = localLaunchSpec(INSTALL, NODE, path.win32);
+  assert.deepEqual(CURSOR.buildEntry(launch), { type: 'stdio', command: NODE, args: [...launch.args] });
+  assert.equal(CURSOR.serverName, 'tally-prime');
+  assert.equal(CURSOR.jsonc, false);
+  // Claude Desktop is pre-written on purpose, so it must NOT have an app-folder gate.
+  assert.equal(CD.appFolder, undefined);
+});
+
+test('--target apps expands to the per-user apps and leaves the workspace-scoped target out', () => {
+  assert.deepEqual(parseCliArgs(['apply', '--target', 'apps']).targets, ['claude-desktop', 'cursor']);
+  assert.deepEqual(parseCliArgs(['apply', '--target', 'apps', '--target', 'vscode']).targets, ['claude-desktop', 'cursor', 'vscode']);
+  assert.deepEqual(parseCliArgs(['apply', '--target', 'cursor', '--target', 'apps']).targets, ['cursor', 'claude-desktop']);
+  assert.equal(parseCliArgs(['remove', '--target', 'cursor', '--home', 'C:\\Users\\asha']).home, 'C:\\Users\\asha');
+  assert.throws(() => parseCliArgs(['apply', '--home']), /--home needs a value/);
+});
+
+test('CLI: Cursor is skipped when it is not installed, connected when it is, and cleaned up on remove', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'tally-cursor-'));
+  const run = (args: string[]) => {
+    const r = spawnSync(process.execPath, [CLI, ...args, '--target', 'cursor', '--home', home, '--install-root', INSTALL, '--node', NODE, '--json'], { encoding: 'utf-8' });
+    return { code: r.status, result: JSON.parse(r.stdout).results[0] };
+  };
+  const cursorDir = path.join(home, '.cursor');
+  const file = path.join(cursorDir, 'mcp.json');
+
+  // Not installed: nothing is created, and it is not an error.
+  for (const command of ['apply', 'status']) {
+    const r = run([command]);
+    assert.equal(r.code, 0, command);
+    assert.equal(r.result.notInstalled, true);
+    assert.match(r.result.skipped, /does not appear to be installed/);
+  }
+  assert.deepEqual(fs.readdirSync(home), [], 'no .cursor folder is created for an app that is not there');
+  assert.deepEqual(run(['detect']).result, { target: 'cursor', file, exists: false, installed: false });
+
+  // Installed, with another server already configured: ours is merged in beside it.
+  fs.mkdirSync(cursorDir);
+  fs.writeFileSync(file, JSON.stringify({ mcpServers: { other: { command: 'npx', args: ['-y', 'x'] } } }, null, 2));
+  const applied = run(['apply']);
+  assert.equal(applied.code, 0);
+  assert.equal(applied.result.wrote, true);
+  const written = JSON.parse(fs.readFileSync(file, 'utf-8'));
+  assert.deepEqual(written.mcpServers.other, { command: 'npx', args: ['-y', 'x'] });
+  assert.deepEqual(written.mcpServers['tally-prime'], CURSOR.buildEntry(localLaunchSpec(INSTALL, NODE)));
+  assert.equal(run(['apply']).result.wrote, false, 'a second apply changes nothing');
+
+  // Installed but no mcp.json yet: the file is created.
+  fs.rmSync(file);
+  assert.equal(run(['apply']).result.wrote, true);
+  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(file, 'utf-8')).mcpServers), ['tally-prime']);
+
+  // Remove takes ours out.
+  assert.equal(run(['remove']).result.wrote, true);
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf-8')).mcpServers?.['tally-prime'], undefined);
+  fs.rmSync(home, { recursive: true, force: true });
 });

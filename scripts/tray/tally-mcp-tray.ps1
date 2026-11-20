@@ -151,13 +151,25 @@ function Read-EnvValue {
 function Test-ClientConfigured {
     param([string]$InstallRoot)
     try {
-        $cfg = Join-Path (Join-Path $env:APPDATA 'Claude') 'claude_desktop_config.json'
-        if (-not (Test-Path -LiteralPath $cfg)) { return $false }
-        $raw = Get-Content -LiteralPath $cfg -Raw -ErrorAction Stop
-        if (-not $raw) { return $false }
-        # Match on the install path rather than the entry name: the name is cosmetic and a user
-        # may rename it, but an entry that does not point HERE is not this install being wired up.
-        return ($raw.IndexOf($InstallRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+        # Connected means at least one app we auto-connect points at this install: Claude Desktop,
+        # or Cursor (whose global config lives under the profile folder).
+        $candidates = @(
+            (Join-Path (Join-Path $env:APPDATA 'Claude') 'claude_desktop_config.json'),
+            (Join-Path (Join-Path $env:USERPROFILE '.cursor') 'mcp.json')
+        )
+        # JSON stores a Windows path with doubled backslashes, so look for that form too.
+        $needles = @($InstallRoot, $InstallRoot.Replace('\', '\\'))
+        foreach ($cfg in $candidates) {
+            if (-not (Test-Path -LiteralPath $cfg)) { continue }
+            $raw = Get-Content -LiteralPath $cfg -Raw -ErrorAction Stop
+            if (-not $raw) { continue }
+            # Match on the install path rather than the entry name: the name is cosmetic and a user
+            # may rename it, but an entry that does not point HERE is not this install being wired up.
+            foreach ($needle in $needles) {
+                if ($raw.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+            }
+        }
+        return $false
     } catch {
         return $null
     }

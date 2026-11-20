@@ -30,7 +30,9 @@
     The Tally MCP install root. Defaults to this script's grandparent.
 
 .PARAMETER Target
-    claude-desktop (default), vscode, or all. VS Code needs -Workspace.
+    apps (default), claude-desktop, cursor, vscode, or all.
+    'apps' is every app with one per-user config: Claude Desktop, and Cursor when it is installed.
+    VS Code is per-project and needs -Workspace.
 
 .PARAMETER Workspace
     Workspace folder for the VS Code target (.vscode/mcp.json is per-project).
@@ -48,8 +50,8 @@
 [CmdletBinding()]
 param(
     [string]$InstallDir,
-    [ValidateSet('claude-desktop', 'vscode', 'all')]
-    [string]$Target = 'claude-desktop',
+    [ValidateSet('apps', 'claude-desktop', 'cursor', 'vscode', 'all')]
+    [string]$Target = 'apps',
     [string]$Workspace,
     [switch]$Remove,
     [switch]$Json
@@ -143,7 +145,9 @@ $anyWrote = $false
 $anyBlocked = $false
 foreach ($r in @($report.results)) {
     if ($r.skipped) {
-        Write-Host ("[skip] {0}: {1}" -f $r.target, $r.skipped)
+        # An app that is simply not on this PC is expected, not a problem: say so quietly.
+        if ($r.notInstalled) { Write-Host ("[--]   {0}: not installed for this user, nothing to do" -f $r.target) -ForegroundColor DarkGray }
+        else { Write-Host ("[skip] {0}: {1}" -f $r.target, $r.skipped) }
         continue
     }
     if ($r.note) {
@@ -176,9 +180,9 @@ if ($anyBlocked) {
 } elseif ($anyWrote) {
     # The restart is not optional and not obvious: Claude Desktop reads this file once at startup,
     # so a user who leaves it running sees no Tally tools and concludes the install failed.
-    Write-Host "Done. Now QUIT Claude Desktop COMPLETELY and reopen it -" -ForegroundColor Green
-    Write-Host "closing the window is not enough; use File > Exit, or the tray icon." -ForegroundColor Green
-    Write-Host "Tally tools appear once it restarts." -ForegroundColor Green
+    Write-Host "Done. Now QUIT the app COMPLETELY and reopen it -" -ForegroundColor Green
+    Write-Host "closing the window is not enough. Claude Desktop: use File > Exit, or the tray icon." -ForegroundColor Green
+    Write-Host "Cursor: close every Cursor window. Tally tools appear once the app restarts." -ForegroundColor Green
 } else {
     Write-Host "Already connected. Nothing needed doing." -ForegroundColor Green
 }
