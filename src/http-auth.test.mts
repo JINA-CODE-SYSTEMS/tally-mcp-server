@@ -668,3 +668,54 @@ test('the client registry is bounded: idle clients are evicted first, signed-in 
   assert.equal(store.makeRoomForClient(clients, 2, new Set(['b'])), true);
   assert.deepEqual([...clients.keys()], ['b']);
 });
+
+test('eviction spares a client that registered moments ago while an older idle client can go instead', () => {
+  const now = 1_000_000_000;
+  const MIN = 60_000;
+  const mk = (id: string, registered_at?: number): [string, store.RegisteredClient] =>
+    [id, { client_id: id, client_name: id, client_secret: 's', redirect_uris: [REDIRECT], registered_at }];
+
+  // 'login' registered a minute ago (a user may be at the sign-in page) and is the OLDEST entry;
+  // 'stale' and 'legacy' (no timestamp) are idle and old. The old ones go first.
+  let clients = new Map([mk('login', now - MIN), mk('stale', now - 60 * MIN), mk('legacy'), mk('busy', now - 90 * MIN)]);
+  assert.equal(store.makeRoomForClient(clients, 4, new Set(['busy']), now), true);
+  assert.deepEqual([...clients.keys()], ['login', 'legacy', 'busy'], 'one old idle client is dropped, the recent one is kept');
+
+  // Only as many as needed are dropped.
+  clients = new Map([mk('stale1', now - 60 * MIN), mk('stale2', now - 50 * MIN), mk('login', now - MIN)]);
+  assert.equal(store.makeRoomForClient(clients, 3, new Set(), now), true);
+  assert.deepEqual([...clients.keys()], ['stale2', 'login']);
+
+  // The window is a preference, not a protection: when every idle client is recent (a flood), the
+  // oldest recent one goes, so registration is never blocked by clients that have not signed in.
+  clients = new Map([mk('busy', now - 90 * MIN), mk('f1', now - 3 * MIN), mk('f2', now - 2 * MIN), mk('f3', now - MIN)]);
+  assert.equal(store.makeRoomForClient(clients, 4, new Set(['busy']), now), true);
+  assert.deepEqual([...clients.keys()], ['busy', 'f2', 'f3']);
+
+  // A client just past the window counts as old; a client in use is never dropped in either pass.
+  clients = new Map([mk('recent', now - 9 * MIN), mk('expired', now - 11 * MIN)]);
+  assert.equal(store.makeRoomForClient(clients, 2, new Set(), now), true);
+  assert.deepEqual([...clients.keys()], ['recent']);
+  clients = new Map([mk('a', now - MIN), mk('b', now - 60 * MIN)]);
+  assert.equal(store.makeRoomForClient(clients, 2, new Set(['a', 'b']), now), false);
+  assert.equal(clients.size, 2);
+
+  // The timestamp is validated on load and optional for older records.
+  const record = { client_id: 'x', client_name: 'x', client_secret: 's', redirect_uris: [REDIRECT] };
+  assert.equal(store.isRegisteredClient(record), true);
+  assert.equal(store.isRegisteredClient({ ...record, registered_at: now }), true);
+  assert.equal(store.isRegisteredClient({ ...record, registered_at: 'yesterday' }), false);
+});
+
+test('registration records when the client registered', async () => {
+  const h = await start(undefined, { maxClients: 3 });
+  try {
+    const before = Date.now();
+    const reg = await postJson(`${h.base}/register`, { client_name: 'fresh', redirect_uris: [REDIRECT] });
+    const id = (await reg.json() as any).client_id;
+    const stored = JSON.parse(fs.readFileSync(path.join(h.dir, '.oauth-clients.json'), 'utf-8'));
+    assert.ok(stored[id].registered_at >= before && stored[id].registered_at <= Date.now());
+  } finally {
+    await h.close();
+  }
+});

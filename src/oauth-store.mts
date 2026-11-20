@@ -15,6 +15,8 @@ export interface RegisteredClient {
   // How the client authenticates at /token. 'none' is a public client (PKCE only, no secret).
   // Absent on records written before this field existed — see authenticateClient.
   token_endpoint_auth_method?: TokenEndpointAuthMethod;
+  // When the client registered (ms since epoch). Absent on older records, which count as old.
+  registered_at?: number;
 }
 
 export type TokenEndpointAuthMethod = 'none' | 'client_secret_basic' | 'client_secret_post';
@@ -50,6 +52,7 @@ export function isRegisteredClient(v: unknown): v is RegisteredClient {
     && typeof v.client_secret === 'string'
     && (v.client_secret.length > 0 || v.token_endpoint_auth_method === 'none')
     && (v.token_endpoint_auth_method === undefined || TOKEN_ENDPOINT_AUTH_METHODS.includes(v.token_endpoint_auth_method as string))
+    && (v.registered_at === undefined || (typeof v.registered_at === 'number' && Number.isFinite(v.registered_at)))
     && Array.isArray(v.redirect_uris) && v.redirect_uris.every(u => typeof u === 'string');
 }
 
@@ -382,20 +385,35 @@ export function authenticateClient(client: RegisteredClient, clientSecret: strin
 
 // ---- Bounded client registry ---------------------------------------------------------------------
 
-// Registration is open, so the registry must not grow without limit. When it is full, the oldest
-// clients that hold nothing — no live access or refresh token, no pending authorization code — are
-// dropped to make room. Only someone who knows PASSWORD can make a client "in use", so a flood of
-// throwaway registrations evicts itself and never a client that has actually signed in.
+// Registration is open, so the registry must not grow without limit. When it is full, clients that
+// hold nothing — no live access or refresh token, no pending authorization code — are dropped to
+// make room, in the order that loses least:
+//   1. idle clients registered longer ago than graceMs, oldest first;
+//   2. only if that frees nothing, idle clients registered within graceMs, oldest first. A client
+//      in that window may have a user at the sign-in page, who holds no code yet; it is spared
+//      whenever an older idle client can go instead.
+// A client in use is never dropped. Only someone who knows PASSWORD can make a client "in use", so
+// a flood of throwaway registrations evicts itself and never a client that has signed in. The grace
+// window is a preference and not a protection for the same reason: registering needs no password,
+// so a hard rule would let a flood of fresh clients block every other registration.
 // Returns false when the registry is full of in-use clients and nothing could be freed.
+export const CLIENT_GRACE_MS = 10 * 60 * 1000; // matches the default authorization code lifetime
+
 export function makeRoomForClient(
   clients: Map<string, RegisteredClient>,
   maxClients: number,
   inUse: Set<string>,
+  now: number = Date.now(),
+  graceMs: number = CLIENT_GRACE_MS,
 ): boolean {
   if (clients.size < maxClients) return true;
-  for (const id of clients.keys()) { // Map iteration is insertion order: oldest first
-    if (clients.size < maxClients) break;
-    if (!inUse.has(id)) clients.delete(id);
+  const recent = (c: RegisteredClient) => c.registered_at !== undefined && now - c.registered_at < graceMs;
+  for (const spareRecent of [true, false]) {
+    for (const [id, client] of clients) { // Map iteration is insertion order: oldest first
+      if (clients.size < maxClients) return true;
+      if (inUse.has(id) || (spareRecent && recent(client))) continue;
+      clients.delete(id);
+    }
   }
   return clients.size < maxClients;
 }

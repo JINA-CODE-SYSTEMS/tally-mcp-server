@@ -152,7 +152,7 @@ Copy `.env.example` to `.env` and configure:
 | `READONLY_MODE` | `false` | Set `true` to disable everything that can change Tally data: all write tools, `gui-send-keys` (free-form keystrokes), `repair-master-names` with `confirm`, `set-entry-order`, and the `tally-raw-xml-probe` debug tool entirely. `gui-screenshot` and the fixed company-loading tools stay available |
 | `ADMIN_SECRET` | | Secret for manual client registration (`Authorization: Bearer …` on `/register`). On its own it does **not** close registration — see the next row |
 | `REQUIRE_ADMIN_SECRET_FOR_REGISTRATION` | `false` | `true`: `/register` accepts only requests carrying `ADMIN_SECRET` (registration is closed if no secret is set). Claude and VS Code register themselves without credentials, so leave this `false` unless you register every client by hand |
-| `OAUTH_MAX_CLIENTS` | `500` | Cap on registered OAuth clients. When full, the oldest clients with no live token are dropped to make room; registration is refused only if every client is signed in |
+| `OAUTH_MAX_CLIENTS` | `500` | Cap on registered OAuth clients. When full, clients with no live token are dropped to make room, those registered more than 10 minutes ago first so a sign-in in progress is not interrupted; registration is refused only if every client is signed in |
 | `OAUTH_REDIRECT_SCHEMES` | | Extra app redirect schemes to accept at registration, comma-separated (built in: `vscode`, `vscode-insiders`, `cursor`, `claude`). `https://` and `http://localhost` / `127.0.0.1` are always accepted; script and file schemes never are |
 | **Auth & Rate Limiting** | | |
 | `AUTH_RATE_LIMIT_WINDOW_MS` | `60000` | Rate limit window in ms (1 minute) |

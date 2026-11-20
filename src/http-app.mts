@@ -369,7 +369,7 @@ app.post('/register', authRateLimiter, (req, res) => {
     return res.status(400).json(registration);
   }
 
-  // Keep the registry bounded: drop the oldest clients that never signed in before refusing.
+  // Keep the registry bounded: drop idle clients (older ones first, see makeRoomForClient) before refusing.
   const before = registeredClients.size;
   if (!store.makeRoomForClient(registeredClients, maxClients, clientsInUse())) {
     console.error(`[register] refused: ${registeredClients.size} registered clients are all in use (OAUTH_MAX_CLIENTS=${maxClients})`);
@@ -392,7 +392,8 @@ app.post('/register', authRateLimiter, (req, res) => {
     client_name: clientName,
     client_secret: clientSecret,
     redirect_uris: redirectUris,
-    token_endpoint_auth_method: authMethod
+    token_endpoint_auth_method: authMethod,
+    registered_at: Date.now()
   });
   saveClients();
 
