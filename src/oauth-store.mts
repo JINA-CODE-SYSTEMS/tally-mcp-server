@@ -13,7 +13,7 @@ export interface RegisteredClient {
   client_secret: string;
   redirect_uris: string[];
   // How the client authenticates at /token. 'none' is a public client (PKCE only, no secret).
-  // Absent on records written before this field existed — see authenticateClient.
+  // A record without it is treated as confidential — see authenticateClient.
   token_endpoint_auth_method?: TokenEndpointAuthMethod;
   // When the client registered (ms since epoch). Absent on older records, which count as old.
   registered_at?: number;
@@ -367,10 +367,8 @@ export function parseClientCredentials(
 // Whether the presented secret authenticates this client.
 //   public client ('none')          no secret exists; PKCE and the refresh token are its credentials.
 //   confidential client             the secret is REQUIRED and must match.
-//   record without the field        registered before the method was recorded, when the secret was
-//                                   checked only if sent. Kept that way so live sessions survive an
-//                                   upgrade; a wrong secret is still rejected. Such a client becomes
-//                                   strict the next time it registers.
+//   record without the field        treated as confidential: the secret is required. (RFC 7591's
+//                                   default method is client_secret_basic.)
 export function authenticateClient(client: RegisteredClient, clientSecret: string | undefined): boolean {
   const matches = (): boolean => {
     if (!clientSecret || !client.client_secret) return false;
@@ -379,7 +377,6 @@ export function authenticateClient(client: RegisteredClient, clientSecret: strin
     return a.length === b.length && crypto.timingSafeEqual(a, b);
   };
   if (client.token_endpoint_auth_method === 'none') return true;
-  if (client.token_endpoint_auth_method === undefined) return clientSecret === undefined ? true : matches();
   return matches();
 }
 

@@ -621,10 +621,11 @@ test('a client registered as public gets no secret and authenticates with PKCE a
   }
 });
 
-test('clients persisted before the auth method was recorded keep working, but never with a wrong secret', () => {
+test('a client record with no recorded auth method is confidential: the secret is required', () => {
   const legacy: store.RegisteredClient = { client_id: 'old', client_name: 'n', client_secret: 's3cret', redirect_uris: [REDIRECT] };
   assert.equal(store.isRegisteredClient(legacy), true);
-  assert.equal(store.authenticateClient(legacy, undefined), true);
+  assert.equal(store.authenticateClient(legacy, undefined), false);
+  assert.equal(store.authenticateClient(legacy, ''), false);
   assert.equal(store.authenticateClient(legacy, 's3cret'), true);
   assert.equal(store.authenticateClient(legacy, 'wrong'), false);
 
