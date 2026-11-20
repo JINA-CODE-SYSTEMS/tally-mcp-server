@@ -6,7 +6,7 @@
 #
 # It used to carry its own vision loop - screenshot, ask gpt-4o/Claude over HTTP for the next
 # action, repeat - which meant a second, weaker model with its own API key was driving the GUI
-# while the Claude session that requested the work sat idle. That loop is gone, and with it the
+# while the assistant session that requested the work sat idle. That loop is gone, and with it the
 # ANTHROPIC_API_KEY / OPENAI_API_KEY requirement: this agent now needs no credentials at all.
 #
 # RUN: In the interactive desktop session where Tally is visible
@@ -314,7 +314,7 @@ function Write-Result {
 }
 
 # --- Ground-truth load verification -----------------------------------------------------------------
-# The keystroke-driven load flows (deterministic select-and-unlock, and Claude-driven sendkeys) are
+# The keystroke-driven load flows (deterministic select-and-unlock, and assistant-driven sendkeys) are
 # open-loop: they blast keys and used to report success without ever confirming Tally accepted them.
 # A wrong/rejected password, an unfocused list, or a premature "looks done" would still be reported as
 # success. These helpers close the loop by asking Tally itself what is loaded.
@@ -439,7 +439,7 @@ function Restart-Self {
 # so keep it quiet - and skip the overlay runspace below, which costs an STA thread and a WinForms
 # load that a single short-lived command has no use for.
 if (-not $Once) {
-    Write-Host "=== MCP Tally GUI Agent v2 (eyes and hands; Claude decides) ==="
+    Write-Host "=== MCP Tally GUI Agent v2 (eyes and hands; the AI assistant decides) ==="
     Write-Host "Version:  $Script:AgentVersion"
     Write-Host "Watching: $CommandFile"
     Write-Host "Results:  $ResultFile"
@@ -485,7 +485,7 @@ public class ClaudeOverlayNative {
             # Suppress the brief startup flash from Application.Run showing the form before the timer.
             $form.Add_Shown({ try { $form.Hide() } catch {} })
             $label = New-Object System.Windows.Forms.Label
-            $label.Text = "  Claude is controlling Tally - please don't use the keyboard or mouse  "
+            $label.Text = "  Your AI assistant is controlling Tally - please don't use the keyboard or mouse  "
             $label.Dock = 'Top'; $label.Height = $barH; $label.TextAlign = 'MiddleCenter'
             $label.BackColor = $orange; $label.ForeColor = [System.Drawing.Color]::White
             $label.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
@@ -565,7 +565,7 @@ public class ClaudeOverlayNative {
         } catch {}
     })
     [void]$overlayPs.BeginInvoke()
-    Write-Host "[overlay] Claude-control indicator ready"
+    Write-Host "[overlay] assistant-control indicator ready"
 } catch { $Script:OverlayState = $null; Write-Host "[overlay] unavailable (non-fatal): $_" }
 
 function Show-ClaudeOverlay {
@@ -606,7 +606,7 @@ function Invoke-AgentCommand {
 
         Write-Host "`n=== Received command: $($cmd.action) ==="
 
-        # Show the "Claude is controlling Tally" frame for GUI-driving commands (screenshot/ping
+        # Show the "Your AI assistant is controlling Tally" frame for GUI-driving commands (screenshot/ping
         # excluded - screenshot must be clean, ping is passive). Auto-hides ~6s after the last action.
         if (@('sendkeys','select-and-unlock-company','switch-company','start-tally') -contains ([string]$cmd.action)) {
             if (Get-Command Show-ClaudeOverlay -ErrorAction SilentlyContinue) { Show-ClaudeOverlay }
@@ -945,7 +945,7 @@ function Invoke-AgentCommand {
                 }
             }
             "bring-foreground" {
-                # Quick state probe + focus. Useful before a Claude-driven sequence to make
+                # Quick state probe + focus. Useful before an assistant-driven sequence to make
                 # sure subsequent press-key / type-text actions land in Tally and not in
                 # some other window the user accidentally clicked into.
                 try {

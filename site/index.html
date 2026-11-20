@@ -3,11 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Claudally — Drive Tally Prime with Claude</title>
+  <title>Claudally — Drive Tally Prime with AI</title>
   <meta name="description" content="Claudally is an open-source Tally Prime ↔ MCP server. Query financial reports, manage masters, create vouchers, and analyse GST from Claude, ChatGPT, Copilot, or any MCP client — in plain language.">
 
   <meta property="og:type" content="website">
-  <meta property="og:title" content="Claudally — Drive Tally Prime with Claude">
+  <meta property="og:title" content="Claudally — Drive Tally Prime with AI">
   <meta property="og:description" content="Open-source Tally Prime ↔ MCP server. Talk to your books in plain language from any MCP client.">
   <meta property="og:url" content="https://claudally.jinacode.systems">
   <meta name="theme-color" content="#0A0705">
@@ -513,9 +513,9 @@
     <!-- HERO -->
     <section class="hero">
       <p class="eyebrow stage stage-1"><span class="o">[</span> Claudally — open-source Tally Prime ↔ MCP server <span class="o">]</span></p>
-      <h1 class="hero-title" aria-label="Drive Tally Prime with Claude.">
+      <h1 class="hero-title" aria-label="Drive Tally Prime with AI.">
         <span class="hero-line" aria-hidden="true"><span class="inner">Drive Tally Prime</span></span>
-        <span class="hero-line" aria-hidden="true"><span class="inner">with <span class="grad-text">Claude.</span></span></span>
+        <span class="hero-line" aria-hidden="true"><span class="inner">with <span class="grad-text">AI.</span></span></span>
       </h1>
       <p class="lede stage stage-2">
         Query financial reports, manage masters, post vouchers, and analyse GST — in plain
@@ -582,15 +582,15 @@
           <span class="dot" style="background:#ff5f57"></span>
           <span class="dot" style="background:#febc2e"></span>
           <span class="dot" style="background:#28c840"></span>
-          <span class="term-title">Claude · Claudally</span>
+          <span class="term-title">Assistant · Claudally</span>
         </div>
         <div class="term-body" id="term-body">
           <p><span class="t-tag">You ›</span> What was my GST liability last quarter?</p>
-          <p><span class="t-tag ai">Claude ›</span> <span class="dim">reading GSTR-3B from Tally…</span><br>
+          <p><span class="t-tag ai">Assistant ›</span> <span class="dim">reading GSTR-3B from Tally…</span><br>
             Output tax <span class="num">₹4,12,860</span> − input credit <span class="num">₹2,88,140</span>
             = net payable <span class="num">₹1,24,720</span> for Jul–Sep.</p>
           <p><span class="t-tag">You ›</span> Post a sales invoice to Acme Ltd for ₹50,000 + 18% GST.</p>
-          <p><span class="t-tag ai">Claude ›</span> <span class="dim">created voucher #1043 ✓</span> — taxable
+          <p><span class="t-tag ai">Assistant ›</span> <span class="dim">created voucher #1043 ✓</span> — taxable
             <span class="num">₹50,000</span>, CGST ₹4,500, SGST ₹4,500, total <span class="num">₹59,000</span>.</p>
         </div>
       </div>
@@ -981,10 +981,10 @@ npm install <span class="p">&amp;&amp;</span> npx tsc
           await sleep(420);
           q.querySelector('.caret').remove();
           var a = document.createElement('p');
-          a.innerHTML = '<span class="t-tag ai">Claude ›</span> <span class="dim">' + pair.think + '</span>';
+          a.innerHTML = '<span class="t-tag ai">Assistant ›</span> <span class="dim">' + pair.think + '</span>';
           body.appendChild(a);
           await sleep(950);
-          a.innerHTML = '<span class="t-tag ai">Claude ›</span> ' + pair.a;
+          a.innerHTML = '<span class="t-tag ai">Assistant ›</span> ' + pair.a;
           await sleep(1500);
         }
         await sleep(3400);

@@ -2973,7 +2973,7 @@ export async function registerMcpServer(): Promise<McpServer> {
     // getServerVersion() reads package.json, which the release build verifies against the git tag.
     // This was hardcoded to '1.0.0', so every MCP client saw a version unrelated to what shipped.
     version: getServerVersion(),
-    description: 'Drive Tally Prime with Claude — query reports, manage masters, post vouchers, and analyse GST.',
+    description: 'Drive Tally Prime with an AI assistant — query reports, manage masters, post vouchers, and analyse GST.',
     websiteUrl: 'https://claudally.jinacode.systems',
     // Tell the client which logo to show (MCP icons). Hosted on the public landing site so any
     // MCP client can fetch it; the plain placeholder tile in some connector UIs is the fallback
@@ -3261,7 +3261,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       // This strategy used to dispatch 'select-company' / 'load-on-startup' to the companion agent,
       // which ran its OWN screenshot -> decide -> act loop against gpt-4o (or Claude) over HTTP,
       // using a separate API key. That was the wrong shape twice over: a second, weaker model drove
-      // the window while the Claude session that asked for the work sat idle waiting, and its
+      // the window while the assistant session that asked for the work sat idle waiting, and its
       // decisions were invisible to the caller and to the user. It is gone.
       //
       // What remains is preparation plus an explicit hand-off. We make sure Tally is actually
@@ -5222,7 +5222,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         }
         if (process.env.ENABLE_GUI_CONTROL !== 'true') {
           auditLog('gui-delete-voucher', args, 'denied', Date.now() - start);
-          return errorResult('PRECONDITION_FAILED', { message: 'GUI control is disabled, so the Tally window cannot be driven.', remedy: 'Enable it from the tray (Allow Claude to control Tally), or set ENABLE_GUI_CONTROL=true in .env and restart.', retryable: false });
+          return errorResult('PRECONDITION_FAILED', { message: 'GUI control is disabled, so the Tally window cannot be driven.', remedy: 'Enable it from the tray (Allow the AI assistant to control Tally), or set ENABLE_GUI_CONTROL=true in .env and restart.', retryable: false });
         }
 
         const company = args.targetCompany || activeCompany || undefined;
@@ -6680,7 +6680,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       const auditArgs = { company: args.company }; // never the password
       if (process.env.ENABLE_GUI_CONTROL !== 'true') {
         auditLog('unlock-stored-credentials', auditArgs, 'denied');
-        return errorResult('PRECONDITION_FAILED', { message: 'Claude-driven GUI control is disabled.', remedy: 'Set ENABLE_GUI_CONTROL=true (and restart the service) to enable it.', retryable: false });
+        return errorResult('PRECONDITION_FAILED', { message: 'Assistant-driven GUI control is disabled.', remedy: 'Set ENABLE_GUI_CONTROL=true (and restart the service) to enable it.', retryable: false });
       }
       try {
         const registry = loadCompanyRegistry(resolveRegistryPath());

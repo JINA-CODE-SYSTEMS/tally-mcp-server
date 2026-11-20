@@ -470,7 +470,7 @@ if ($mode -eq 'remote') {
 if ($mode -eq 'local' -and -not $SkipClientConfig) {
     $connectScript = Join-Path $InstallDir "scripts\installer\connect-client.ps1"
     if (-not (Test-Path $connectScript)) {
-        Write-Host "[WARN] connect-client.ps1 not found at $connectScript - configure Claude manually" -ForegroundColor Yellow
+        Write-Host "[WARN] connect-client.ps1 not found at $connectScript - configure your MCP client manually" -ForegroundColor Yellow
     } else {
         # connect-client.ps1 writes %APPDATA%\Claude\claude_desktop_config.json for WHOEVER RUNS
         # IT. If this script was elevated as a different account than the one that opens Claude,
@@ -486,7 +486,7 @@ if ($mode -eq 'local' -and -not $SkipClientConfig) {
         }
         if ($AgentTaskUser -and $AgentTaskUser -ne $env:USERNAME) {
             Write-Host "[WARN] You are '$env:USERNAME' but the agent will run as '$AgentTaskUser'." -ForegroundColor Yellow
-            Write-Host "       Claude reads a per-user config, so run this as $AgentTaskUser too:" -ForegroundColor Yellow
+            Write-Host "       The MCP client reads a per-user config, so run this as $AgentTaskUser too:" -ForegroundColor Yellow
             Write-Host "         powershell -ExecutionPolicy Bypass -File `"$connectScript`" -InstallDir `"$InstallDir`"" -ForegroundColor Yellow
         }
     }
@@ -566,8 +566,8 @@ if ($mode -eq 'remote') {
     Write-Host "  nssm stop $ServiceName               # Stop service"
     Write-Host "  nssm edit $ServiceName               # Edit config (GUI)"
 } else {
-    Write-Host "  # Local mode has no service - Claude starts the server on demand over stdio."
-    Write-Host "  powershell -File scripts\installer\connect-client.ps1 -InstallDir `"$InstallDir`"    # (re)connect a user's Claude"
+    Write-Host "  # Local mode has no service - the MCP client starts the server on demand over stdio."
+    Write-Host "  powershell -File scripts\installer\connect-client.ps1 -InstallDir `"$InstallDir`"    # (re)connect a user's AI assistant"
 }
 Write-Host "  powershell -File scripts\verify-deployment.ps1        # Check the deployment against its mode"
 Write-Host "  schtasks /Query /TN $AgentTaskName   # Check agent task status"

@@ -4,7 +4,7 @@
 
 # Claudally
 
-**Drive Tally Prime with Claude.** A Tally Prime ERP ↔ [MCP](https://modelcontextprotocol.io/) server for Claude, ChatGPT, Copilot, and any MCP client.
+**Drive Tally Prime with AI.** A Tally Prime ERP ↔ [MCP](https://modelcontextprotocol.io/) server for any MCP client: Claude, ChatGPT, Copilot and others.
 
 by **JINA CODE SYSTEMS LLP** &nbsp;<img src="scripts/tray/assets/jina-logo.png" height="26" alt="JINA CODE SYSTEMS LLP logo">
 

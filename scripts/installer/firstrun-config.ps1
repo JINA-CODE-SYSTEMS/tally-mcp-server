@@ -50,7 +50,7 @@
       - The deployment mode is read, never changed.
       - Services and tasks that already exist are re-registered with the same identity (so the new
         release's definition applies) and restarted. Nothing that did not exist is created.
-      - The Claude client configuration is left alone, unless the install has moved.
+      - The MCP client configuration is left alone, unless the install has moved.
       - An existing tunnel service is re-registered with --token-file, the token file written from
         the TUNNEL_TOKEN in .env, and the registry copy scrubbed (#193). If the file cannot be
         locked down the tunnel is left unregistered and the run fails, so Setup exits 10.
@@ -99,7 +99,7 @@ param(
     [string]$TallyIniPath,
     [string]$McpDomain,
     [string]$AgentTaskUser,
-    # Opt-in for Claude-driven GUI control (gui-screenshot / gui-send-keys). Wizard passes
+    # Opt-in for assistant-driven GUI control (gui-screenshot / gui-send-keys). Wizard passes
     # 'true'/'false'; a bare Reconfigure omits it, so we preserve the existing .env value below.
     [string]$EnableGuiControl,
     # '' is a MEANINGFUL value here: it means the wizard's "ask me later" option was chosen, so no
@@ -365,7 +365,7 @@ if ($Upgrade) {
         }
 
         # Has the install moved since the agent task was registered? That is the one case in which
-        # the Claude client configuration (which records the install path) must be rewritten.
+        # the MCP client configuration (which records the install path) must be rewritten.
         if ($_agentTask) {
             $_taskArgs = (@($_agentTask.Actions) | ForEach-Object { "$($_.Arguments)" }) -join ' '
             $_here = $InstallDir.TrimEnd('\') + '\scripts\'
@@ -746,7 +746,7 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         # Persisted so a later Reconfigure preserves the agent user instead of falling back to
         # whoever runs the wizard (see the _Coalesce for $AgentTaskUser above).
         "AGENT_TASK_USER=$(_envQuote $AgentTaskUser)"
-        # Claude-driven GUI control (gui-screenshot / gui-send-keys). On unless the operator opted out.
+        # assistant-driven GUI control (gui-screenshot / gui-send-keys). On unless the operator opted out.
         "ENABLE_GUI_CONTROL=$EnableGuiControl"
         # Update notification. The tray checks once a day whether a newer release exists and, if so,
         # says so. It downloads and runs NOTHING - that is a separate, signed channel (#177). Written
@@ -1028,9 +1028,9 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         # moved (its agent task still points at the old folder), where the old entry is now wrong.
         $connectScript = Join-Path $InstallDir 'scripts\installer\connect-client.ps1'
         if ($Upgrade -and -not $_upgradeInstallMoved) {
-            Write-Host "[OK] Upgrade: Claude client configuration left as it is (the install path has not changed)"
+            Write-Host "[OK] Upgrade: MCP client configuration left as it is (the install path has not changed)"
         } elseif (-not (Test-Path -LiteralPath $connectScript)) {
-            Write-Host "[WARN] $connectScript not found - skipping auto-connect. Use the 'Connect Claude to Tally' Start Menu item." -ForegroundColor Yellow
+            Write-Host "[WARN] $connectScript not found - skipping auto-connect. Use the 'Connect your AI assistant to Tally' Start Menu item." -ForegroundColor Yellow
         } else {
             $connectTask = 'TallyMCPConnectOnce'
             # schtasks writes "cannot find the file specified" to stderr when the task does not
@@ -1066,15 +1066,15 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
                     Write-Host "[OK] Claude Desktop configuration written for '$AgentTaskUser'"
                 } elseif ($info -and $info.LastTaskResult -eq 267011) {
                     Write-Host "[*]  Auto-connect queued: '$AgentTaskUser' is not logged on right now." -ForegroundColor Yellow
-                    Write-Host "     They should run 'Connect Claude to Tally' from the Start Menu after signing in." -ForegroundColor Yellow
+                    Write-Host "     They should run 'Connect your AI assistant to Tally' from the Start Menu after signing in." -ForegroundColor Yellow
                 } else {
                     $code = 'unknown'
                     if ($info) { $code = $info.LastTaskResult }
-                    Write-Host "[WARN] Auto-connect finished with result $code. Run 'Connect Claude to Tally' from the Start Menu as $AgentTaskUser." -ForegroundColor Yellow
+                    Write-Host "[WARN] Auto-connect finished with result $code. Run 'Connect your AI assistant to Tally' from the Start Menu as $AgentTaskUser." -ForegroundColor Yellow
                 }
             } catch {
                 Write-Host "[WARN] Could not run auto-connect: $_" -ForegroundColor Yellow
-                Write-Host "       Use the 'Connect Claude to Tally' Start Menu item instead." -ForegroundColor Yellow
+                Write-Host "       Use the 'Connect your AI assistant to Tally' Start Menu item instead." -ForegroundColor Yellow
             } finally {
                 schtasks /Delete /TN $connectTask /F 2>$null | Out-Null
                 $ErrorActionPreference = $savedPrefC

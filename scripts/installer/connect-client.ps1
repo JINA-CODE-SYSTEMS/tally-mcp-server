@@ -18,7 +18,7 @@
 
     Three routes, all landing here, all idempotent so running two of them is harmless:
       1. install time  - firstrun-config.ps1 launches it as AGENT_TASK_USER
-      2. Start Menu    - "Connect Claude to Tally", for the very common case where Claude Desktop
+      2. Start Menu    - "Connect your AI assistant to Tally", for the very common case where Claude Desktop
                          is installed AFTER Claudally, or a second user needs connecting
       3. the tray      - same command, for a user who has already dismissed the installer
 
@@ -127,7 +127,7 @@ if ($Json) { Write-Output $rawText; exit $exit }
 
 # --- Human summary -------------------------------------------------------------------------------
 Write-Host ""
-Write-Host "Connect Claude to Tally" -ForegroundColor Cyan
+Write-Host "Connect your AI assistant to Tally" -ForegroundColor Cyan
 Write-Host ("  running as : {0}\{1}" -f $env:USERDOMAIN, $env:USERNAME)
 Write-Host ("  install    : {0}" -f $InstallDir)
 Write-Host ""
@@ -172,7 +172,7 @@ Write-Host ""
 if ($anyBlocked) {
     Write-Host "Some targets need a manual step - see above." -ForegroundColor Yellow
 } elseif ($Remove) {
-    Write-Host "Claude will no longer see this Tally server." -ForegroundColor Green
+    Write-Host "Your AI assistant will no longer see this Tally server." -ForegroundColor Green
 } elseif ($anyWrote) {
     # The restart is not optional and not obvious: Claude Desktop reads this file once at startup,
     # so a user who leaves it running sees no Tally tools and concludes the install failed.

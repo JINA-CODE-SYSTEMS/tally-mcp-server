@@ -44,7 +44,7 @@ Write-Host "=== Tally MCP uninstall cleanup ==="
 # server the user cannot explain and cannot fix without hand-editing the JSON this product exists
 # to keep them out of.
 #
-# ACROSS EVERY PROFILE, not just AGENT_TASK_USER: the "Connect Claude to Tally" Start Menu item is
+# ACROSS EVERY PROFILE, not just AGENT_TASK_USER: the "Connect your AI assistant to Tally" Start Menu item is
 # available to anyone who logs in, so a second user may well have wired themselves up.
 #
 # --require-install-root is what makes touching other people's files defensible. Without it the
@@ -56,7 +56,7 @@ try {
     $nodeExe   = Join-Path $InstallDir 'node-portable\node.exe'
     $configCli = Join-Path $InstallDir 'dist\client-config.mjs'
     if (-not (Test-Path -LiteralPath $nodeExe) -or -not (Test-Path -LiteralPath $configCli)) {
-        Write-Host "[*] client-config tooling not present - skipping Claude config cleanup"
+        Write-Host "[*] client-config tooling not present - skipping MCP client config cleanup"
     } else {
         $profileRoot = Split-Path -Parent $env:PUBLIC          # normally C:\Users
         $cleaned = 0; $skipped = 0
@@ -70,13 +70,13 @@ try {
                     try { $res = ($out | ConvertFrom-Json).results[0] } catch { }
                     if ($res -and $res.wrote) {
                         $cleaned++
-                        Write-Host "[OK] Removed the Tally entry from $($dir.Name)'s Claude configuration"
+                        Write-Host "[OK] Removed the Tally entry from $($dir.Name)'s MCP client configuration"
                     } elseif ($res -and $res.state -eq 'foreign') {
                         $skipped++
-                        Write-Host "[*]  Left $($dir.Name)'s Claude entry alone - it points at a different install"
+                        Write-Host "[*]  Left $($dir.Name)'s MCP client entry alone - it points at a different install"
                     }
                 } catch {
-                    Write-Host "[WARN] Could not clean $($dir.Name)'s Claude configuration: $_"
+                    Write-Host "[WARN] Could not clean $($dir.Name)'s MCP client configuration: $_"
                 }
             }
             # Per-user breadcrumb written by connect-client.ps1. Small, but it is ours and it names
@@ -84,7 +84,7 @@ try {
             $crumb = Join-Path $dir.FullName 'AppData\Local\Claudally'
             if (Test-Path -LiteralPath $crumb) { Remove-Item -Recurse -Force -LiteralPath $crumb -ErrorAction SilentlyContinue }
         }
-        Write-Host "[OK] Claude configuration cleanup: $cleaned removed, $skipped left alone"
+        Write-Host "[OK] MCP client configuration cleanup: $cleaned removed, $skipped left alone"
     }
 } catch {
     Write-Host "[WARN] client-config cleanup raised: $_"

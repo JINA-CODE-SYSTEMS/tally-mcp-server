@@ -433,7 +433,7 @@ function Show-CompanyEditDialog {
     $form.Controls.Add($grpIdentity)
 
     $tbAlias = New-DialogField -Parent $grpIdentity -Y 25 -Label 'Alias' -Required $true `
-        -Hint 'Short name you will say to Claude (e.g. "main", "branch")' `
+        -Hint 'Short name you will say to your AI assistant (e.g. "main", "branch")' `
         -Initial ([string]$Existing.alias)
 
     $tbFolderId = New-DialogField -Parent $grpIdentity -Y 80 -Label 'Folder ID' -Required $true `
@@ -655,7 +655,7 @@ function Show-ManageCompaniesDialog {
     $headerPanel.Controls.Add($lblTitle)
 
     $lblSub = New-Object System.Windows.Forms.Label
-    $lblSub.Text = 'Register a short alias for each Tally company. Then ask Claude to "load <alias>" - no screenshot loop, no manual lookup.'
+    $lblSub.Text = 'Register a short alias for each Tally company. Then ask your AI assistant to "load <alias>" - no screenshot loop, no manual lookup.'
     $lblSub.Location = New-Object System.Drawing.Point(20, 44)
     $lblSub.Size = New-Object System.Drawing.Size(870, 18)
     $lblSub.Font = New-Object System.Drawing.Font 'Segoe UI', 9

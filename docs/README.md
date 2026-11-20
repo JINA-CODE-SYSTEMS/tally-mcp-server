@@ -4,7 +4,7 @@
 
 # Claudally
 
-**Drive Tally Prime with Claude.** A Tally Prime ERP ↔ [MCP](https://modelcontextprotocol.io/) server for Claude, ChatGPT, Copilot, and any MCP client.
+**Drive Tally Prime with AI.** A Tally Prime ERP ↔ [MCP](https://modelcontextprotocol.io/) server for any MCP client: Claude, ChatGPT, Copilot and others.
 
 by **JINA CODE SYSTEMS LLP** &nbsp;<img src="../scripts/tray/assets/jina-logo.png" height="26" alt="JINA CODE SYSTEMS LLP logo">
 
@@ -79,9 +79,9 @@ matches a number we published. **If either check fails, do not run the file.**
 **The setup wizard collects (most values auto-detect — usually just click Next):**
 
 - **Page 1 — Tally MCP Configuration:** Tally exe / data / `tally.ini` paths, and the Windows user the GUI agent runs as.
-- **Page 2 — Tally Edition:** Silver / Gold, plus a checkbox to let **Claude control Tally directly** (screenshots + keystrokes for login / company switching) — on by default.
+- **Page 2 — Tally Edition:** Silver / Gold, plus a checkbox to let **your AI assistant control Tally directly** (screenshots + keystrokes for login / company switching) — on by default.
 
-There is no password page, because there is no password. The installer sets up a **local** deployment: the server runs on this PC, started by Claude when you use it. Nothing listens on the network, so there is no login to gate — see [What a local install does and does not create](#what-a-local-install-does-and-does-not-create).
+There is no password page, because there is no password. The installer sets up a **local** deployment: the server runs on this PC, started by your AI assistant when you use it. Nothing listens on the network, so there is no login to gate — see [What a local install does and does not create](#what-a-local-install-does-and-does-not-create).
 
 **Remote access is not offered by the installer at present** ([#192](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/192)). Existing remote installs keep working and are preserved across upgrades untouched; only new installs are local-only.
 
@@ -93,11 +93,11 @@ These are the properties a local install is built around. They are stated here b
 
 **Does not create:**
 
-- **No Windows service.** The server is started by Claude when you use it and exits with it. Nothing runs while you are not working.
+- **No Windows service.** The server is started by your AI assistant when you use it and exits with it. Nothing runs while you are not working.
 - **No listening socket of ours.** Nothing of Claudally binds a port, so there is nothing on your machine or your LAN to connect to, and nothing to forward in a router.
 - **No password.** The OAuth password exists only to gate a listener. With no listener, it is never asked for, never written to `.env`, and never created.
 - **No token stores.** `.oauth-clients.json` and `.oauth-tokens.json` are never written. If you switch an existing remote install to local, they are shredded and removed.
-- **No outbound tunnel.** No third party sits between Claude and your books.
+- **No outbound tunnel.** No third party sits between your AI assistant and your books.
 
 **One honest correction to the obvious version of this claim:** your machine *does* still have a listening socket, because Tally Prime itself needs one — its XML server listens on port 9000, and Claudally could not read a single ledger without it. The claim is that **no Claudally process listens**, not that nothing on the PC does. Anyone telling you to check `netstat` for silence is describing something that was never true of a working Tally install.
 
@@ -214,9 +214,9 @@ Because the MCP server typically runs as a Windows service in **Session 0** (no 
 
 > **This section applies to remote deployments, which the installer does not currently set up** ([#192](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/192)). It is kept for existing remote installs and for anyone configuring one by hand.
 
-Where your Claude client runs decides what URL to point it at. **Rule of thumb: you only need a public URL when the client is *not* on the Tally PC.**
+Where your MCP client runs decides what URL to point it at. **Rule of thumb: you only need a public URL when the client is *not* on the Tally PC.**
 
-| Your Claude client | URL to use | Wizard "Remote Access" page |
+| Your MCP client | URL to use | Wizard "Remote Access" page |
 | --- | --- | --- |
 | **Claude Desktop on the Tally PC** | local (stdio, or `http://127.0.0.1:3000/mcp`) | leave both fields blank |
 | **Claude Desktop on another PC** | the public HTTPS URL | fill it in (tunnel or own domain) |
@@ -231,11 +231,11 @@ Either way, add the URL (with `/mcp`) as a custom connector in your client and s
 
 ### Local (Claude Desktop)
 
-**The installer does this for you.** It writes the entry into `claude_desktop_config.json` as the user who runs Claude, merging into that file rather than replacing it — any other MCP servers you have configured are left alone, and the file is backed up first.
+**The installer does this for you.** It writes the entry into `claude_desktop_config.json` as the user who runs the AI assistant, merging into that file rather than replacing it — any other MCP servers you have configured are left alone, and the file is backed up first.
 
 Then **quit Claude Desktop completely and reopen it**. Closing the window is not enough (use File → Exit, or the tray icon): Claude reads this file only at startup, so until it restarts you will see no Tally tools.
 
-If Claude Desktop was installed *after* Claudally, or you want to connect a second Windows user, run **Connect Claude to Tally** from the Start Menu — it is safe to run repeatedly and does nothing if the entry is already correct.
+If Claude Desktop was installed *after* Claudally, or you want to connect a second Windows user, run **Connect your AI assistant to Tally** from the Start Menu — it is safe to run repeatedly and does nothing if the entry is already correct.
 
 To add the entry by hand instead (File → Settings → Developer):
 

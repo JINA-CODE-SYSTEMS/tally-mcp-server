@@ -166,7 +166,7 @@ function Test-ClientConfigured {
 # Write (replace or append) a single KEY=VALUE in .env, preserving all other lines. Writes in place
 # rather than tmp+rename: firstrun-config.ps1 grants the agent user FullControl on the .env FILE
 # (icacls ${AgentTaskUser}:F) but not the Program Files directory, so we can rewrite the file but not
-# create a sibling .tmp there. Used by the "Allow Claude to control Tally" toggle.
+# create a sibling .tmp there. Used by the "Allow the AI assistant to control Tally" toggle.
 function Set-EnvValue {
     param([string]$EnvPath, [string]$Key, [string]$Value)
     $lines = @()
@@ -543,8 +543,8 @@ function Format-Tooltip {
     }
     if ($State.DeploymentMode -eq 'local') {
         $lines += "  Mode:     on this computer (no service, no open port)"
-        if ($State.ClientConfigured -eq $true) { $lines += "  Claude:   connected" }
-        elseif ($State.ClientConfigured -eq $false) { $lines += "  Claude:   not connected yet" }
+        if ($State.ClientConfigured -eq $true) { $lines += "  Assistant: connected" }
+        elseif ($State.ClientConfigured -eq $false) { $lines += "  Assistant: not connected yet" }
     } elseif ($State.Service) {
         $lines += "  Service:  $($State.Service.Status)"
     } else {
@@ -596,7 +596,7 @@ $miTallyState.Add_Click({
     try {
         if ($State.TallyXmlOk -eq $false) {
             $msg = @"
-Tally Prime is open, but Claude cannot read from it yet.
+Tally Prime is open, but your AI assistant cannot read from it yet.
 
 Tally ships with its data connection switched OFF. It has to be turned on once,
 inside Tally itself - nothing on this machine can do it for you.
@@ -623,7 +623,7 @@ someone clears it.
             $msg = @"
 You have $($State.TallyCount) copies of Tally open at the same time.
 
-Only one of them can hold the data connection, and Claude can only work with
+Only one of them can hold the data connection, and your AI assistant can only work with
 that one. Loading or switching a company will be refused while it is unclear
 which copy you mean - deliberately, because keystrokes sent to the wrong copy
 would land in a different company's window.
@@ -631,7 +631,7 @@ would land in a different company's window.
 Either:
 
   - Close the copies you are not using, or
-  - Turn the connection on in the copy you DO want Claude to use:
+  - Turn the connection on in the copy you DO want your AI assistant to use:
     F1 > Settings > Connectivity > Client/Server Configuration,
     'TallyPrime acts as' = Server, Port = 9000, then Ctrl+A.
 "@
@@ -715,7 +715,7 @@ $miStopService = $menu.Items.Add('Stop service')
 $miStopService.Add_Click({
     try {
         $confirm = [System.Windows.Forms.MessageBox]::Show(
-            "Stop the TallyMCP service?`n`nAll MCP tools become unavailable (any Claude session using them will fail) until you start it again with `"Restart service`".",
+            "Stop the TallyMCP service?`n`nAll MCP tools become unavailable (any AI assistant session using them will fail) until you start it again with `"Restart service`".",
             'TallyMCP', 'OKCancel', 'Warning')
         if ($confirm -ne 'OK') { return }
         # Elevated, like Restart. Use `sc.exe stop` (non-blocking - it sends the STOP control and
@@ -780,10 +780,10 @@ $miRestartAgent.Add_Click({
     }
 })
 
-# Toggle Claude-driven GUI control (ENABLE_GUI_CONTROL). Checkable; reflects current .env at build
+# Toggle assistant-driven GUI control (ENABLE_GUI_CONTROL). Checkable; reflects current .env at build
 # time. Enabling warns (arbitrary keystroke injection + screenshots) and restarts the service so the
 # server re-reads .env. Since #23 the server loads .env by absolute path, so a plain restart applies it.
-$miGuiControl = $menu.Items.Add('Allow Claude to control Tally (advanced)')
+$miGuiControl = $menu.Items.Add('Allow the AI assistant to control Tally (advanced)')
 $miGuiControl.Checked = ((Read-EnvValue -EnvPath (Join-Path $InstallDir '.env') -Key 'ENABLE_GUI_CONTROL') -eq 'true')
 $miGuiControl.Add_Click({
     try {
@@ -791,7 +791,7 @@ $miGuiControl.Add_Click({
         $cur = Read-EnvValue -EnvPath $envFile -Key 'ENABLE_GUI_CONTROL'
         $newVal = if ($cur -eq 'true') { 'false' } else { 'true' }
         if ($newVal -eq 'true') {
-            $warn = "Enable Claude-driven GUI control?`n`nThis lets Claude capture screenshots of the Tally window and send arbitrary keystrokes to it. Only enable on a machine you trust.`n`nThe service will restart to apply the change."
+            $warn = "Enable assistant-driven GUI control?`n`nThis lets the AI assistant capture screenshots of the Tally window and send arbitrary keystrokes to it. Only enable on a machine you trust.`n`nThe service will restart to apply the change."
             if ([System.Windows.Forms.MessageBox]::Show($warn, 'TallyMCP', 'OKCancel', 'Warning') -ne 'OK') { return }
         }
         Set-EnvValue -EnvPath $envFile -Key 'ENABLE_GUI_CONTROL' -Value $newVal
@@ -899,7 +899,7 @@ $miManageCompanies.Add_Click({
 # NOT elevated, deliberately: that file lives in %APPDATA%, which is per-user. Running it as an
 # admin who never opens Claude writes the wrong profile, and the user then sees no Tally tools with
 # nothing anywhere explaining why. connect-client.ps1 documents the same rule.
-$miConnectClaude = $menu.Items.Add('Connect Claude to Tally')
+$miConnectClaude = $menu.Items.Add('Connect your AI assistant to Tally')
 $miConnectClaude.Add_Click({
     $script = Join-Path $InstallDir 'scripts\installer\connect-client.ps1'
     if (-not (Test-Path -LiteralPath $script)) {
@@ -1163,7 +1163,7 @@ function Show-Dashboard {
             'Service'   { if ($State.DeploymentMode -eq 'local') { 'Mode' } else { 'Service' } }
             'Agent'     { 'GUI agent' }
             'Tally'     { 'Tally' }
-            'PublicUrl' { if ($State.DeploymentMode -eq 'local') { 'Claude' } else { 'Public URL' } }
+            'PublicUrl' { if ($State.DeploymentMode -eq 'local') { 'AI assistant' } else { 'Public URL' } }
         }
         $caption.Location  = New-Object System.Drawing.Point 16, ($rowY + 2)
         $caption.Size      = New-Object System.Drawing.Size 84, 18
@@ -1225,13 +1225,13 @@ function Show-Dashboard {
     if (-not $isLocal) {
         $btnSpecs += @{ Text = 'Restart service'; Kind = 'primary'; Click = { $miRestartService.PerformClick() } }
     }
-    $btnSpecs += @{ Text = 'Connect Claude to Tally'; Kind = $(if ($isLocal) { 'primary' } else { 'secondary' }); Click = { $miConnectClaude.PerformClick() } }
+    $btnSpecs += @{ Text = 'Connect your AI assistant to Tally'; Kind = $(if ($isLocal) { 'primary' } else { 'secondary' }); Click = { $miConnectClaude.PerformClick() } }
     $btnSpecs += @{ Text = 'Restart GUI agent';   Kind = 'secondary'; Click = { $miRestartAgent.PerformClick() } }
     $btnSpecs += @{ Text = 'Launch Tally';        Kind = 'secondary'; Click = { $miLaunchTally.PerformClick() } }
     $btnSpecs += @{ Text = 'Manage Companies...'; Kind = 'secondary'; Click = { $miManageCompanies.PerformClick() } }
     $btnSpecs += @{ Text = 'Open logs';           Kind = 'secondary'; Click = { $miOpenLogs.PerformClick() } }
     $btnSpecs += @{ Text = 'Reconfigure...';      Kind = 'secondary'; Click = { $miReconfigure.PerformClick() } }
-    $btnSpecs += @{ Text = 'Claude GUI control...'; Kind = 'secondary'; Click = { $miGuiControl.PerformClick() } }
+    $btnSpecs += @{ Text = 'Assistant GUI control...'; Kind = 'secondary'; Click = { $miGuiControl.PerformClick() } }
     if (-not $isLocal) {
         $btnSpecs += @{ Text = 'Copy public URL'; Kind = 'secondary'; Click = {
             if ($State.PublicUrl) {
@@ -1365,11 +1365,11 @@ function Update-DashboardUi {
     # question that actually decides whether the product works there: is Claude pointed at us?
     if ($State.DeploymentMode -eq 'local') {
         if ($State.ClientConfigured -eq $true) {
-            Set-StatusRow $script:DashboardLabels['PublicUrl'] 'Connected' 'quit and reopen Claude if tools are missing' 'green'
+            Set-StatusRow $script:DashboardLabels['PublicUrl'] 'Connected' 'quit and reopen your AI assistant if tools are missing' 'green'
         } elseif ($State.ClientConfigured -eq $false) {
-            Set-StatusRow $script:DashboardLabels['PublicUrl'] 'Not connected' 'use Connect Claude to Tally' 'amber'
+            Set-StatusRow $script:DashboardLabels['PublicUrl'] 'Not connected' 'use Connect your AI assistant to Tally' 'amber'
         } else {
-            Set-StatusRow $script:DashboardLabels['PublicUrl'] 'Unknown' 'could not read the Claude config' 'gray'
+            Set-StatusRow $script:DashboardLabels['PublicUrl'] 'Unknown' 'could not read the MCP client config' 'gray'
         }
     } elseif ($null -eq $State.PublicUrlOk) {
         Set-StatusRow $script:DashboardLabels['PublicUrl'] 'Not configured' '' 'gray'

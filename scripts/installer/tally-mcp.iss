@@ -44,7 +44,12 @@
 ; climbs two levels to reach the repo root. SourcePath itself is provided by Inno.
 ; Both roots are overridable from the command line (ISCC /DRepoRoot=...). The release build
 ; leaves them alone; CI points them at a tree of stub files so the Pascal Script and the
-; [Setup]/[Files]/[Run] sections are compiled on every PR without first downloading a
+; [Setup]/[Files]/[InstallDelete]
+; The Start Menu item was renamed to "Connect your AI assistant to Tally"; an upgrade would otherwise
+; leave the old shortcut beside the new one.
+Type: files; Name: "{group}\Connect Claude to Tally.lnk"
+
+[Run] sections are compiled on every PR without first downloading a
 ; portable Node, NSSM and cloudflared. See scripts/installer/check-iss.ps1.
 #ifndef RepoRoot
   #define RepoRoot       "..\\.."
@@ -175,7 +180,7 @@ Name: "{group}\Open {#MyAppName} Dashboard"; Filename: "powershell.exe"; Paramet
 Name: "{autodesktop}\{#MyAppName}";          Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File ""{app}\scripts\tray\tally-mcp-tray.ps1"" -InstallDir ""{app}"" -ShowDashboard"; WorkingDir: "{app}"; Tasks: desktopicon; IconFilename: "{app}\assets\tally-mcp.ico"; Comment: "Open the Tally MCP status dashboard"
 Name: "{group}\{#MyAppName} Logs";       Filename: "{app}\logs"
 Name: "{group}\Reconfigure {#MyAppName}"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"""; WorkingDir: "{app}"
-Name: "{group}\Connect Claude to Tally"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\connect-client.ps1"" -InstallDir ""{app}"""; WorkingDir: "{app}"; Comment: "Point Claude Desktop at this Tally server (run as the person who uses Claude)"
+Name: "{group}\Connect your AI assistant to Tally"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\connect-client.ps1"" -InstallDir ""{app}"""; WorkingDir: "{app}"; Comment: "Point Claude Desktop at this Tally server (run as the person who uses the AI assistant)"
 Name: "{group}\Uninstall {#MyAppName}";  Filename: "{uninstallexe}"
 
 [Run]
@@ -426,7 +431,7 @@ begin
   EntryOrderPage.Add('Debit line first, for every kind');
   EntryOrderPage.SelectedValueIndex := GetPreviousDataIndex(GetPreviousData('EntryOrder', ''));
 
-  // Claude-driven GUI control (issue #81). ON by default (opt-OUT): it is Claudally's core capability —
+  // assistant-driven GUI control (issue #81). ON by default (opt-OUT): it is Claudally's core capability —
   // it lets Claude log in, select/switch companies and unlock protected companies by driving the Tally
   // window (screenshots + keystrokes). Unchecking disables it (ENABLE_GUI_CONTROL=false in .env, written
   // by firstrun-config.ps1) for locked-down boxes that only want the read/write XML tools. Placed on the
@@ -438,7 +443,7 @@ begin
   GuiControlOptIn.Top := EditionPage.Surface.Height - ScaleY(38);
   GuiControlOptIn.Width := EditionPage.SurfaceWidth;
   GuiControlOptIn.Height := ScaleY(32);
-  GuiControlOptIn.Caption := 'Let Claude see and drive the Tally window (screenshots + keystrokes). On by default — untick to disable, or change it any time from the tray icon.';
+  GuiControlOptIn.Caption := 'Let your AI assistant see and drive the Tally window (screenshots + keystrokes). On by default — untick to disable, or change it any time from the tray icon.';
   // ON by default: driving the Tally GUI is the product’s core capability, and every
   // company-loading tool already works without this flag, so the practical cost of shipping it
   // off is that Tally’s GUI state becomes unrecoverable from the server — an ungated tool can
@@ -815,14 +820,14 @@ begin
     if IsLocalMode() then
       WizardForm.FinishedLabel.Caption :=
         'Claudally is installed on this computer. Two things left, both one-time:' + #13#10 + #13#10 +
-        '1. TURN ON TALLY''S DATA CONNECTION. Tally comes with it switched off, and Claude cannot ' +
+        '1. TURN ON TALLY''S DATA CONNECTION. Tally comes with it switched off, and the AI assistant cannot ' +
         'read anything until it is on. In Tally Prime: press F1, then Settings > Connectivity > ' +
         'Client/Server Configuration. Set "TallyPrime acts as" to Server and Port to 9000, then ' +
         'press Ctrl+A. Leave Tally open whenever you want to use this.' + #13#10 + #13#10 +
         '2. RESTART CLAUDE DESKTOP COMPLETELY - closing the window is not enough. Use File > Exit, ' +
         'or right-click its icon near the clock and choose Quit. Tally tools appear once it ' +
         'reopens. If you have not installed Claude Desktop yet, install it and then run ' +
-        '"Connect Claude to Tally" from the Start Menu.' + #13#10 + #13#10 +
+        '"Connect your AI assistant to Tally" from the Start Menu.' + #13#10 + #13#10 +
         'The tray icon near the clock tells you if either step is still outstanding. Nothing is ' +
         'listening on the network and no password was created.' + #13#10 + #13#10 +
         'Once a day the tray asks GitHub whether a newer version exists, and tells you if so. It ' +
