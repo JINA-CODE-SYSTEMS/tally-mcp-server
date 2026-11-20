@@ -69,18 +69,27 @@ OutputDir={#RepoRoot}\dist-installer
 OutputBaseFilename=Claudally-Setup-{#MyAppVersion}
 Compression=lzma2/ultra
 SolidCompression=yes
-WizardStyle=modern
+; Look: the Windows 11 style (rounded, flat controls on an off-white page) over the modern layout,
+; with the horizontal divider lines hidden. Needs Inno Setup 6.7+ (hidebevels); CI pins 6.7.1.
+; Light only for now. Adding the word "dynamic" makes Setup follow the Windows dark setting, and the
+; artwork below already works on a dark page - but 6.7.1 has a startup delay with a long licence text
+; under the dark style (fixed in 6.7.3), so hold that until the pinned version is raised.
+; A high-contrast Windows theme, or running Setup with /NOSTYLE, falls back to the plain look.
+WizardStyle=modern windows11 hidebevels
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 UninstallDisplayIcon={app}\assets\tally-mcp.ico
 ; Jina Code Systems brand icon for the installer .exe itself (generated from scripts/tray/assets/jina-logo.png).
 SetupIconFile=assets\tally-mcp.ico
 ChangesEnvironment=yes
-; JINA CODE SYSTEMS LLP branding. Comma-separated lists let Inno pick the closest size
-; to the user's display scaling — the standard BMP renders on 100% DPI, the @2x
-; variant covers 150-200% scaling without upscale blur.
-WizardImageFile=assets\wizard-sidebar.bmp,assets\wizard-sidebar@2x.bmp
-WizardSmallImageFile=assets\wizard-small.bmp,assets\wizard-small@2x.bmp
+; Branding. Each list holds the same picture at the sizes Setup needs for 100%, 150%, 200% and 250%
+; display scaling; it picks the closest, so nothing is upscaled and blurred. PNG (Inno Setup 6.5.2+).
+; Rendered from the SVG masters in assets\ - see assets\REGENERATE-BRANDING.md.
+;   sidebar (Welcome / Finished): the Claudally mark and name over the brand colour, with the
+;     JINA CODE SYSTEMS LLP publisher mark at the foot. Aspect 164:314.
+;   small (top right of every other page): the app tile on a transparent background. Square.
+WizardImageFile=assets\wizard-sidebar-202.png,assets\wizard-sidebar-336.png,assets\wizard-sidebar-430.png,assets\wizard-sidebar-534.png
+WizardSmallImageFile=assets\wizard-small-58.png,assets\wizard-small-97.png,assets\wizard-small-124.png,assets\wizard-small-159.png
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -461,6 +470,8 @@ begin
   BrandLabel := TNewStaticText.Create(WizardForm);
   BrandLabel.Parent := WizardForm;
   BrandLabel.Caption := 'Claudally — by JINA CODE SYSTEMS LLP';
+  // Ignored while the Windows 11 style is active (a style supplies its own text colour); it still
+  // applies under /NOSTYLE and high-contrast, where the plain look is used.
   BrandLabel.Font.Color := clGray;
   BrandLabel.Left := ScaleX(16);
   BrandLabel.Top := WizardForm.CancelButton.Top + (WizardForm.CancelButton.Height - BrandLabel.Height) div 2;

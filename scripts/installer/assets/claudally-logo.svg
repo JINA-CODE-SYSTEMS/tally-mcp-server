@@ -4,7 +4,7 @@
     Concept: a warm-orange app tile (brand colour, matching the "Your AI assistant is controlling Tally" overlay)
     carrying a white Claude-style spark sitting on a Tally ledger — the spark = Claude's intelligence,
     the three tapering lines = ledger entries / a tally sheet. Reads cleanly from 16px to full size.
-    Master art; regenerate the .ico / wizard .bmp files from this — see REGENERATE-BRANDING.md.
+    Master art; regenerate the .ico and wizard .png files from this — see REGENERATE-BRANDING.md.
   -->
   <defs>
     <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
