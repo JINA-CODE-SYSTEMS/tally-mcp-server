@@ -2987,7 +2987,7 @@ export async function registerMcpServer(): Promise<McpServer> {
   });
 
   // The data-entry method, for every client: two prompts and a read-only tool. See feeding-guide.mts.
-  registerFeedingGuide(mcpServer);
+  registerFeedingGuide(mcpServer, (toolName, durationMs) => auditLog(toolName, {}, 'success', durationMs));
 
   mcpServer.registerTool(
     'query-database',

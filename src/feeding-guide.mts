@@ -327,7 +327,8 @@ export const FEEDING_INSTRUCTIONS_LINE =
   + 'It covers learning the client\'s existing conventions, the per-client instruction sheet, previewing every write and asking for consent. '
   + 'Clients that support MCP prompts also offer it as the `feed-tally-data` and `profile-client-books` prompts.';
 
-export function registerFeedingGuide(server: McpServer): void {
+/** `audit` records a call in the server's audit log, like every other tool; mcp.mts supplies it. */
+export function registerFeedingGuide(server: McpServer, audit: (toolName: string, durationMs: number) => void = () => {}): void {
   server.registerPrompt(
     'feed-tally-data',
     {
@@ -361,6 +362,11 @@ export function registerFeedingGuide(server: McpServer): void {
       inputSchema: {},
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
-    async () => ({ content: [{ type: 'text', text: feedingGuideText() }] })
+    async () => {
+      const start = Date.now();
+      const text = feedingGuideText();
+      audit('feeding-guide', Date.now() - start);
+      return { content: [{ type: 'text', text }] };
+    }
   );
 }
