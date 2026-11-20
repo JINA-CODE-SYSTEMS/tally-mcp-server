@@ -10,6 +10,8 @@
         <DESC>
             <STATICVARIABLES>
                 <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+                <MCPVOUCHERNUMBER>{voucherNumber}</MCPVOUCHERNUMBER>
+                <MCPVOUCHERTYPE>{voucherType}</MCPVOUCHERTYPE>
                 <SVFROMDATE>{fromDate}</SVFROMDATE>
                 <SVTODATE>{toDate}</SVTODATE>
                 <nunjuck>if targetCompany</nunjuck>
@@ -71,8 +73,8 @@
                         <FETCH>MasterID,Reference,VoucherNumber,VoucherTypeName,Date,PartyLedgerName,Amount</FETCH>
                         <FILTER>FilterNumber,FilterType,FilterOptionalVouchers</FILTER>
                     </COLLECTION>
-                    <SYSTEM TYPE="Formulae" NAME="FilterNumber">$VoucherNumber = "{voucherNumber}"</SYSTEM>
-                    <SYSTEM TYPE="Formulae" NAME="FilterType">$VoucherTypeName = "{voucherType}"</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="FilterNumber">$VoucherNumber = ##MCPVoucherNumber</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="FilterType">$VoucherTypeName = ##MCPVoucherType</SYSTEM>
                     <SYSTEM TYPE="Formulae" NAME="FilterOptionalVouchers">NOT $IsOptional</SYSTEM>
                 </TDLMESSAGE>
             </TDL>

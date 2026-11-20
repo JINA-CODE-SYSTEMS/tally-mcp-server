@@ -10,6 +10,7 @@
         <DESC>
             <STATICVARIABLES>
                 <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+                <MCPLEDGERNAME>{ledgerName}</MCPLEDGERNAME>
                 <SVFROMDATE>{fromDate}</SVFROMDATE>
                 <SVTODATE>{toDate}</SVTODATE>
                 <nunjuck>if targetCompany</nunjuck>
@@ -79,7 +80,7 @@
                         <XMLTAG>F04</XMLTAG>
                     </FIELD>
                     <FIELD NAME="FldAmountOp">
-                        <SET>if $$IsDebit:$OpeningBalance:Ledger:"{ledgerName}" then -$$NumValue:$OpeningBalance:Ledger:"{ledgerName}" else $$NumValue:$OpeningBalance:Ledger:"{ledgerName}"</SET>
+                        <SET>if $$IsDebit:$OpeningBalance:Ledger:##MCPLedgerName then -$$NumValue:$OpeningBalance:Ledger:##MCPLedgerName else $$NumValue:$OpeningBalance:Ledger:##MCPLedgerName</SET>
                         <XMLTAG>F05</XMLTAG>
                     </FIELD>
                     <FIELD NAME="FldNarrationOp">
@@ -124,7 +125,7 @@
                         <FILTER>FilterLedger,FilterExcludeInventoryVch,FilterExcludeOrderVch,FilterCancelledVouchers,FilterOptionalVouchers</FILTER>
                     </COLLECTION>
                     <SYSTEM TYPE="Formulae" NAME="FilterLedger">NOT $$IsEmpty:$AllLedgerEntries[1,@@FilterLedgerEqual].LedgerName</SYSTEM>
-                    <SYSTEM TYPE="Formulae" NAME="FilterLedgerEqual">$LedgerName = "{ledgerName}"</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="FilterLedgerEqual">$LedgerName = ##MCPLedgerName</SYSTEM>
                     <SYSTEM TYPE="Formulae" NAME="FilterExcludeInventoryVch">NOT $$IsInventoryVch:$VoucherTypeName</SYSTEM>
                     <SYSTEM TYPE="Formulae" NAME="FilterExcludeOrderVch">NOT $$IsOrderVch:$VoucherTypeName</SYSTEM>
                     <SYSTEM TYPE="Formulae" NAME="FilterCancelledVouchers">NOT $IsCancelled</SYSTEM>

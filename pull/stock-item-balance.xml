@@ -10,6 +10,7 @@
         <DESC>
             <STATICVARIABLES>
                 <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+                <MCPITEMNAME>{itemName}</MCPITEMNAME>
                 <SVTODATE>{toDate}</SVTODATE>
                 <nunjuck>if targetCompany</nunjuck>
                 <SVCURRENTCOMPANY>{{targetCompany | escape}}</SVCURRENTCOMPANY>
@@ -41,7 +42,7 @@
                         <TYPE>StockItem</TYPE>
                         <FILTER>FltrItemName</FILTER>
                     </COLLECTION>
-                    <SYSTEM TYPE="Formulae" NAME="FltrItemName">$$IsEqual:$Name:"{itemName}"</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="FltrItemName">$$IsEqual:$Name:##MCPItemName</SYSTEM>
                 </TDLMESSAGE>
             </TDL>
         </DESC>

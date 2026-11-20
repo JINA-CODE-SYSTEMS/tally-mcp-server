@@ -29,7 +29,9 @@ Thank you for your interest in contributing! This project bridges Tally Prime ER
 ```
 src/
   index.mts      # Entry point (stdio mode)
-  server.mts     # Express HTTP server + OAuth
+  server.mts     # Entry point (HTTP mode): env, bind, shutdown
+  http-app.mts   # Express app: MCP transport + OAuth endpoints
+  oauth-store.mts # OAuth client/token stores and lookups
   mcp.mts        # MCP tool registrations
   tally.mts      # Tally XML communication
   database.mts   # DuckDB in-memory cache

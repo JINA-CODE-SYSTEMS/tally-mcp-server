@@ -9,6 +9,7 @@ import { handlePull, handlePush, jsonToTSV, pingTally, postTallyXML, pushXml, re
 import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, buildAlterVoucherXml, applyPatchToBlock, alterWouldBlankVoucher, blockHasLedgerEntries, deriveRemoteId, findRemoteIdCollisions, voucherBalance, orderEntries, type EntryOrder, isDateInOpenPeriod, findMissingMasters, canonicalizeVoucherMasters, masterKey, resolveMasterNames, referencedLedgers, decodeXmlEntities, escapeXml, xmlName, type VoucherEntry, type VoucherInput, type VoucherPatch } from './voucher.mjs';
 import { MASTER_TAGS, MASTER_COLLECTION_TYPES, planMasterNameRepairs, buildRenameMasterXml, verifyRename, buildMasterNamesCollectionXml, parseMasterNamesFromCollection } from './master.mjs';
 import type { ModelPushResponse } from './models.mjs';
+import { FEEDING_INSTRUCTIONS_LINE, registerFeedingGuide } from './feeding-guide.mjs';
 import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
 import { normalizePartyFields, validatePartyFields, planPartyUpdate, changesFromPlan, buildPartyAlterXml, verifyPartyFields, type PartyRow } from './party.mjs';
 
@@ -613,6 +614,65 @@ export function normalizeOpenCompanyStrategy(s: string): { strategy: string; dep
 export function parseTallyRequestVerb(xml: string): string | null {
   const m = /<TALLYREQUEST\b[^>]*>\s*([^<\s]+)\s*<\/TALLYREQUEST>/i.exec(xml);
   return m ? m[1].toLowerCase() : null;
+}
+
+// Whether a raw envelope may be treated as a READ. Deliberately an allow-list of one: the envelope
+// must contain exactly one <TALLYREQUEST> element and its whole text must be "Export" (or the legacy
+// spelling "Export Data"). Everything else is a write — "Import Data", Alter, Delete, a verb this
+// code has never heard of, an envelope with no verb, an encoded or CDATA-wrapped verb, or more than
+// one TALLYREQUEST element (a decoy Export next to the real verb). Guessing "read" for something
+// unrecognised is how a read-only guard gets bypassed, so unknown means write.
+export function isReadOnlyTallyRequest(xml: string): boolean {
+  if (typeof xml !== 'string') return false;
+  const elements = xml.match(/<\s*TALLYREQUEST\b/gi) ?? [];
+  if (elements.length !== 1) return false;
+  const m = /<TALLYREQUEST\b[^>]*>([^<]*)<\/TALLYREQUEST\s*>/i.exec(xml);
+  if (!m) return false;
+  const verb = m[1].trim().replace(/\s+/g, ' ').toLowerCase();
+  return verb === 'export' || verb === 'export data';
+}
+
+// Decides whether the raw XML probe may post an envelope. Order matters: READONLY_MODE is an
+// operator decision and wins over everything the caller sends.
+export function rawXmlProbeGate(
+  xml: string,
+  allowWrite: boolean | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): { allowed: true; write: boolean } | { allowed: false; code: 'PRECONDITION_FAILED' | 'READONLY'; message: string; remedy: string } {
+  if (env.TALLY_DEBUG_XML !== '1') {
+    return { allowed: false, code: 'PRECONDITION_FAILED', message: 'Raw XML probe is disabled.', remedy: 'Set TALLY_DEBUG_XML=1 in the server env to enable raw XML probes.' };
+  }
+  // READONLY_MODE refuses the probe altogether, Export included: a raw envelope can carry inline
+  // TDL, and what caller-written TDL does when Tally evaluates it cannot be proven read-only from
+  // the verb. The wrapped read tools build their own XML and remain available.
+  if (env.READONLY_MODE === 'true') {
+    return { allowed: false, code: 'READONLY', message: 'The raw XML probe is disabled in READONLY_MODE: a raw envelope (even an Export) can carry TDL whose effects cannot be verified as read-only.', remedy: 'Use the wrapped read tools, or unset READONLY_MODE on the server to use the probe.' };
+  }
+  if (isReadOnlyTallyRequest(xml)) return { allowed: true, write: false };
+  const verb = parseTallyRequestVerb(xml);
+  if (allowWrite !== true) {
+    return { allowed: false, code: 'PRECONDITION_FAILED', message: `Refusing TALLYREQUEST "${verb ?? '(none)'}" — this probe is read-only by default and only a single, plain "Export" request is treated as a read.`, remedy: 'If you genuinely intend a write (Import/Alter/Delete), re-call with allowWrite: true.' };
+  }
+  return { allowed: true, write: true };
+}
+
+// Gate for the free-form GUI tools. gui-screenshot only looks. gui-send-keys injects arbitrary
+// keystrokes into Tally, and there is no subset of keys that can navigate menus yet cannot also
+// create, alter or delete a voucher (letters are menu hotkeys, Enter accepts, Alt+D deletes) — so
+// in READONLY_MODE it is refused outright rather than filtered. Company loading and unlocking stay
+// available in read-only mode through the fixed-sequence tools (load-company, switch-company,
+// unlock-stored-credentials), which do not take caller-chosen keys.
+export function guiControlGate(
+  tool: 'gui-screenshot' | 'gui-send-keys',
+  env: NodeJS.ProcessEnv = process.env,
+): { allowed: true } | { allowed: false; code: 'PRECONDITION_FAILED' | 'READONLY'; message: string; remedy: string } {
+  if (env.ENABLE_GUI_CONTROL !== 'true') {
+    return { allowed: false, code: 'PRECONDITION_FAILED', message: 'GUI control is disabled.', remedy: 'Set ENABLE_GUI_CONTROL=true (and restart the service) to enable gui-screenshot / gui-send-keys.' };
+  }
+  if (tool === 'gui-send-keys' && env.READONLY_MODE === 'true') {
+    return { allowed: false, code: 'READONLY', message: 'gui-send-keys is disabled in READONLY_MODE: keystrokes can create, alter or delete data in Tally.', remedy: 'Use load-company / switch-company / unlock-stored-credentials to open a company, and gui-screenshot to look. Unset READONLY_MODE on the server to allow free-form keystrokes.' };
+  }
+  return { allowed: true };
 }
 
 // Minimal path interface so the containment check can be unit-tested against
@@ -2303,7 +2363,7 @@ Hard preconditions (discover via \`status\`/\`get-context\`, don't hit walls):
 - The Tally XML server must be running for any data read.
 - The GUI automation agent must be running to load/switch companies or unlock protected ones.
 - On Silver only one company is resident at a time; loading another replaces it.
-- Write tools are refused when readonly is true (READONLY_MODE).
+- Write tools are refused when readonly is true (READONLY_MODE). So is \`gui-send-keys\` — free-form keystrokes can change data; in read-only mode open companies with \`load-company\` / \`switch-company\` / \`unlock-stored-credentials\` and use \`gui-screenshot\` only to look.
 - Purchase, Sales, Receipt and Payment ship with a default (the party line leads, matching how Tally prompts). Those write without asking, but the result carries \`entryOrderNote\` — RELAY IT to the user the first time, and when they confirm or change it call \`set-entry-order\` so the note stops. Every OTHER type has no default.
 - Entry order is PER VOUCHER TYPE, and a type with no answer is REFUSED on write (ENTRY_ORDER_UNSET). Receipts, payments, sales and purchases genuinely differ in which side an accountant expects to lead, so do not assume one answer covers the others. \`status\`/\`get-context\` report \`entryOrder.byVoucherType\` and \`entryOrder.default\`. When a type is unanswered, ASK THE USER "for <type> vouchers, should the credit line or the debit line come first?", say that it changes only how the voucher READS when opened (the posting, signs and balance are identical), then call \`set-entry-order\` with that \`voucherType\`. Omit \`voucherType\` ONLY if they say the same order applies to every type. Never guess, and never re-ask a type that is already answered.
 
@@ -2914,7 +2974,7 @@ export async function registerMcpServer(): Promise<McpServer> {
     // getServerVersion() reads package.json, which the release build verifies against the git tag.
     // This was hardcoded to '1.0.0', so every MCP client saw a version unrelated to what shipped.
     version: getServerVersion(),
-    description: 'Drive Tally Prime with Claude — query reports, manage masters, post vouchers, and analyse GST.',
+    description: 'Drive Tally Prime with an AI assistant — query reports, manage masters, post vouchers, and analyse GST.',
     websiteUrl: 'https://claudally.jinacode.systems',
     // Tell the client which logo to show (MCP icons). Hosted on the public landing site so any
     // MCP client can fetch it; the plain placeholder tile in some connector UIs is the fallback
@@ -2923,8 +2983,11 @@ export async function registerMcpServer(): Promise<McpServer> {
       { src: 'https://claudally.jinacode.systems/claudally-logo.png', mimeType: 'image/png', sizes: ['256x256'] }
     ]
   }, {
-    instructions: TALLY_MCP_INSTRUCTIONS
+    instructions: `${TALLY_MCP_INSTRUCTIONS}\n\n${FEEDING_INSTRUCTIONS_LINE}`
   });
+
+  // The data-entry method, for every client: two prompts and a read-only tool. See feeding-guide.mts.
+  registerFeedingGuide(mcpServer, (toolName, durationMs) => auditLog(toolName, {}, 'success', durationMs));
 
   mcpServer.registerTool(
     'query-database',
@@ -3202,7 +3265,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       // This strategy used to dispatch 'select-company' / 'load-on-startup' to the companion agent,
       // which ran its OWN screenshot -> decide -> act loop against gpt-4o (or Claude) over HTTP,
       // using a separate API key. That was the wrong shape twice over: a second, weaker model drove
-      // the window while the Claude session that asked for the work sat idle waiting, and its
+      // the window while the assistant session that asked for the work sat idle waiting, and its
       // decisions were invisible to the caller and to the user. It is gone.
       //
       // What remains is preparation plus an explicit hand-off. We make sure Tally is actually
@@ -3454,6 +3517,11 @@ export async function registerMcpServer(): Promise<McpServer> {
     },
     async (args) => {
       const start = Date.now();
+      // Only affects how this server WRITES vouchers, and persists a setting; neither belongs in read-only mode.
+      if (process.env.READONLY_MODE === 'true') {
+        auditLog('set-entry-order', args, 'denied', Date.now() - start);
+        return errorResult('READONLY');
+      }
       try {
         const cfgPath = entryOrderConfigPath();
         const updated = applyEntryOrderChoice(readEntryOrderConfig(cfgPath), args.order, args.voucherType);
@@ -3622,7 +3690,7 @@ export async function registerMcpServer(): Promise<McpServer> {
     'tally-raw-xml-probe',
     {
       title: 'Tally Raw XML Probe (debug only)',
-      description: `Posts a raw XML envelope to the Tally XML server and returns the raw response — bypasses all wrapper logic. Used for protocol reverse-engineering and undocumented verb discovery. NOT for normal use; the wrapped tools (list-master, trial-balance, etc.) construct XML safely. Disabled unless TALLY_DEBUG_XML=1 is set in the server env. Read-only by default: any non-Export TALLYREQUEST verb (Import/Alter/Delete) is refused unless allowWrite=true is passed explicitly.`,
+      description: `Posts a raw XML envelope to the Tally XML server and returns the raw response — bypasses all wrapper logic. Used for protocol reverse-engineering and undocumented verb discovery. NOT for normal use; the wrapped tools (list-master, trial-balance, etc.) construct XML safely. Disabled unless TALLY_DEBUG_XML=1 is set in the server env. Read-only by default: anything other than a single plain Export request (Import Data/Alter/Delete, an unknown or missing verb) is refused unless allowWrite=true is passed explicitly. The whole tool is refused when READONLY_MODE=true.`,
       inputSchema: {
         xml: z.string().describe('raw XML envelope to POST to the Tally XML server. Standard structure: <ENVELOPE><HEADER>...</HEADER><BODY>...</BODY></ENVELOPE>.'),
         label: z.string().optional().describe('optional label included in the audit log so probes can be correlated to experiment notes (e.g. "H1-import-variant").'),
@@ -3638,15 +3706,13 @@ export async function registerMcpServer(): Promise<McpServer> {
       const verb = parseTallyRequestVerb(args.xml);
       // Log the full XML for this debug/write primitive so any mutation is auditable.
       const auditArgs = { xmlLength: args.xml.length, label: args.label, verb, xml: args.xml };
-      if (process.env.TALLY_DEBUG_XML !== '1') {
+      // Read-only by default, and never a write in READONLY_MODE. Only a single plain Export
+      // request counts as a read; anything else (including a missing or unrecognised verb) is a
+      // write and needs allowWrite — see rawXmlProbeGate.
+      const gate = rawXmlProbeGate(args.xml, args.allowWrite);
+      if (!gate.allowed) {
         auditLog('tally-raw-xml-probe', auditArgs, 'denied', Date.now() - start);
-        return errorResult('PRECONDITION_FAILED', { message: 'Raw XML probe is disabled.', remedy: 'Set TALLY_DEBUG_XML=1 in the server env to enable raw XML probes.', retryable: false });
-      }
-      // Read-only by default. Export is the only read verb; Import/Alter/Delete mutate
-      // Tally data, so refuse them unless the caller explicitly opts in via allowWrite.
-      if (verb && verb !== 'export' && args.allowWrite !== true) {
-        auditLog('tally-raw-xml-probe', auditArgs, 'denied', Date.now() - start);
-        return errorResult('PRECONDITION_FAILED', { message: `Refusing TALLYREQUEST verb "${verb}" — this probe is read-only by default and only "Export" is allowed.`, remedy: 'If you genuinely intend a write (Import/Alter/Delete), re-call with allowWrite: true.', retryable: false });
+        return errorResult(gate.code, { message: gate.message, remedy: gate.remedy, retryable: false });
       }
       try {
         const resp = await postTallyXML(args.xml);
@@ -4095,7 +4161,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         collection: z.enum(['ledger', 'group', 'stockitem', 'stockgroup', 'vouchertype', 'costcentre', 'costcategory', 'godown', 'currency', 'unit']).optional().describe('master collection to scan; defaults to ledger'),
         targetCompany: z.string().optional().describe('optional company name; defaults to the active company'),
         only: z.array(z.string()).optional().describe('optional: restrict the repair to masters whose cleaned name is one of these (exact, case-insensitive). Omit to act on every malformed master found.'),
-        confirm: z.boolean().optional().describe('must be true to actually rename. Without it the tool only reports what it would do.'),
+        confirm: z.boolean().optional().describe('must be true to actually rename. Without it the tool only reports what it would do. Refused when READONLY_MODE=true.'),
       },
       annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
@@ -4106,6 +4172,11 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (!tag) {
         auditLog('repair-master-names', args, 'error', Date.now() - start);
         return errorResult('PRECONDITION_FAILED', { message: `Unsupported collection "${collection}".`, retryable: false });
+      }
+      // Scanning and the dry-run only read; confirm:true renames masters, which is a write.
+      if (args.confirm && process.env.READONLY_MODE === 'true') {
+        auditLog('repair-master-names', args, 'denied', Date.now() - start);
+        return errorResult('READONLY');
       }
       const company = (args.targetCompany && args.targetCompany.trim()) || activeCompany || undefined;
 
@@ -5155,7 +5226,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         }
         if (process.env.ENABLE_GUI_CONTROL !== 'true') {
           auditLog('gui-delete-voucher', args, 'denied', Date.now() - start);
-          return errorResult('PRECONDITION_FAILED', { message: 'GUI control is disabled, so the Tally window cannot be driven.', remedy: 'Enable it from the tray (Allow Claude to control Tally), or set ENABLE_GUI_CONTROL=true in .env and restart.', retryable: false });
+          return errorResult('PRECONDITION_FAILED', { message: 'GUI control is disabled, so the Tally window cannot be driven.', remedy: 'Enable it from the tray (Allow the AI assistant to control Tally), or set ENABLE_GUI_CONTROL=true in .env and restart.', retryable: false });
         }
 
         const company = args.targetCompany || activeCompany || undefined;
@@ -6556,7 +6627,7 @@ export async function registerMcpServer(): Promise<McpServer> {
     'gui-send-keys',
     {
       title: 'GUI Send Keys (Tally window)',
-      description: `sends an ordered sequence of keystrokes / typed text to the Tally Prime window to log in, select a company, or navigate menus. Pair with gui-screenshot to see the result and iterate step by step. Requires ENABLE_GUI_CONTROL=true and the GUI agent running with Tally open. Each step is {action, value}: "type" types the literal string (folder id, username, password); "key" presses ONE of these supported keys — enter, escape, tab, backspace, up, down, left, right, f1-f5, f10, f12, any single letter a-z (Tally menu hotkeys and Yes/No confirms), any digit 0-9; "combo" presses a supported modifier chord — alt/ctrl/shift + one of f1-f5/f10 or any letter a-z or digit 0-9 (e.g. "alt+f3", "alt+d" to delete a voucher, "alt+x" to cancel, "ctrl+a"); "wait" pauses for value milliseconds (useful after an action that triggers a screen change). Keys/combos outside these sets are ignored (logged as unmapped). Focus is re-asserted before each step. Typed values are filtered from audit logs.`,
+      description: `sends an ordered sequence of keystrokes / typed text to the Tally Prime window to log in, select a company, or navigate menus. Pair with gui-screenshot to see the result and iterate step by step. Requires ENABLE_GUI_CONTROL=true and the GUI agent running with Tally open. Refused when READONLY_MODE=true (keystrokes can change data). Each step is {action, value}: "type" types the literal string (folder id, username, password); "key" presses ONE of these supported keys — enter, escape, tab, backspace, up, down, left, right, f1-f5, f10, f12, any single letter a-z (Tally menu hotkeys and Yes/No confirms), any digit 0-9; "combo" presses a supported modifier chord — alt/ctrl/shift + one of f1-f5/f10 or any letter a-z or digit 0-9 (e.g. "alt+f3", "alt+d" to delete a voucher, "alt+x" to cancel, "ctrl+a"); "wait" pauses for value milliseconds (useful after an action that triggers a screen change). Keys/combos outside these sets are ignored (logged as unmapped). Focus is re-asserted before each step. Typed values are filtered from audit logs.`,
       inputSchema: {
         keys: z.array(z.object({
           action: z.enum(['type', 'key', 'combo', 'wait']).describe('type = literal text; key = single key; combo = modifier chord (e.g. alt+f3); wait = pause milliseconds'),
@@ -6569,9 +6640,10 @@ export async function registerMcpServer(): Promise<McpServer> {
       const start = Date.now();
       // Redact literal typed text (may be a password) before it reaches the audit log.
       const redacted = { keys: (args.keys || []).map(k => k.action === 'type' ? { action: 'type', value: '***' } : k) };
-      if (process.env.ENABLE_GUI_CONTROL !== 'true') {
+      const gate = guiControlGate('gui-send-keys');
+      if (!gate.allowed) {
         auditLog('gui-send-keys', redacted, 'denied');
-        return errorResult('PRECONDITION_FAILED', { message: 'GUI control is disabled.', remedy: 'Set ENABLE_GUI_CONTROL=true (and restart the service) to enable gui-screenshot / gui-send-keys.', retryable: false });
+        return errorResult(gate.code, { message: gate.message, remedy: gate.remedy, retryable: false });
       }
       if (!args.keys || args.keys.length === 0) {
         auditLog('gui-send-keys', redacted, 'denied');
@@ -6612,7 +6684,7 @@ export async function registerMcpServer(): Promise<McpServer> {
       const auditArgs = { company: args.company }; // never the password
       if (process.env.ENABLE_GUI_CONTROL !== 'true') {
         auditLog('unlock-stored-credentials', auditArgs, 'denied');
-        return errorResult('PRECONDITION_FAILED', { message: 'Claude-driven GUI control is disabled.', remedy: 'Set ENABLE_GUI_CONTROL=true (and restart the service) to enable it.', retryable: false });
+        return errorResult('PRECONDITION_FAILED', { message: 'Assistant-driven GUI control is disabled.', remedy: 'Set ENABLE_GUI_CONTROL=true (and restart the service) to enable it.', retryable: false });
       }
       try {
         const registry = loadCompanyRegistry(resolveRegistryPath());

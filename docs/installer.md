@@ -11,7 +11,7 @@ A double-click installer that takes a Windows box from "nothing installed" to
    - Tally exe / data / ini paths (auto-detected; user can override)
    - Tally edition (Silver / Gold)
    - Windows user the GUI agent runs as
-   - Whether Claude may drive the Tally window (screenshots + keystrokes) - on by default
+   - Whether the AI assistant may drive the Tally window (screenshots + keystrokes) - on by default
 
    New installs are **local** (`DEPLOYMENT_MODE=local`). No OAuth password is collected, because
    there is no listener to gate. Remote access is not currently offered by the installer
@@ -22,7 +22,7 @@ A double-click installer that takes a Windows box from "nothing installed" to
    `TUNNEL_TOKEN` are not written at all.
 4. **Remote mode only:** registers the `TallyMCP` Windows service via the bundled NSSM, pointing at
    the bundled portable Node (no system Node required). A local install registers no service -
-   Claude starts the stdio entrypoint on demand - and instead writes the entry into the user's
+   the MCP client starts the stdio entrypoint on demand - and instead writes the entry into the user's
    `claude_desktop_config.json`, merging into it rather than replacing it.
 5. **If a Cloudflare Tunnel token was supplied**, registers a second NSSM service `TallyMCPTunnel`
    running the bundled `cloudflared` so the box gets a stable public HTTPS URL with no router/domain
@@ -203,7 +203,7 @@ It skips every settings page, passes no settings, and runs `firstrun-config.ps1 
   restarted - they were stopped to replace their files. One that did not exist before is not
   created; the log says so. What `.env` rules out is still removed, as on every run: a `TallyMCP`
   service in local mode, a tunnel with no `TUNNEL_TOKEN`.
-- **leaves the Claude client configuration alone**, unless the install has moved (the existing
+- **leaves the MCP client configuration alone**, unless the install has moved (the existing
   agent task points at a different folder), in which case it is rewritten for the agent user.
 - **carries out the #193 tunnel-token migration.** This is how installs configured before
   [#193](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/193) receive it: an existing

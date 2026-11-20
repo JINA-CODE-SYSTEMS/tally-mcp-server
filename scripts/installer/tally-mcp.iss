@@ -69,18 +69,27 @@ OutputDir={#RepoRoot}\dist-installer
 OutputBaseFilename=Claudally-Setup-{#MyAppVersion}
 Compression=lzma2/ultra
 SolidCompression=yes
-WizardStyle=modern
+; Look: the Windows 11 style (rounded, flat controls on an off-white page) over the modern layout,
+; with the horizontal divider lines hidden. Needs Inno Setup 6.7+ (hidebevels); CI pins 6.7.1.
+; Light only for now. Adding the word "dynamic" makes Setup follow the Windows dark setting, and the
+; artwork below already works on a dark page - but 6.7.1 has a startup delay with a long licence text
+; under the dark style (fixed in 6.7.3), so hold that until the pinned version is raised.
+; A high-contrast Windows theme, or running Setup with /NOSTYLE, falls back to the plain look.
+WizardStyle=modern windows11 hidebevels
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 UninstallDisplayIcon={app}\assets\tally-mcp.ico
 ; Jina Code Systems brand icon for the installer .exe itself (generated from scripts/tray/assets/jina-logo.png).
 SetupIconFile=assets\tally-mcp.ico
 ChangesEnvironment=yes
-; JINA CODE SYSTEMS LLP branding. Comma-separated lists let Inno pick the closest size
-; to the user's display scaling — the standard BMP renders on 100% DPI, the @2x
-; variant covers 150-200% scaling without upscale blur.
-WizardImageFile=assets\wizard-sidebar.bmp,assets\wizard-sidebar@2x.bmp
-WizardSmallImageFile=assets\wizard-small.bmp,assets\wizard-small@2x.bmp
+; Branding. Each list holds the same picture at the sizes Setup needs for 100%, 150%, 200% and 250%
+; display scaling; it picks the closest, so nothing is upscaled and blurred. PNG (Inno Setup 6.5.2+).
+; Rendered from the SVG masters in assets\ - see assets\REGENERATE-BRANDING.md.
+;   sidebar (Welcome / Finished): the Claudally mark and name over the brand colour, with the
+;     JINA CODE SYSTEMS LLP publisher mark at the foot. Aspect 164:314.
+;   small (top right of every other page): the app tile on a transparent background. Square.
+WizardImageFile=assets\wizard-sidebar-202.png,assets\wizard-sidebar-336.png,assets\wizard-sidebar-430.png,assets\wizard-sidebar-534.png
+WizardSmallImageFile=assets\wizard-small-58.png,assets\wizard-small-97.png,assets\wizard-small-124.png,assets\wizard-small-159.png
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -117,6 +126,7 @@ Source: "{#RepoRoot}\scripts\setup-windows.ps1";      DestDir: "{app}\scripts"; 
 Source: "{#RepoRoot}\scripts\installer\firstrun-config.ps1";    DestDir: "{app}\scripts\installer"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\installer\stop-install-processes.ps1"; DestDir: "{app}\scripts\installer"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\installer\connect-client.ps1";        DestDir: "{app}\scripts\installer"; Flags: ignoreversion
+Source: "{#RepoRoot}\scripts\installer\connection-details.ps1";    DestDir: "{app}\scripts\installer"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\installer\uninstall-cleanup.ps1";  DestDir: "{app}\scripts\installer"; Flags: ignoreversion
 
 ; --- Tray status app (issue #20). Polls service/agent/Tally health and surfaces a
@@ -175,8 +185,13 @@ Name: "{group}\Open {#MyAppName} Dashboard"; Filename: "powershell.exe"; Paramet
 Name: "{autodesktop}\{#MyAppName}";          Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File ""{app}\scripts\tray\tally-mcp-tray.ps1"" -InstallDir ""{app}"" -ShowDashboard"; WorkingDir: "{app}"; Tasks: desktopicon; IconFilename: "{app}\assets\tally-mcp.ico"; Comment: "Open the Tally MCP status dashboard"
 Name: "{group}\{#MyAppName} Logs";       Filename: "{app}\logs"
 Name: "{group}\Reconfigure {#MyAppName}"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"""; WorkingDir: "{app}"
-Name: "{group}\Connect Claude to Tally"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\connect-client.ps1"" -InstallDir ""{app}"""; WorkingDir: "{app}"; Comment: "Point Claude Desktop at this Tally server (run as the person who uses Claude)"
+Name: "{group}\Connect your AI assistant to Tally"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\connect-client.ps1"" -InstallDir ""{app}"""; WorkingDir: "{app}"; Comment: "Point Claude Desktop at this Tally server (run as the person who uses the AI assistant)"
 Name: "{group}\Uninstall {#MyAppName}";  Filename: "{uninstallexe}"
+
+[InstallDelete]
+; The Start Menu item was renamed to "Connect your AI assistant to Tally"; an upgrade would otherwise
+; leave the old shortcut beside the new one.
+Type: files; Name: "{group}\Connect Claude to Tally.lnk"
 
 [Run]
 ; --- 1. First-run wizard: writes .env from collected wizard inputs and registers the NSSM service ---
@@ -426,7 +441,7 @@ begin
   EntryOrderPage.Add('Debit line first, for every kind');
   EntryOrderPage.SelectedValueIndex := GetPreviousDataIndex(GetPreviousData('EntryOrder', ''));
 
-  // Claude-driven GUI control (issue #81). ON by default (opt-OUT): it is Claudally's core capability —
+  // assistant-driven GUI control (issue #81). ON by default (opt-OUT): it is Claudally's core capability —
   // it lets Claude log in, select/switch companies and unlock protected companies by driving the Tally
   // window (screenshots + keystrokes). Unchecking disables it (ENABLE_GUI_CONTROL=false in .env, written
   // by firstrun-config.ps1) for locked-down boxes that only want the read/write XML tools. Placed on the
@@ -438,7 +453,7 @@ begin
   GuiControlOptIn.Top := EditionPage.Surface.Height - ScaleY(38);
   GuiControlOptIn.Width := EditionPage.SurfaceWidth;
   GuiControlOptIn.Height := ScaleY(32);
-  GuiControlOptIn.Caption := 'Let Claude see and drive the Tally window (screenshots + keystrokes). On by default — untick to disable, or change it any time from the tray icon.';
+  GuiControlOptIn.Caption := 'Let your AI assistant see and drive the Tally window (screenshots + keystrokes). On by default — untick to disable, or change it any time from the tray icon.';
   // ON by default: driving the Tally GUI is the product’s core capability, and every
   // company-loading tool already works without this flag, so the practical cost of shipping it
   // off is that Tally’s GUI state becomes unrecoverable from the server — an ungated tool can
@@ -455,6 +470,8 @@ begin
   BrandLabel := TNewStaticText.Create(WizardForm);
   BrandLabel.Parent := WizardForm;
   BrandLabel.Caption := 'Claudally — by JINA CODE SYSTEMS LLP';
+  // Ignored while the Windows 11 style is active (a style supplies its own text colour); it still
+  // applies under /NOSTYLE and high-contrast, where the plain look is used.
   BrandLabel.Font.Color := clGray;
   BrandLabel.Left := ScaleX(16);
   BrandLabel.Top := WizardForm.CancelButton.Top + (WizardForm.CancelButton.Height - BrandLabel.Height) div 2;
@@ -815,14 +832,14 @@ begin
     if IsLocalMode() then
       WizardForm.FinishedLabel.Caption :=
         'Claudally is installed on this computer. Two things left, both one-time:' + #13#10 + #13#10 +
-        '1. TURN ON TALLY''S DATA CONNECTION. Tally comes with it switched off, and Claude cannot ' +
+        '1. TURN ON TALLY''S DATA CONNECTION. Tally comes with it switched off, and the AI assistant cannot ' +
         'read anything until it is on. In Tally Prime: press F1, then Settings > Connectivity > ' +
         'Client/Server Configuration. Set "TallyPrime acts as" to Server and Port to 9000, then ' +
         'press Ctrl+A. Leave Tally open whenever you want to use this.' + #13#10 + #13#10 +
         '2. RESTART CLAUDE DESKTOP COMPLETELY - closing the window is not enough. Use File > Exit, ' +
         'or right-click its icon near the clock and choose Quit. Tally tools appear once it ' +
         'reopens. If you have not installed Claude Desktop yet, install it and then run ' +
-        '"Connect Claude to Tally" from the Start Menu.' + #13#10 + #13#10 +
+        '"Connect your AI assistant to Tally" from the Start Menu.' + #13#10 + #13#10 +
         'The tray icon near the clock tells you if either step is still outstanding. Nothing is ' +
         'listening on the network and no password was created.' + #13#10 + #13#10 +
         'Once a day the tray asks GitHub whether a newer version exists, and tells you if so. It ' +

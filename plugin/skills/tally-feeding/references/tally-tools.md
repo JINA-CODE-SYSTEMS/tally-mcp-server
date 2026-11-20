@@ -158,6 +158,8 @@ vouchers that reference them.
 
 ## READONLY_MODE
 
-The server env var `READONLY_MODE=true` disables all write tools. If a write fails
+The server env var `READONLY_MODE=true` disables all write tools, and also `gui-send-keys`
+(free-form keystrokes can change data) — `gui-screenshot`, `load-company`, `switch-company` and
+`unlock-stored-credentials` still work. If a write fails
 because of this, don't keep retrying — tell the user, and fall back to producing the
 exact voucher/master plan (and XML if helpful) for manual entry in Tally.

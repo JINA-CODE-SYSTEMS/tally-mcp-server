@@ -10,6 +10,7 @@
         <DESC>
             <STATICVARIABLES>
                 <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+                <MCPREFERENCE>{reference}</MCPREFERENCE>
                 <SVFROMDATE>{fromDate}</SVFROMDATE>
                 <SVTODATE>{toDate}</SVTODATE>
                 <nunjuck>if targetCompany</nunjuck>
@@ -67,7 +68,7 @@
                         <FETCH>MasterID,Reference,VoucherNumber,VoucherTypeName,Date,PartyLedgerName,Amount</FETCH>
                         <FILTER>FilterReference,FilterCancelledVouchers,FilterOptionalVouchers</FILTER>
                     </COLLECTION>
-                    <SYSTEM TYPE="Formulae" NAME="FilterReference">$Reference = "{reference}"</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="FilterReference">$Reference = ##MCPReference</SYSTEM>
                     <SYSTEM TYPE="Formulae" NAME="FilterCancelledVouchers">NOT $IsCancelled</SYSTEM>
                     <SYSTEM TYPE="Formulae" NAME="FilterOptionalVouchers">NOT $IsOptional</SYSTEM>
                 </TDLMESSAGE>

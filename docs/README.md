@@ -4,7 +4,7 @@
 
 # Claudally
 
-**Drive Tally Prime with Claude.** A Tally Prime ERP ↔ [MCP](https://modelcontextprotocol.io/) server for Claude, ChatGPT, Copilot, and any MCP client.
+**Drive Tally Prime with AI.** A Tally Prime ERP ↔ [MCP](https://modelcontextprotocol.io/) server for any MCP client: Claude, ChatGPT, Copilot and others.
 
 by **JINA CODE SYSTEMS LLP** &nbsp;<img src="../scripts/tray/assets/jina-logo.png" height="26" alt="JINA CODE SYSTEMS LLP logo">
 
@@ -79,9 +79,9 @@ matches a number we published. **If either check fails, do not run the file.**
 **The setup wizard collects (most values auto-detect — usually just click Next):**
 
 - **Page 1 — Tally MCP Configuration:** Tally exe / data / `tally.ini` paths, and the Windows user the GUI agent runs as.
-- **Page 2 — Tally Edition:** Silver / Gold, plus a checkbox to let **Claude control Tally directly** (screenshots + keystrokes for login / company switching) — on by default.
+- **Page 2 — Tally Edition:** Silver / Gold, plus a checkbox to let **your AI assistant control Tally directly** (screenshots + keystrokes for login / company switching) — on by default.
 
-There is no password page, because there is no password. The installer sets up a **local** deployment: the server runs on this PC, started by Claude when you use it. Nothing listens on the network, so there is no login to gate — see [What a local install does and does not create](#what-a-local-install-does-and-does-not-create).
+There is no password page, because there is no password. The installer sets up a **local** deployment: the server runs on this PC, started by your AI assistant when you use it. Nothing listens on the network, so there is no login to gate — see [What a local install does and does not create](#what-a-local-install-does-and-does-not-create).
 
 **Remote access is not offered by the installer at present** ([#192](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/192)). Existing remote installs keep working and are preserved across upgrades untouched; only new installs are local-only.
 
@@ -93,11 +93,11 @@ These are the properties a local install is built around. They are stated here b
 
 **Does not create:**
 
-- **No Windows service.** The server is started by Claude when you use it and exits with it. Nothing runs while you are not working.
+- **No Windows service.** The server is started by your AI assistant when you use it and exits with it. Nothing runs while you are not working.
 - **No listening socket of ours.** Nothing of Claudally binds a port, so there is nothing on your machine or your LAN to connect to, and nothing to forward in a router.
 - **No password.** The OAuth password exists only to gate a listener. With no listener, it is never asked for, never written to `.env`, and never created.
 - **No token stores.** `.oauth-clients.json` and `.oauth-tokens.json` are never written. If you switch an existing remote install to local, they are shredded and removed.
-- **No outbound tunnel.** No third party sits between Claude and your books.
+- **No outbound tunnel.** No third party sits between your AI assistant and your books.
 
 **One honest correction to the obvious version of this claim:** your machine *does* still have a listening socket, because Tally Prime itself needs one — its XML server listens on port 9000, and Claudally could not read a single ledger without it. The claim is that **no Claudally process listens**, not that nothing on the PC does. Anyone telling you to check `netstat` for silence is describing something that was never true of a working Tally install.
 
@@ -149,11 +149,18 @@ Copy `.env.example` to `.env` and configure:
 | `MCP_DOMAIN` | `http://localhost:3000` | Public-facing URL |
 | `BIND_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` only behind reverse proxy) |
 | `CORS_ORIGINS` | *(defaults to MCP_DOMAIN)* | Comma-separated allowed origins |
-| `READONLY_MODE` | `false` | Set `true` to disable all write tools |
-| `ADMIN_SECRET` | | Optional secret for manual client registration |
+| `READONLY_MODE` | `false` | Set `true` to disable everything that can change Tally data: all write tools, `gui-send-keys` (free-form keystrokes), `repair-master-names` with `confirm`, `set-entry-order`, and the `tally-raw-xml-probe` debug tool entirely. `gui-screenshot` and the fixed company-loading tools stay available |
+| `ADMIN_SECRET` | | Secret for manual client registration (`Authorization: Bearer …` on `/register`). On its own it does **not** close registration — see the next row |
+| `REQUIRE_ADMIN_SECRET_FOR_REGISTRATION` | `false` | `true`: `/register` accepts only requests carrying `ADMIN_SECRET` (registration is closed if no secret is set). Claude and VS Code register themselves without credentials, so leave this `false` unless you register every client by hand |
+| `OAUTH_MAX_CLIENTS` | `500` | Cap on registered OAuth clients. When full, clients with no live token are dropped to make room, those registered more than 10 minutes ago first so a sign-in in progress is not interrupted; registration is refused only if every client is signed in |
+| `OAUTH_REDIRECT_SCHEMES` | | Extra app redirect schemes to accept at registration, comma-separated (built in: `vscode`, `vscode-insiders`, `cursor`, `claude`). `https://` and `http://localhost` / `127.0.0.1` are always accepted; script and file schemes never are |
 | **Auth & Rate Limiting** | | |
 | `AUTH_RATE_LIMIT_WINDOW_MS` | `60000` | Rate limit window in ms (1 minute) |
-| `AUTH_RATE_LIMIT_MAX` | `10` | Max auth attempts per window |
+| `AUTH_RATE_LIMIT_MAX` | `10` | Max auth attempts per window, per client IP |
+| `TRUST_PROXY` | *(loopback)* | Whose `X-Forwarded-For` to believe when working out the client IP. Default trusts only a proxy on the same machine (cloudflared, nginx, caddy). `false` for direct/LAN serving; a hop count, or a comma-separated list of IPs/CIDRs, for a reverse proxy on another host |
+| `AUTH_BACKOFF_FREE_ATTEMPTS` | `5` | Wrong passwords (from anyone, any IP) allowed before the global backoff starts |
+| `AUTH_BACKOFF_BASE_MS` | `1000` | First lockout after that; doubles with each further failure |
+| `AUTH_BACKOFF_MAX_MS` | `60000` | Longest lockout. While locked, sign-in attempts get `429` and the password is not checked |
 | `AUTH_CODE_EXPIRY_MS` | `600000` | Authorization code TTL in ms (10 minutes) |
 | `ACCESS_TOKEN_EXPIRY_SEC` | `3600` | Access token TTL in seconds (1 hour) |
 | `TOKEN_CLEANUP_INTERVAL_MS` | `60000` | Expired token cleanup interval in ms |
@@ -165,7 +172,7 @@ Copy `.env.example` to `.env` and configure:
 | `GIT_COMMIT` / `BUILD_TIME` | *(unset)* | Optional build info surfaced in `/status` `build.commit` / `build.builtAt`. |
 | **GUI Agent (open-company)** | | |
 | `OPEN_COMPANY_GUI_TIMEOUT_SEC` | `180` | GUI agent timeout in seconds (min 90) |
-| `ENABLE_GUI_CONTROL` | `true` | Exposes `gui-screenshot` / `gui-send-keys`, the supervised look-then-act loop. Set `false` for XML-only boxes. |
+| `ENABLE_GUI_CONTROL` | `true` | Exposes `gui-screenshot` / `gui-send-keys`, the supervised look-then-act loop. Set `false` for XML-only boxes. With `READONLY_MODE=true`, `gui-send-keys` is refused and only `gui-screenshot` remains. |
 | `ENTRY_ORDER` | *(unset)* | Blanket fallback: `credit-first` or `debit-first`. Resolution order is **user's per-type answer → user's blanket default → this key → built-in defaults → ask**. Purchase / Sales / Receipt / Payment ship with defaults (party line leads, as Tally prompts); any other type with no answer is **refused on write** so the user is asked rather than defaulted. Display only; the posting is identical either way. |
 | `TALLY_ENTRY_ORDER_CONFIG` | `<dataPath>/.tally-mcp-entry-order.json` | Where per-voucher-type entry order is recorded. |
 | `UPDATE_CHECK` | `true` | Tray asks GitHub once a day whether a newer release exists and says so. Downloads and runs nothing. The only outbound call a local install makes; set `false` to stop it. |
@@ -207,9 +214,9 @@ Because the MCP server typically runs as a Windows service in **Session 0** (no 
 
 > **This section applies to remote deployments, which the installer does not currently set up** ([#192](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/192)). It is kept for existing remote installs and for anyone configuring one by hand.
 
-Where your Claude client runs decides what URL to point it at. **Rule of thumb: you only need a public URL when the client is *not* on the Tally PC.**
+Where your MCP client runs decides what URL to point it at. **Rule of thumb: you only need a public URL when the client is *not* on the Tally PC.**
 
-| Your Claude client | URL to use | Wizard "Remote Access" page |
+| Your MCP client | URL to use | Wizard "Remote Access" page |
 | --- | --- | --- |
 | **Claude Desktop on the Tally PC** | local (stdio, or `http://127.0.0.1:3000/mcp`) | leave both fields blank |
 | **Claude Desktop on another PC** | the public HTTPS URL | fill it in (tunnel or own domain) |
@@ -224,11 +231,11 @@ Either way, add the URL (with `/mcp`) as a custom connector in your client and s
 
 ### Local (Claude Desktop)
 
-**The installer does this for you.** It writes the entry into `claude_desktop_config.json` as the user who runs Claude, merging into that file rather than replacing it — any other MCP servers you have configured are left alone, and the file is backed up first.
+**The installer does this for you.** It writes the entry into `claude_desktop_config.json` as the user who runs the AI assistant, merging into that file rather than replacing it — any other MCP servers you have configured are left alone, and the file is backed up first.
 
 Then **quit Claude Desktop completely and reopen it**. Closing the window is not enough (use File → Exit, or the tray icon): Claude reads this file only at startup, so until it restarts you will see no Tally tools.
 
-If Claude Desktop was installed *after* Claudally, or you want to connect a second Windows user, run **Connect Claude to Tally** from the Start Menu — it is safe to run repeatedly and does nothing if the entry is already correct.
+If Claude Desktop was installed *after* Claudally, or you want to connect a second Windows user, run **Connect your AI assistant to Tally** from the Start Menu — it is safe to run repeatedly and does nothing if the entry is already correct.
 
 To add the entry by hand instead (File → Settings → Developer):
 
@@ -242,6 +249,36 @@ To add the entry by hand instead (File → Settings → Developer):
   }
 }
 ```
+
+### Local (Cursor)
+
+If Cursor is installed for the Windows user, the installer and **Connect your AI assistant to Tally** also add the server to Cursor's global `~/.cursor/mcp.json`, merging beside any servers already there. Cursor is skipped, and nothing is created, when it is not installed. Close every Cursor window and reopen it to see the tools.
+
+### Command-line tools (Claude Code, Codex CLI, Gemini CLI)
+
+These are connected with each tool's own command, which **Connection details for other AI apps...** prints ready to paste with this install's paths filled in. Their config files are not edited for you: they hold the tool's other settings and the vendors document the command.
+
+### Cloud assistants (Claude, ChatGPT, Copilot Studio, Gemini, Le Chat)
+
+When Remote Access gives the server a public `https://` address, **Connection details for other AI apps...** also lists the click path for adding it in each product's settings, with a link to the vendor's own instructions. All five sign in through the server's OAuth page. Gemini Enterprise is not supported: it needs a client ID and secret entered by an administrator.
+
+### Data-entry guidance for every client
+
+The method for entering data the way a client's books are already kept (learn the conventions, keep a per-client instruction sheet, preview every write, ask for consent, verify) is served by the server itself, so it reaches any MCP client and not only those that can install the Claude plugin:
+
+- **Prompts** `feed-tally-data` and `profile-client-books`, for clients that show MCP prompts as commands. Both take an optional company name; `profile-client-books` is read-only.
+- **Tool** `feeding-guide`, which returns the same guide. The server instructions tell the model to call it once per session before the first write, so the guidance applies even in clients with no prompt support and when the user simply says "post these invoices".
+
+The instruction sheet is kept in the user's working folder when the client has file access, in the assistant's own memory when it has one, and is otherwise handed to the user to paste back next session.
+
+### Any other AI app or custom agent
+
+For an MCP client the installer has no auto-connect for (an agent you built, an agent framework, another AI app), right-click the tray icon and choose **Connection details for other AI apps...**. It shows, and copies to the clipboard:
+
+- the **local** entry (an `mcpServers` block with the command and argument), for an app or agent running on the Tally PC; and
+- the **network** URL (`<your address>/mcp`, Streamable HTTP with OAuth sign-in), for a cloud assistant or an agent on another machine. This is only available when Remote Access is set up; in local mode nothing listens on the network.
+
+The same text is available from a terminal: `node dist/client-config.mjs show` (add `--json` for a machine-readable form). It changes nothing.
 
 ### Local (VS Code / GitHub Copilot)
 
@@ -377,7 +414,7 @@ The config never stores passwords — only the hint that one is needed, so calle
 | `update-party-details` | Fill in missing address / PAN / GST details on an existing party (e.g. from an invoice); reports conflicts instead of overwriting, then reads the ledger back to confirm |
 | `create-stock-item` | Create a new stock item master |
 
-> Write tools are disabled when `READONLY_MODE=true`.
+> Write tools are disabled when `READONLY_MODE=true`, and so is `gui-send-keys` — keystrokes can change data just as a write tool can.
 
 ### Analytics
 

@@ -141,13 +141,13 @@ These threats come **through the AI itself**, not from network attackers.
 | Encrypted tunnel to Tally (VPN/SSH) | ⬜ Infra |
 | SQL restricted to read-only | ✅ Done — `validateSQL()` + `enable_external_access=false` |
 | Real password set (not default) | ✅ Done — startup fails if `PASSWORD` missing |
-| `/register` requires auth | ✅ Done — `ADMIN_SECRET` bearer token required |
+| `/register` requires auth | ⚠️ Opt-in — open by default for dynamic client registration (redirect URIs are validated; `PASSWORD` on `/authorize` is the gate). Set `REQUIRE_ADMIN_SECRET_FOR_REGISTRATION=true` to require the `ADMIN_SECRET` bearer token |
 | Write tools have approval workflow | ✅ Done — `destructiveHint` + `READONLY_MODE` env var |
 | Audit logging | ✅ Done — all write tools + `query-database` |
 | Auth on GET/DELETE `/mcp` | ✅ Done — bearer token validated |
 | CORS configured | ✅ Done — `CORS_ORIGINS` env var |
 | DNS rebinding protection | ✅ Done — enabled in transport |
-| Client secret verification | ✅ Done — `/token` verifies `client_secret` |
+| Client secret verification | ✅ Done — `/token` requires and verifies `client_secret` for confidential clients; clients registered with `token_endpoint_auth_method: none` are public and rely on PKCE. A stored client record with no recorded method is treated as confidential |
 | Separate refresh tokens | ✅ Done |
 | Rate limiting | ✅ Done — 10 req/min on auth endpoints |
 | Bind to 127.0.0.1 | ✅ Done — `BIND_HOST` env var, defaults to `127.0.0.1` |

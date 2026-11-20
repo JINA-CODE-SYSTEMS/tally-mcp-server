@@ -1,4 +1,5 @@
 import { XMLParser } from 'fast-xml-parser';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -160,29 +161,35 @@ export function handlePull(targetReport: string, inputParams: Map<string, any>):
     });
 }
 
-function sendTally(xml: string, lstVariables: Map<string, any>): Promise<string> {
+// Renders a request template with nunjucks. `xml` must be TEMPLATE SOURCE ONLY — a file from pull/
+// or push/ — and must never contain a caller-supplied value: nunjucks evaluates whatever expressions
+// its source holds. Caller values reach the output exclusively as template variables (`{{ name }}`)
+// or through the placeholder pass in renderPullRequest below.
+export function renderTallyTemplate(xml: string, lstVariables: Map<string, any>): string {
+    // remove targetCompany from lstVariables if found with default value
+    if (lstVariables.has('targetCompany') && lstVariables.get('targetCompany') == '##SVCurrentCompany') {
+        lstVariables.delete('targetCompany');
+    }
+
+    let o = new Object();
+
+    // define properties for every keys in Map in object
+    lstVariables.forEach((v, k) => {
+        Object.defineProperty(o, k, { enumerable: true, value: v });
+    });
+
+    return nunjucks.renderString(xml, o);
+}
+
+function sendTally(xmlRequest: string): Promise<string> {
     return new Promise<string>(async (resolve, reject) => {
         try {
-
-            // remove targetCompany from lstVariables if found with default value
-            if (lstVariables.has('targetCompany') && lstVariables.get('targetCompany') == '##SVCurrentCompany') {
-                lstVariables.delete('targetCompany');
-            }
-
-            let o = new Object();
-            
-            // define properties for every keys in Map in object
-            lstVariables.forEach((v, k) => {
-                Object.defineProperty(o, k, { enumerable: true, value: v });
-            });
-
-            let xmlRequest = nunjucks.renderString(xml, o);
-
             // inject company user/password credentials into STATICVARIABLES if configured
             const companyUser = process.env.TALLY_COMPANY_USER || '';
             const companyPassword = process.env.TALLY_COMPANY_PASSWORD || '';
             if (companyUser) {
-                xmlRequest = xmlRequest.replace('</STATICVARIABLES>',
+                // Function replacer: a string replacement would expand `$&`-style patterns in the credentials.
+                xmlRequest = xmlRequest.replace('</STATICVARIABLES>', () =>
                     `<SVCOMPANYUSER>${utility.String.escapeHTML(companyUser)}</SVCOMPANYUSER>` +
                     `<SVCOMPANYPASSWORD>${utility.String.escapeHTML(companyPassword)}</SVCOMPANYPASSWORD>` +
                     '</STATICVARIABLES>');
@@ -269,21 +276,81 @@ export async function pingTally(timeoutMs: number = tallyPingTimeoutMs()): Promi
     }
 }
 
-function substituteTDLParameters(msg: string, substitutions: Map<string, any>): string {
-    let retval = msg;
-    substitutions.forEach((v, k) => {
-        let regPtrn = new RegExp(`\\{${k}\\}`, 'g');
-        if (typeof v === 'string')
-            retval = retval.replace(regPtrn, utility.String.escapeHTML(v));
-        else if (typeof v === 'number')
-            retval = retval.replace(regPtrn, v.toString());
-        else if (v instanceof Date)
-            retval = retval.replace(regPtrn, utility.Date.format(v, 'd-MMM-yyyy'));
-        else if (typeof v === 'boolean')
-            retval = retval.replace(regPtrn, v ? 'Yes' : 'No');
-        else;
+function formatTDLParameter(v: any): string | undefined {
+    if (typeof v === 'string')
+        return utility.String.escapeHTML(v);
+    else if (typeof v === 'number')
+        return v.toString();
+    else if (v instanceof Date)
+        return utility.Date.format(v, 'd-MMM-yyyy');
+    else if (typeof v === 'boolean')
+        return v ? 'Yes' : 'No';
+    return undefined;
+}
+
+// A caller string must never sit inside a TDL string literal such as
+//   $LedgerName = "{ledgerName}"
+// XML-escaping protects the XML layer only: Tally's XML parser turns &quot; back into a double
+// quote before the formula is read, so a quote in the value would end the literal and the rest of
+// the value would be read as formula. The pull templates avoid the literal altogether: the value is
+// set as a Tally variable in STATICVARIABLES (<MCPLEDGERNAME>{ledgerName}</MCPLEDGERNAME>) and the
+// formula reads ##MCPLedgerName, so the value is only ever XML text.
+//
+// This check is the backstop for a template that does quote a placeholder: a value with a double
+// quote or a control character (a line break also ends the formula) is refused rather than sent.
+//
+// Returns the name of the first offending parameter, or undefined when the request is safe.
+export function findUnsafeTdlLiteralParam(tmplXML: string, params: Map<string, any>): string | undefined {
+    for (const [name, value] of params) {
+        if (typeof value !== 'string' || !/["\u0000-\u001f\u007f]/.test(value)) continue;
+        const placeholder = `{${name}}`;
+        for (const line of tmplXML.split('\n')) {
+            let from = 0;
+            for (let at = line.indexOf(placeholder, from); at !== -1; at = line.indexOf(placeholder, from)) {
+                // inside a literal when an odd number of quotes precede it on the line (attribute quotes pair up)
+                const quotesBefore = line.slice(0, at).split('"').length - 1;
+                if (quotesBefore % 2 === 1) return name;
+                from = at + placeholder.length;
+            }
+        }
+    }
+    return undefined;
+}
+
+// Builds the outgoing XML for a pull report from its template and the caller's parameters.
+//
+// A pull template mixes two notations: nunjucks (`{{ var }}`, `<nunjuck>…</nunjuck>`) and plain
+// `{param}` placeholders. The placeholders used to be filled in BEFORE the nunjucks pass, which put
+// caller text into the template source — any template expression inside a ledger name, voucher
+// number, reference etc. was then evaluated by nunjucks inside this process. The order is now:
+//
+//   1. each `{param}` in the template source becomes an opaque marker carrying a per-call random
+//      nonce (the source still contains nothing from the caller);
+//   2. nunjucks renders that source;
+//   3. the markers are swapped for the escaped values, in one pass, with a function replacer.
+//
+// So a value is only ever data: it is not parsed by nunjucks, it is not re-scanned for further
+// `{param}` placeholders, and `$`-patterns in it are not interpreted by String.replace. The nonce
+// keeps a value from forging a marker. A placeholder must sit in template TEXT — inside a nunjucks
+// tag use the variable itself (see pull/bills-outstanding.xml); a test enforces this.
+export function renderPullRequest(tmplXML: string, params: Map<string, any>): string {
+    const nonce = crypto.randomBytes(12).toString('hex');
+    const values = new Map<string, string>();
+    params.forEach((v, k) => {
+        const formatted = formatTDLParameter(v);
+        if (formatted !== undefined) values.set(k, formatted);
     });
-    return retval;
+
+    const source = tmplXML.replace(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (whole, name: string, offset: number) => {
+        // leave nunjucks `{{ name }}` alone, and any brace group that is not a known parameter
+        if (tmplXML[offset - 1] === '{' || tmplXML[offset + whole.length] === '}') return whole;
+        return values.has(name) ? `\u0001TDL:${nonce}:${name}\u0001` : whole;
+    });
+
+    const rendered = renderTallyTemplate(source, params);
+
+    return rendered.replace(new RegExp(`\u0001TDL:${nonce}:([A-Za-z_][A-Za-z0-9_]*)\u0001`, 'g'),
+        (_whole, name: string) => values.get(name) ?? '');
 }
 
 function extractReport(reportConfig: m.ModelPullReportInfo, reportInputParams: Map<string, any>): Promise<m.ModelPullResponse> {
@@ -368,8 +435,12 @@ function extractReport(reportConfig: m.ModelPullReportInfo, reportInputParams: M
             }
 
             let tmplXML = fs.readFileSync(path.join(__dirname, `../pull/${reportConfig.name}.xml`), 'utf-8'); //load XML template
-            tmplXML = substituteTDLParameters(tmplXML, reportInputParams); //substitute angular bracket params with values
-            let respContent = await sendTally(tmplXML, reportInputParams);
+            const unsafeParam = findUnsafeTdlLiteralParam(tmplXML, reportInputParams);
+            if (unsafeParam) {
+                retval.error = `Parameter ${unsafeParam} contains a double quote or a control character, which cannot be used to look a record up by name. Use list-master / search to find the record, or query it another way.`;
+                return;
+            }
+            let respContent = await sendTally(renderPullRequest(tmplXML, reportInputParams));
 
             if (!respContent) {
                 retval.error = 'Empty data received from Tally';
@@ -556,7 +627,7 @@ export function handlePush(templateName: string, inputParams: Map<string, any>):
 
             // load and render template
             let tmplXML = fs.readFileSync(path.join(__dirname, `../push/${objTemplate.name}.xml`), 'utf-8');
-            let respContent = await sendTally(tmplXML, lstInputs);
+            let respContent = await sendTally(renderTallyTemplate(tmplXML, lstInputs));
 
             if (!respContent) {
                 retval.error = 'Empty response received from Tally';
@@ -593,7 +664,7 @@ export function pushXml(xml: string): Promise<m.ModelPushResponse> {
             const companyUser = process.env.TALLY_COMPANY_USER || '';
             const companyPassword = process.env.TALLY_COMPANY_PASSWORD || '';
             if (companyUser && xmlRequest.includes('</STATICVARIABLES>')) {
-                xmlRequest = xmlRequest.replace('</STATICVARIABLES>',
+                xmlRequest = xmlRequest.replace('</STATICVARIABLES>', () =>
                     `<SVCOMPANYUSER>${utility.String.escapeHTML(companyUser)}</SVCOMPANYUSER>` +
                     `<SVCOMPANYPASSWORD>${utility.String.escapeHTML(companyPassword)}</SVCOMPANYPASSWORD>` +
                     '</STATICVARIABLES>');

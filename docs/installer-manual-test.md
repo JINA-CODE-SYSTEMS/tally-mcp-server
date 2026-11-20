@@ -11,7 +11,7 @@ here because it actually broke at least once:
   valid hostname for a blank password. No compiler will ever tell you this.
 - **Interactivity.** A `Read-Host` on a path the installer reaches makes the install hang with no
   visible window, because `[Run]` uses `runhidden`.
-- **Privilege boundaries.** The installer is elevated; the person who uses Claude is not. Anything
+- **Privilege boundaries.** The installer is elevated; the person who uses the AI assistant is not. Anything
   that has to land in a user's `%APPDATA%` goes through the scheduled-task trampoline, which no
   unit test exercises.
 - **Upgrade paths.** Preserved state (deployment mode, GUI-control choice, password) is only real
@@ -48,9 +48,9 @@ Check the `{code:GetWizard*}` accessors and `NextButtonClick`'s validation again
 
 ## 2. Fresh local install
 
-1. Run the setup `.exe` as an admin who is **not** the person who uses Claude, if you can.
+1. Run the setup `.exe` as an admin who is **not** the person who uses the AI assistant, if you can.
 2. Expected wizard pages: License, Destination, Tally configuration (4 fields), Tally edition
-   (+ the "Let Claude see and drive the Tally window" checkbox, ticked), Ready, Install, Finished.
+   (+ the "Let your AI assistant see and drive the Tally window" checkbox, ticked), Ready, Install, Finished.
    **There must be no mode page and no password/domain/tunnel page.**
 3. The install must not hang. If it does, something on the local path is prompting.
 
@@ -78,7 +78,7 @@ pwsh scripts\verify-deployment.ps1
       expected, because the installer locks `.env` and the vault away from other accounts; that is
       exit 3, not a failure, but it is also not the verification this step asks for.)
 
-Then, **as the user who runs Claude**:
+Then, **as the user who runs the AI assistant**:
 
 - [ ] `%APPDATA%\Claude\claude_desktop_config.json` contains a `tally` server entry pointing at
       `C:\Program Files\TallyMCP\dist\index.mjs`
@@ -148,7 +148,7 @@ If that install had a Cloudflare Tunnel token (#193 - older builds put it in the
 
 ## 7. Uninstall
 
-Set up first: a second Windows profile that has also connected Claude, and a **fork** of the repo
+Set up first: a second Windows profile that has also connected the AI assistant, and a **fork** of the repo
 at some other path with its own `claude_desktop_config.json` entry pointing at
 `D:\my-fork\dist\index.mjs`.
 
@@ -174,7 +174,7 @@ at some other path with its own `claude_desktop_config.json` entry pointing at
 ## 8. Regression: one-shot agent while the watcher is running
 
 CI covers this (`windows-sources` job), but if you are already on a VM with Tally open it is worth
-confirming for real: with the `TallyMCPAgent` task running, ask Claude to take a screenshot. A
+confirming for real: with the `TallyMCPAgent` task running, ask the AI assistant to take a screenshot. A
 mutex regression here returns `null` in a way that looks exactly like a timeout.
 
 ## 9. Unattended upgrade, run as SYSTEM
