@@ -122,6 +122,7 @@ Source: "{#RepoRoot}\scripts\setup-windows.ps1";      DestDir: "{app}\scripts"; 
 Source: "{#RepoRoot}\scripts\installer\firstrun-config.ps1";    DestDir: "{app}\scripts\installer"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\installer\stop-install-processes.ps1"; DestDir: "{app}\scripts\installer"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\installer\connect-client.ps1";        DestDir: "{app}\scripts\installer"; Flags: ignoreversion
+Source: "{#RepoRoot}\scripts\installer\connection-details.ps1";    DestDir: "{app}\scripts\installer"; Flags: ignoreversion
 Source: "{#RepoRoot}\scripts\installer\uninstall-cleanup.ps1";  DestDir: "{app}\scripts\installer"; Flags: ignoreversion
 
 ; --- Tray status app (issue #20). Polls service/agent/Tally health and surfaces a

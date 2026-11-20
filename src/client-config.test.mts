@@ -749,3 +749,79 @@ test('entryPointsInside also considers the command, for launcher-style entries',
 test('entryPointsInside says no when there is no install root to compare against', () => {
   assert.equal(entryPointsInside({ command: 'node', args: ['x.mjs'] }, '', path.win32), false);
 });
+
+// --- connection details for clients with no target (custom agents, other AI apps) ---
+
+const showModule = await import('./client-config.mjs');
+
+test('connectionDetails: the stdio block is the generic mcpServers shape, with Windows paths intact', () => {
+  const launch = localLaunchSpec(INSTALL, NODE, path.win32);
+  const d = showModule.connectionDetails(launch, { DEPLOYMENT_MODE: 'local' });
+  assert.deepEqual(d.stdio, { command: NODE, args: ['C:\\Program Files\\Tally MCP Server\\dist\\index.mjs'] });
+  assert.deepEqual(d.mcpServers, { mcpServers: { 'tally-prime': d.stdio } });
+  // What gets pasted must be valid JSON that round-trips to the same paths (backslashes escaped once).
+  const text = showModule.formatConnectionDetails(d);
+  const block = text.slice(text.indexOf('{'), text.lastIndexOf('}\n') + 1);
+  assert.deepEqual(JSON.parse(block), d.mcpServers);
+  assert.match(text, /Command   : C:\\Program Files\\nodejs\\node\.exe/);
+  assert.equal(/[^\x00-\x7f]/.test(text), false, 'plain ASCII: it goes through a Windows console and the clipboard');
+});
+
+test('connectionDetails: local mode offers no URL, and says why', () => {
+  const launch = localLaunchSpec(INSTALL, NODE, path.win32);
+  // MCP_DOMAIN is present in every .env copied from .env.example; local mode must still win.
+  const d = showModule.connectionDetails(launch, { DEPLOYMENT_MODE: 'local', MCP_DOMAIN: 'http://localhost:3000' });
+  assert.equal(d.http, null);
+  assert.match(d.httpUnavailable!, /local mode/);
+  const text = showModule.formatConnectionDetails(d);
+  assert.match(text, /Not available\. This install is in local mode/);
+  assert.doesNotMatch(text, /URL       :/);
+});
+
+test('connectionDetails: a remote install gives the /mcp URL; no address means no URL', () => {
+  const launch = localLaunchSpec(INSTALL, NODE, path.win32);
+  for (const [domain, url] of [
+    ['https://tally.example.com', 'https://tally.example.com/mcp'],
+    ['https://tally.example.com/', 'https://tally.example.com/mcp'],
+    ['  http://localhost:3000  ', 'http://localhost:3000/mcp'],
+  ]) {
+    for (const mode of ['remote', '', undefined]) { // an install predating the key is a remote one
+      const d = showModule.connectionDetails(launch, { DEPLOYMENT_MODE: mode, MCP_DOMAIN: domain });
+      assert.deepEqual(d.http, { url, transport: 'streamable-http', auth: 'oauth2.1' }, `${domain} / ${mode}`);
+      assert.match(showModule.formatConnectionDetails(d), new RegExp(`URL       : ${url.replace(/[.]/g, '\\.')}\n`));
+    }
+  }
+  for (const domain of [undefined, '', 'tally.example.com', 'ftp://x']) {
+    const d = showModule.connectionDetails(launch, { DEPLOYMENT_MODE: 'remote', MCP_DOMAIN: domain });
+    assert.equal(d.http, null, String(domain));
+    assert.match(d.httpUnavailable!, /MCP_DOMAIN/);
+  }
+});
+
+test('CLI: show prints the details from the install .env, writes nothing, and needs no target', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tally-show-'));
+  const run = (args: string[]) => spawnSync(process.execPath, [CLI, 'show', '--install-root', root, '--node', NODE, ...args], { encoding: 'utf-8' });
+
+  // No .env at all: still prints the stdio half.
+  let r = run(['--json']);
+  assert.equal(r.status, 0);
+  let out = JSON.parse(r.stdout);
+  assert.equal(out.command, 'show');
+  assert.deepEqual(out.stdio, { command: NODE, args: [path.join(root, 'dist', 'index.mjs')] });
+  assert.equal(out.http, null);
+
+  fs.writeFileSync(path.join(root, '.env'), 'DEPLOYMENT_MODE=remote\nMCP_DOMAIN="https://books.example.com"  # public address\n');
+  out = JSON.parse(run(['--json']).stdout);
+  assert.equal(out.http.url, 'https://books.example.com/mcp');
+
+  r = run([]);
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /^Claudally connection details/);
+  assert.match(r.stdout, /URL       : https:\/\/books\.example\.com\/mcp/);
+
+  fs.writeFileSync(path.join(root, '.env'), 'DEPLOYMENT_MODE=local\nMCP_DOMAIN=http://localhost:3000\n');
+  assert.equal(JSON.parse(run(['--json']).stdout).http, null);
+
+  assert.deepEqual(fs.readdirSync(root), ['.env'], 'show must not create anything in the install');
+  fs.rmSync(root, { recursive: true, force: true });
+});

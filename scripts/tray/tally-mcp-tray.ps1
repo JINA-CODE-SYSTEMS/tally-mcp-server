@@ -910,6 +910,20 @@ $miConnectClaude.Add_Click({
     Start-Process -FilePath 'powershell.exe' -ArgumentList $connectArgs
 })
 
+# For any MCP client we have no auto-connect for (a custom agent, another AI app): prints the stdio
+# launch block and, when the install serves HTTP, the URL, and copies both to the clipboard.
+# Read-only and not elevated - it only reads this install's .env.
+$miConnectionDetails = $menu.Items.Add('Connection details for other AI apps...')
+$miConnectionDetails.Add_Click({
+    $script = Join-Path $InstallDir 'scripts\installer\connection-details.ps1'
+    if (-not (Test-Path -LiteralPath $script)) {
+        [System.Windows.Forms.MessageBox]::Show("Connection details script not found at: $script", 'Claudally', 'OK', 'Warning') | Out-Null
+        return
+    }
+    $detailsArgs = "-ExecutionPolicy Bypass -NoProfile -NoExit -File `"$script`" -InstallDir `"$InstallDir`""
+    Start-Process -FilePath 'powershell.exe' -ArgumentList $detailsArgs
+})
+
 $miReconfigure = $menu.Items.Add('Reconfigure...')
 $miReconfigure.Add_Click({
     $script = Join-Path $InstallDir 'scripts\installer\firstrun-config.ps1'

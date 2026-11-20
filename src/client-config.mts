@@ -43,6 +43,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
+import dotenv from 'dotenv';
 
 // Minimal path interface so path handling can be unit-tested under both win32 and posix semantics
 // on whatever OS CI happens to run. Mirrors the PathLike in mcp.mts:420 (kept local rather than
@@ -285,6 +286,87 @@ export function targetById(id: string): ClientTarget | undefined {
 /** The stdio launch line for a local install: `node <installRoot>/dist/index.mjs` (see src/index.mts). */
 export function localLaunchSpec(installRoot: string, nodeExe: string = process.execPath, p: PathLike = path): LaunchSpec {
   return { command: nodeExe, args: [p.join(installRoot, 'dist', 'index.mjs')] };
+}
+
+// ---------------------------------------------------------------------------
+// Connection details for clients we have no target for
+// ---------------------------------------------------------------------------
+//
+// The targets above cover the clients whose config file we know how to edit. Everything else - a
+// custom agent, an agent framework, an app we have not added yet - still only needs two facts: the
+// stdio launch line, and (when the install serves HTTP) the URL. `show` prints both so they can be
+// pasted wherever that client keeps its MCP servers. Read-only: it writes nothing anywhere.
+
+/** The name used for our entry in the generic block; the same one docs/README.md gives for VS Code. */
+export const GENERIC_SERVER_NAME = 'tally-prime';
+
+export interface ConnectionDetails {
+  /** For a client on this machine: it starts the server itself and talks over stdin/stdout. */
+  stdio: { command: string; args: string[] };
+  /** The stdio entry in the `mcpServers` shape most clients and agent frameworks accept. */
+  mcpServers: Record<string, unknown>;
+  /** For a client elsewhere (a cloud assistant, another machine). Null when this install serves no HTTP. */
+  http: { url: string; transport: 'streamable-http'; auth: 'oauth2.1' } | null;
+  /** Why `http` is null, in words the tray can show. */
+  httpUnavailable?: string;
+}
+
+/**
+ * `env` is the install's .env, already parsed. HTTP is offered only when the install is not in
+ * local mode AND has an MCP_DOMAIN: local mode starts no service and opens no port (#172), so
+ * printing a URL there would send the user to an address nothing is listening on.
+ */
+export function connectionDetails(launch: LaunchSpec, env: Record<string, string | undefined> = {}): ConnectionDetails {
+  const stdio = { command: launch.command, args: [...launch.args] };
+  const mcpServers = { mcpServers: { [GENERIC_SERVER_NAME]: { ...stdio } } };
+  const mode = (env.DEPLOYMENT_MODE ?? '').trim().toLowerCase();
+  const domain = (env.MCP_DOMAIN ?? '').trim().replace(/\/+$/, '');
+  if (mode === 'local') {
+    return { stdio, mcpServers, http: null,
+      httpUnavailable: 'This install is in local mode: the server is started on this PC by the app that uses it, and nothing listens on the network. Turn on Remote Access (tray > Reconfigure) to get a URL.' };
+  }
+  if (!/^https?:\/\/[^\s/]+/i.test(domain)) {
+    return { stdio, mcpServers, http: null,
+      httpUnavailable: 'No server address is configured (MCP_DOMAIN is not set in .env). Set up Remote Access (tray > Reconfigure) to get a URL.' };
+  }
+  return { stdio, mcpServers, http: { url: `${domain}/mcp`, transport: 'streamable-http', auth: 'oauth2.1' } };
+}
+
+/** The same details as text a person can paste from. Plain ASCII: it goes through a Windows console and the clipboard. */
+export function formatConnectionDetails(d: ConnectionDetails): string {
+  const lines = [
+    'Claudally connection details',
+    '============================',
+    '',
+    '1. LOCAL - for an AI app or agent running on this PC (stdio)',
+    '',
+    '   Add this to the app\'s MCP server configuration:',
+    '',
+    JSON.stringify(d.mcpServers, null, 2),
+    '',
+    '   If the app asks for the parts separately:',
+    `     Command   : ${d.stdio.command}`,
+    ...d.stdio.args.map((a, i) => `     Argument ${i + 1}: ${a}`),
+    '   Some apps name the top-level key differently (VS Code uses "servers" and also needs "type": "stdio").',
+    '',
+    '2. NETWORK - for a cloud assistant, or an agent on another machine (HTTP)',
+    '',
+  ];
+  if (d.http) {
+    lines.push(
+      `   URL       : ${d.http.url}`,
+      '   Transport : Streamable HTTP',
+      '   Sign-in   : OAuth 2.1. The app registers itself and opens the sign-in page; enter this server\'s password.',
+      '   An app on another network can only reach this URL if it is a public address.');
+  } else {
+    lines.push(`   Not available. ${d.httpUnavailable ?? ''}`.trimEnd());
+  }
+  return lines.join('\n') + '\n';
+}
+
+/** The install's .env as a plain record; {} when there is none. Never throws: `show` must still print the stdio half. */
+export function readInstallEnv(installRoot: string): Record<string, string> {
+  try { return dotenv.parse(fs.readFileSync(path.join(installRoot, '.env'), 'utf-8')); } catch { return {}; }
 }
 
 // ---------------------------------------------------------------------------
@@ -710,9 +792,9 @@ export function parseCliArgs(argv: string[]): CliOptions {
   return opts;
 }
 
-const CLI_COMMANDS = ['detect', 'status', 'apply', 'remove'];
+const CLI_COMMANDS = ['detect', 'status', 'apply', 'remove', 'show'];
 
-const USAGE = 'usage: node dist/client-config.mjs <detect|status|apply|remove> [--target claude-desktop|vscode|all]'
+const USAGE = 'usage: node dist/client-config.mjs <detect|status|apply|remove|show> [--target claude-desktop|vscode|all]'
   + ' [--workspace DIR] [--appdata DIR] [--require-install-root] [--install-root DIR] [--node PATH] [--json] [--dry-run] [--allow-comment-loss]\n';
 
 export function runCli(argv: string[]): number {
@@ -730,6 +812,12 @@ export function runCli(argv: string[]): number {
     return 1;
   }
   const launch = localLaunchSpec(opts.installRoot, opts.nodeExe);
+  // `show` touches no client config at all, so it returns before any target is resolved.
+  if (opts.command === 'show') {
+    const details = connectionDetails(launch, readInstallEnv(opts.installRoot));
+    process.stdout.write(opts.json ? JSON.stringify({ command: 'show', ...details }, null, 2) + '\n' : formatConnectionDetails(details));
+    return 0;
+  }
   const report: Record<string, unknown>[] = [];
   let exit = 0;
   for (const id of opts.targets) {

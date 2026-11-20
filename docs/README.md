@@ -250,6 +250,15 @@ To add the entry by hand instead (File → Settings → Developer):
 }
 ```
 
+### Any other AI app or custom agent
+
+For an MCP client the installer has no auto-connect for (an agent you built, an agent framework, another AI app), right-click the tray icon and choose **Connection details for other AI apps...**. It shows, and copies to the clipboard:
+
+- the **local** entry (an `mcpServers` block with the command and argument), for an app or agent running on the Tally PC; and
+- the **network** URL (`<your address>/mcp`, Streamable HTTP with OAuth sign-in), for a cloud assistant or an agent on another machine. This is only available when Remote Access is set up; in local mode nothing listens on the network.
+
+The same text is available from a terminal: `node dist/client-config.mjs show` (add `--json` for a machine-readable form). It changes nothing.
+
 ### Local (VS Code / GitHub Copilot)
 
 Add to your workspace `.vscode/mcp.json`:
