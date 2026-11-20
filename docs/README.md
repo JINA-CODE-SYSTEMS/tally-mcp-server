@@ -262,6 +262,15 @@ These are connected with each tool's own command, which **Connection details for
 
 When Remote Access gives the server a public `https://` address, **Connection details for other AI apps...** also lists the click path for adding it in each product's settings, with a link to the vendor's own instructions. All five sign in through the server's OAuth page. Gemini Enterprise is not supported: it needs a client ID and secret entered by an administrator.
 
+### Data-entry guidance for every client
+
+The method for entering data the way a client's books are already kept (learn the conventions, keep a per-client instruction sheet, preview every write, ask for consent, verify) is served by the server itself, so it reaches any MCP client and not only those that can install the Claude plugin:
+
+- **Prompts** `feed-tally-data` and `profile-client-books`, for clients that show MCP prompts as commands. Both take an optional company name; `profile-client-books` is read-only.
+- **Tool** `feeding-guide`, which returns the same guide. The server instructions tell the model to call it once per session before the first write, so the guidance applies even in clients with no prompt support and when the user simply says "post these invoices".
+
+The instruction sheet is kept in the user's working folder when the client has file access, in the assistant's own memory when it has one, and is otherwise handed to the user to paste back next session.
+
 ### Any other AI app or custom agent
 
 For an MCP client the installer has no auto-connect for (an agent you built, an agent framework, another AI app), right-click the tray icon and choose **Connection details for other AI apps...**. It shows, and copies to the clipboard:

@@ -9,6 +9,7 @@ import { handlePull, handlePush, jsonToTSV, pingTally, postTallyXML, pushXml, re
 import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, buildAlterVoucherXml, applyPatchToBlock, alterWouldBlankVoucher, blockHasLedgerEntries, deriveRemoteId, findRemoteIdCollisions, voucherBalance, orderEntries, type EntryOrder, isDateInOpenPeriod, findMissingMasters, canonicalizeVoucherMasters, masterKey, resolveMasterNames, referencedLedgers, decodeXmlEntities, escapeXml, xmlName, type VoucherEntry, type VoucherInput, type VoucherPatch } from './voucher.mjs';
 import { MASTER_TAGS, MASTER_COLLECTION_TYPES, planMasterNameRepairs, buildRenameMasterXml, verifyRename, buildMasterNamesCollectionXml, parseMasterNamesFromCollection } from './master.mjs';
 import type { ModelPushResponse } from './models.mjs';
+import { FEEDING_INSTRUCTIONS_LINE, registerFeedingGuide } from './feeding-guide.mjs';
 import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
 import { normalizePartyFields, validatePartyFields, planPartyUpdate, changesFromPlan, buildPartyAlterXml, verifyPartyFields, type PartyRow } from './party.mjs';
 
@@ -2982,8 +2983,11 @@ export async function registerMcpServer(): Promise<McpServer> {
       { src: 'https://claudally.jinacode.systems/claudally-logo.png', mimeType: 'image/png', sizes: ['256x256'] }
     ]
   }, {
-    instructions: TALLY_MCP_INSTRUCTIONS
+    instructions: `${TALLY_MCP_INSTRUCTIONS}\n\n${FEEDING_INSTRUCTIONS_LINE}`
   });
+
+  // The data-entry method, for every client: two prompts and a read-only tool. See feeding-guide.mts.
+  registerFeedingGuide(mcpServer);
 
   mcpServer.registerTool(
     'query-database',
