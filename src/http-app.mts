@@ -491,7 +491,10 @@ app.get('/authorize', async (req, res) => {
     code_challenge: req.query.code_challenge,
     code_challenge_method: req.query.code_challenge_method,
   }, registeredClients);
-  console.log(`[authorize GET] client_id=${typeof req.query.client_id === 'string' ? req.query.client_id : '(invalid)'}, ok=${!('error' in params)}`);
+  // The client id comes straight from the query string: log it as a bounded JSON string so a line
+  // break or control character in it cannot forge a log entry.
+  const loggedClientId = typeof req.query.client_id === 'string' ? JSON.stringify(req.query.client_id.slice(0, 80)) : '(invalid)';
+  console.log(`[authorize GET] client_id=${loggedClientId}, ok=${!('error' in params)}`);
   if ('error' in params) {
     return res.status(400).json(params);
   }

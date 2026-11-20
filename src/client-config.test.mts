@@ -791,7 +791,7 @@ test('connectionDetails: a remote install gives the /mcp URL; no address means n
       assert.equal(d.http!.url, url, `${domain} / ${mode}`);
       assert.equal(d.http!.transport, 'streamable-http');
       assert.equal(d.http!.auth, 'oauth2.1');
-      assert.match(showModule.formatConnectionDetails(d), new RegExp(`URL       : ${url.replace(/[.]/g, '\\.')}\n`));
+      assert.match(showModule.formatConnectionDetails(d), new RegExp(`URL       : ${url.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}\n`));
     }
   }
   for (const domain of [undefined, '', 'tally.example.com', 'ftp://x']) {
@@ -905,8 +905,13 @@ test('shellQuote: bare when safe, quoted when it has spaces, with shell metachar
   assert.equal(showModule.shellQuote('C:\\node\\node.exe'), 'C:\\node\\node.exe');
   assert.equal(showModule.shellQuote('/usr/bin/node'), '/usr/bin/node');
   assert.equal(showModule.shellQuote('C:\\Program Files\\node.exe'), '"C:\\Program Files\\node.exe"');
-  assert.equal(showModule.shellQuote('/opt/my $app/`x`/"q"'), '"/opt/my \\$app/\\`x\\`/\\"q\\""');
-  assert.equal(showModule.shellQuote(''), '""');
+  // POSIX words are single-quoted, so $ ` " and a trailing backslash-free path need no escaping.
+  assert.equal(showModule.shellQuote('/opt/my $app/`x`/"q"'), `'/opt/my $app/\`x\`/"q"'`);
+  assert.equal(showModule.shellQuote("/opt/it's here"), `'/opt/it'\\''s here'`);
+  // A Windows path keeps its backslashes exactly, including a trailing one.
+  assert.equal(showModule.shellQuote('C:\\My Apps\\'), '"C:\\My Apps\\"');
+  assert.equal(showModule.shellQuote('C:\\a b\\$x"y`z%P%'), '"C:\\a b\\xyzP"');
+  assert.equal(showModule.shellQuote(''), "''");
 });
 
 // --- Cursor: a per-user app that is connected only when it is actually installed ---

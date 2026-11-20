@@ -388,9 +388,19 @@ export const CLI_TOOLS: CliTool[] = [
   },
 ];
 
-/** One shell word. Double quotes work in cmd, PowerShell and POSIX shells; a path cannot contain one on Windows. */
+/**
+ * One shell word, for a command a person pastes into a terminal.
+ *   - a Windows path (it has a backslash): double quotes, which cmd and PowerShell both honour.
+ *     Backslashes are left alone - doubling them would change the path - and a Windows path cannot
+ *     contain a double quote. Any other character that could end the quoting is refused by
+ *     dropping it, which cannot happen for a real path.
+ *   - anything else: POSIX single quotes, inside which nothing is special; an embedded single quote
+ *     is closed, escaped and reopened.
+ */
 export function shellQuote(word: string): string {
-  return /^[A-Za-z0-9_\-.:\\/]+$/.test(word) ? word : `"${word.replace(/(["$`])/g, '\\$1')}"`;
+  if (/^[A-Za-z0-9_\-.:\\/]+$/.test(word)) return word;
+  if (word.includes('\\')) return `"${word.replace(/["`$%\r\n]/g, '')}"`;
+  return `'${word.replace(/'/g, `'\\''`)}'`;
 }
 
 /** The full command line that registers this install with a command-line tool. */
