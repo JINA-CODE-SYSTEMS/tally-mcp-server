@@ -19,7 +19,20 @@ A double-click installer that takes a Windows box from "nothing installed" to
    install keeps its mode, password, domain and service across an upgrade, because the wizard
    passes no mode at all and `firstrun-config.ps1` preserves whatever the install already has.
 3. Writes `.env` from the collected values. In local mode `PASSWORD`, `BIND_HOST`, `MCP_DOMAIN` and
-   `TUNNEL_TOKEN` are not written at all.
+   `TUNNEL_TOKEN` are not written at all. `.env` and the **Claudally agent folder**,
+   `%ProgramData%\Claudally\agent` - which holds the company password vault
+   (`.tally-mcp-companies.json`) and the GUI agent's IPC files - are restricted to `SYSTEM`,
+   `Administrators` and the agent user. The groups are granted **by SID** (`*S-1-5-18`,
+   `*S-1-5-32-544`), never by name, because the names are localised and `icacls ... Administrators:F`
+   changes nothing on a non-English Windows
+   ([#230](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/230)). Each lockdown is checked
+   with `Get-Acl` afterwards, and one that did not take **stops the configuration with an error**:
+   `.env` is written into a file that was locked first, so a failed lockdown writes no secret at all.
+
+   **Tally's data folder (`TALLY_DATA_PATH`) is left to Tally.** Earlier versions kept the vault and
+   the IPC files there and locked the whole folder down, which on a PC shared by several Windows
+   accounts shut the others out of their Tally companies. The installer now never writes to it or
+   changes its permissions - except to undo that: see [Tally's data folder](#tallys-data-folder-and-the-agent-folder).
 4. **Remote mode only:** registers the `TallyMCP` Windows service via the bundled NSSM, pointing at
    the bundled portable Node (no system Node required). A local install registers no service -
    Claude starts the stdio entrypoint on demand - and instead writes the entry into the user's
@@ -27,10 +40,18 @@ A double-click installer that takes a Windows box from "nothing installed" to
 5. **If a Cloudflare Tunnel token was supplied**, registers a second NSSM service `TallyMCPTunnel`
    running the bundled `cloudflared` so the box gets a stable public HTTPS URL with no router/domain
    config (the MCP server then binds loopback-only — cloudflared connects to it on `127.0.0.1`).
-   cloudflared reads the token from `.tunnel-token` in the install directory (`--token-file`),
-   which only `SYSTEM` and `Administrators` can read — never from the service's registry
-   environment, which any local user can read. Upgrading an older tunnel install removes the
-   token from the registry ([#193](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/193)).
+   cloudflared reads the token from `.tunnel-token` in the install directory (`--token-file`) —
+   never from the service's registry environment, which any local user can read. That *file* is
+   readable only by `SYSTEM` and `Administrators`. The *token* is not held to that alone: `.env` keeps
+   a copy (`TUNNEL_TOKEN`) so Reconfigure and upgrades can preserve it, and `.env` is also readable
+   by the agent user. Upgrading an older tunnel install removes the token from the registry —
+   NSSM's `AppEnvironmentExtra` and `AppEnvironment` alike
+   ([#193](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/193)). A machine-wide
+   `TUNNEL_TOKEN` environment variable (which cloudflared would prefer to the file, and which every
+   local account can read) is reported loudly but not deleted, since something else may use it;
+   `verify-deployment.ps1` fails until it is removed. If the tunnel cannot be registered (the token
+   file cannot be locked down, or `cloudflared.exe` is missing), the configuration fails with an
+   error rather than finishing without a tunnel.
 6. Registers the `TallyMCPAgent` scheduled task at-logon for the configured user.
 7. Registers the `TallyMCPTray` scheduled task at-logon (status tray icon — issue #20).
 8. Starts the service(s) and triggers both scheduled tasks immediately so the operator sees
@@ -161,6 +182,13 @@ Start Menu → "Tally MCP Server" → "Reconfigure Tally MCP Server" launches
 idempotent: it stops + re-registers the service so settings actually take
 effect.
 
+Whether run from the installer or from Reconfigure, the script exits non-zero when anything it
+must do fails - a lockdown of `.env`, the agent folder or the vault that could not be applied and
+verified (it stops there), or a configured tunnel that could not be registered (reported after the
+agent and tray have been restarted). Reconfigure's window stays open on the error. The installer
+shows the error, says so on its last page instead of "installed and running", and exits with
+**code 10**; it used to run the script from `[Run]`, which ignores the exit code.
+
 ## Unattended upgrade and silent installs
 
 The daily `TallyMCPUpdate` task ([#177](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/177),
@@ -209,12 +237,17 @@ It skips every settings page, passes no settings, and runs `firstrun-config.ps1 
   [#193](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/193) receive it: an existing
   `TallyMCPTunnel` is re-registered with `--token-file`, `.tunnel-token` is written from the
   `TUNNEL_TOKEN` already in `.env` (which itself is not touched), and `TUNNEL_TOKEN` is scrubbed
-  from the registry environment of `TallyMCPTunnel` and `TallyMCP`. If the token file cannot be
-  locked down to SYSTEM + Administrators the tunnel is left unregistered - never protected less
-  well - and the run fails (exit 10), so the updater rolls back instead of reporting success over
-  an outage. A missing tunnel service is still not created.
-- re-applies the NTFS lockdown on `.env`, the company registry and the IPC directory, for the same
-  user.
+  from the registry environment (`AppEnvironmentExtra` and `AppEnvironment`) of `TallyMCPTunnel`
+  and `TallyMCP`. If the token file cannot be locked down to SYSTEM + Administrators the tunnel is
+  left unregistered - never protected less well - and the run fails (exit 10), so the updater rolls
+  back instead of reporting success over an outage. A missing tunnel service is still not created.
+- re-applies the NTFS lockdown on `.env` and the agent folder, for the same user, by SID
+  ([#230](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/230)). This is also how an
+  install made on a non-English Windows before #230 - where the lockdown silently did nothing - gets
+  it. If a lockdown cannot be applied and verified, the run stops (exit 10).
+- **moves the company vault out of Tally's data folder** into the agent folder, and gives Tally's
+  folder its permissions back (see [below](#tallys-data-folder-and-the-agent-folder)). If the vault
+  cannot be moved, the run stops (exit 10) with the vault where it was.
 
 To *change* a setting, use Reconfigure or run the installer interactively; an unattended upgrade
 never will.
@@ -234,7 +267,12 @@ behaviour, left for a follow-up that pre-fills the wizard from `.env`.
    `TallyMCPTunnel` service with no `TUNNEL_TOKEN` in `.env` (the upgrade could only remove it), and
    dry-runs the token-file lockdown on a scratch file holding no secret (`.tunnel-token.preflight`,
    shredded straight away), so a folder where the lockdown cannot work is found before the tunnel
-   is stopped rather than after.
+   is stopped rather than after. For every install it does the same for the `.env` / vault
+   lockdown (#230): the agent user must resolve to a SID, and the lockdown is dry-run on
+   `.tally-mcp-acl.preflight` in the install folder and in the agent folder (or, before it exists,
+   the nearest folder above it). It also refuses an agent folder it could not trust (a junction, or
+   one owned by another account) and a vault in Tally's data folder it would have to move but
+   cannot read. The preflight never creates the agent folder.
 2. Services and tasks are stopped, files are replaced.
 3. `firstrun-config.ps1 -Upgrade` runs. If it fails, Setup exits with **code 10**: the new files are
    in place but services or tasks may be stopped - the caller must roll back. Its own log is
@@ -244,7 +282,7 @@ behaviour, left for a follow-up that pre-fills the wizard from `.env`.
 |---|---|---|
 | 0 | Upgraded; every setting kept | Health check ([update-manifest.md §7.4](dev/update-manifest.md#74-behaviour-per-deployment-mode)) |
 | 7 | Refused before anything changed (no existing install, or preflight refused) | Report; do not roll back - nothing changed |
-| 10 | Files replaced, reconfiguration failed | Roll back |
+| 10 | Files replaced, reconfiguration failed. Returned by any run, not only an upgrade: a new install whose configuration failed exits 10 too | Roll back |
 | any other | An Inno Setup failure ([Setup exit codes](https://jrsoftware.org/ishelp/index.php?topic=setupexitcodes)) | Roll back if files may have changed (4, 5) |
 
 ### How the updater invokes it
@@ -286,6 +324,61 @@ as an `[UninstallRun]` parameter, and Inno expands those at *install* time, so t
 empty and the passwords were always kept. The uninstaller now passes it in its own environment
 (`CLAUDALLY_UNINSTALL_REMOVE_VAULT`), which also reaches the cleanup entries that older installers
 left in `unins000.dat` on upgraded machines.
+
+## Tally's data folder and the agent folder
+
+**Behaviour change (#230 follow-up).** The company vault (`.tally-mcp-companies.json`) and the GUI
+agent's IPC files (`_mcp_gui_command.json`, `_mcp_gui_result.json`, `_mcp_screenshot.png`) live in
+`%ProgramData%\Claudally\agent`, not in Tally's data folder (`TALLY_DATA_PATH`). `TALLY_DATA_PATH`
+still means only "where Tally keeps its data".
+
+Why: to keep those files private, every version up to #230 ran
+`icacls <TALLY_DATA_PATH> /inheritance:r /grant:r SYSTEM Administrators <agent user>` on Tally's own
+folder. On a PC shared by several Windows accounts, that removed every other account's access to the
+books - by propagation, to each company folder too.
+
+**The agent folder.** `%ProgramData%` is per-machine (the SYSTEM service and the user's session
+resolve it to the same place), is not replaced by an upgrade, and is where the updater keeps its state
+(`%ProgramData%\Claudally\update`). But any user may create folders in `C:\ProgramData`, so the
+installer:
+
+- takes `%ProgramData%\Claudally` (creating it if needed) and locks it to SYSTEM + Administrators,
+  owner Administrators - after which no other account can create anything in it;
+- creates `Claudally\agent` and locks it, before anything is written in it, to SYSTEM,
+  Administrators and the agent user, `(OI)(CI)` so the files the service creates there inherit the
+  agent user's access; owner Administrators; verified with `Get-Acl`;
+- **refuses** - stops with an error, touching nothing inside - if either folder already exists as a
+  junction or symbolic link, or is owned by an account other than SYSTEM, Administrators or the agent
+  user. A junction would make the lockdown re-permission whatever it points at; a folder another
+  account planted may already hold files of theirs (a prepared command, a vault of their choosing)
+  that no permission reset could make trustworthy. Delete it and run the installer again. A folder
+  owned by SYSTEM, Administrators or the agent user is simply taken back: owner reset, permission
+  list replaced, any other account's entry removed and named in the output.
+
+**Moving the vault.** On the first run of this version (an upgrade, a Reconfigure or a reinstall),
+`<TALLY_DATA_PATH>\.tally-mcp-companies.json` moves to the agent folder without a readable copy at any
+point: the new file is created empty, locked and verified first; then the bytes are written into it
+and read back; only when they match is the old file shredded. The bytes are unchanged, so stored
+passwords still decrypt (DPAPI machine scope, and the entropy is a fixed string, not the path). A
+pre-entropy backup next to it moves the same way; a half-written `.tmp` is shredded. If a vault
+already exists in the agent folder and differs, it is kept and the old one moves in beside it as
+`.tally-mcp-companies.json.from-tally-data-folder-<timestamp>`, for a person to reconcile. If the move
+cannot be done, the run stops and the old vault stays exactly where it was. Stale IPC files in Tally's
+folder are shredded (a command file can hold a company password). `TALLY_COMPANIES_CONFIG`, if set,
+still wins for the server; the installer does not create or lock a vault there.
+
+**Giving Tally's folder back.** If Tally's data folder has inheritance disabled *and* carries the
+fingerprint of the old command - exactly one explicit Full Control `(OI)(CI)` entry each for SYSTEM
+and Administrators - the installer re-enables inheritance (`/inheritance:e`), then removes the explicit
+SYSTEM and Administrators entries if inheritance now grants them the same, and logs each step. The
+agent user's explicit entry is kept: the old command replaced whatever that account had before, so
+there is no telling whether it needs one. Nothing else is touched - no other account's entry, no deny
+entry. A folder whose inheritance is on is left alone (nothing to restore); one protected in any other
+shape is reported and left alone. A failure here is a warning, not an error.
+
+`verify-deployment.ps1` checks the agent folder by SID (and its owner), FAILs if any of our files are
+still in Tally's folder, and WARNs if Tally's folder still has inheritance disabled, with the command
+that restores it.
 
 ## Why Inno Setup, not WiX
 

@@ -134,17 +134,81 @@ If that install had a Cloudflare Tunnel token (#193 - older builds put it in the
 - [ ] `verify-deployment.ps1` (elevated) reports *Tunnel token kept out of the service registry* as PASS
 - [ ] Reconfigure with the token blanked removes `.tunnel-token`
 
-If that install had a Cloudflare Tunnel token (#193 - older builds put it in the service registry):
+The #229 follow-ups, on the same install:
 
-- [ ] `(Get-Item HKLM:\SYSTEM\CurrentControlSet\Services\TallyMCPTunnel\Parameters).GetValue('AppEnvironmentExtra')`
-      has no `TUNNEL_TOKEN=` entry, and neither does the same value under `TallyMCP`; any other
-      entry that was there before is still there
-- [ ] `nssm get TallyMCPTunnel AppParameters` is `tunnel run --token-file .tunnel-token`
-- [ ] `icacls "C:\Program Files\TallyMCP\.tunnel-token"` shows only `NT AUTHORITY\SYSTEM:(F)` and
-      `BUILTIN\Administrators:(F)`, no `(I)` entries; `(Get-Acl ...).Owner` is `BUILTIN\Administrators`
-- [ ] `TallyMCPTunnel` is running and `logs\tunnel.log` shows `Registered tunnel connection`
-- [ ] `verify-deployment.ps1` (elevated) reports *Tunnel token kept out of the service registry* as PASS
-- [ ] Reconfigure with the token blanked removes `.tunnel-token`
+- [ ] `nssm set TallyMCPTunnel AppEnvironment TUNNEL_TOKEN=x HTTPS_PROXY=y`, then Reconfigure:
+      `AppEnvironment` keeps `HTTPS_PROXY=y` and has no `TUNNEL_TOKEN`
+- [ ] `[Environment]::SetEnvironmentVariable('TUNNEL_TOKEN', 'x', 'Machine')`, then Reconfigure: a
+      red `SECURITY: a machine-wide TUNNEL_TOKEN` warning, the variable is still there afterwards,
+      and `verify-deployment.ps1` FAILs *Tunnel token kept out of the service registry* until it is
+      removed. Remove it again when done.
+- [ ] Rename `bin\cloudflared.exe`, then Reconfigure: the window stops on an error and the script
+      exits non-zero (it used to print a WARN, say "Configuration complete." and exit 0). Put it back.
+
+## 6b. Non-English Windows (#230)
+
+On a Windows installed in another language - German or French, where `Administrators` is
+`Administratoren` / `Administrateurs` - with the UI language set to it. (The CI harness simulates
+this by making every account *name* fail in its icacls stand-in; this is the real thing.)
+
+- [ ] A fresh install completes, and `icacls` on `.env`, on `%ProgramData%\Claudally\agent` and on
+      the vault in it shows no `(I)` entries on `.env` and the folder, only SYSTEM, Administrators and
+      the agent user under their localised names; `icacls %ProgramData%\Claudally` shows SYSTEM and
+      Administrators only
+- [ ] `verify-deployment.ps1` (elevated) reports *Configuration file ACL*, *Agent folder ACL* and
+      *Company vault ACL* as PASS
+- [ ] An install made on that machine by a build **before** #230 reports *Configuration file ACL* as
+      FAIL (inheritance enabled); an unattended upgrade to this build then turns it PASS
+- [ ] Make the lockdown fail - e.g. deny Administrators write on `%ProgramData%\Claudally` - and run
+      Setup: it shows the error, its last page says configuring FAILED, and it exits 10. For an
+      unattended upgrade over such an install, the preflight refuses first (exit 7) and nothing is
+      stopped.
+
+## 6c. A Tally PC shared by several Windows accounts (#230 follow-up)
+
+The case the move out of Tally's data folder is for. Two local accounts, **alice** (the accountant the
+GUI agent runs as) and **bob** (a second person who also uses Tally on this PC), both able to open the
+same Tally company from `C:\Users\Public\TallyPrimeEditLog\data` before anything of ours is installed.
+
+Upgrade from a build before this change:
+
+- [ ] Install the **old** build with alice as the agent user. Confirm the problem first: signed in as
+      bob, Tally can no longer open the company (`icacls <data folder>` shows `SYSTEM`,
+      `Administrators` and `alice` only, no `(I)` entries).
+- [ ] Save a company password in Manage Companies (as alice). Note the vault file's SHA-256.
+- [ ] Upgrade to this build (interactive, then repeat with the unattended `/UPDATE` path).
+- [ ] `icacls <data folder>` shows inherited `(I)` entries again, plus alice's explicit entry; the
+      SYSTEM and Administrators explicit entries are gone. The Setup log / `firstrun-config.log`
+      lists each restored item.
+- [ ] Signed in as **bob**, Tally opens the company again. Company sub-folders show `(I)` entries too.
+- [ ] `%ProgramData%\Claudally\agent\.tally-mcp-companies.json` exists with the same SHA-256 as
+      noted; the data folder has no `.tally-mcp-companies.json` and no `_mcp_*` files.
+- [ ] As alice, *Reload last company* / load-company with the stored password works (the password
+      still decrypts from the new location).
+- [ ] As bob, `Get-Content C:\ProgramData\Claudally\agent\.tally-mcp-companies.json` and
+      `Get-ChildItem C:\ProgramData\Claudally\agent` are denied, and bob cannot create a file there.
+- [ ] `verify-deployment.ps1` (elevated) reports *Tally's data folder left to Tally* and *Agent
+      folder ACL* as PASS.
+
+Fresh install, and hand-made permissions:
+
+- [ ] On a PC where the data folder was never touched by us, install: `icacls <data folder>` output is
+      identical before and after, and the log says "already inherits its permissions; nothing to
+      restore".
+- [ ] Before an upgrade from the old build, add bob explicitly to the data folder
+      (`icacls <data> /grant bob:(OI)(CI)M`). After the upgrade that entry is still there.
+- [ ] Disable inheritance on the data folder in some other shape (e.g. copy entries, then remove
+      Administrators). Reconfigure warns that it was "not in the shape" it left it and changes
+      nothing; `verify-deployment.ps1` shows a WARN with `icacls ... /inheritance:e`.
+
+Planted folder:
+
+- [ ] As bob (not an administrator), before installing: `mkdir C:\ProgramData\Claudally\agent`. Run
+      Setup: it stops with an error naming bob as the owner, writes nothing into that folder, and exits
+      10 (an unattended upgrade refuses in the preflight with exit 7). Delete the folder as an
+      administrator and run Setup again: it succeeds.
+- [ ] Same with a junction: `mklink /J C:\ProgramData\Claudally\agent C:\Users\bob\Desktop\x`. Setup
+      refuses; `icacls C:\Users\bob\Desktop\x` is unchanged.
 
 ## 7. Uninstall
 
