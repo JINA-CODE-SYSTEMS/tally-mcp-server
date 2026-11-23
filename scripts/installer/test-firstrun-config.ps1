@@ -407,7 +407,7 @@ try {
     $r = Invoke-Firstrun @{ InstallDir = $root; Upgrade = $true; Unattended = $true; UserProfileRoot = $profiles }
     Check ($null -eq $r.Error) 'completes without error'
     Check (@(Calls 'Register-ScheduledTask' | Where-Object { $_.Target -eq 'TallyMCPConnectOnce' -and $_.User -eq $Accountant }).Count -eq 1) "connect-client re-runs as '$Accountant'"
-    Check ($r.Output -notmatch 'left as it is') 'does not claim the configuration was left alone'
+    Check ($r.Output -notmatch 'MCP client configuration left as it is') 'does not claim the client configuration was left alone'
     Show-OnFailure $r
 
     # Same upgrade, but the user removed the entry: they are left alone.
