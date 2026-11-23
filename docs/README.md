@@ -175,7 +175,7 @@ Copy `.env.example` to `.env` and configure:
 | `ENABLE_GUI_CONTROL` | `true` | Exposes `gui-screenshot` / `gui-send-keys`, the supervised look-then-act loop. Set `false` for XML-only boxes. With `READONLY_MODE=true`, `gui-send-keys` is refused and only `gui-screenshot` remains. |
 | `ENTRY_ORDER` | *(unset)* | Blanket fallback: `credit-first` or `debit-first`. Resolution order is **user's per-type answer → user's blanket default → this key → built-in defaults → ask**. Purchase / Sales / Receipt / Payment ship with defaults (party line leads, as Tally prompts); any other type with no answer is **refused on write** so the user is asked rather than defaulted. Display only; the posting is identical either way. |
 | `TALLY_ENTRY_ORDER_CONFIG` | `<dataPath>/.tally-mcp-entry-order.json` | Where per-voucher-type entry order is recorded. |
-| `UPDATE_CHECK` | `true` | Tray asks GitHub once a day whether a newer release exists and says so. Downloads and runs nothing. The only outbound call a local install makes; set `false` to stop it. |
+| `UPDATE_CHECK` | `true` | Tray asks GitHub once a day whether a newer release exists and says so; users can also check any time with **Check for updates...** in the tray menu or dashboard, or by asking their AI assistant (tool `check-for-updates`). Downloads and runs nothing. The only outbound calls a local install makes; set `false` to stop them all (a manual check then only reports the installed version). |
 | `ANTHROPIC_API_VERSION` | `2023-06-01` | Anthropic API version header |
 
 ## Editions
@@ -235,9 +235,11 @@ Either way, add the URL (with `/mcp`) as a custom connector in your client and s
 
 Then **quit Claude Desktop completely and reopen it**. Closing the window is not enough (use File → Exit, or the tray icon): Claude reads this file only at startup, so until it restarts you will see no Tally tools.
 
-**Which file?** The classic Claude Desktop installer reads `%APPDATA%\Claude\claude_desktop_config.json`. The newer packaged (Microsoft Store style) build does not: Windows gives it a private copy at `%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json`, and a file written anywhere else is invisible to it. Claudally writes both, so either build finds the entry. Claudally 0.9.0 wrote only the first, which is why the packaged build showed no Tally tools after an install that said "connected" — run **Connect your AI assistant to Tally** once after updating to fix an existing install.
+**Which file?** The classic Claude Desktop installer reads `%APPDATA%\Claude\claude_desktop_config.json`. The newer packaged (Microsoft Store style) build does not: Windows gives it a private copy at `%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json`, and a file written anywhere else is invisible to it. Later packaged builds moved again, to `%LOCALAPPDATA%\Claude-Data\claude_<id>\claude_desktop_config.json`. Claudally writes every one of these that exists on the PC, so each build finds the entry. Claudally 0.9.0 wrote only the first, which is why the packaged build showed no Tally tools after an install that said "connected".
 
-**Is it really loaded?** Each time an app starts the Tally server, the server notes it locally (`%LOCALAPPDATA%\Claudally\clients\`; nothing leaves the PC, and setting `CLAUDALLY_NO_SIGHTING=1` turns it off). The tray compares that with when Claude Desktop started: hover over it to see *connected (Claude started Tally)*, *restart Claude to load Tally*, or *Claude is NOT loading Tally*. The last one also raises a notification, because it means Claude is reading its settings from somewhere Claudally does not know about.
+**Is it really loaded?** Each time an app starts the Tally server, the server notes it locally (`%LOCALAPPDATA%\Claudally\clients\`; nothing leaves the PC, and setting `CLAUDALLY_NO_SIGHTING=1` turns it off). The tray compares that with when Claude Desktop started: hover over it to see *connected (Claude started Tally)*, *restart Claude to load Tally*, or *Claude is NOT loading Tally*. The last two also put a bold item at the top of the tray menu, and *not loading* raises a notification: clicking either updates Claude's settings with no window or typing, then offers to restart Claude. If it keeps coming back after that, Claude has moved its settings somewhere this version does not know about; please report it.
+
+Upgrading re-runs the connect step for anyone who is still connected, so new places Claude reads its settings from are picked up by installing the new version. Someone who removed the Tally entry is left alone.
 
 If Claude Desktop was installed *after* Claudally, or you want to connect a second Windows user, run **Connect your AI assistant to Tally** from the Start Menu — it is safe to run repeatedly and does nothing if the entry is already correct.
 
@@ -274,6 +276,15 @@ The method for entering data the way a client's books are already kept (learn th
 - **Tool** `feeding-guide`, which returns the same guide. The server instructions tell the model to call it once per session before the first write, so the guidance applies even in clients with no prompt support and when the user simply says "post these invoices".
 
 The instruction sheet is kept in the user's working folder when the client has file access, in the assistant's own memory when it has one, and is otherwise handed to the user to paste back next session.
+
+### Checking for updates
+
+Claudally never updates itself; installing a new version is always a deliberate act. To find out whether there is one:
+
+- **Tray:** a bold *Update available* row appears in the menu when the daily check finds a newer release. **Check for updates...** (menu and dashboard) asks immediately and always answers: newer version available, up to date, or could not check.
+- **AI assistant:** ask "is Claudally up to date?". The read-only tool `check-for-updates` reports the installed and latest versions and how to update.
+
+Both ask GitHub only for the latest version number, send nothing about the PC or its data, and are turned off by `UPDATE_CHECK=false`.
 
 ### Any other AI app or custom agent
 

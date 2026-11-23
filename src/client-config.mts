@@ -289,7 +289,7 @@ export const CLIENT_TARGETS: ClientTarget[] = [
     //   %LOCALAPPDATA%\Packages\Claude_<publisher id>\LocalCache\Roaming
     // and a file written to the real %APPDATA% from outside the package is invisible to it. The
     // result was an install that reported "connected" while Claude showed no Tally tools at all.
-    // So when a Claude package folder exists we write there too. The real %APPDATA% file is still
+    // So when a Claude package folder exists we write there too (and to Claude-Data, below). The real %APPDATA% file is still
     // written: the classic (non-packaged) installer reads that one, and a machine can move from
     // one build to the other.
     extraPaths: (ctx) => {
@@ -300,10 +300,19 @@ export const CLIENT_TARGETS: ClientTarget[] = [
       if (!local) return [];
       const packages = p.join(local, 'Packages');
       const list = ctx.listDir ?? listDirOrEmpty;
-      return list(packages)
+      const virtualized = list(packages)
         .filter(name => /^Claude_[A-Za-z0-9]+$/.test(name))
         .sort()
         .map(name => p.join(packages, name, 'LocalCache', 'Roaming', 'Claude', 'claude_desktop_config.json'));
+      // Later packaged builds moved their data out of the virtualized Roaming altogether, to
+      // %LOCALAPPDATA%\Claude-Data\claude_<publisher id>, with the config directly inside. Seen on a
+      // Team-plan install where both of the paths above held our entry and Claude read neither.
+      const dataRoot = p.join(local, 'Claude-Data');
+      const moved = list(dataRoot)
+        .filter(name => /^claude_[A-Za-z0-9]+$/i.test(name))
+        .sort()
+        .map(name => p.join(dataRoot, name, 'claude_desktop_config.json'));
+      return [...virtualized, ...moved];
     }
   },
   {

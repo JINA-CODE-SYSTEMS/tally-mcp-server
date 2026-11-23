@@ -156,6 +156,10 @@ function Get-ClaudeConfigFiles {
     foreach ($pkg in @(Get-ChildItem -LiteralPath $pkgRoot -Directory -Filter 'Claude_*' -ErrorAction SilentlyContinue)) {
         $files += Join-Path $pkg.FullName 'LocalCache\Roaming\Claude\claude_desktop_config.json'
     }
+    # Later packaged builds keep their data in %LOCALAPPDATA%\Claude-Data\claude_<id> instead.
+    foreach ($dd in @(Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'Claude-Data') -Directory -Filter 'claude_*' -ErrorAction SilentlyContinue)) {
+        $files += Join-Path $dd.FullName 'claude_desktop_config.json'
+    }
     return $files
 }
 
@@ -173,9 +177,7 @@ function Get-ClaudeLoadState {
     try {
         # claude.exe is also the name of Claude Code's CLI, so match on where it lives: the packaged
         # build under WindowsApps\Claude_*, the classic one under %LOCALAPPDATA%\AnthropicClaude.
-        $procs = @(Get-Process -Name 'claude' -ErrorAction SilentlyContinue | Where-Object {
-            $_.Path -and ($_.Path -match '\\WindowsApps\\Claude_' -or $_.Path -match '\\AnthropicClaude\\')
-        })
+        $procs = Get-ClaudeDesktopProcesses
         if ($procs.Count -eq 0) { return $null }
         # Sort, not Measure-Object -Minimum: Windows PowerShell 5.1 only measures numbers.
         $started = ($procs | Where-Object { $_.StartTime } | Sort-Object StartTime | Select-Object -First 1).StartTime
@@ -219,6 +221,63 @@ function Get-ClaudeLoadState {
         return 'missing'
     } catch {
         return $null
+    }
+}
+
+# Claude Desktop processes (not Claude Code's CLI, which is also claude.exe).
+function Get-ClaudeDesktopProcesses {
+    return @(Get-Process -Name 'claude' -ErrorAction SilentlyContinue | Where-Object {
+        $_.Path -and ($_.Path -match '\\WindowsApps\\Claude_' -or $_.Path -match '\\AnthropicClaude\\')
+    })
+}
+
+# Quit and relaunch Claude Desktop, so it reads the entry we just wrote. Only ever called after the
+# user said yes in a dialog that warns about unsent messages.
+function Restart-ClaudeDesktop {
+    $procs = Get-ClaudeDesktopProcesses
+    $exe = ($procs | Select-Object -First 1).Path
+    $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+    $deadline = (Get-Date).AddSeconds(10)
+    while ((Get-ClaudeDesktopProcesses).Count -gt 0 -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
+    # A packaged app cannot be started from its WindowsApps path; it starts through its AppID.
+    $app = $null
+    try { $app = Get-StartApps -ErrorAction Stop | Where-Object { $_.Name -eq 'Claude' } | Select-Object -First 1 } catch { }
+    if ($app) { Start-Process 'explorer.exe' "shell:AppsFolder\$($app.AppID)"; return $true }
+    if ($exe -and $exe -notmatch '\\WindowsApps\\') { Start-Process $exe; return $true }
+    return $false
+}
+
+# The one-click answer to "Claude is not loading Tally": write the entry wherever this version knows
+# Claude reads it (silently - no console window), then offer to restart Claude. Non-technical users
+# should never need the Start Menu item, a config file, or a PowerShell prompt.
+function Invoke-ClaudeAutoFix {
+    $script = Join-Path $InstallDir 'scripts\installer\connect-client.ps1'
+    if (-not (Test-Path -LiteralPath $script)) {
+        [System.Windows.Forms.MessageBox]::Show("The connect step is missing from this install ($script). Reinstall Claudally to repair it.", 'Claudally', 'OK', 'Warning') | Out-Null
+        return
+    }
+    $p = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -Wait -PassThru `
+            -ArgumentList "-ExecutionPolicy Bypass -NoProfile -File `"$script`" -InstallDir `"$InstallDir`" -Target claude-desktop"
+    if ($p.ExitCode -eq 1) {
+        $ans = [System.Windows.Forms.MessageBox]::Show(
+            "Claudally could not update Claude's settings automatically.`r`n`r`nOpen the detailed connect window to see why?",
+            'Claudally', 'YesNo', 'Warning')
+        if ($ans -eq 'Yes') { $miConnectClaude.PerformClick() }
+        return
+    }
+    if ((Get-ClaudeDesktopProcesses).Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("Tally is set up for Claude. Open Claude and the Tally tools will be there.", 'Claudally', 'OK', 'Information') | Out-Null
+        return
+    }
+    $ans = [System.Windows.Forms.MessageBox]::Show(
+        "Tally is set up for Claude. Claude has to restart to load it.`r`n`r`nRestart Claude now? Anything you have typed but not sent in Claude may be lost.",
+        'Claudally', 'YesNo', 'Question')
+    if ($ans -eq 'Yes') {
+        if (-not (Restart-ClaudeDesktop)) {
+            [System.Windows.Forms.MessageBox]::Show("Claude was closed. Open it again from the Start Menu.", 'Claudally', 'OK', 'Information') | Out-Null
+        }
+    } else {
+        [System.Windows.Forms.MessageBox]::Show("When you are ready: quit Claude from its icon near the clock (closing the window is not enough), then open it again.", 'Claudally', 'OK', 'Information') | Out-Null
     }
 }
 
@@ -337,7 +396,7 @@ function Dispose-StatusIcon {
 # UPDATE_CHECK=false in .env, and it runs at most once a day.
 $Script:ReleasesPageUrl = 'https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/releases/latest'
 $Script:ReleasesApiUrl  = 'https://api.github.com/repos/JINA-CODE-SYSTEMS/tally-mcp-server/releases/latest'
-$Script:UpdateCheck     = @{ Shell = $null; Handle = $null }
+$Script:UpdateCheck     = @{ Shell = $null; Handle = $null; Manual = $false }
 
 # Where the last check is remembered, so restarting the tray does not re-hit the API. Under
 # LOCALAPPDATA because the install root is usually Program Files and not user-writable.
@@ -396,11 +455,24 @@ function Test-UpdateCheckEnabled {
 # ticks every few seconds on that thread, and a request to a host that blackholes packets would
 # freeze the tray for the whole timeout.
 function Start-UpdateCheck {
-    if ($Script:UpdateCheck.Handle) { return }        # one in flight is enough
-    if (-not (Test-UpdateCheckEnabled)) { return }
+    # -Manual: the user clicked "Check for updates". It skips the once-a-day window and reports the
+    # answer in a dialog whatever it is, including "you are up to date" and "could not check".
+    param([switch]$Manual)
+    if ($Manual) { $Script:UpdateCheck.Manual = $true }
+    if ($Script:UpdateCheck.Handle) { return }        # one in flight is enough; it will report
+    if (-not (Test-UpdateCheckEnabled)) {
+        if ($Manual) {
+            $Script:UpdateCheck.Manual = $false
+            $ans = [System.Windows.Forms.MessageBox]::Show(
+                "You have Claudally $(Get-InstalledVersion).`r`n`r`nUpdate checks are turned off on this PC (UPDATE_CHECK=false in the settings file), so Claudally did not look anything up.`r`n`r`nOpen the releases page in your browser to check yourself?",
+                'Check for updates', 'YesNo', 'Information')
+            if ($ans -eq 'Yes') { try { Start-Process $Script:ReleasesPageUrl | Out-Null } catch { } }
+        }
+        return
+    }
 
     $stamp = Get-UpdateStampPath
-    if ($stamp -and (Test-Path -LiteralPath $stamp)) {
+    if (-not $Manual -and $stamp -and (Test-Path -LiteralPath $stamp)) {
         try {
             $prev = Get-Content -LiteralPath $stamp -Raw | ConvertFrom-Json
             # Serve the remembered answer and skip the call entirely inside the 24h window.
@@ -433,6 +505,28 @@ function Start-UpdateCheck {
     }
 }
 
+# The answer to a manual check. The download link is the constant releases page, as everywhere else.
+function Show-UpdateCheckResult {
+    param([string]$Tag)
+    $installed = Get-InstalledVersion
+    if (-not $Tag) {
+        $ans = [System.Windows.Forms.MessageBox]::Show(
+            "You have Claudally $installed.`r`n`r`nCould not reach GitHub to check for a newer version (offline, or blocked by a firewall or proxy).`r`n`r`nOpen the releases page in your browser instead?",
+            'Check for updates', 'YesNo', 'Warning')
+        if ($ans -eq 'Yes') { try { Start-Process $Script:ReleasesPageUrl | Out-Null } catch { } }
+        return
+    }
+    $latest = $Tag.TrimStart('v', 'V')
+    if ($installed -and (Compare-ProductVersion -A $latest -B $installed) -gt 0) {
+        $ans = [System.Windows.Forms.MessageBox]::Show(
+            "Claudally $latest is available. You have $installed.`r`n`r`nDownload the installer and run it; your settings and companies are kept. Afterwards quit your AI app completely and reopen it.`r`n`r`nOpen the download page now?",
+            'Update available', 'YesNo', 'Information')
+        if ($ans -eq 'Yes') { try { Start-Process $Script:ReleasesPageUrl | Out-Null } catch { } }
+    } else {
+        [System.Windows.Forms.MessageBox]::Show("You have Claudally $installed, the latest release. Nothing to do.", 'Check for updates', 'OK', 'Information') | Out-Null
+    }
+}
+
 function Set-UpdateState {
     param([string]$Latest)
     if (-not $Latest) { return }
@@ -457,6 +551,10 @@ function Complete-UpdateCheck {
         try { $Script:UpdateCheck.Shell.Dispose() } catch { }
         $Script:UpdateCheck.Shell = $null
         $Script:UpdateCheck.Handle = $null
+    }
+    if ($Script:UpdateCheck.Manual) {
+        $Script:UpdateCheck.Manual = $false
+        Show-UpdateCheckResult -Tag $tag
     }
     if ($tag) {
         Set-UpdateState -Latest $tag
@@ -748,6 +846,19 @@ $miUpdate.Add_Click({
     } catch { }
 })
 
+# Only the "Claude is not loading Tally" balloon does anything when clicked; the flag is cleared when
+# any balloon closes, so clicking a later, unrelated balloon never runs the fix.
+$script:BalloonAction = ''
+$tray.Add_BalloonTipClicked({
+    $act = $script:BalloonAction; $script:BalloonAction = ''
+    if ($act -eq 'fix-claude') { try { Invoke-ClaudeAutoFix } catch { } }
+})
+$tray.Add_BalloonTipClosed({ $script:BalloonAction = '' })
+
+# Always there, unlike the row above: lets the user ask now instead of waiting for the daily check.
+$miCheckUpdates = $menu.Items.Add('Check for updates...')
+$miCheckUpdates.Add_Click({ try { Start-UpdateCheck -Manual } catch { } })
+
 [void]$menu.Items.Add('-')
 
 # Action items
@@ -1002,6 +1113,13 @@ $miConnectClaude.Add_Click({
     $connectArgs = "-ExecutionPolicy Bypass -NoProfile -NoExit -File `"$script`" -InstallDir `"$InstallDir`""
     Start-Process -FilePath 'powershell.exe' -ArgumentList $connectArgs
 })
+
+# Shown only while Claude Desktop is running without Tally loaded (see Get-ClaudeLoadState).
+$miFixClaude = New-Object System.Windows.Forms.ToolStripMenuItem 'Fix: Claude is not loading Tally'
+$miFixClaude.Font = New-Object System.Drawing.Font($menu.Font, [System.Drawing.FontStyle]::Bold)
+$miFixClaude.Visible = $false
+$miFixClaude.Add_Click({ try { Invoke-ClaudeAutoFix } catch { } })
+[void]$menu.Items.Insert(0, $miFixClaude)
 
 # For any MCP client we have no auto-connect for (a custom agent, another AI app): prints the stdio
 # launch block and, when the install serves HTTP, the URL, and copies both to the clipboard.
@@ -1338,6 +1456,7 @@ function Show-Dashboard {
     $btnSpecs += @{ Text = 'Manage Companies...'; Kind = 'secondary'; Click = { $miManageCompanies.PerformClick() } }
     $btnSpecs += @{ Text = 'Open logs';           Kind = 'secondary'; Click = { $miOpenLogs.PerformClick() } }
     $btnSpecs += @{ Text = 'Reconfigure...';      Kind = 'secondary'; Click = { $miReconfigure.PerformClick() } }
+    $btnSpecs += @{ Text = 'Check for updates';   Kind = 'secondary'; Click = { $miCheckUpdates.PerformClick() } }
     $btnSpecs += @{ Text = 'Assistant GUI control...'; Kind = 'secondary'; Click = { $miGuiControl.PerformClick() } }
     if (-not $isLocal) {
         $btnSpecs += @{ Text = 'Copy public URL'; Kind = 'secondary'; Click = {
@@ -1540,10 +1659,13 @@ function Update-TrayUi {
     }
     # Configured-but-not-loaded is the failure that used to be silent, so it gets said out loud once.
     if ($State.ClaudeLoad -eq 'missing' -and $State.PreviousClaudeLoad -ne 'missing') {
-        $tray.ShowBalloonTip(12000, 'TallyMCP - Claude is not loading Tally',
-            "Claude Desktop is running but has not started Tally. Quit Claude from its tray icon, run 'Connect your AI assistant to Tally' from the Start Menu, then reopen Claude. If this keeps happening, Claude may have moved its settings - please report it.",
+        $script:BalloonAction = 'fix-claude'
+        $tray.ShowBalloonTip(15000, 'Claude is not loading Tally',
+            "Click here to fix it. Claudally will update Claude's settings and offer to restart Claude.",
             [System.Windows.Forms.ToolTipIcon]::Warning)
     }
+    $miFixClaude.Visible = ($State.ClaudeLoad -in @('missing', 'restart'))
+    $miFixClaude.Text = $(if ($State.ClaudeLoad -eq 'restart') { 'Restart Claude to load Tally' } else { 'Fix: Claude is not loading Tally' })
     $State.PreviousClaudeLoad = $State.ClaudeLoad
     $State.PreviousStatus    = $status
     $State.ServiceWasRunning = $serviceRunning
@@ -1627,12 +1749,14 @@ $showDashTimer.Add_Tick({
 })
 $showDashTimer.Start()
 
-# One-shot, 20s after launch. Late enough that the tray is already usable and a laptop resuming from
-# sleep has probably found its network; the 24h stamp then keeps it to roughly once a day.
+# First check 20s after launch: late enough that the tray is already usable and a laptop resuming
+# from sleep has probably found its network. Then every 6 hours, because a tray left running for
+# weeks used to check exactly once and never hear of a later release. The 24h stamp still keeps the
+# actual network call to about once a day.
 $updateTimer = New-Object System.Windows.Forms.Timer
 $updateTimer.Interval = 20000
 $updateTimer.Add_Tick({
-    $updateTimer.Stop()
+    $updateTimer.Interval = 6 * 60 * 60 * 1000
     try { Start-UpdateCheck } catch { }
 }.GetNewClosure())
 $updateTimer.Start()

@@ -121,6 +121,9 @@ param(
     [string]$DeploymentMode,
     [string]$RemoteAuth,
     [string]$RemoteTransport,
+    # Where user profiles live (normally C:\Users). Only tests pass it, to point the upgrade
+    # re-connect check below at a fake profile.
+    [string]$UserProfileRoot,
     # Cloudflare Tunnel. When -TunnelToken is non-empty, a second NSSM service ($TunnelServiceName)
     # runs cloudflared so a NAT'd box gets a stable public HTTPS URL with no router config. Blank on a
     # bare Reconfigure -> preserved from .env below (like McpDomain), so a reconfigure doesn't drop it.
@@ -1027,7 +1030,33 @@ If you're a developer testing changes to firstrun-config.ps1 itself, either:
         # the user may have edited or removed it on purpose. The exception is an install that has
         # moved (its agent task still points at the old folder), where the old entry is now wrong.
         $connectScript = Join-Path $InstallDir 'scripts\installer\connect-client.ps1'
-        if ($Upgrade -and -not $_upgradeInstallMoved) {
+        #
+        # The other exception: the user is still connected. Claude Desktop has moved where it reads
+        # its settings more than once (the classic %APPDATA% file, then the packaged build's private
+        # copies), and each new release learns the new places. An upgrade that left things alone
+        # left every existing user on the old places, unable to see Tally until they found and ran
+        # the Start Menu item. So when any of the user's Claude configs still names this install,
+        # the connect step runs again; it is idempotent and only ADDS the entry where it is missing.
+        # A user who removed the entry everywhere is still left alone.
+        $_profileRoot = if ($UserProfileRoot) { $UserProfileRoot } else { Split-Path -Parent $env:PUBLIC }
+        $_stillConnected = $false
+        if ($Upgrade -and -not $_upgradeInstallMoved -and $AgentTaskUser) {
+            $_profile = Join-Path $_profileRoot (($AgentTaskUser -split '\\')[-1])
+            $_cfgs = @(
+                (Join-Path $_profile 'AppData\Roaming\Claude\claude_desktop_config.json')
+            ) + @(Get-ChildItem -Path (Join-Path $_profile 'AppData\Local\Packages\Claude_*\LocalCache\Roaming\Claude\claude_desktop_config.json') -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }) `
+              + @(Get-ChildItem -Path (Join-Path $_profile 'AppData\Local\Claude-Data\claude_*\claude_desktop_config.json') -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+            $_needles = @($InstallDir, $InstallDir.Replace('\', '\\'))
+            foreach ($_c in $_cfgs) {
+                if (-not (Test-Path -LiteralPath $_c)) { continue }
+                $_raw = ''
+                try { $_raw = [System.IO.File]::ReadAllText($_c) } catch { }
+                foreach ($_n in $_needles) {
+                    if ($_raw -and $_raw.IndexOf($_n, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $_stillConnected = $true }
+                }
+            }
+        }
+        if ($Upgrade -and -not $_upgradeInstallMoved -and -not $_stillConnected) {
             Write-Host "[OK] Upgrade: MCP client configuration left as it is (the install path has not changed)"
         } elseif (-not (Test-Path -LiteralPath $connectScript)) {
             Write-Host "[WARN] $connectScript not found - skipping auto-connect. Use the 'Connect your AI assistant to Tally' Start Menu item." -ForegroundColor Yellow

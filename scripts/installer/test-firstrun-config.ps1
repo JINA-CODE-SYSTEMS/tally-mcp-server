@@ -376,7 +376,7 @@ try {
     Add-FakeTask $AgentTask $Accountant $root
     Add-FakeTask $TrayTask  $Accountant $root 'scripts\tray\tally-mcp-tray.ps1'
     $before = Get-FileHashText (Join-Path $root '.env')
-    $r = Invoke-Firstrun @{ InstallDir = $root; Upgrade = $true; Unattended = $true }
+    $r = Invoke-Firstrun @{ InstallDir = $root; Upgrade = $true; Unattended = $true; UserProfileRoot = (Join-Path $work 'no-profiles') }
     Check ($null -eq $r.Error) 'completes without error'
     Check ((Get-FileHashText (Join-Path $root '.env')) -eq $before) '.env is byte-for-byte unchanged'
     Check (-not (Test-Path -LiteralPath (Join-Path $root '.env.tmp'))) 'no .env.tmp left behind'
@@ -390,6 +390,33 @@ try {
     Check ($grants.Count -ge 2 -and @($grants | Where-Object { $_.Detail -notmatch [regex]::Escape("${Accountant}:") }).Count -eq 0) "ACL grants go to '$Accountant' only"
     Check (@(NssmLog).Count -eq 0) 'no service touched (local mode)'
     Check ($r.Output -match 'left exactly as it was') 'says .env was left as it was'
+    Show-OnFailure $r
+
+    # ------------------------------------------------------------------------------------------
+    Write-Host "`n[1b] Upgrade of a local install whose user is still connected: the connect step re-runs"
+    Write-Host "     so the entry reaches any new place Claude Desktop reads (e.g. the packaged build's copy)."
+    Reset-Fakes; $script:FailuresBefore = $script:Failures
+    $root = New-FakeInstall -EnvText $localEnv
+    Add-FakeTask $AgentTask $Accountant $root
+    Add-FakeTask $TrayTask  $Accountant $root 'scripts\tray\tally-mcp-tray.ps1'
+    $profiles = Join-Path $work ('profiles-' + [guid]::NewGuid().ToString('n').Substring(0, 6))
+    $cfgDir = Join-Path $profiles "$Accountant\AppData\Roaming\Claude"
+    New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
+    $json = '{ "mcpServers": { "Tally Prime": { "command": "' + (Join-Path $root 'node-portable\node.exe').Replace('\', '\\') + '", "args": [] } } }'
+    [System.IO.File]::WriteAllText((Join-Path $cfgDir 'claude_desktop_config.json'), $json, (New-Object System.Text.UTF8Encoding $false))
+    $r = Invoke-Firstrun @{ InstallDir = $root; Upgrade = $true; Unattended = $true; UserProfileRoot = $profiles }
+    Check ($null -eq $r.Error) 'completes without error'
+    Check (@(Calls 'Register-ScheduledTask' | Where-Object { $_.Target -eq 'TallyMCPConnectOnce' -and $_.User -eq $Accountant }).Count -eq 1) "connect-client re-runs as '$Accountant'"
+    Check ($r.Output -notmatch 'left as it is') 'does not claim the configuration was left alone'
+    Show-OnFailure $r
+
+    # Same upgrade, but the user removed the entry: they are left alone.
+    Reset-Fakes; $script:FailuresBefore = $script:Failures
+    [System.IO.File]::WriteAllText((Join-Path $cfgDir 'claude_desktop_config.json'), '{ "mcpServers": {} }', (New-Object System.Text.UTF8Encoding $false))
+    Add-FakeTask $AgentTask $Accountant $root
+    Add-FakeTask $TrayTask  $Accountant $root 'scripts\tray\tally-mcp-tray.ps1'
+    $r = Invoke-Firstrun @{ InstallDir = $root; Upgrade = $true; Unattended = $true; UserProfileRoot = $profiles }
+    Check (@(Calls 'Register-ScheduledTask' | Where-Object { $_.Target -eq 'TallyMCPConnectOnce' }).Count -eq 0) 'a user who removed the entry is left alone'
     Show-OnFailure $r
 
     # ------------------------------------------------------------------------------------------

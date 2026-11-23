@@ -66,6 +66,7 @@ try {
             # The packaged (MSIX) Claude Desktop keeps its own copy under the profile's Packages
             # folder. --appdata moves LOCALAPPDATA to this same profile, so one remove call covers both.
             $pkgCfgs = @(Get-ChildItem -Path (Join-Path $dir.FullName 'AppData\Local\Packages\Claude_*\LocalCache\Roaming\Claude\claude_desktop_config.json') -File -ErrorAction SilentlyContinue)
+            $pkgCfgs += @(Get-ChildItem -Path (Join-Path $dir.FullName 'AppData\Local\Claude-Data\claude_*\claude_desktop_config.json') -File -ErrorAction SilentlyContinue)
             if ((Test-Path -LiteralPath $cfg) -or $pkgCfgs.Count -gt 0) {
                 try {
                     $out = & $nodeExe $configCli remove --target claude-desktop --appdata $appData --install-root $InstallDir --require-install-root --json 2>&1 | Out-String
