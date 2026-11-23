@@ -9,7 +9,7 @@ import {
   CLIENT_TARGETS, targetById, localLaunchSpec, parseClientConfig, serializeClientConfig,
   statusOfEntry, entryIdentity, mergeEntry, applyEntryToText, removeEntryFromText, parseCliArgs,
   applyToFile, removeFromFile, backupConfigFile,
-  stripJsonComments, stripTrailingCommas, type EditOutcome, type ClientTarget, entryPointsInside } from './client-config.mjs';
+  stripJsonComments, stripTrailingCommas, type EditOutcome, type ClientTarget, entryPointsInside, envForAppdata } from './client-config.mjs';
 
 // --- #172 B1: the client-config merge engine ---
 //
@@ -73,6 +73,42 @@ test('buildEntry copies the args array rather than aliasing the caller\'s', () =
 test('Claude Desktop resolves under %APPDATA% on Windows', () => {
   const r = CD.resolvePath({ platform: 'win32', env: { APPDATA: 'C:\\Users\\ca\\AppData\\Roaming' }, p: path.win32 });
   assert.deepEqual(r, { ok: true, file: 'C:\\Users\\ca\\AppData\\Roaming\\Claude\\claude_desktop_config.json' });
+});
+
+// --- the packaged (MSIX) Windows build of Claude Desktop ---
+// It reads a private copy of Roaming under %LOCALAPPDATA%\Packages\Claude_<id>\LocalCache, and never
+// the real %APPDATA% file. Writing only the real file is how an install reported "connected" while
+// Claude showed no Tally tools.
+
+const LOCAL = 'C:\\Users\\ca\\AppData\\Local';
+const pkgCtx = (names: string[]) => ({
+  platform: 'win32' as const, p: path.win32,
+  env: { APPDATA: 'C:\\Users\\ca\\AppData\\Roaming', LOCALAPPDATA: LOCAL },
+  listDir: (dir: string) => (dir === LOCAL + '\\Packages' ? names : []),
+});
+
+test('packaged Claude Desktop: its private config is an extra path, the real one stays primary', () => {
+  const ctx = pkgCtx(['Microsoft.WindowsStore_8wekyb3d8bbwe', 'Claude_pzs8sxrjxfjjc']);
+  assert.deepEqual(CD.resolvePath(ctx), { ok: true, file: 'C:\\Users\\ca\\AppData\\Roaming\\Claude\\claude_desktop_config.json' });
+  assert.deepEqual(CD.extraPaths!(ctx), [
+    'C:\\Users\\ca\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Roaming\\Claude\\claude_desktop_config.json',
+  ]);
+});
+
+test('packaged Claude Desktop: classic installs and other packages add nothing', () => {
+  assert.deepEqual(CD.extraPaths!(pkgCtx([])), []);
+  assert.deepEqual(CD.extraPaths!(pkgCtx(['ClaudeHelper_abc.extra', 'NotClaude_x', 'claude'])), []);
+});
+
+test('packaged Claude Desktop: never looked for off Windows or without LOCALAPPDATA', () => {
+  assert.deepEqual(CD.extraPaths!({ ...pkgCtx(['Claude_x']), platform: 'darwin' }), []);
+  assert.deepEqual(CD.extraPaths!({ ...pkgCtx(['Claude_x']), env: { APPDATA: 'C:\\x' } }), []);
+});
+
+test('--appdata for another user moves LOCALAPPDATA to that same profile', () => {
+  const env = envForAppdata('C:\\Users\\asha\\AppData\\Roaming', { LOCALAPPDATA: 'C:\\Users\\admin\\AppData\\Local' }, path.win32);
+  assert.equal(env.APPDATA, 'C:\\Users\\asha\\AppData\\Roaming');
+  assert.equal(env.LOCALAPPDATA, 'C:\\Users\\asha\\AppData\\Local', 'never the caller\'s own packaged config');
 });
 
 test('Claude Desktop falls back to the profile when APPDATA is missing from a stripped environment', () => {

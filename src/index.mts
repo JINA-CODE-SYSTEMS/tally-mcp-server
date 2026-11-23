@@ -32,6 +32,11 @@ setGuiTransportMode('in-session');
 
 const mcpServer = await registerMcpServer().catch(err => fail('startup', err));
 
+// Record that a client really started us (see client-sighting.mts). Stdio only: this entry point
+// is what desktop apps launch from their config file, which is the path that can silently miss.
+const { recordSighting } = await import('./client-sighting.mjs');
+mcpServer.server.oninitialized = () => { recordSighting(mcpServer.server.getClientVersion()); };
+
 try {
   const transport = new StdioServerTransport(); // receives on stdin, sends on stdout
   await mcpServer.connect(transport);

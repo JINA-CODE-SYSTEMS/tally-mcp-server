@@ -112,6 +112,8 @@ $State = [hashtable]::Synchronized(@{
     LatestVersion    = ''      # newest published version, or '' if unknown/not checked
     UpdateAvailable  = $false  # LatestVersion is newer than the one installed
     ClientConfigured = $null   # $true / $false / $null (not checked yet) - local mode only
+    ClaudeLoad       = $null   # 'loaded' / 'restart' / 'missing' / $null (Claude Desktop not running, or too early to say)
+    PreviousClaudeLoad = $null
 })
 
 # ---------------------------------------------------------------------------
@@ -145,6 +147,81 @@ function Read-EnvValue {
     return ''
 }
 
+# Every claude_desktop_config.json Claude Desktop might read. The classic installer reads the real
+# %APPDATA% one; the packaged (MSIX) build reads a private copy under its package folder and never
+# the real one. client-config.mts writes both, so "connected" has to look at both.
+function Get-ClaudeConfigFiles {
+    $files = @(Join-Path (Join-Path $env:APPDATA 'Claude') 'claude_desktop_config.json')
+    $pkgRoot = Join-Path $env:LOCALAPPDATA 'Packages'
+    foreach ($pkg in @(Get-ChildItem -LiteralPath $pkgRoot -Directory -Filter 'Claude_*' -ErrorAction SilentlyContinue)) {
+        $files += Join-Path $pkg.FullName 'LocalCache\Roaming\Claude\claude_desktop_config.json'
+    }
+    return $files
+}
+
+# Did Claude Desktop actually START Tally, as opposed to us having written its config?
+# The server records a "sighting" each time a client completes the MCP handshake
+# (src/client-sighting.mts). If Claude Desktop has been running for a while and no sighting is newer
+# than its start, it is reading its settings from somewhere we did not write - which is exactly how
+# the packaged build failed silently - and the user is told, instead of the tray saying "connected".
+#   'loaded'  - started Tally since Claude last launched
+#   'restart' - our entry was written after Claude launched; it reads config only at startup
+#   'missing' - running long enough, entry written before launch, and still no sighting
+#   $null     - Claude Desktop is not running, or it is too early to say
+function Get-ClaudeLoadState {
+    param([string]$InstallRoot)
+    try {
+        # claude.exe is also the name of Claude Code's CLI, so match on where it lives: the packaged
+        # build under WindowsApps\Claude_*, the classic one under %LOCALAPPDATA%\AnthropicClaude.
+        $procs = @(Get-Process -Name 'claude' -ErrorAction SilentlyContinue | Where-Object {
+            $_.Path -and ($_.Path -match '\\WindowsApps\\Claude_' -or $_.Path -match '\\AnthropicClaude\\')
+        })
+        if ($procs.Count -eq 0) { return $null }
+        # Sort, not Measure-Object -Minimum: Windows PowerShell 5.1 only measures numbers.
+        $started = ($procs | Where-Object { $_.StartTime } | Sort-Object StartTime | Select-Object -First 1).StartTime
+        if (-not $started) { return $null }
+
+        # Sightings land in our own LOCALAPPDATA, or - when Windows virtualizes the packaged app's
+        # child processes - in that package's private LocalCache\Local. Look in both.
+        $globs = @(
+            (Join-Path $env:LOCALAPPDATA 'Claudally\clients\*.json'),
+            (Join-Path $env:LOCALAPPDATA 'Packages\Claude_*\LocalCache\Local\Claudally\clients\*.json')
+        )
+        foreach ($g in $globs) {
+            foreach ($f in @(Get-ChildItem -Path $g -File -ErrorAction SilentlyContinue)) {
+                try {
+                    $s = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json
+                    # Claude Code (the CLI) also names itself claude-*; it is not Claude Desktop.
+                    if ($s.client -match 'claude' -and $s.client -notmatch 'code' -and ([datetime]$s.seenAt).ToLocalTime() -ge $started.AddSeconds(-5)) {
+                        return 'loaded'
+                    }
+                } catch { }
+            }
+        }
+
+        $needles = @($InstallRoot, $InstallRoot.Replace('\', '\\'))
+        $newestOurs = $null
+        foreach ($cfg in (Get-ClaudeConfigFiles)) {
+            if (-not (Test-Path -LiteralPath $cfg)) { continue }
+            $raw = Get-Content -LiteralPath $cfg -Raw -ErrorAction SilentlyContinue
+            if (-not $raw) { continue }
+            $hit = $false
+            foreach ($n in $needles) { if ($raw.IndexOf($n, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $hit = $true } }
+            if ($hit) {
+                $t = (Get-Item -LiteralPath $cfg).LastWriteTime
+                if (-not $newestOurs -or $t -gt $newestOurs) { $newestOurs = $t }
+            }
+        }
+        if (-not $newestOurs) { return $null }   # not configured at all: Test-ClientConfigured says so
+        if ($newestOurs -gt $started) { return 'restart' }
+        # Claude starts its MCP servers at launch; three minutes is generous for a slow machine.
+        if (((Get-Date) - $started).TotalMinutes -lt 3) { return $null }
+        return 'missing'
+    } catch {
+        return $null
+    }
+}
+
 # In local mode there is no service to interrogate, so "is it working?" becomes "is this user's
 # Claude pointed at this install?". The tray runs as that user, so it can just read the file -
 # no elevation, no IPC. Returns $true / $false, or $null when we cannot tell.
@@ -153,8 +230,7 @@ function Test-ClientConfigured {
     try {
         # Connected means at least one app we auto-connect points at this install: Claude Desktop,
         # or Cursor (whose global config lives under the profile folder).
-        $candidates = @(
-            (Join-Path (Join-Path $env:APPDATA 'Claude') 'claude_desktop_config.json'),
+        $candidates = @(Get-ClaudeConfigFiles) + @(
             (Join-Path (Join-Path $env:USERPROFILE '.cursor') 'mcp.json')
         )
         # JSON stores a Windows path with doubled backslashes, so look for that form too.
@@ -412,8 +488,10 @@ function Invoke-StatusPoll {
     } catch { $State.DeploymentMode = 'remote' }
     if ($State.DeploymentMode -eq 'local') {
         $State.ClientConfigured = Test-ClientConfigured $InstallDir
+        $State.ClaudeLoad = Get-ClaudeLoadState $InstallDir
     } else {
         $State.ClientConfigured = $null
+        $State.ClaudeLoad = $null
     }
 
     try {
@@ -555,7 +633,10 @@ function Format-Tooltip {
     }
     if ($State.DeploymentMode -eq 'local') {
         $lines += "  Mode:     on this computer (no service, no open port)"
-        if ($State.ClientConfigured -eq $true) { $lines += "  Assistant: connected" }
+        if ($State.ClaudeLoad -eq 'loaded') { $lines += "  Assistant: connected (Claude started Tally)" }
+        elseif ($State.ClaudeLoad -eq 'restart') { $lines += "  Assistant: restart Claude to load Tally" }
+        elseif ($State.ClaudeLoad -eq 'missing') { $lines += "  Assistant: Claude is NOT loading Tally" }
+        elseif ($State.ClientConfigured -eq $true) { $lines += "  Assistant: connected" }
         elseif ($State.ClientConfigured -eq $false) { $lines += "  Assistant: not connected yet" }
     } elseif ($State.Service) {
         $lines += "  Service:  $($State.Service.Status)"
@@ -1457,6 +1538,13 @@ function Update-TrayUi {
     if ($State.AgentWasRunning -and -not $agentRunning) {
         $tray.ShowBalloonTip(6000, 'TallyMCP - agent stopped', "The GUI agent process is no longer running. Password-protected company loading will fail until restarted.", [System.Windows.Forms.ToolTipIcon]::Warning)
     }
+    # Configured-but-not-loaded is the failure that used to be silent, so it gets said out loud once.
+    if ($State.ClaudeLoad -eq 'missing' -and $State.PreviousClaudeLoad -ne 'missing') {
+        $tray.ShowBalloonTip(12000, 'TallyMCP - Claude is not loading Tally',
+            "Claude Desktop is running but has not started Tally. Quit Claude from its tray icon, run 'Connect your AI assistant to Tally' from the Start Menu, then reopen Claude. If this keeps happening, Claude may have moved its settings - please report it.",
+            [System.Windows.Forms.ToolTipIcon]::Warning)
+    }
+    $State.PreviousClaudeLoad = $State.ClaudeLoad
     $State.PreviousStatus    = $status
     $State.ServiceWasRunning = $serviceRunning
     $State.AgentWasRunning   = $agentRunning
