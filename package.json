@@ -1,6 +1,6 @@
 {
   "name": "tally-mcp-server",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Tally Prime MCP (Model Context Protocol) Server implementation to feed Tally Prime ERP data to any LLM client supporting MCP, such as Claude or ChatGPT",
   "main": "dist/server.mjs",
   "scripts": {
@@ -40,7 +40,7 @@
     "cors": "^2.8.6",
     "dotenv": "^18.0.10",
     "express": "^5.3.0",
-    "express-rate-limit": "^8.7.4",
+    "express-rate-limit": "^8.7.5",
     "fast-xml-parser": "^5.11.2",
     "helmet": "^8.3.0",
     "nunjucks": "^3.2.4"
@@ -48,7 +48,7 @@
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
-    "@types/node": "^26.6.5",
+    "@types/node": "^26.6.6",
     "@types/nunjucks": "^3.2.6",
     "typescript": "^7.0.2"
   }

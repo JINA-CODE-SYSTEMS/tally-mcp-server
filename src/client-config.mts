@@ -48,7 +48,7 @@ import dotenv from 'dotenv';
 // Minimal path interface so path handling can be unit-tested under both win32 and posix semantics
 // on whatever OS CI happens to run. Mirrors the PathLike in mcp.mts:420 (kept local rather than
 // imported — see the atomicWriteFile note below for why this module must not import mcp.mjs).
-export type PathLike = { join: (...s: string[]) => string; resolve: (...s: string[]) => string; sep: string };
+export type PathLike = { join: (...s: string[]) => string; resolve: (...s: string[]) => string; sep: string; dirname: (s: string) => string };
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -200,6 +200,8 @@ export interface TargetContext {
   /** Workspace folder, for workspace-scoped targets (VS Code). */
   workspace?: string;
   p?: PathLike;
+  /** Lists a folder's entries; injectable so tests need no real disk. Missing folder -> []. */
+  listDir?: (dir: string) => string[];
 }
 
 export type PathResult = { ok: true; file: string } | { ok: false; reason: string };
@@ -227,6 +229,24 @@ export interface ClientTarget {
    * up wherever the file exists.
    */
   appFolder?(ctx: TargetContext): string | undefined;
+  /**
+   * Further copies of the same config that the app may read INSTEAD of resolvePath's file. Every
+   * command treats each one exactly like the main file. See the Claude Desktop target for why.
+   */
+  extraPaths?(ctx: TargetContext): string[];
+}
+
+/**
+ * The environment for acting on ANOTHER user's profile via --appdata. LOCALAPPDATA is Roaming's
+ * sibling and moves with it, so that user's packaged Claude config is found under their profile and
+ * never under the caller's.
+ */
+export function envForAppdata(appdata: string, base: NodeJS.ProcessEnv = process.env, p: PathLike = path): NodeJS.ProcessEnv {
+  return { ...base, APPDATA: appdata, LOCALAPPDATA: p.join(p.dirname(appdata), 'Local') };
+}
+
+function listDirOrEmpty(dir: string): string[] {
+  try { return fs.readdirSync(dir); } catch { return []; }
 }
 
 /** The name for our entry wherever we choose it: the generic block, Cursor, the command-line tools. No spaces, no underscores. */
@@ -263,6 +283,27 @@ export const CLIENT_TARGETS: ClientTarget[] = [
       if (!home) return { ok: false, reason: 'cannot locate the home directory for the Claude Desktop config' };
       if (platform === 'darwin') return { ok: true, file: p.join(home, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json') };
       return { ok: true, file: p.join(env.XDG_CONFIG_HOME || p.join(home, '.config'), 'Claude', 'claude_desktop_config.json') };
+    },
+    // The packaged (MSIX) Windows build of Claude Desktop does not read %APPDATA%\Claude. Windows
+    // gives a packaged app a private copy of Roaming under
+    //   %LOCALAPPDATA%\Packages\Claude_<publisher id>\LocalCache\Roaming
+    // and a file written to the real %APPDATA% from outside the package is invisible to it. The
+    // result was an install that reported "connected" while Claude showed no Tally tools at all.
+    // So when a Claude package folder exists we write there too. The real %APPDATA% file is still
+    // written: the classic (non-packaged) installer reads that one, and a machine can move from
+    // one build to the other.
+    extraPaths: (ctx) => {
+      const p = ctx.p ?? path;
+      const env = ctx.env ?? process.env;
+      if ((ctx.platform ?? process.platform) !== 'win32') return [];
+      const local = env.LOCALAPPDATA;
+      if (!local) return [];
+      const packages = p.join(local, 'Packages');
+      const list = ctx.listDir ?? listDirOrEmpty;
+      return list(packages)
+        .filter(name => /^Claude_[A-Za-z0-9]+$/.test(name))
+        .sort()
+        .map(name => p.join(packages, name, 'LocalCache', 'Roaming', 'Claude', 'claude_desktop_config.json'));
     }
   },
   {
@@ -1070,12 +1111,14 @@ export function runCli(argv: string[]): number {
     const ctx: TargetContext = {
       workspace: opts.workspace,
       home: opts.home,
-      // Only override when asked: an empty --appdata must not blank out the real one.
-      env: opts.appdata ? { ...process.env, APPDATA: opts.appdata } : undefined,
+      // Only override when asked: an empty --appdata must not blank out the real one. LOCALAPPDATA
+      // moves with it (Roaming's sibling), so another user's packaged config is found under THEIR
+      // profile and never under the caller's.
+      env: opts.appdata ? envForAppdata(opts.appdata) : undefined,
     };
     const resolved = target.resolvePath(ctx);
     if (!resolved.ok) { report.push({ target: id, skipped: resolved.reason }); continue; }
-    const file = resolved.file;
+    const files = [resolved.file, ...(target.extraPaths?.(ctx) ?? [])];
     // An app that is not on this machine gets no config written for it. `detect` and `remove` still
     // look: detect reports what is there, and remove must be able to clean up after an uninstall.
     const appFolder = target.appFolder?.(ctx);
@@ -1085,43 +1128,45 @@ export function runCli(argv: string[]): number {
       continue;
     }
     const entry = target.buildEntry(launch);
-    try {
-      if (opts.command === 'detect') {
-        report.push({ target: id, file, exists: fs.existsSync(file), ...(appFolder !== undefined ? { installed } : {}) });
-        continue;
-      }
-      // `status` is `apply --dry-run`: same parse, same ownership test, no write. One code path, so
-      // what status reports is exactly what apply would do.
-      // Strict gate, checked BEFORE the remove runs so nothing is written on refusal.
-      if (opts.command === 'remove' && opts.requireInstallRoot) {
-        let existing: unknown;
-        try {
-          const parsed = parseClientConfig(fs.readFileSync(file, 'utf-8'));
-          if (parsed.ok) {
-            const bucket = parsed.data[target.serversKey];
-            if (isPlainObject(bucket)) existing = bucket[target.serverName];
-          }
-        } catch { /* unreadable: fall through and let the normal path report it */ }
-        if (existing !== undefined && !entryPointsInside(existing, opts.installRoot)) {
-          report.push({ target: id, file, state: 'foreign', changed: false, wrote: false, backup: null,
-            note: `left untouched: the entry under "${target.serverName}" does not point inside ${opts.installRoot}, so it is not ours to delete` });
-          exit = Math.max(exit, 2);
+    for (const file of files) {
+      try {
+        if (opts.command === 'detect') {
+          report.push({ target: id, file, exists: fs.existsSync(file), ...(appFolder !== undefined ? { installed } : {}) });
           continue;
         }
-      }
-      const run = opts.command === 'remove' ? removeFromFile : applyToFile;
-      const res = run(target, file, entry, { ...opts, dryRun: opts.dryRun || opts.command === 'status' });
-      if (!res.outcome.ok) {
-        report.push({ target: id, file, error: res.outcome.reason });
+        // `status` is `apply --dry-run`: same parse, same ownership test, no write. One code path, so
+        // what status reports is exactly what apply would do.
+        // Strict gate, checked BEFORE the remove runs so nothing is written on refusal.
+        if (opts.command === 'remove' && opts.requireInstallRoot) {
+          let existing: unknown;
+          try {
+            const parsed = parseClientConfig(fs.readFileSync(file, 'utf-8'));
+            if (parsed.ok) {
+              const bucket = parsed.data[target.serversKey];
+              if (isPlainObject(bucket)) existing = bucket[target.serverName];
+            }
+          } catch { /* unreadable: fall through and let the normal path report it */ }
+          if (existing !== undefined && !entryPointsInside(existing, opts.installRoot)) {
+            report.push({ target: id, file, state: 'foreign', changed: false, wrote: false, backup: null,
+              note: `left untouched: the entry under "${target.serverName}" does not point inside ${opts.installRoot}, so it is not ours to delete` });
+            exit = Math.max(exit, 2);
+            continue;
+          }
+        }
+        const run = opts.command === 'remove' ? removeFromFile : applyToFile;
+        const res = run(target, file, entry, { ...opts, dryRun: opts.dryRun || opts.command === 'status' });
+        if (!res.outcome.ok) {
+          report.push({ target: id, file, error: res.outcome.reason });
+          exit = Math.max(exit, 1);
+          continue;
+        }
+        const { status, changed, note, commentsDropped, bomStripped } = res.outcome;
+        report.push({ target: id, file, state: status.state, current: status.current, changed, wrote: res.wrote, backup: res.backup, commentsDropped, bomStripped, ...(note ? { note } : {}) });
+        if (note) exit = Math.max(exit, 2);
+      } catch (e) {
+        report.push({ target: id, file, error: e instanceof Error ? e.message : String(e) });
         exit = Math.max(exit, 1);
-        continue;
       }
-      const { status, changed, note, commentsDropped, bomStripped } = res.outcome;
-      report.push({ target: id, file, state: status.state, current: status.current, changed, wrote: res.wrote, backup: res.backup, commentsDropped, bomStripped, ...(note ? { note } : {}) });
-      if (note) exit = Math.max(exit, 2);
-    } catch (e) {
-      report.push({ target: id, file, error: e instanceof Error ? e.message : String(e) });
-      exit = Math.max(exit, 1);
     }
   }
   if (opts.json) {

@@ -235,6 +235,10 @@ Either way, add the URL (with `/mcp`) as a custom connector in your client and s
 
 Then **quit Claude Desktop completely and reopen it**. Closing the window is not enough (use File → Exit, or the tray icon): Claude reads this file only at startup, so until it restarts you will see no Tally tools.
 
+**Which file?** The classic Claude Desktop installer reads `%APPDATA%\Claude\claude_desktop_config.json`. The newer packaged (Microsoft Store style) build does not: Windows gives it a private copy at `%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json`, and a file written anywhere else is invisible to it. Claudally writes both, so either build finds the entry. Claudally 0.9.0 wrote only the first, which is why the packaged build showed no Tally tools after an install that said "connected" — run **Connect your AI assistant to Tally** once after updating to fix an existing install.
+
+**Is it really loaded?** Each time an app starts the Tally server, the server notes it locally (`%LOCALAPPDATA%\Claudally\clients\`; nothing leaves the PC, and setting `CLAUDALLY_NO_SIGHTING=1` turns it off). The tray compares that with when Claude Desktop started: hover over it to see *connected (Claude started Tally)*, *restart Claude to load Tally*, or *Claude is NOT loading Tally*. The last one also raises a notification, because it means Claude is reading its settings from somewhere Claudally does not know about.
+
 If Claude Desktop was installed *after* Claudally, or you want to connect a second Windows user, run **Connect your AI assistant to Tally** from the Start Menu — it is safe to run repeatedly and does nothing if the entry is already correct.
 
 To add the entry by hand instead (File → Settings → Developer):

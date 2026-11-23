@@ -63,17 +63,22 @@ try {
         foreach ($dir in (Get-ChildItem -Path $profileRoot -Directory -ErrorAction SilentlyContinue)) {
             $appData = Join-Path $dir.FullName 'AppData\Roaming'
             $cfg     = Join-Path $appData 'Claude\claude_desktop_config.json'
-            if (Test-Path -LiteralPath $cfg) {
+            # The packaged (MSIX) Claude Desktop keeps its own copy under the profile's Packages
+            # folder. --appdata moves LOCALAPPDATA to this same profile, so one remove call covers both.
+            $pkgCfgs = @(Get-ChildItem -Path (Join-Path $dir.FullName 'AppData\Local\Packages\Claude_*\LocalCache\Roaming\Claude\claude_desktop_config.json') -File -ErrorAction SilentlyContinue)
+            if ((Test-Path -LiteralPath $cfg) -or $pkgCfgs.Count -gt 0) {
                 try {
                     $out = & $nodeExe $configCli remove --target claude-desktop --appdata $appData --install-root $InstallDir --require-install-root --json 2>&1 | Out-String
-                    $res = $null
-                    try { $res = ($out | ConvertFrom-Json).results[0] } catch { }
-                    if ($res -and $res.wrote) {
-                        $cleaned++
-                        Write-Host "[OK] Removed the Tally entry from $($dir.Name)'s MCP client configuration"
-                    } elseif ($res -and $res.state -eq 'foreign') {
-                        $skipped++
-                        Write-Host "[*]  Left $($dir.Name)'s MCP client entry alone - it points at a different install"
+                    $results = @()
+                    try { $results = @(($out | ConvertFrom-Json).results) } catch { }
+                    foreach ($res in $results) {
+                        if ($res -and $res.wrote) {
+                            $cleaned++
+                            Write-Host "[OK] Removed the Tally entry from $($dir.Name)'s Claude Desktop configuration ($($res.file))"
+                        } elseif ($res -and $res.state -eq 'foreign') {
+                            $skipped++
+                            Write-Host "[*]  Left $($dir.Name)'s Claude Desktop entry alone - it points at a different install ($($res.file))"
+                        }
                     }
                 } catch {
                     Write-Host "[WARN] Could not clean $($dir.Name)'s MCP client configuration: $_"
@@ -103,6 +108,10 @@ try {
             # paths that are about to stop existing.
             $crumb = Join-Path $dir.FullName 'AppData\Local\Claudally'
             if (Test-Path -LiteralPath $crumb) { Remove-Item -Recurse -Force -LiteralPath $crumb -ErrorAction SilentlyContinue }
+            # Sightings written while running under the packaged Claude can land in its private copy.
+            foreach ($pkgCrumb in @(Get-ChildItem -Path (Join-Path $dir.FullName 'AppData\Local\Packages\Claude_*\LocalCache\Local\Claudally') -Directory -ErrorAction SilentlyContinue)) {
+                Remove-Item -Recurse -Force -LiteralPath $pkgCrumb.FullName -ErrorAction SilentlyContinue
+            }
         }
         Write-Host "[OK] MCP client configuration cleanup: $cleaned removed, $skipped left alone"
     }
