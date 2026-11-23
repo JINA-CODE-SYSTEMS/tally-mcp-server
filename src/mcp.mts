@@ -10,6 +10,7 @@ import { buildVoucherXml, buildCancelVoucherXml, buildDeleteVoucherXml, buildAlt
 import { MASTER_TAGS, MASTER_COLLECTION_TYPES, planMasterNameRepairs, buildRenameMasterXml, verifyRename, buildMasterNamesCollectionXml, parseMasterNamesFromCollection } from './master.mjs';
 import type { ModelPushResponse } from './models.mjs';
 import { FEEDING_INSTRUCTIONS_LINE, registerFeedingGuide } from './feeding-guide.mjs';
+import { registerUpdateCheck } from './update-check.mjs';
 import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
 import { normalizePartyFields, validatePartyFields, planPartyUpdate, changesFromPlan, buildPartyAlterXml, verifyPartyFields, type PartyRow } from './party.mjs';
 
@@ -2988,6 +2989,7 @@ export async function registerMcpServer(): Promise<McpServer> {
 
   // The data-entry method, for every client: two prompts and a read-only tool. See feeding-guide.mts.
   registerFeedingGuide(mcpServer, (toolName, durationMs) => auditLog(toolName, {}, 'success', durationMs));
+  registerUpdateCheck(mcpServer, getServerVersion, (toolName, durationMs) => auditLog(toolName, {}, 'success', durationMs));
 
   mcpServer.registerTool(
     'query-database',

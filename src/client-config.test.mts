@@ -81,10 +81,10 @@ test('Claude Desktop resolves under %APPDATA% on Windows', () => {
 // Claude showed no Tally tools.
 
 const LOCAL = 'C:\\Users\\ca\\AppData\\Local';
-const pkgCtx = (names: string[]) => ({
+const pkgCtx = (names: string[], dataNames: string[] = []) => ({
   platform: 'win32' as const, p: path.win32,
   env: { APPDATA: 'C:\\Users\\ca\\AppData\\Roaming', LOCALAPPDATA: LOCAL },
-  listDir: (dir: string) => (dir === LOCAL + '\\Packages' ? names : []),
+  listDir: (dir: string) => (dir === LOCAL + '\\Packages' ? names : dir === LOCAL + '\\Claude-Data' ? dataNames : []),
 });
 
 test('packaged Claude Desktop: its private config is an extra path, the real one stays primary', () => {
@@ -92,6 +92,14 @@ test('packaged Claude Desktop: its private config is an extra path, the real one
   assert.deepEqual(CD.resolvePath(ctx), { ok: true, file: 'C:\\Users\\ca\\AppData\\Roaming\\Claude\\claude_desktop_config.json' });
   assert.deepEqual(CD.extraPaths!(ctx), [
     'C:\\Users\\ca\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Roaming\\Claude\\claude_desktop_config.json',
+  ]);
+});
+
+test('packaged Claude Desktop: the newer Claude-Data folder is covered too', () => {
+  const ctx = pkgCtx(['Claude_pzs8sxrjxfjjc'], ['claude_pzs8sxrjxfjjc', 'claude-backup', 'other']);
+  assert.deepEqual(CD.extraPaths!(ctx), [
+    'C:\\Users\\ca\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Roaming\\Claude\\claude_desktop_config.json',
+    'C:\\Users\\ca\\AppData\\Local\\Claude-Data\\claude_pzs8sxrjxfjjc\\claude_desktop_config.json',
   ]);
 });
 
