@@ -492,23 +492,29 @@ export function makeBatchJournalStore(baseDir: string, opts: { ttlMs?: number; n
     for (const name of names) {
       const file = path.join(dir, name);
       try {
-        // lstat: judge the entry itself, never what a link might point at; unlink removes only the entry.
-        const st = fs.lstatSync(file);
-        if (!st.isFile()) continue;
-        if (name.endsWith('.tmp')) { if (now() - st.mtimeMs > 60 * 60 * 1000) fs.unlinkSync(file); continue; }
-        // A lock left by a process that died: its heartbeat (which rewrites the file) stopped long ago.
-        if (name.endsWith('.lock')) { if (now() - st.mtimeMs > 24 * 60 * 60 * 1000) fs.unlinkSync(file); continue; }
-        if (!name.endsWith('.json')) continue;
-        let at = st.mtimeMs;
+        // Judge the entry through one open handle (time, type and contents all from the same file),
+        // then delete by name. Deleting removes only the directory entry, never a link's target.
+        const kind = name.endsWith('.tmp') ? 'tmp' : name.endsWith('.lock') ? 'lock' : name.endsWith('.json') ? 'json' : null;
+        if (!kind) continue;
+        let expired = false;
+        const fd = fs.openSync(file, 'r');
         try {
-          const fd = fs.openSync(file, 'r');
-          let raw: string;
-          try { raw = fs.readFileSync(fd, 'utf-8'); } finally { fs.closeSync(fd); }
-          const j = JSON.parse(raw);
-          const t = Date.parse(j?.updatedAt ?? j?.createdAt);
-          if (Number.isFinite(t)) at = t;
-        } catch { /* judged by file time */ }
-        if (now() - at > ttl) fs.unlinkSync(file);
+          const st = fs.fstatSync(fd);
+          if (!st.isFile()) continue;
+          if (kind === 'tmp') expired = now() - st.mtimeMs > 60 * 60 * 1000;
+          // A lock left by a process that died: its heartbeat (which rewrites the file) stopped long ago.
+          else if (kind === 'lock') expired = now() - st.mtimeMs > 24 * 60 * 60 * 1000;
+          else {
+            let at = st.mtimeMs;
+            try {
+              const j = JSON.parse(fs.readFileSync(fd, 'utf-8'));
+              const t = Date.parse(j?.updatedAt ?? j?.createdAt);
+              if (Number.isFinite(t)) at = t;
+            } catch { /* judged by file time */ }
+            expired = now() - at > ttl;
+          }
+        } finally { fs.closeSync(fd); }
+        if (expired) fs.unlinkSync(file);
       } catch { /* raced with another process; skip */ }
     }
   };
