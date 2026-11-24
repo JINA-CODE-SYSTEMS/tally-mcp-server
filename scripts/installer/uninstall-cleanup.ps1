@@ -60,6 +60,11 @@ try {
     } else {
         $profileRoot = Split-Path -Parent $env:PUBLIC          # normally C:\Users
         $cleaned = 0; $skipped = 0
+        $homeTargets = @(
+            @{ Id = 'cursor';   Label = 'Cursor';    File = '.cursor\mcp.json' },
+            @{ Id = 'windsurf'; Label = 'Windsurf';  File = '.codeium\windsurf\mcp_config.json' },
+            @{ Id = 'lmstudio'; Label = 'LM Studio'; File = '.lmstudio\mcp.json' }
+        )
         foreach ($dir in (Get-ChildItem -Path $profileRoot -Directory -ErrorAction SilentlyContinue)) {
             $appData = Join-Path $dir.FullName 'AppData\Roaming'
             $cfg     = Join-Path $appData 'Claude\claude_desktop_config.json'
@@ -85,24 +90,26 @@ try {
                     Write-Host "[WARN] Could not clean $($dir.Name)'s MCP client configuration: $_"
                 }
             }
-            # Cursor keeps its global config under the profile folder itself, not AppData, so it
-            # is reached with --home. Same ownership gate: only an entry pointing inside this
-            # install is removed.
-            $cursorCfg = Join-Path $dir.FullName '.cursor\mcp.json'
-            if (Test-Path -LiteralPath $cursorCfg) {
+            # Cursor, Windsurf and LM Studio keep their per-user config under the profile folder
+            # itself, not AppData, so each is reached with --home. Same ownership gate: only an
+            # entry pointing inside this install is removed. Keep this list in step with the
+            # targets in src/client-config.mts that resolve under the home folder.
+            foreach ($homeTarget in $homeTargets) {
+                $homeCfg = Join-Path $dir.FullName $homeTarget.File
+                if (-not (Test-Path -LiteralPath $homeCfg)) { continue }
                 try {
-                    $out = & $nodeExe $configCli remove --target cursor --home $dir.FullName --install-root $InstallDir --require-install-root --json 2>&1 | Out-String
+                    $out = & $nodeExe $configCli remove --target $homeTarget.Id --home $dir.FullName --install-root $InstallDir --require-install-root --json 2>&1 | Out-String
                     $res = $null
                     try { $res = ($out | ConvertFrom-Json).results[0] } catch { }
                     if ($res -and $res.wrote) {
                         $cleaned++
-                        Write-Host "[OK] Removed the Tally entry from $($dir.Name)'s Cursor configuration"
+                        Write-Host "[OK] Removed the Tally entry from $($dir.Name)'s $($homeTarget.Label) configuration"
                     } elseif ($res -and $res.state -eq 'foreign') {
                         $skipped++
-                        Write-Host "[*]  Left $($dir.Name)'s Cursor entry alone - it points at a different install"
+                        Write-Host "[*]  Left $($dir.Name)'s $($homeTarget.Label) entry alone - it points at a different install"
                     }
                 } catch {
-                    Write-Host "[WARN] Could not clean $($dir.Name)'s Cursor configuration: $_"
+                    Write-Host "[WARN] Could not clean $($dir.Name)'s $($homeTarget.Label) configuration: $_"
                 }
             }
             # Per-user breadcrumb written by connect-client.ps1. Small, but it is ours and it names

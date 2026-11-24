@@ -28,7 +28,19 @@
     HOW OWNERSHIP IS DECIDED NOW: a process is ours if its executable lives under the install
     directory (which catches the bundled node.exe whatever entrypoint it runs), or if its command
     line references the install directory (which catches powershell.exe running our scripts, since
-    its ExecutablePath is always System32 and can never identify it).
+    its ExecutablePath is always System32 and can never identify it), or if it has a module (a DLL
+    or a native .node addon) loaded from under the install directory.
+
+    The third test is for the Claude Desktop extension (mcpb/server/launcher.mjs, #40). Claude
+    Desktop starts it with ITS OWN Node.js, as `node <extensions folder>\...\server\launcher.mjs`,
+    and the launcher import()s <install>\dist\index.mjs into that same process. Neither the
+    executable nor the command line names the install directory (it arrives through an environment
+    variable, or not at all), yet the process has DuckDB's native module and duckdb.dll mapped from
+    <install>\node_modules - exactly the files an upgrade then fails to replace. Matching on the
+    launcher's path instead would depend on how Claude Desktop names its extension folders; a
+    loaded module IS the lock, so it identifies every in-process host however it was started.
+    Only modules are checked, not open file handles: the server keeps no file under the install
+    open, so a loaded image is the only lock it can hold there.
 
     EXCLUSIONS, both deliberate:
       - Anything under <install>\update is left alone. #177's updater orchestrator runs from there
@@ -38,7 +50,8 @@
         directory and would otherwise match.
 
 .PARAMETER InstallDir
-    The install root. Processes under it, or naming it on their command line, are considered ours.
+    The install root. Processes under it, naming it on their command line, or with a module loaded
+    from it, are considered ours.
 
 .PARAMETER WhatIf
     List what would be stopped and stop nothing.
@@ -80,6 +93,34 @@ try {
     exit 0
 }
 
+# The first module a process has loaded from under the install (outside update\), or $null.
+#
+# Process.Modules throws for a process this one may not open (protected processes, some services)
+# and for one that exited after the CIM query; each of those is simply "not ours by this test". The
+# installer runs elevated and 64-bit (ArchitecturesInstallIn64BitMode), so it can read the modules
+# of an ordinary 64-bit node.exe started by any user. uninstall-cleanup.ps1 runs elevated as well.
+function Get-ModuleUnderInstall([int]$ProcessId) {
+    try {
+        $proc = [System.Diagnostics.Process]::GetProcessById($ProcessId)
+        foreach ($m in $proc.Modules) {
+            $f = "$($m.FileName)"
+            if (-not $f) { continue }
+            if (-not $f.StartsWith($rootWithSep, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            # #177's updater keeps its own copy under update\; a module loaded from there locks
+            # nothing this install replaces, and that process must survive anyway.
+            if ($f.StartsWith($updateDir + '\', [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            return $f
+        }
+    } catch { }
+    return $null
+}
+
+# Programs under Windows' own folder (svchost, explorer, the shell's helpers) never host our
+# server, and they are most of what runs on a PC. Skipping them keeps the module scan, one
+# enumeration per process, short. powershell.exe running our scripts lives there too, but it is
+# matched by its command line before this skip is reached.
+$systemRootWithSep = "$($env:SystemRoot)".TrimEnd('\') + '\'
+
 $targets = @()
 foreach ($p in $all) {
     if ($selfIds -contains [int]$p.ProcessId) { continue }
@@ -87,9 +128,21 @@ foreach ($p in $all) {
     $exe = "$($p.ExecutablePath)"
     $cmd = "$($p.CommandLine)"
 
-    $byExe = $exe -and $exe.StartsWith($rootWithSep, [System.StringComparison]::OrdinalIgnoreCase)
-    $byCmd = $cmd -and ($cmd.IndexOf($root, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
-    if (-not ($byExe -or $byCmd)) { continue }
+    $why = $null
+    if ($exe -and $exe.StartsWith($rootWithSep, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $why = 'executable path'
+    } elseif ($cmd -and ($cmd.IndexOf($root, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)) {
+        $why = 'command line'
+    } elseif ($exe -and ($systemRootWithSep.Length -gt 1) -and
+              $exe.StartsWith($systemRootWithSep, [System.StringComparison]::OrdinalIgnoreCase)) {
+        continue
+    } else {
+        # The Claude Desktop extension's host (see DESCRIPTION). An empty ExecutablePath means CIM
+        # could not open the process, so its modules cannot be read either and this finds nothing.
+        $module = Get-ModuleUnderInstall ([int]$p.ProcessId)
+        if ($module) { $why = 'loaded module ' + $module }
+    }
+    if (-not $why) { continue }
 
     # #177's updater must outlive the install it is driving.
     $inUpdate = ($exe -and $exe.StartsWith($updateDir + '\', [System.StringComparison]::OrdinalIgnoreCase)) -or
@@ -99,20 +152,17 @@ foreach ($p in $all) {
         continue
     }
 
-    $targets += $p
+    $targets += New-Object PSObject -Property @{ ProcessId = $p.ProcessId; Name = $p.Name; Why = $why }
 }
 
 if ($targets.Count -eq 0) { Write-Host '[stop] no processes from this install are running'; exit 0 }
 
 foreach ($t in $targets) {
-    $why = 'command line'
-    $exe = "$($t.ExecutablePath)"
-    if ($exe -and $exe.StartsWith($rootWithSep, [System.StringComparison]::OrdinalIgnoreCase)) { $why = 'executable path' }
     if ($WhatIf) {
-        Write-Host ("[stop] WHATIF pid {0} ({1}) - matched by {2}" -f $t.ProcessId, $t.Name, $why)
+        Write-Host ("[stop] WHATIF pid {0} ({1}) - matched by {2}" -f $t.ProcessId, $t.Name, $t.Why)
         continue
     }
-    Write-Host ("[stop] stopping pid {0} ({1}) - matched by {2}" -f $t.ProcessId, $t.Name, $why)
+    Write-Host ("[stop] stopping pid {0} ({1}) - matched by {2}" -f $t.ProcessId, $t.Name, $t.Why)
     try { Stop-Process -Id $t.ProcessId -Force -ErrorAction Stop }
     catch { Write-Host ("[stop] could not stop pid {0}: {1}" -f $t.ProcessId, $_.Exception.Message) }
 }

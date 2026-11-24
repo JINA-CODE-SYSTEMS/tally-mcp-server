@@ -88,6 +88,21 @@ if (-not $ownsSingleton) {
 $ManageDialogPath = Join-Path (Split-Path -Parent $PSCommandPath) 'manage-companies-dialog.ps1'
 if (Test-Path -LiteralPath $ManageDialogPath) { . $ManageDialogPath }
 
+# The rest of the tray lives in helper files next to this one (all shipped by tally-mcp.iss), split
+# out so this file stays readable. Each only defines functions (plus a little script-scoped state):
+#   tray-coordination.ps1 - AI-activity frame (#22) and restart countdown (#25), coordination files
+#   tray-tally.ps1        - start Tally / XML server / copies / Tally on another computer (#33 #34 #37)
+#   tally-ini-xml.ps1     - the tally.ini edit behind "Switch on Tally's XML server" (#33)
+#   tray-ai-apps.ps1      - per-app connection status and late-install offers (#38 #39)
+# A missing or broken helper costs only its own feature: every call site is wrapped.
+$script:TrayDir = Split-Path -Parent $PSCommandPath
+foreach ($trayHelper in @('tray-coordination.ps1', 'tray-tally.ps1', 'tally-ini-xml.ps1', 'tray-ai-apps.ps1')) {
+    $trayHelperPath = Join-Path $script:TrayDir $trayHelper
+    if (Test-Path -LiteralPath $trayHelperPath) {
+        try { . $trayHelperPath } catch { }
+    }
+}
+
 # ---------------------------------------------------------------------------
 # State container shared between the polling timer and the menu handlers.
 # Single Hashtable rather than a class so the script stays easy to copy-paste-debug.
@@ -114,6 +129,12 @@ $State = [hashtable]::Synchronized(@{
     ClientConfigured = $null   # $true / $false / $null (not checked yet) - local mode only
     ClaudeLoad       = $null   # 'loaded' / 'restart' / 'missing' / $null (Claude Desktop not running, or too early to say)
     PreviousClaudeLoad = $null
+    TallyHost        = '127.0.0.1' # TALLY_HOST from .env
+    TallyPort        = 9000    # TALLY_PORT from .env
+    TallyIsRemote    = $false  # TALLY_HOST is another computer: no process checks, no frame, no launch
+    TallyPortOwnerPid = 0      # with several copies open: the one listening on TallyPort, or 0
+    TallyPortOwnerAt = [datetime]::MinValue
+    CoordDir         = ''      # TALLY_DATA_PATH (coordination folder)
 })
 
 # ---------------------------------------------------------------------------
@@ -592,6 +613,20 @@ function Invoke-StatusPoll {
         $State.ClaudeLoad = $null
     }
 
+    # Where Tally is (#37) and where the coordination files are (#22 #25). Read once per poll; the
+    # fast timers and the overlay thread only ever use these cached values.
+    try {
+        $ep = Get-TallyEndpoint
+        $State.TallyHost = $ep.Host
+        $State.TallyPort = $ep.Port
+        $State.TallyIsRemote = $ep.IsRemote
+    } catch { $State.TallyHost = '127.0.0.1'; $State.TallyPort = 9000; $State.TallyIsRemote = $false }
+    try {
+        $coord = Read-EnvValue -EnvPath (Join-Path $InstallDir '.env') -Key 'TALLY_DATA_PATH'
+        if (-not $coord) { $coord = 'C:\Users\Public\TallyPrimeEditLog\data' }
+        $State.CoordDir = $coord
+    } catch { $State.CoordDir = 'C:\Users\Public\TallyPrimeEditLog\data' }
+
     try {
         # Get-ScheduledTask returns CIM instance objects; .State is 'Running' / 'Ready' / 'Disabled' / etc.
         $State.AgentTask = Get-ScheduledTask -TaskName $AgentTaskName -ErrorAction SilentlyContinue
@@ -615,10 +650,37 @@ function Invoke-StatusPoll {
         # Count them. More than one running Tally is the condition that makes company loading
         # ambiguous (the server refuses to guess which to drive), and the tray is where a user can
         # actually see and fix it - so surface the count rather than quietly taking the first.
-        $allTally = @(Get-Process -Name 'tally' -ErrorAction SilentlyContinue)
+        # A Tally on another computer (#37) is not ours to count: any tally.exe here is unrelated.
+        if ($State.TallyIsRemote) {
+            $allTally = @()
+        } else {
+            $allTally = @(Get-Process -Name 'tally' -ErrorAction SilentlyContinue)
+        }
         $State.TallyCount   = $allTally.Count
         $State.TallyProcess = if ($allTally.Count -gt 0) { $allTally[0] } else { $null }
     } catch { $State.TallyProcess = $null; $State.TallyCount = 0 }
+
+    # With several copies open, which one holds the XML port? The frame goes around that one, and
+    # the copies dialog marks it. A CIM query, so only when it matters and at most every 30 s.
+    try {
+        if ($State.TallyCount -gt 1) {
+            if (((Get-Date) - $State.TallyPortOwnerAt).TotalSeconds -ge 30) {
+                $State.TallyPortOwnerPid = Get-TallyPortOwnerPid -Port $State.TallyPort
+                $State.TallyPortOwnerAt  = Get-Date
+            }
+        } else {
+            $State.TallyPortOwnerPid = 0
+            $State.TallyPortOwnerAt  = [datetime]::MinValue
+        }
+    } catch { $State.TallyPortOwnerPid = 0 }
+
+    # Hand the overlay thread what it needs, and tidy activity files of servers that are gone.
+    try {
+        $script:OverlayShared.Dir          = $State.CoordDir
+        $script:OverlayShared.Enabled      = (-not $State.TallyIsRemote)
+        $script:OverlayShared.PortOwnerPid = [int]$State.TallyPortOwnerPid
+    } catch { }
+    try { Remove-StaleActivityFiles -Dir $State.CoordDir } catch { }
 
     # Public URL probe is optional - if MCP_DOMAIN is unset, the operator is running localhost-only
     # and there's nothing to probe externally. Probe the local OAuth metadata endpoint instead so
@@ -660,28 +722,22 @@ function Invoke-StatusPoll {
         }
     } catch { $State.LastLoadedAlias = '' }
 
-    # Best-effort "what's loaded right now" via the in-process Tally XML server. Fast probe (<200ms
-    # when Tally is up; instant timeout when it's not). Skipped if Tally isn't running to avoid
-    # poll-interval-sized delays from blocked TCP connects.
-    if ($State.TallyProcess) {
+    # Best-effort "what's loaded right now" via the Tally XML server (Test-TallyXml in tray-tally.ps1:
+    # a short TCP connect first, then the "List of Companies" export). Fast (<200ms when Tally is up;
+    # a refused connect is instant). Skipped if a local Tally isn't running, so a closed Tally reads
+    # as "closed" rather than "XML server off". A Tally on another computer (#37) is always probed,
+    # since its process cannot be seen from here.
+    if ($State.TallyProcess -or $State.TallyIsRemote) {
         try {
-            $body = '<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>List of Companies</ID></HEADER></ENVELOPE>'
-            $resp = Invoke-WebRequest -Uri 'http://127.0.0.1:9000/' -Method POST -Body $body -ContentType 'text/xml; charset=utf-8' -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
-            # Tally returns an XML-like list of companies; the first <COMPANY NAME="..."> is the active one.
-            # Simple regex extract - full XML parse is unwarranted for a tooltip string.
-            # Tally's "List of Companies" envelope returns <NAME>...</NAME> tags inside <COMPANY>
-            # blocks (verified against a real Tally Prime Edit Log instance). Take the first <NAME>.
-            $match = [regex]::Match($resp.Content, '<NAME>([^<]+)</NAME>', 'IgnoreCase')
-            if ($match.Success) {
-                $State.LoadedCompany = $match.Groups[1].Value.Trim()
-            } else {
-                $State.LoadedCompany = ''
-            }
+            $probeHost = '127.0.0.1'
+            if ($State.TallyIsRemote) { $probeHost = $State.TallyHost }
+            $probe = Test-TallyXml -HostName $probeHost -Port $State.TallyPort -TimeoutSec 2
+            $State.LoadedCompany = $probe.Company
             # Tally answered. This is the distinction the tray used to discard: "the process exists"
             # and "the process is reachable" are different things, and a fresh Tally has its data
             # connection switched OFF - so the common first-run state was a tray cheerfully reporting
             # "Running" while nothing worked.
-            $State.TallyXmlOk = $true
+            $State.TallyXmlOk = [bool]$probe.Ok
         } catch {
             $State.LoadedCompany = ''
             $State.TallyXmlOk = $false
@@ -689,6 +745,49 @@ function Invoke-StatusPoll {
     } else {
         $State.LoadedCompany = ''
         $State.TallyXmlOk = $null
+    }
+}
+
+# One phrase for "how is Tally", shared by the tooltip, the menu row and the dashboard (#33 #34 #37).
+#   Word   - short status for the dashboard pill
+#   Detail - plain sentence
+#   Health - green / amber / red / gray
+#   Remedy - '' or the one-click fix: start-tally / enable-xml / copies
+function Get-TallyStatusInfo {
+    $port = $State.TallyPort
+    if ($State.TallyIsRemote) {
+        $where = "$($State.TallyHost):$port"
+        if ($State.TallyXmlOk -eq $true) {
+            $d = "on $where"
+            if ($State.LoadedCompany) { $d += " - $($State.LoadedCompany)" }
+            return @{ Word = 'Connected'; Detail = $d; Health = 'green'; Remedy = '' }
+        }
+        return @{ Word = 'Unreachable'; Detail = "Tally on $where is not answering - is it open there, with its XML server on?"; Health = 'red'; Remedy = '' }
+    }
+    $starting = $false
+    try { $starting = [bool]$script:TallyReady.Active } catch { }
+    if (-not $State.TallyProcess) {
+        return @{ Word = 'Closed'; Detail = 'Tally is closed'; Health = 'gray'; Remedy = 'start-tally' }
+    }
+    if ($State.TallyCount -gt 1) {
+        return @{ Word = "$($State.TallyCount) copies open"; Detail = "You have $($State.TallyCount) copies of Tally open"; Health = 'amber'; Remedy = 'copies' }
+    }
+    if ($State.TallyXmlOk -eq $false) {
+        if ($starting) { return @{ Word = 'Starting'; Detail = 'Tally is starting...'; Health = 'amber'; Remedy = '' } }
+        return @{ Word = 'XML server off'; Detail = 'Tally is open but its XML server is off'; Health = 'amber'; Remedy = 'enable-xml' }
+    }
+    $d = ''
+    if ($State.LoadedCompany) { $d = $State.LoadedCompany }
+    return @{ Word = 'Running'; Detail = $d; Health = 'green'; Remedy = '' }
+}
+
+# Runs a remedy named by Get-TallyStatusInfo (dashboard button, menu row, balloon click).
+function Invoke-TallyRemedy {
+    param([string]$Remedy)
+    switch ($Remedy) {
+        'start-tally' { Start-TallyFromTray }
+        'enable-xml'  { Invoke-EnableTallyXmlServer }
+        'copies'      { Show-TallyCopiesDialog }
     }
 }
 
@@ -729,6 +828,17 @@ function Format-Tooltip {
         $lines += '  (initializing...)'
         return ($lines -join "`r`n")
     }
+    # Tally first: the tooltip is clipped to 63 characters, and "is Tally reachable, and if not, what
+    # do I do" is the line a user most needs to see without opening anything.
+    try {
+        $ti = Get-TallyStatusInfo
+        $tl = $ti.Detail
+        if ($ti.Word -eq 'Running') { $tl = 'Tally running'; if ($ti.Detail) { $tl += " - $($ti.Detail)" } }
+        elseif ($ti.Word -eq 'Connected') { $tl = "Tally connected $($ti.Detail)" }
+        elseif ($ti.Remedy -eq 'start-tally') { $tl = 'Tally is closed - right-click > Start Tally' }
+        elseif ($ti.Remedy -eq 'enable-xml') { $tl = "Tally open, XML server off" }
+        $lines += "  $tl"
+    } catch { }
     if ($State.DeploymentMode -eq 'local') {
         $lines += "  Mode:     on this computer (no service, no open port)"
         if ($State.ClaudeLoad -eq 'loaded') { $lines += "  Assistant: connected (Claude started Tally)" }
@@ -746,12 +856,6 @@ function Format-Tooltip {
         $lines += "  Agent:    $($State.AgentTask.State) ($procPart)"
     } else {
         $lines += "  Agent:    task not registered"
-    }
-    if ($State.TallyProcess) {
-        $cmp = if ($State.LoadedCompany) { " - $($State.LoadedCompany)" } else { '' }
-        $lines += "  Tally:    Running$cmp"
-    } else {
-        $lines += "  Tally:    not running"
     }
     if ($null -ne $State.PublicUrlOk) {
         $urlState = if ($State.PublicUrlOk) { 'OK' } else { 'unreachable' }
@@ -785,21 +889,41 @@ $miTallyState = $menu.Items.Add('  Tally: -')
 $miTallyState.Enabled = $false
 $miTallyState.Add_Click({
     try {
+        if ($State.TallyIsRemote) {
+            if ($State.TallyXmlOk -ne $true) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Claudally is set to use the Tally on $($State.TallyHost), port $($State.TallyPort), and it is not answering.`r`n`r`nOn that computer: open Tally, switch its XML server on ($(Get-TallyXmlMenuPath -Port $State.TallyPort)), and make sure Windows Firewall lets this computer in on port $($State.TallyPort).`r`n`r`nIf Tally is on this computer after all, right-click the tray icon and choose 'Tally is on this computer'.",
+                    'Tally is not reachable', 'OK', 'Warning') | Out-Null
+            }
+            return
+        }
+        if (-not $State.TallyProcess) {
+            $ans = [System.Windows.Forms.MessageBox]::Show("Tally is closed. Your AI assistant can only work with Tally while it is open.`r`n`r`nStart Tally now?", 'Tally is closed', 'YesNo', 'Question')
+            if ($ans -eq 'Yes') { Start-TallyFromTray }
+            return
+        }
+        # Several copies: the list with a Close button per copy (#34). The message box further down
+        # stays as the fallback if that dialog is unavailable.
+        if ($State.TallyCount -gt 1 -and (Get-Command Show-TallyCopiesDialog -ErrorAction SilentlyContinue)) {
+            Show-TallyCopiesDialog
+            return
+        }
         if ($State.TallyXmlOk -eq $false) {
             $msg = @"
-Tally Prime is open, but your AI assistant cannot read from it yet.
+Tally Prime is open, but your AI assistant cannot read from it yet:
+its XML server (the data connection) is switched off.
 
-Tally ships with its data connection switched OFF. It has to be turned on once,
-inside Tally itself - nothing on this machine can do it for you.
+Tally ships with it switched OFF. Claudally can switch it on for you -
+Tally has to be closed for a moment while its settings file is changed.
 
-In Tally Prime:
+Or do it yourself, in Tally Prime:
 
   1. Press F1  (Help)
   2. Choose  Settings
   3. Choose  Connectivity
   4. Choose  Client/Server Configuration
   5. Set  'TallyPrime acts as'  to  Server
-  6. Set  Port  to  9000
+  6. Set  Port  to  $($State.TallyPort)
   7. Press Ctrl+A to accept
 
 Leave Tally open. The connection only works while Tally is running.
@@ -807,8 +931,11 @@ Leave Tally open. The connection only works while Tally is running.
 If it is already set to Server, look at the Tally window: a message box waiting
 for an answer (a licence reminder, for example) stops Tally responding until
 someone clears it.
+
+Switch it on for you now?
 "@
-            [System.Windows.Forms.MessageBox]::Show($msg.Trim(), 'Tally is not connected yet', 'OK', 'Information') | Out-Null
+            $ans = [System.Windows.Forms.MessageBox]::Show($msg.Trim(), 'Tally is not connected yet', 'YesNo', 'Information')
+            if ($ans -eq 'Yes') { Invoke-EnableTallyXmlServer }
         }
         elseif ($State.TallyCount -gt 1) {
             $msg = @"
@@ -824,7 +951,7 @@ Either:
   - Close the copies you are not using, or
   - Turn the connection on in the copy you DO want your AI assistant to use:
     F1 > Settings > Connectivity > Client/Server Configuration,
-    'TallyPrime acts as' = Server, Port = 9000, then Ctrl+A.
+    'TallyPrime acts as' = Server, Port = $($State.TallyPort), then Ctrl+A.
 "@
             [System.Windows.Forms.MessageBox]::Show($msg.Trim(), 'More than one Tally is open', 'OK', 'Warning') | Out-Null
         }
@@ -846,12 +973,24 @@ $miUpdate.Add_Click({
     } catch { }
 })
 
-# Only the "Claude is not loading Tally" balloon does anything when clicked; the flag is cleared when
-# any balloon closes, so clicking a later, unrelated balloon never runs the fix.
+# Only balloons that set $script:BalloonAction do anything when clicked ("Claude is not loading
+# Tally", "Connect Cursor to Tally?", "Tally's XML server is off"); the flag is cleared when any
+# balloon closes, so clicking a later, unrelated balloon never runs an action.
 $script:BalloonAction = ''
 $tray.Add_BalloonTipClicked({
     $act = $script:BalloonAction; $script:BalloonAction = ''
-    if ($act -eq 'fix-claude') { try { Invoke-ClaudeAutoFix } catch { } }
+    try {
+        if ($act -eq 'fix-claude') { Invoke-ClaudeAutoFix }
+        elseif ($act -eq 'enable-xml') { Invoke-EnableTallyXmlServer }
+        elseif ($act -eq 'start-tally') { Start-TallyFromTray }
+        elseif ($act -like 'connect:*') {
+            # "connect:<target>|<label>" from Invoke-LateInstallOffers (#39).
+            $parts = $act.Substring(8).Split('|')
+            $label = $parts[0]
+            if ($parts.Count -gt 1) { $label = $parts[1] }
+            Invoke-ConnectApp -Target $parts[0] -Label $label
+        }
+    } catch { }
 })
 $tray.Add_BalloonTipClosed({ $script:BalloonAction = '' })
 
@@ -1012,20 +1151,61 @@ Start-Service -Name '$ServiceName' -ErrorAction Stop
     }
 })
 
-$miLaunchTally = $menu.Items.Add('Launch Tally Prime')
-$miLaunchTally.Add_Click({
-    $envFile = Join-Path $InstallDir '.env'
-    $exe = Read-EnvValue -EnvPath $envFile -Key 'TALLY_EXE_PATH'
-    if (-not $exe) { $exe = 'C:\Program Files\TallyPrimeEditLog\tally.exe' }
-    if (-not (Test-Path -LiteralPath $exe)) {
-        [System.Windows.Forms.MessageBox]::Show("tally.exe not found at: $exe`n`nUpdate TALLY_EXE_PATH in .env via Reconfigure.", 'TallyMCP', 'OK', 'Warning') | Out-Null
-        return
-    }
+# Toggle "show each posted voucher in Tally" (SHOW_AFTER_POST, #23). Same shape as the GUI-control
+# toggle above: checkable, reflects .env at build time, and the server only reads .env when it
+# starts - so in remote mode the service is restarted (after a confirmation that says so), and in
+# local mode, where each AI app starts its own server, the user is told to restart the AI app.
+$miShowAfterPost = $menu.Items.Add('Show each posted voucher in Tally')
+$miShowAfterPost.Checked = ((Read-EnvValue -EnvPath (Join-Path $InstallDir '.env') -Key 'SHOW_AFTER_POST') -eq 'true')
+$miShowAfterPost.Add_Click({
     try {
-        Start-Process -FilePath $exe
+        $envFile = Join-Path $InstallDir '.env'
+        $cur = Read-EnvValue -EnvPath $envFile -Key 'SHOW_AFTER_POST'
+        $newVal = if ($cur -eq 'true') { 'false' } else { 'true' }
+        $isLocal = ($State.DeploymentMode -eq 'local')
+        if (-not $isLocal) {
+            $ask = if ($newVal -eq 'true') {
+                "Show each posted voucher in Tally?`n`nAfter your AI assistant posts a voucher, Tally opens it on screen so you can check it.`n`nThe service will restart to apply the change."
+            } else {
+                "Stop showing posted vouchers in Tally?`n`nThe service will restart to apply the change."
+            }
+            if ([System.Windows.Forms.MessageBox]::Show($ask, 'TallyMCP', 'OKCancel', 'Question') -ne 'OK') { return }
+        }
+        Set-EnvValue -EnvPath $envFile -Key 'SHOW_AFTER_POST' -Value $newVal
+        $this.Checked = ($newVal -eq 'true')
+        $what = if ($newVal -eq 'true') { 'Saved: Tally will open each voucher your AI assistant posts, so you can check it.' } else { 'Saved: posted vouchers will no longer be opened in Tally.' }
+        # Already asked above, in words that name the service restart.
+        Invoke-EnvChangeApply -What $what -AlreadyConfirmed
     } catch {
-        [System.Windows.Forms.MessageBox]::Show("Launch failed: $_", 'TallyMCP', 'OK', 'Error') | Out-Null
+        [System.Windows.Forms.MessageBox]::Show("Toggle voucher display failed: $_", 'TallyMCP', 'OK', 'Error') | Out-Null
     }
+})
+
+# Start Tally (#33). The one-click remedy when Tally is closed; after starting it the tray watches the
+# XML port for up to 90 s and says when Tally is ready (or how to switch its XML server on).
+$miLaunchTally = $menu.Items.Add('Start Tally')
+$miLaunchTally.Add_Click({ try { Start-TallyFromTray } catch { [System.Windows.Forms.MessageBox]::Show("Launch failed: $_", 'TallyMCP', 'OK', 'Error') | Out-Null } })
+
+# Switch on Tally's XML server by editing tally.ini (#33). Only while Tally is closed; offers to close
+# it gracefully first. Hidden while Tally is on another computer.
+$miEnableXml = $menu.Items.Add("Switch on Tally's XML server...")
+$miEnableXml.Add_Click({ try { Invoke-EnableTallyXmlServer } catch { [System.Windows.Forms.MessageBox]::Show("Switching on the XML server failed: $_", 'Claudally', 'OK', 'Error') | Out-Null } })
+
+# Every running copy of Tally, each with a Close button (#34). Shown only while more than one is open.
+$miTallyCopies = $menu.Items.Add('Copies of Tally open...')
+$miTallyCopies.Visible = $false
+$miTallyCopies.Add_Click({ try { Show-TallyCopiesDialog } catch { } })
+
+# Tally on another computer (#37): test and save TALLY_HOST / TALLY_PORT, and the way back.
+$miRemoteTally = $menu.Items.Add('Tally is on another computer...')
+$miRemoteTally.Add_Click({ try { Show-RemoteTallyDialog } catch { [System.Windows.Forms.MessageBox]::Show("Failed: $_", 'Claudally', 'OK', 'Error') | Out-Null } })
+$miLocalTally = $menu.Items.Add('Tally is on this computer')
+$miLocalTally.Visible = $false
+$miLocalTally.Add_Click({
+    try {
+        $ans = [System.Windows.Forms.MessageBox]::Show("Use the Tally on this computer again, instead of the one on $($State.TallyHost)?", 'Claudally', 'YesNo', 'Question')
+        if ($ans -eq 'Yes') { Set-TallyOnThisComputer }
+    } catch { }
 })
 
 # Reloads whichever company was most recently Test'd via the Manage Companies
@@ -1175,6 +1355,11 @@ $tray.ContextMenuStrip = $menu
 # ---------------------------------------------------------------------------
 $Dashboard       = $null     # the Form instance, or $null if never opened / disposed
 $DashboardLabels = $null     # per-row hashtable { Pill; Dot; Word; Detail } of the live status widgets
+$DashboardAiList = $null     # the scrolling panel inside the "AI apps" card
+$script:DashboardStartTallyBtn = $null
+$script:AiAppsSignature = '' # what the AI apps rows currently show, so they are rebuilt only on change
+$script:AiAppsRefreshAt = [datetime]::MinValue
+$script:AiAppsBusy      = $false   # an app row's Fix/Connect is running: do not rebuild the rows under it
 
 # ---------------------------------------------------------------------------
 # Dashboard skin helpers (flat/modern reskin). All best-effort: any failure degrades
@@ -1438,6 +1623,21 @@ function Show-Dashboard {
         $rowY += 27
     }
 
+    # One-click remedy beside the Tally row (#33 #34): Start Tally / Switch on XML server / See the
+    # copies. Shown only while there is something to fix; Update-DashboardUi sets its text and Tag.
+    $tallyRowCtl = $labels['Tally']
+    $remedyBtn = New-Object System.Windows.Forms.Button
+    $remedyBtn.Size     = New-Object System.Drawing.Size 150, 24
+    $remedyBtn.Location = New-Object System.Drawing.Point (600 - 14 - 150), ($tallyRowCtl.Detail.Top - 3)
+    $remedyBtn.Anchor   = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+    $remedyBtn.Visible  = $false
+    $remedyBtn.Tag      = ''
+    Set-FlatButton $remedyBtn 'primary'
+    $remedyBtn.Add_Click({ try { Invoke-TallyRemedy -Remedy ([string]$this.Tag) } catch { } })
+    $status.Controls.Add($remedyBtn)
+    $remedyBtn.BringToFront()
+    $tallyRowCtl.Remedy = $remedyBtn
+
     # --- Actions card: 3x3 grid of flat buttons. Each .PerformClick()s the corresponding
     # right-click ToolStripMenuItem so the implementation stays in one place. ---
     # Which actions exist depends on the deployment mode. In local mode there is no service to
@@ -1452,12 +1652,16 @@ function Show-Dashboard {
     }
     $btnSpecs += @{ Text = 'Connect your AI assistant to Tally'; Kind = $(if ($isLocal) { 'primary' } else { 'secondary' }); Click = { $miConnectClaude.PerformClick() } }
     $btnSpecs += @{ Text = 'Restart GUI agent';   Kind = 'secondary'; Click = { $miRestartAgent.PerformClick() } }
-    $btnSpecs += @{ Text = 'Launch Tally';        Kind = 'secondary'; Click = { $miLaunchTally.PerformClick() } }
+    # Called directly rather than through PerformClick: these menu items are hidden while Tally is on
+    # another computer, and a hidden ToolStripMenuItem ignores PerformClick.
+    $btnSpecs += @{ Text = 'Start Tally';         Kind = 'secondary'; Click = { try { Start-TallyFromTray } catch { } } }
     $btnSpecs += @{ Text = 'Manage Companies...'; Kind = 'secondary'; Click = { $miManageCompanies.PerformClick() } }
     $btnSpecs += @{ Text = 'Open logs';           Kind = 'secondary'; Click = { $miOpenLogs.PerformClick() } }
     $btnSpecs += @{ Text = 'Reconfigure...';      Kind = 'secondary'; Click = { $miReconfigure.PerformClick() } }
     $btnSpecs += @{ Text = 'Check for updates';   Kind = 'secondary'; Click = { $miCheckUpdates.PerformClick() } }
     $btnSpecs += @{ Text = 'Assistant GUI control...'; Kind = 'secondary'; Click = { $miGuiControl.PerformClick() } }
+    $btnSpecs += @{ Text = 'Show posted vouchers...'; Kind = 'secondary'; Click = { $miShowAfterPost.PerformClick() } }
+    $btnSpecs += @{ Text = 'Tally on another PC...'; Kind = 'secondary'; Click = { try { Show-RemoteTallyDialog } catch { } } }
     if (-not $isLocal) {
         $btnSpecs += @{ Text = 'Copy public URL'; Kind = 'secondary'; Click = {
             if ($State.PublicUrl) {
@@ -1467,12 +1671,11 @@ function Show-Dashboard {
         $btnSpecs += @{ Text = 'Stop service';    Kind = 'danger';    Click = { $miStopService.PerformClick() } }
     }
 
-    # Size the card to the rows the buttons actually need. Remote mode has ten actions (four rows)
-    # and local seven (three), so a fixed height would clip the last row in one mode or leave a band
-    # of dead white in the other.
+    # Size the card to the rows the buttons actually need. Remote mode has thirteen actions (five
+    # rows) and local ten (four), so a fixed height would clip the last row in one mode or leave a
+    # band of dead white in the other.
     $btnRows      = [math]::Ceiling($btnSpecs.Count / 3)
     $actionsH     = 42 + ($btnRows * 42) + 6
-    $actionsGrew  = $actionsH - 174
 
     $actions = New-DashCard 16 266 600 $actionsH ([System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right) 'Actions'
     $form.Controls.Add($actions)
@@ -1490,19 +1693,49 @@ function Show-Dashboard {
         Set-FlatButton $btn $spec.Kind
         $btn.Add_Click($spec.Click)
         $actions.Controls.Add($btn)
+        # Greyed out while Tally is on another computer (#37); see Update-DashboardUi.
+        if ($spec.Text -eq 'Start Tally') { $script:DashboardStartTallyBtn = $btn }
         $btnIndex++
     }
 
-    # Give the window back the height the extra button row took, so the License card keeps its size
-    # instead of quietly shrinking in remote mode.
-    if ($actionsGrew -gt 0) {
-        $form.Height      = $form.Height + $actionsGrew
-        $form.MinimumSize = New-Object System.Drawing.Size $form.MinimumSize.Width, ($form.MinimumSize.Height + $actionsGrew)
+    # --- AI apps card (#38): one row per app - configured? started Tally? - with Fix / Connect.
+    #     Rows are built by Update-AiAppsCard (and rebuilt only when what they say changes). ---
+    $aiY = 266 + $actionsH + 12
+    $aiH = 132
+    $aiCard = New-DashCard 16 $aiY 600 $aiH ([System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right) 'AI apps'
+    $form.Controls.Add($aiCard)
+    $aiList = New-Object System.Windows.Forms.Panel
+    $aiList.Location   = New-Object System.Drawing.Point 12, 34
+    $aiList.Size       = New-Object System.Drawing.Size 576, ($aiH - 40)
+    $aiList.Anchor     = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $aiList.AutoScroll = $true
+    $aiList.BackColor  = [System.Drawing.Color]::White
+    $aiCard.Controls.Add($aiList)
+
+    # Grow the window for the extra cards, but never past the screen: on a small screen the window
+    # scrolls instead (and the License card then keeps a fixed height rather than following the
+    # bottom edge, which is what lets it scroll).
+    $licY  = $aiY + $aiH + 12
+    $wantH = $licY + 150 + 58
+    $fits  = $true
+    try {
+        $waH = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Height
+        if ($waH -gt 200 -and $wantH -gt $waH) { $wantH = $waH; $fits = $false }
+    } catch { }
+    $form.MinimumSize = New-Object System.Drawing.Size $form.MinimumSize.Width, ([Math]::Min($wantH, $licY + 100 + 58))
+    $form.Height      = $wantH
+    $licH = 150
+    $licAnchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    if ($fits) {
+        $licH = [Math]::Max(100, $form.ClientSize.Height - $licY - 12)
+        $licAnchor = $licAnchor -bor [System.Windows.Forms.AnchorStyles]::Bottom
+    } else {
+        $form.AutoScroll = $true
     }
 
     # --- License card: read-only viewer of the bundled LICENSE file. Anchored to all four sides
     # so the user can resize the window to read more without horizontal scroll. ---
-    $licenseGroup = New-DashCard 16 (452 + $actionsGrew) 600 210 ([System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right) 'License'
+    $licenseGroup = New-DashCard 16 $licY 600 $licH $licAnchor 'License'
     $form.Controls.Add($licenseGroup)
 
     $licenseBox = New-Object System.Windows.Forms.TextBox
@@ -1516,7 +1749,7 @@ function Show-Dashboard {
     $licenseBox.ForeColor  = [System.Drawing.Color]::FromArgb(75, 85, 99)
     # Sit inside the card, clear of its header label; anchored all four so it grows with the card.
     $licenseBox.Location   = New-Object System.Drawing.Point 12, 36
-    $licenseBox.Size       = New-Object System.Drawing.Size 576, 160
+    $licenseBox.Size       = New-Object System.Drawing.Size 576, ($licH - 50)
     $licenseBox.Anchor     = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
     # The shipped LICENSE (AGPL v3) is ~34KB; default TextBox.MaxLength = 32767 chars
     # would silently truncate the closing sections of the license, which is exactly the
@@ -1542,10 +1775,14 @@ function Show-Dashboard {
     $form.add_FormClosed({
         $script:Dashboard = $null
         $script:DashboardLabels = $null
+        $script:DashboardAiList = $null
     })
 
     $script:Dashboard = $form
     $script:DashboardLabels = $labels
+    $script:DashboardAiList = $aiList
+    $script:AiAppsSignature = ''
+    $script:AiAppsRefreshAt = [datetime]::MinValue
     Update-DashboardUi  # populate immediately so it doesn't flash a row of '-' before the next poll tick
     $form.Show()
     $form.Activate()
@@ -1579,12 +1816,36 @@ function Update-DashboardUi {
         Set-StatusRow $script:DashboardLabels['Agent'] 'Not registered' '' 'red'
     }
 
-    # Tally
-    if ($State.TallyProcess) {
-        $cmp = if ($State.LoadedCompany) { "$($State.LoadedCompany)" } else { '' }
-        Set-StatusRow $script:DashboardLabels['Tally'] 'Running' $cmp 'green'
-    } else {
-        Set-StatusRow $script:DashboardLabels['Tally'] 'Not running' '' 'gray'
+    # Tally (#33 #34 #37): closed / open but XML server off / several copies / on another computer,
+    # each with its one-click remedy beside the row.
+    try {
+        $ti = Get-TallyStatusInfo
+        $tallyRow = $script:DashboardLabels['Tally']
+        Set-StatusRow $tallyRow $ti.Word $ti.Detail $ti.Health
+        $rb = $tallyRow.Remedy
+        if ($rb -and -not $rb.IsDisposed) {
+            $rt = switch ($ti.Remedy) {
+                'start-tally' { 'Start Tally' }
+                'enable-xml'  { 'Switch on XML server' }
+                'copies'      { 'See the copies...' }
+                default       { '' }
+            }
+            $rb.Tag = [string]$ti.Remedy
+            if ($rt) { $rb.Text = $rt }
+            $rb.Visible = [bool]$rt
+            # Keep the detail text clear of the button.
+            $avail = $tallyRow.Detail.Parent.ClientSize.Width - 14 - $tallyRow.Detail.Left
+            if ($rt) { $avail = $rb.Left - 8 - $tallyRow.Detail.Left }
+            if ($avail -gt 40) { $tallyRow.Detail.Width = $avail }
+        }
+        $sb = $script:DashboardStartTallyBtn
+        if ($sb -and -not $sb.IsDisposed) { $sb.Enabled = -not $State.TallyIsRemote }
+    } catch {
+        if ($State.TallyProcess) {
+            Set-StatusRow $script:DashboardLabels['Tally'] 'Running' "$($State.LoadedCompany)" 'green'
+        } else {
+            Set-StatusRow $script:DashboardLabels['Tally'] 'Not running' '' 'gray'
+        }
     }
 
     # Public URL row. Local mode has no public URL by design, so the row is repurposed to the
@@ -1603,6 +1864,94 @@ function Update-DashboardUi {
         Set-StatusRow $script:DashboardLabels['PublicUrl'] 'OK' "$($State.PublicUrl)" 'green'
     } else {
         Set-StatusRow $script:DashboardLabels['PublicUrl'] 'Unreachable' "$($State.PublicUrl)" 'red'
+    }
+
+    try { Update-AiAppsCard } catch { }
+}
+
+# The "AI apps" card (#38). Re-reads sightings and config files at most every 15 s while the dashboard
+# is open, and rebuilds the rows only when what they say has changed (no flicker every poll).
+function Update-AiAppsCard {
+    param([switch]$Force)
+    $panel = $script:DashboardAiList
+    if (-not $panel -or $panel.IsDisposed) { return }
+    # A row's Fix/Connect is still on the stack (its message boxes pump the timers): rebuilding now
+    # would dispose the very button whose click handler is running.
+    if ($script:AiAppsBusy) { return }
+    if (-not $Force -and ((Get-Date) - $script:AiAppsRefreshAt).TotalSeconds -lt 15) { return }
+    $script:AiAppsRefreshAt = Get-Date
+
+    $rows = @(Get-AiAppRows -InstallRoot $InstallDir)
+    $sig = (@($rows | ForEach-Object { "$($_.Key)|$($_.Text)|$($_.Action)" }) -join ';')
+    if ($sig -eq $script:AiAppsSignature -and $panel.Controls.Count -gt 0) { return }
+    $script:AiAppsSignature = $sig
+
+    $panel.SuspendLayout()
+    try {
+        foreach ($old in @($panel.Controls)) { try { $old.Dispose() } catch { } }
+        $w = $panel.ClientSize.Width
+        if ($rows.Count -eq 0) {
+            $none = New-Object System.Windows.Forms.Label
+            $none.Text      = "No AI app on this PC is connected to Tally yet. Use 'Connect your AI assistant to Tally'."
+            $none.Location  = New-Object System.Drawing.Point 2, 4
+            $none.Size      = New-Object System.Drawing.Size ($w - 4), 36
+            $none.ForeColor = [System.Drawing.Color]::FromArgb(107, 114, 128)
+            $panel.Controls.Add($none)
+            return
+        }
+        $y = 0
+        foreach ($r in $rows) {
+            $pal = Get-HealthPalette $r.Health
+
+            $dot = New-Object System.Windows.Forms.Panel
+            $dot.Location  = New-Object System.Drawing.Point 2, ($y + 9)
+            $dot.Size      = New-Object System.Drawing.Size 8, 8
+            $dot.BackColor = $pal.Dot
+            $dotRgn = New-RoundedRegion 8 8 4
+            if ($dotRgn) { $dot.Region = $dotRgn }
+            $panel.Controls.Add($dot)
+
+            $name = New-Object System.Windows.Forms.Label
+            $name.Text      = [string]$r.Label
+            $name.Font      = New-Object System.Drawing.Font 'Segoe UI Semibold', 9
+            $name.ForeColor = [System.Drawing.Color]::FromArgb(55, 65, 81)
+            $name.Location  = New-Object System.Drawing.Point 16, ($y + 4)
+            $name.Size      = New-Object System.Drawing.Size 120, 20
+            $name.AutoEllipsis = $true
+            $panel.Controls.Add($name)
+
+            $txt = New-Object System.Windows.Forms.Label
+            $txt.Text      = [string]$r.Text
+            $txt.ForeColor = $(if ($r.Health -eq 'amber') { $pal.Text } else { [System.Drawing.Color]::FromArgb(107, 114, 128) })
+            $txt.Location  = New-Object System.Drawing.Point 140, ($y + 4)
+            $txt.Size      = New-Object System.Drawing.Size ([Math]::Max(80, $w - 140 - 124)), 20
+            $txt.AutoEllipsis = $true
+            $txt.Anchor    = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+            $panel.Controls.Add($txt)
+
+            if ($r.Action) {
+                $b = New-Object System.Windows.Forms.Button
+                $b.Text     = $(if ($r.Action -eq 'fix') { 'Fix' } else { 'Connect' })
+                $b.Size     = New-Object System.Drawing.Size 100, 24
+                $b.Location = New-Object System.Drawing.Point ([Math]::Max(240, $w - 118)), ($y + 1)
+                $b.Anchor   = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+                Set-FlatButton $b $(if ($r.Action -eq 'fix') { 'primary' } else { 'secondary' })
+                # Per-row data rides on the button, never on a loop variable read after the loop.
+                $b.Tag = @{ Action = $r.Action; Target = $r.Target; Label = $r.Label }
+                $b.Add_Click({
+                    $script:AiAppsBusy = $true
+                    try { Invoke-AiAppAction -Info $this.Tag } catch { }
+                    finally {
+                        $script:AiAppsBusy = $false
+                        $script:AiAppsRefreshAt = [datetime]::MinValue
+                    }
+                })
+                $panel.Controls.Add($b)
+            }
+            $y += 28
+        }
+    } finally {
+        $panel.ResumeLayout()
     }
 }
 
@@ -1691,20 +2040,42 @@ function Update-TrayUi {
         $miUpdate.Visible = $false
     }
 
-    if ($State.TallyProcess) {
-        $cmp = if ($State.LoadedCompany) { " - $($State.LoadedCompany)" } else { '' }
-        $many = if ($State.TallyCount -gt 1) { " ($($State.TallyCount) copies open)" } else { '' }
-        if ($State.TallyXmlOk -eq $false) {
-            $miTallyState.Text = "  Tally:    open, but NOT connected$many  -  click for help"
-        } else {
-            $miTallyState.Text = "  Tally:    Running$cmp$many"
-        }
-    } else {
-        $miTallyState.Text = "  Tally:    not running"
-    }
     # The status row is the only place a non-technical user will look, so make it the thing that
-    # explains itself when it is unhappy. Enabled only while there is something to explain.
-    $miTallyState.Enabled = ($State.TallyXmlOk -eq $false) -or ($State.TallyCount -gt 1)
+    # explains itself when it is unhappy. Enabled only while there is something to explain or fix:
+    # closed -> start it, XML server off -> switch it on, several copies -> pick which to close,
+    # another computer not answering -> what to check there.
+    try {
+        $ti = Get-TallyStatusInfo
+        switch ($ti.Remedy) {
+            'start-tally' { $miTallyState.Text = "  Tally:    closed  -  click to start it" }
+            'enable-xml'  { $miTallyState.Text = "  Tally:    open, but its XML server is off  -  click to fix" }
+            'copies'      { $miTallyState.Text = "  Tally:    $($State.TallyCount) copies open  -  click to choose" }
+            default {
+                if ($State.TallyIsRemote -and $State.TallyXmlOk -ne $true) {
+                    $miTallyState.Text = "  Tally:    on $($State.TallyHost), NOT reachable  -  click for help"
+                } elseif ($State.TallyIsRemote) {
+                    $cmpR = if ($State.LoadedCompany) { " - $($State.LoadedCompany)" } else { '' }
+                    $miTallyState.Text = "  Tally:    on $($State.TallyHost), connected$cmpR"
+                } elseif ($ti.Word -eq 'Starting') {
+                    $miTallyState.Text = "  Tally:    starting..."
+                } else {
+                    $cmp = if ($State.LoadedCompany) { " - $($State.LoadedCompany)" } else { '' }
+                    $miTallyState.Text = "  Tally:    Running$cmp"
+                }
+            }
+        }
+        $miTallyState.Enabled = [bool]$ti.Remedy -or ($State.TallyIsRemote -and $State.TallyXmlOk -ne $true)
+    } catch {
+        $miTallyState.Enabled = ($State.TallyXmlOk -eq $false) -or ($State.TallyCount -gt 1)
+    }
+
+    # Tally-process actions mean nothing for a Tally on another computer (#37).
+    $isRemoteTally = [bool]$State.TallyIsRemote
+    $miLaunchTally.Visible  = -not $isRemoteTally
+    $miEnableXml.Visible    = -not $isRemoteTally
+    $miTallyCopies.Visible  = (-not $isRemoteTally) -and ($State.TallyCount -gt 1)
+    $miLocalTally.Visible   = $isRemoteTally
+    $miRemoteTally.Text     = $(if ($isRemoteTally) { "Tally is on another computer ($($State.TallyHost))..." } else { 'Tally is on another computer...' })
 
     if ($null -eq $State.PublicUrlOk) {
         $miUrlState.Text = "  Public URL: not configured"
@@ -1730,6 +2101,8 @@ $timer.Add_Tick({
     Complete-UpdateCheck
     Update-TrayUi
     Update-DashboardUi
+    # At most every few minutes: offer to connect Cursor / Windsurf / LM Studio installed after us (#39).
+    try { Invoke-LateInstallOffers } catch { }
 })
 
 # First poll synchronously so the icon shows real status from the moment the tray appears
@@ -1738,6 +2111,19 @@ $timer.Add_Tick({
 Invoke-StatusPoll
 Update-TrayUi
 $timer.Start()
+
+# The AI-activity frame (#22) runs on its own thread with its own 200 ms timer (see
+# tray-coordination.ps1 for why); the first poll above has already handed it the coordination folder.
+try { Start-ActivityOverlay } catch { }
+
+# Restart countdown (#25): a cheap file check four times a second on the UI thread. Show(), not
+# ShowDialog(), so this message loop - and every other timer - keeps running while it is up.
+$coordTimer = New-Object System.Windows.Forms.Timer
+$coordTimer.Interval = 250
+$coordTimer.Add_Tick({
+    try { Update-RestartCountdown } catch { }
+})
+$coordTimer.Start()
 
 # Watch for "show dashboard" requests from a second launch (the Open Dashboard shortcut). Poll the
 # named event on the UI thread so Show-Dashboard runs on the WinForms message-loop thread (WinForms
@@ -1768,7 +2154,11 @@ if ($ShowDashboard) { Show-Dashboard }
 
 [System.Windows.Forms.Application]::Run()
 
-# Cleanup on Application.Exit
+# Cleanup on Application.Exit (which also ends the overlay thread's message loop; the Stop flag is
+# the belt to that brace).
+try { Stop-ActivityOverlay } catch { }
+try { Stop-TallyReadyWatch } catch { }
+try { $coordTimer.Dispose() } catch { }
 $tray.Visible = $false
 $tray.Dispose()
 $timer.Dispose()

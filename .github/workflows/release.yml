@@ -80,8 +80,45 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Publishing a draft release creates its v* tag, and that tag push starts this workflow again
+  # (#42). Without this job the second run sat waiting for `release` environment approval, and if
+  # approved would only have failed on "Release vX already exists". This cheap job runs WITHOUT the
+  # environment, so it needs no approval: when a tag push names a release that already exists, the
+  # build (and everything after it) is skipped. A tag pushed with no release behind it builds as
+  # before, and a manual dispatch always builds (exists is never true for it), so the draft path is
+  # unchanged.
+  #
+  # Read-only token: a draft is invisible to it, so a tag pushed by hand while a draft for it exists
+  # still builds, and the "already exists" guard in Publish release (which runs with write access)
+  # stops it there, as it always has.
+  check:
+    name: Check for an existing release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      exists: ${{ steps.lookup.outputs.exists }}
+    steps:
+      - name: Look up the release for this tag
+        id: lookup
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT_NAME" = "push" ] && gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release $TAG already exists (published from a draft). Nothing to build."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: Build Windows installer
+    needs: check
+    if: needs.check.outputs.exists != 'true'
     runs-on: windows-latest
     # Scopes signing secrets to this environment and lets a required reviewer gate the build.
     # Configure at Settings -> Environments -> release.
@@ -151,6 +188,12 @@ jobs:
           npx tsc --noEmit
           npm test
 
+      # The Claude Desktop extension (#40): a small launcher for the installed server, zipped from
+      # mcpb/ with Node built-ins only (no dependency). The script refuses a manifest whose version
+      # differs from package.json, which the version step above has already tied to the tag.
+      - name: Build Claude Desktop extension
+        run: npm run build:mcpb
+
       # Pinned + hash-verified, installed portable into its own directory, and passed to the build
       # by path - never whichever ISCC the runner image or `choco install` happens to provide.
       - name: Install Inno Setup (pinned)
@@ -174,7 +217,7 @@ jobs:
           }
           & .\scripts\installer\build-installer.ps1 @buildArgs
 
-      - name: Hash the installer
+      - name: Hash the installer and the extension
         id: hash
         shell: pwsh
         run: |
@@ -187,6 +230,15 @@ jobs:
           "name=$($exe.Name)"      | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "sha=$sha"               | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
+          $mcpb = Get-ChildItem dist-mcpb\claudally-*.mcpb | Select-Object -First 1
+          if (-not $mcpb) { throw "No extension produced in dist-mcpb/" }
+          $mcpbSha = (Get-FileHash -Path $mcpb.FullName -Algorithm SHA256).Hash.ToLower()
+          "$mcpbSha  $($mcpb.Name)" | Out-File -FilePath "$($mcpb.FullName).sha256" -Encoding ascii
+          Write-Host "$($mcpb.Name)  $($mcpb.Length) bytes  sha256=$mcpbSha"
+          "mcpb_path=$($mcpb.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "mcpb_name=$($mcpb.Name)"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "mcpb_sha=$mcpbSha"           | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
       - name: Upload build artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -194,6 +246,8 @@ jobs:
           path: |
             dist-installer/Claudally-Setup-*.exe
             dist-installer/Claudally-Setup-*.exe.sha256
+            dist-mcpb/claudally-*.mcpb
+            dist-mcpb/claudally-*.mcpb.sha256
           retention-days: 14
 
       # Cryptographic provenance: proves this exact binary was produced by this workflow, from this
@@ -203,7 +257,9 @@ jobs:
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
-          subject-path: ${{ steps.hash.outputs.path }}
+          subject-path: |
+            ${{ steps.hash.outputs.path }}
+            ${{ steps.hash.outputs.mcpb_path }}
 
       # Notes come from .github/release-notes.md.tmpl so they can be edited without touching this
       # workflow. A manual dispatch produces a DRAFT, so a build can be exercised end to end
@@ -222,6 +278,8 @@ jobs:
           $notes = $notes.Replace('{{VERSION}}', $v)
           $notes = $notes.Replace('{{FILE}}', '${{ steps.hash.outputs.name }}')
           $notes = $notes.Replace('{{SHA}}', '${{ steps.hash.outputs.sha }}')
+          $notes = $notes.Replace('{{MCPB_FILE}}', '${{ steps.hash.outputs.mcpb_name }}')
+          $notes = $notes.Replace('{{MCPB_SHA}}', '${{ steps.hash.outputs.mcpb_sha }}')
           $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
           $notes | Out-File -FilePath $notesFile -Encoding utf8
 
@@ -229,6 +287,8 @@ jobs:
             "v$v",
             '${{ steps.hash.outputs.path }}',
             '${{ steps.hash.outputs.path }}.sha256',
+            '${{ steps.hash.outputs.mcpb_path }}',
+            '${{ steps.hash.outputs.mcpb_path }}.sha256',
             '--title', "Claudally $v",
             '--notes-file', $notesFile
           )
@@ -239,7 +299,9 @@ jobs:
 
   # Refresh the landing page so its download button and verification hash describe the release we
   # just published. Invoked as a reusable workflow rather than left to pages.yml's own `release`
-  # trigger, which cannot fire for a release created with GITHUB_TOKEN.
+  # trigger, which cannot fire for a release created with GITHUB_TOKEN. Skipped with the build when
+  # `check` finds the release already exists: publishing a draft by hand is a real user's event, so
+  # pages.yml's own `release` trigger refreshes the site for that one (#43).
   publish-site:
     name: Republish landing page
     needs: build

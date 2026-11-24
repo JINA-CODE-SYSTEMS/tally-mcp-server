@@ -49,4 +49,6 @@ export interface ModelPushResponse {
     deleted: number;
     lastVchId: number;
     error?: string;
+    /** Set when nothing was written because another process is reloading Tally (#26). */
+    busy?: { retryAfterSec: number; tool: string };
 }

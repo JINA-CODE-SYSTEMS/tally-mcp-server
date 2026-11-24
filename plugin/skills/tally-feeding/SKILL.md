@@ -75,8 +75,20 @@ the wrong books. Confirm the exact company first:
 - `list-loaded-companies` to see what's active. If the client isn't loaded, find it
   with `list-companies` / `list-available-companies`, then `open-company` or
   `load-company`, and `set-active-company`.
+- `load-company` closes and reopens Tally, and anyone entering data in Tally loses
+  unsaved work. Ask first ("Tally will close and reopen to load the company. Anyone
+  entering data in Tally will lose unsaved work. Shall I go ahead?") and only on a yes
+  call it with `confirmRestart: true`. If it reports someone using the PC, or a cancel
+  at the PC, tell the user and don't retry on your own.
 - Once you know the exact name, **pass `targetCompany` explicitly on every read and
   write** for the rest of the session. Don't rely on the default staying put.
+- **Right machine, right books.** The same account can be used on two PCs, each with
+  its own Tally. `status` reports `machine` and `companyId`; the sheet records both.
+  Compare them before the first write of a session, and on a mismatch **stop and ask**
+  ("This sheet was made for <machine> / <company id>; you are on <machine> / <company
+  id>. Which books should I use?"). Pass the sheet's id as `expectedCompanyId` and its
+  machine as `expectedMachine` on every write so the server refuses any other books,
+  including a copy of the same books on another PC.
 
 ### Phase 1 — Load or start the client's instruction sheet
 
@@ -176,6 +188,20 @@ ledger or stock item that doesn't yet exist will fail.
      splits CGST+SGST vs IGST from the `isInterState` flag and auto-resolves tax
      ledgers.
    - `create-voucher` for non-GST double entry — Payment, Receipt, Contra, Journal.
+   - `create-vouchers` for several at once: **chunks of about 50**, reporting each
+     chunk's results before the next. **Always pass `reference`** (bill / document
+     number) **and `skipIfExists: true`** for vouchers from documents, so a resend (or
+     someone on another PC posting the same bill) is recognised, not duplicated. After a
+     partial failure resume with the remaining rows only; never resend a whole batch
+     without `skipIfExists`.
+   - `import-vouchers` for a CSV or Excel **file** of transactions: don't re-type the
+     rows. Build the column mapping, run it with `dryRun` (the default) and show the
+     user the totals, samples and row-numbered errors, then post with `dryRun: false`.
+   - Every real batch returns a `batchId`: resend the same rows with `resumeBatchId`
+     after a stop part-way, and `undo-batch` previews then deletes exactly that batch
+     (only after the user confirms; vouchers edited since are refused).
+   - A used manual voucher number is refused with `DUPLICATE_NUMBER`; pass
+     `allowDuplicateNumber` only if the user confirms the repeat is intended.
    - `create-ledger` / `create-stock-item` for masters.
    - Always pass `targetCompany`.
 5. **Capture results** — voucher numbers and any errors. On an error, **stop the batch
@@ -211,7 +237,12 @@ loop is what makes the skill get better with use.
 - **Never fabricate** GSTINs, HSN/SAC codes, or tax rates — read them from masters or
   ask. Wrong GST data flows straight into returns.
 - **Dates in `YYYY-MM-DD`; amounts > 0; debit/credit direction correct.**
-- **On any tool error, stop and report** — don't retry writes blindly.
+- **On any tool error, stop and report** — don't retry writes blindly. `BUSY` means
+  another AI window is using Tally; waiting the suggested seconds and retrying is safe.
+- **Chunks of ~50, with references and `skipIfExists: true`.** Resume, never resend.
+- **Right machine, right books** — compare `machine` / `companyId` with the sheet;
+  pass `expectedCompanyId` and `expectedMachine`.
+- **Never restart Tally without asking** — `load-company` needs the user's yes.
 
 ## Distribution note
 

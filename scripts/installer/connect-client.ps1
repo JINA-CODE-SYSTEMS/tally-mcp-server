@@ -30,8 +30,11 @@
     The Tally MCP install root. Defaults to this script's grandparent.
 
 .PARAMETER Target
-    apps (default), claude-desktop, cursor, vscode, or all.
-    'apps' is every app with one per-user config: Claude Desktop, and Cursor when it is installed.
+    apps (default), claude-desktop, cursor, windsurf, lmstudio, vscode, or all.
+    'apps' is every app with one per-user config: Claude Desktop, and Cursor, Windsurf and LM Studio
+    when each is installed for this user. Name one to connect only that app, e.g.
+        connect-client.ps1 -Target windsurf
+        connect-client.ps1 -Target lmstudio
     VS Code is per-project and needs -Workspace.
 
 .PARAMETER Workspace
@@ -50,7 +53,7 @@
 [CmdletBinding()]
 param(
     [string]$InstallDir,
-    [ValidateSet('apps', 'claude-desktop', 'cursor', 'vscode', 'all')]
+    [ValidateSet('apps', 'claude-desktop', 'cursor', 'windsurf', 'lmstudio', 'vscode', 'all')]
     [string]$Target = 'apps',
     [string]$Workspace,
     [switch]$Remove,
@@ -182,7 +185,8 @@ if ($anyBlocked) {
     # so a user who leaves it running sees no Tally tools and concludes the install failed.
     Write-Host "Done. Now QUIT the app COMPLETELY and reopen it -" -ForegroundColor Green
     Write-Host "closing the window is not enough. Claude Desktop: use File > Exit, or the tray icon." -ForegroundColor Green
-    Write-Host "Cursor: close every Cursor window. Tally tools appear once the app restarts." -ForegroundColor Green
+    Write-Host "Cursor, Windsurf, LM Studio: close every window of the app, then open it again." -ForegroundColor Green
+    Write-Host "Tally tools appear once the app restarts." -ForegroundColor Green
 } else {
     Write-Host "Already connected. Nothing needed doing." -ForegroundColor Green
 }

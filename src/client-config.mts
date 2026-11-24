@@ -226,9 +226,10 @@ export interface ClientTarget {
    * one and it is missing, `apply` skips the target rather than creating a config (and a folder)
    * for an app that is not there. Claude Desktop has none on purpose: pre-writing its config is
    * what makes "install Claude later" work (#172). Removal ignores this - a stale entry is cleaned
-   * up wherever the file exists.
+   * up wherever the file exists. A list means "any one of these": an app with both a per-user
+   * install folder and a data folder in the profile is installed when either is present.
    */
-  appFolder?(ctx: TargetContext): string | undefined;
+  appFolder?(ctx: TargetContext): string | string[] | undefined;
   /**
    * Further copies of the same config that the app may read INSTEAD of resolvePath's file. Every
    * command treats each one exactly like the main file. See the Claude Desktop target for why.
@@ -247,6 +248,35 @@ export function envForAppdata(appdata: string, base: NodeJS.ProcessEnv = process
 
 function listDirOrEmpty(dir: string): string[] {
   try { return fs.readdirSync(dir); } catch { return []; }
+}
+
+/**
+ * %LOCALAPPDATA% for a target's app-folder test. With --home pointing at ANOTHER profile, that
+ * profile's own AppData\Local, never the caller's; otherwise the real variable. Undefined off
+ * Windows, or when neither is known.
+ */
+function userLocalDir(ctx: TargetContext): string | undefined {
+  if ((ctx.platform ?? process.platform) !== 'win32') return undefined;
+  const p = ctx.p ?? path;
+  if (ctx.home) return p.join(ctx.home, 'AppData', 'Local');
+  return (ctx.env ?? process.env).LOCALAPPDATA || undefined;
+}
+
+/**
+ * %ProgramFiles% for a target's app-folder test: where a machine-wide install lives. Unlike
+ * userLocalDir it does not follow --home, because it is the same folder for every profile.
+ * Undefined off Windows, or when the variable is not set.
+ */
+function machineProgramFilesDir(ctx: TargetContext): string | undefined {
+  if ((ctx.platform ?? process.platform) !== 'win32') return undefined;
+  return (ctx.env ?? process.env).ProgramFiles || undefined;
+}
+
+/** The app-folder candidates as a list, or undefined for a target that is never gated. */
+export function appFolderCandidates(target: ClientTarget, ctx: TargetContext): string[] | undefined {
+  const f = target.appFolder?.(ctx);
+  if (f === undefined) return undefined;
+  return Array.isArray(f) ? f : [f];
 }
 
 /** The name for our entry wherever we choose it: the generic block, Cursor, the command-line tools. No spaces, no underscores. */
@@ -338,9 +368,90 @@ export const CLIENT_TARGETS: ClientTarget[] = [
       if (!home) return { ok: false, reason: 'cannot locate the home directory for the Cursor config' };
       return { ok: true, file: p.join(home, '.cursor', 'mcp.json') };
     },
+    // Installed when either program folder exists (the per-user installer's, or a machine-wide
+    // install's), or when Cursor has already created ~/.cursor. The program folders are needed
+    // because ~/.cursor only appears once Cursor has been LAUNCHED: the tray offers to connect
+    // Cursor as soon as it is installed (scripts/tray/tray-ai-apps.ps1 tests these same two
+    // program folders), and that offer used to end in "Cursor does not appear to be installed".
+    // Writing ~/.cursor/mcp.json before the first launch is safe: Cursor reads it on start.
     appFolder: (ctx) => {
+      const p = ctx.p ?? path;
       const home = ctx.home ?? os.homedir();
-      return home ? (ctx.p ?? path).join(home, '.cursor') : undefined;
+      const local = userLocalDir(ctx);
+      const programFiles = machineProgramFilesDir(ctx);
+      return [
+        ...(local ? [p.join(local, 'Programs', 'cursor')] : []),
+        ...(programFiles ? [p.join(programFiles, 'cursor')] : []),
+        ...(home ? [p.join(home, '.cursor')] : [])
+      ];
+    }
+  },
+  // --- Windsurf and LM Studio (#39) ------------------------------------------------------------
+  // RE-VERIFY BOTH AGAINST THE VENDOR DOCS AT EVERY RELEASE. The paths and schemas below were taken
+  // from each vendor's documentation in November 2026, and neither is stable: Windsurf (formerly
+  // Codeium's editor) has been renamed in places, and its config still lives under ".codeium". LM
+  // Studio documents its mcp.json as following Cursor's notation. If a vendor moves the file, this
+  // writes a config the app never reads and the user sees no Tally tools, so check before shipping.
+  {
+    id: 'windsurf',
+    label: 'Windsurf',
+    serversKey: 'mcpServers',
+    serverName: GENERIC_SERVER_NAME,
+    jsonc: false,
+    // Windsurf documents { command, args, env } for a local server and no "type" field, so the
+    // entry is exactly that (the same shape as Claude Desktop's).
+    buildEntry: (launch) => ({
+      command: launch.command,
+      args: [...launch.args],
+      ...(launch.env ? { env: { ...launch.env } } : {})
+    }),
+    // Per-user: ~/.codeium/windsurf/mcp_config.json (Windows: %USERPROFILE%\.codeium\windsurf).
+    resolvePath: (ctx) => {
+      const p = ctx.p ?? path;
+      const home = ctx.home ?? os.homedir();
+      if (!home) return { ok: false, reason: 'cannot locate the home directory for the Windsurf config' };
+      return { ok: true, file: p.join(home, '.codeium', 'windsurf', 'mcp_config.json') };
+    },
+    // Installed when its per-user program folder exists, or when Windsurf has already created its
+    // data folder in the profile (a machine-wide install has no per-user program folder).
+    appFolder: (ctx) => {
+      const p = ctx.p ?? path;
+      const home = ctx.home ?? os.homedir();
+      const local = userLocalDir(ctx);
+      return [
+        ...(local ? [p.join(local, 'Programs', 'Windsurf')] : []),
+        ...(home ? [p.join(home, '.codeium', 'windsurf')] : [])
+      ];
+    }
+  },
+  {
+    id: 'lmstudio',
+    label: 'LM Studio',
+    serversKey: 'mcpServers',
+    serverName: GENERIC_SERVER_NAME,
+    jsonc: false,
+    // LM Studio's mcp.json follows Cursor's notation, so it gets Cursor's entry.
+    buildEntry: (launch) => ({
+      type: 'stdio',
+      command: launch.command,
+      args: [...launch.args],
+      ...(launch.env ? { env: { ...launch.env } } : {})
+    }),
+    // Per-user: ~/.lmstudio/mcp.json (Windows: %USERPROFILE%\.lmstudio).
+    resolvePath: (ctx) => {
+      const p = ctx.p ?? path;
+      const home = ctx.home ?? os.homedir();
+      if (!home) return { ok: false, reason: 'cannot locate the home directory for the LM Studio config' };
+      return { ok: true, file: p.join(home, '.lmstudio', 'mcp.json') };
+    },
+    appFolder: (ctx) => {
+      const p = ctx.p ?? path;
+      const home = ctx.home ?? os.homedir();
+      const local = userLocalDir(ctx);
+      return [
+        ...(home ? [p.join(home, '.lmstudio')] : []),
+        ...(local ? [p.join(local, 'Programs', 'LM Studio')] : [])
+      ];
     }
   },
   {
@@ -369,7 +480,7 @@ export const CLIENT_TARGETS: ClientTarget[] = [
 ];
 
 /** Targets configured once per user, as opposed to per workspace folder (VS Code). */
-export const USER_LEVEL_TARGETS = ['claude-desktop', 'cursor'];
+export const USER_LEVEL_TARGETS = ['claude-desktop', 'cursor', 'windsurf', 'lmstudio'];
 
 export function targetById(id: string): ClientTarget | undefined {
   return CLIENT_TARGETS.find(t => t.id === id);
@@ -1015,7 +1126,7 @@ export interface CliOptions {
    * which hand-rolled JSON editing in PowerShell would have thrown away.
    */
   appdata?: string;
-  /** Override for the home directory, for targets that live under it (Cursor). Same purpose as --appdata. */
+  /** Override for the home directory, for targets that live under it (Cursor, Windsurf, LM Studio). Same purpose as --appdata. */
   home?: string;
   /**
    * Refuse to remove an entry unless it actually points INSIDE --install-root.
@@ -1088,7 +1199,7 @@ export function parseCliArgs(argv: string[]): CliOptions {
 
 const CLI_COMMANDS = ['detect', 'status', 'apply', 'remove', 'show'];
 
-const USAGE = 'usage: node dist/client-config.mjs <detect|status|apply|remove|show> [--target claude-desktop|cursor|vscode|apps|all]'
+const USAGE = 'usage: node dist/client-config.mjs <detect|status|apply|remove|show> [--target claude-desktop|cursor|windsurf|lmstudio|vscode|apps|all]'
   + ' [--workspace DIR] [--appdata DIR] [--home DIR] [--require-install-root] [--install-root DIR] [--node PATH] [--json] [--dry-run] [--allow-comment-loss]\n';
 
 export function runCli(argv: string[]): number {
@@ -1130,17 +1241,18 @@ export function runCli(argv: string[]): number {
     const files = [resolved.file, ...(target.extraPaths?.(ctx) ?? [])];
     // An app that is not on this machine gets no config written for it. `detect` and `remove` still
     // look: detect reports what is there, and remove must be able to clean up after an uninstall.
-    const appFolder = target.appFolder?.(ctx);
-    const installed = appFolder === undefined || fs.existsSync(appFolder);
+    const appFolders = appFolderCandidates(target, ctx);
+    const installed = appFolders === undefined || appFolders.some(f => fs.existsSync(f));
     if (!installed && (opts.command === 'apply' || opts.command === 'status')) {
-      report.push({ target: id, skipped: `${target.label} does not appear to be installed for this user (no ${appFolder})`, notInstalled: true });
+      const where = appFolders!.length === 0 ? 'no app folder to look for' : `no ${appFolders!.join(' or ')}`;
+      report.push({ target: id, skipped: `${target.label} does not appear to be installed for this user (${where})`, notInstalled: true });
       continue;
     }
     const entry = target.buildEntry(launch);
     for (const file of files) {
       try {
         if (opts.command === 'detect') {
-          report.push({ target: id, file, exists: fs.existsSync(file), ...(appFolder !== undefined ? { installed } : {}) });
+          report.push({ target: id, file, exists: fs.existsSync(file), ...(appFolders !== undefined ? { installed } : {}) });
           continue;
         }
         // `status` is `apply --dry-run`: same parse, same ownership test, no write. One code path, so

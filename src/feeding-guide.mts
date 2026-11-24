@@ -17,6 +17,7 @@
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { IMPORT_VOUCHERS_GUIDE } from './import-vouchers.mjs';
 
 export const FEEDING_GUIDE = `# Feeding data into Tally Prime: client-consistent data entry
 
@@ -73,8 +74,21 @@ books. Confirm the exact company first:
 - Call \`status\`, then \`list-loaded-companies\` to see what is active. If the client isn't loaded,
   find it with \`list-companies\` / \`list-available-companies\`, then \`open-company\` or
   \`load-company\`, and \`set-active-company\`.
+- \`load-company\` closes and reopens Tally, and anyone entering data in Tally loses unsaved work.
+  It refuses until you have asked: tell the user "Tally will close and reopen to load the company.
+  Anyone entering data in Tally will lose unsaved work. Shall I go ahead?" and only on a yes call it
+  again with \`confirmRestart: true\`. If it answers that someone is using the PC, or that the
+  restart was cancelled at the PC, tell the user and do not retry on your own.
 - Once you know the exact name, **pass \`targetCompany\` explicitly on every read and write** for
   the rest of the session. Don't rely on the default staying put.
+- **Check you are on the right machine and books.** The same account can be used on two PCs, each
+  with its own Tally, and a company with the same name on another PC may be a copy. \`status\`
+  reports \`machine\` and \`companyId\`. The instruction sheet records both. Before the first write
+  in a session, compare them. On a mismatch, **stop and ask**: "This sheet was made for
+  <machine> / <company id>; you are on <machine> / <company id>. Which books should I use?" Pass
+  the sheet's company id as \`expectedCompanyId\` and its machine as \`expectedMachine\` on every
+  write; the server then refuses a write to any other books, including a copy of the same books on
+  another PC.
 
 ### Phase 1: load or start the client's instruction sheet
 
@@ -162,6 +176,15 @@ stock item that doesn't yet exist will fail.
    - \`create-gst-voucher\` for GST Sales, Purchase, Debit Note and Credit Note. It splits
      CGST+SGST versus IGST from the inter-state flag and resolves the tax ledgers.
    - \`create-voucher\` for non-GST double entry: Payment, Receipt, Contra, Journal.
+   - \`create-vouchers\` for several vouchers at once. **Post in chunks of about 50 rows**, and
+     report each chunk's results to the user before sending the next. Large single batches hit
+     output limits and are hard to recover from.
+   - **Always pass a \`reference\`** (the bill or document number) and **\`skipIfExists: true\`** for
+     vouchers that come from a document. The reference makes the voucher's identity stable, so a
+     resend (or another person on another PC posting the same bill) is recognised instead of
+     duplicated.
+   - **After a partial failure, resume with the remaining rows only.** Never resend the whole
+     batch without \`skipIfExists: true\`.
    - \`create-ledger\` / \`create-stock-item\` for masters.
    - Always pass \`targetCompany\`.
    - If a write result carries an entry-order note, relay it to the user.
@@ -171,6 +194,8 @@ stock item that doesn't yet exist will fail.
 
 > If the server is in read-only mode (\`status\` reports it), the write tools are refused. Hand the
 > user the exact plan for manual entry instead.
+
+${IMPORT_VOUCHERS_GUIDE}
 
 ### Phase 5: verify what you fed
 
@@ -196,7 +221,13 @@ place** so contradictions do not accumulate.
 - **Never fabricate** GSTINs, HSN/SAC codes or tax rates. Read them from masters or ask. Wrong
   GST data flows straight into returns.
 - **Dates in \`YYYY-MM-DD\`; amounts greater than zero; debit and credit direction correct.**
-- **On any tool error, stop and report.** Don't retry writes blindly.
+- **On any tool error, stop and report.** Don't retry writes blindly. \`BUSY\` means another AI
+  window is using Tally; waiting the suggested seconds and retrying is safe.
+- **Chunks of about 50, with references, \`skipIfExists: true\`.** Resume after a failure; never
+  resend a whole batch.
+- **Right machine, right books.** Compare \`machine\` and \`companyId\` with the sheet before the
+  first write; pass \`expectedCompanyId\` and \`expectedMachine\`.
+- **Never restart Tally without asking.** \`load-company\` needs the user's yes first.
 - **Never enter data through the Tally window.** Keystrokes are for login and company selection
   only; all masters and vouchers go through the write tools.`;
 
@@ -205,6 +236,8 @@ export const INSTRUCTION_SHEET_TEMPLATE = `Replace every <angle-bracket> placeho
 # Instruction sheet — <Company Name>
 
 - **Company (exact Tally name):** <Company Name as shown in Tally>
+- **Machine (PC name, from status; pass as expectedMachine on every write):** <machine>
+- **Company id (from status; pass as expectedCompanyId on every write):** <companyId>
 - **Slug (filename):** <company-slug>
 - **GSTIN(s):** <GSTIN or "none">
 - **Financial year in use:** <e.g. 2025-26>

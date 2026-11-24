@@ -6,6 +6,14 @@ Download `{{FILE}}` and run it. The wizard takes a Windows box from nothing inst
 
 Requires Tally Prime (Silver or Gold) with the XML server enabled on port 9000: **F1 → Settings → Connectivity → Client/Server Configuration**.
 
+### Claude Desktop extension (optional)
+
+`{{MCPB_FILE}}` adds Tally to Claude Desktop as an extension that Claude Desktop installs and manages itself. It starts the Claudally installed by the setup above, so install that first, then open the `.mcpb` file (or drag it into Claude Desktop's Extensions settings). SHA-256:
+
+```
+{{MCPB_SHA}}
+```
+
 ### Verify your download
 
 This installer is **not yet code-signed**, so Windows will warn about an unrecognised publisher. Until signing is in place the SHA-256 below is the only way to confirm you have the file we built — check it before running:
@@ -29,6 +37,7 @@ release workflow from a specific commit — not just that it matches a hash we p
 
 ```
 gh attestation verify .\{{FILE}} -R JINA-CODE-SYSTEMS/tally-mcp-server
+gh attestation verify .\{{MCPB_FILE}} -R JINA-CODE-SYSTEMS/tally-mcp-server
 ```
 
 That is a stronger guarantee than a checksum alone, and it holds even before code signing lands.
