@@ -13,7 +13,7 @@ import type { ModelPushResponse } from './models.mjs';
 import { FEEDING_INSTRUCTIONS_LINE, registerFeedingGuide } from './feeding-guide.mjs';
 import { registerUpdateCheck } from './update-check.mjs';
 import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
-import { ACTIVITY_BANNERS, MachineBusyError, describeBusy, readLockHolder, runRestartCountdown, withActivity, withMachineLock, type LockHolder } from './coordination.mjs';
+import { MachineBusyError, describeBusy, readLockHolder, runRestartCountdown, withActivity, withMachineLock, type LockHolder } from './coordination.mjs';
 import { buildJournal, describeBatchBusy, executeUndo, findEarlierBatch, makeBatchJournalStore, NOT_SENT, OUTCOME_UNKNOWN, openJournalForResume, planUndo, runJournaledBatch, isValidBatchId, type BatchJournal, type BatchJournalStore, type BeforeSend, type JournaledBatchResult } from './batch-journal.mjs';
 import { allowedImportRoots, checkImportPath, convertRows, importVouchersInputShape, loadImportTable, summarizeImport } from './import-vouchers.mjs';
 import { describeExistingNumber, findManualNumberClash, inBatchNumberClashes, inBatchNumberRefusals, makeDuplicateNumberChecker, makeNumberingResolver, type DuplicateNumberChecker } from './voucher-numbering.mjs';

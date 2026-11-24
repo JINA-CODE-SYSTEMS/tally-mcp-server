@@ -30,9 +30,10 @@ export const DEFAULT_TALLY_DATA_PATH = 'C:\\Users\\Public\\TallyPrimeEditLog\\da
 export function coordinationDir(env: NodeJS.ProcessEnv = process.env): string {
   const configured = (env.TALLY_DATA_PATH ?? '').trim();
   if (configured) return configured;
-  // Off Windows (tests, a Linux remote server) there is no Tally data folder; keep the files out of
-  // the install tree and somewhere every process agrees on.
-  return process.platform === 'win32' ? DEFAULT_TALLY_DATA_PATH : path.join(os.tmpdir(), 'claudally');
+  // Off Windows (tests, a Linux remote server) there is no Tally data folder. Use a folder only this
+  // user can reach, not the shared temp dir: in /tmp another local user could create claudally/
+  // first and plant links or lock files there. Every process of the same user agrees on this path.
+  return process.platform === 'win32' ? DEFAULT_TALLY_DATA_PATH : path.join(os.homedir(), '.claudally', 'coordination');
 }
 
 // On Windows, renaming over a file fails with EPERM/EACCES/EBUSY while another handle has the target

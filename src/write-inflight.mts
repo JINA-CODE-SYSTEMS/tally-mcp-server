@@ -103,8 +103,11 @@ export function liveInflightWrites(opts: { env?: NodeJS.ProcessEnv; now?: () => 
     let mtime = 0;
     let rec: InflightWrite | null = null;
     try {
-      mtime = fs.statSync(file).mtimeMs;
-      const obj = JSON.parse(fs.readFileSync(file, 'utf-8').replace(/^﻿/, ''));
+      // One handle for both, so the time and the contents belong to the same file.
+      const fd = fs.openSync(file, 'r');
+      let text: string;
+      try { mtime = fs.fstatSync(fd).mtimeMs; text = fs.readFileSync(fd, 'utf-8'); } finally { fs.closeSync(fd); }
+      const obj = JSON.parse(text.replace(/^﻿/, ''));
       rec = obj && typeof obj === 'object' && obj.schemaVersion === 1 ? obj as InflightWrite : null;
     } catch (err: any) {
       if (err?.code === 'ENOENT') continue; // finished while we looked

@@ -285,6 +285,8 @@ const num = (s: string | undefined): number => {
  * vouchers carry the party line there); stock lines from ALLINVENTORYENTRIES.LIST / INVENTORYENTRIES.LIST.
  * Side: ISDEEMEDPOSITIVE=Yes is a debit; without that tag, a negative AMOUNT is (Tally's sign convention).
  */
+const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 export function normalizedPostingFromExport(block: string): NormalizedPosting | null {
   const b = String(block ?? '');
   if (!/<VOUCHER\b/.test(b)) return null;
@@ -293,7 +295,7 @@ export function normalizedPostingFromExport(block: string): NormalizedPosting | 
   const dm = /^(\d{4})(\d{2})(\d{2})$/.exec(rawDate) ?? /^(\d{4})-(\d{2})-(\d{2})/.exec(rawDate);
   const date = dm ? `${dm[1]}-${dm[2]}-${dm[3]}` : rawDate;
   const vchType = child(header, 'VOUCHERTYPENAME') ?? decodeXmlEntities((/\bVCHTYPE="([^"]*)"/.exec(b) || [])[1] ?? '');
-  const lists = (tag: string) => [...b.matchAll(new RegExp(`<${tag.replace(/\./g, '\\.')}\\b[^>]*>([\\s\\S]*?)</${tag.replace(/\./g, '\\.')}>`, 'g'))].map(m => stripLists(m[1] ?? ''));
+  const lists = (tag: string) => { const t = escapeRegExp(tag); return [...b.matchAll(new RegExp(`<${t}\\b[^>]*>([\\s\\S]*?)</${t}>`, 'g'))].map(m => stripLists(m[1] ?? '')); };
   const readLedgers = (tag: string) => lists(tag)
     .map(e => {
       const name = child(e, 'LEDGERNAME');
@@ -490,14 +492,19 @@ export function makeBatchJournalStore(baseDir: string, opts: { ttlMs?: number; n
     for (const name of names) {
       const file = path.join(dir, name);
       try {
-        const st = fs.statSync(file);
+        // lstat: judge the entry itself, never what a link might point at; unlink removes only the entry.
+        const st = fs.lstatSync(file);
+        if (!st.isFile()) continue;
         if (name.endsWith('.tmp')) { if (now() - st.mtimeMs > 60 * 60 * 1000) fs.unlinkSync(file); continue; }
         // A lock left by a process that died: its heartbeat (which rewrites the file) stopped long ago.
         if (name.endsWith('.lock')) { if (now() - st.mtimeMs > 24 * 60 * 60 * 1000) fs.unlinkSync(file); continue; }
         if (!name.endsWith('.json')) continue;
         let at = st.mtimeMs;
         try {
-          const j = JSON.parse(fs.readFileSync(file, 'utf-8'));
+          const fd = fs.openSync(file, 'r');
+          let raw: string;
+          try { raw = fs.readFileSync(fd, 'utf-8'); } finally { fs.closeSync(fd); }
+          const j = JSON.parse(raw);
           const t = Date.parse(j?.updatedAt ?? j?.createdAt);
           if (Number.isFinite(t)) at = t;
         } catch { /* judged by file time */ }
