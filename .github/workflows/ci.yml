@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -60,13 +60,34 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
 
       # --ignore-scripts, like release.yml: no dependency lifecycle scripts, and CI tests the exact
       # install mode the release build uses (so a dependency that starts needing one fails here).
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Run tests
+        run: npm test
+
+  # The same test run the release build does, on the OS the product ships for. Without it, a test
+  # that only fails on Windows (path short names, environment-name casing) is first seen when the
+  # release build fails - after the PR has merged. That is how the 0.11.0 build broke.
+  test-windows:
+    name: Tests (Windows)
+    runs-on: windows-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
@@ -82,7 +103,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
