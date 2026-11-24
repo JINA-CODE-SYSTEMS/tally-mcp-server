@@ -23,7 +23,10 @@ A double-click installer that takes a Windows box from "nothing installed" to
 4. **Remote mode only:** registers the `TallyMCP` Windows service via the bundled NSSM, pointing at
    the bundled portable Node (no system Node required). A local install registers no service -
    the MCP client starts the stdio entrypoint on demand - and instead writes the entry into the user's
-   `claude_desktop_config.json`, merging into it rather than replacing it.
+   `claude_desktop_config.json`, merging into it rather than replacing it. Cursor
+   (`~/.cursor/mcp.json`), Windsurf (`~/.codeium/windsurf/mcp_config.json`) and LM Studio
+   (`~/.lmstudio/mcp.json`) get the same entry when they are installed for that user, and are
+   skipped otherwise. See [Connecting one app](#connecting-one-app).
 5. **If a Cloudflare Tunnel token was supplied**, registers a second NSSM service `TallyMCPTunnel`
    running the bundled `cloudflared` so the box gets a stable public HTTPS URL with no router/domain
    config (the MCP server then binds loopback-only — cloudflared connects to it on `127.0.0.1`).
@@ -153,6 +156,8 @@ indices, interactivity, privilege boundaries, upgrade paths - is in
 | `scripts/installer/uninstall-cleanup.ps1` | Pre-uninstall: stops the service(s) incl. `TallyMCPTunnel`, removes NSSM entries, deletes both scheduled tasks |
 | `scripts/installer/test-firstrun-config.ps1` | Tests `firstrun-config.ps1` (above all `-Upgrade`) against fake install roots with every service/task/ACL call stubbed; run in CI |
 | `scripts/tray/tally-mcp-tray.ps1`       | Status tray icon (issue #20). WinForms NotifyIcon + polling loop. |
+| `scripts/installer/connect-client.ps1`  | Writes (or with `-Remove` removes) our entry in the AI apps' config files, as the user who runs it |
+| `mcpb/`, `scripts/build-mcpb.mjs`       | The Claude Desktop extension and its build (`npm run build:mcpb` writes `dist-mcpb/claudally-<version>.mcpb`) |
 
 ## Re-configuring an installed instance
 
@@ -286,6 +291,94 @@ as an `[UninstallRun]` parameter, and Inno expands those at *install* time, so t
 empty and the passwords were always kept. The uninstaller now passes it in its own environment
 (`CLAUDALLY_UNINSTALL_REMOVE_VAULT`), which also reaches the cleanup entries that older installers
 left in `unins000.dat` on upgraded machines.
+
+## Connecting one app
+
+`connect-client.ps1` connects every installed app by default (`-Target apps`). Name one to connect
+only that app, for example after installing it later. Run it as the person who uses the app, not
+as an administrator:
+
+```powershell
+$c = "$env:ProgramFiles\TallyMCP\scripts\installer\connect-client.ps1"
+powershell -ExecutionPolicy Bypass -NoProfile -File $c -Target claude-desktop
+powershell -ExecutionPolicy Bypass -NoProfile -File $c -Target cursor
+powershell -ExecutionPolicy Bypass -NoProfile -File $c -Target windsurf
+powershell -ExecutionPolicy Bypass -NoProfile -File $c -Target lmstudio
+```
+
+Add `-Remove` to take the entry out again. An app that is not installed for the user is reported
+as "not installed" and nothing is created for it. The uninstaller removes our entry from every
+profile's Claude Desktop, Cursor, Windsurf and LM Studio config, but only where it still points
+inside the install being removed.
+
+The Windsurf and LM Studio paths and entry formats follow each vendor's documentation as of
+November 2026. Re-check them against the vendor docs before each release (Windsurf has been
+renamed in places); the targets are in `src/client-config.mts`.
+
+## Claude Desktop extension (.mcpb)
+
+Each release carries `claudally-<version>.mcpb` beside the installer. It is a Claude Desktop
+extension (an MCP Bundle, the format formerly called DXT) that Claude Desktop installs and manages
+itself, so it does not depend on where Claude Desktop keeps its config file, a location that has
+moved more than once on Windows. The config-file route above stays as the fallback, for Claude
+Desktop builds without extension support.
+
+The extension is a thin launcher (`mcpb/server/launcher.mjs`), not a second copy of the server. It
+starts the Claudally that the installer put on this PC, from `C:\Program Files\TallyMCP` by
+default, so settings, passwords and updates all stay with that install. It runs the installed
+`dist\index.mjs` inside the process Claude Desktop started, with Claude Desktop's own Node.js.
+
+### Installing it
+
+1. Install Claudally with `Claudally-Setup-<version>.exe` first. Without it, the extension reports
+   that Claudally is not installed and does not start.
+2. Download `claudally-<version>.mcpb` from the same release. Check its SHA-256 against the
+   `.sha256` file published beside it.
+3. Double-click the file to open it in Claude Desktop, or drag it onto the Extensions page of
+   Claude Desktop's settings. Review the details and choose Install.
+4. If Claudally was installed in a folder other than the default, enter that folder as
+   "Claudally install folder" in the extension's settings.
+
+Use either the extension or the config-file entry, not both, or Claude Desktop lists the Tally
+tools twice. To drop the config-file entry, run `connect-client.ps1 -Target claude-desktop -Remove`
+as that user. An upgrade does not add it back once it has been removed everywhere.
+
+A new Claudally version does not need a new extension: the launcher always starts whatever
+version is installed.
+
+Upgrading Claudally while Claude Desktop is open is fine. The extension's server has the
+install's DuckDB module loaded, so the installer stops it first (`stop-install-processes.ps1`
+recognises it by that loaded module, since its command line names only Claude Desktop's
+extensions folder). Claude Desktop then shows the extension as stopped until it is restarted:
+quit it completely (File > Exit, or Quit from its icon near the clock) and reopen it to start the
+new version. Quitting Claude Desktop before the upgrade and opening it afterwards works the same.
+
+### For Team and Enterprise Owners
+
+On Team and Enterprise plans, Owners can control desktop extensions for the organization from
+Claude's admin settings, separately from local MCP servers configured in Claude Desktop's config
+file. Depending on the plan and settings, that covers whether members may install desktop
+extensions at all, and which extensions are allowed. If your organization restricts them:
+
+- allow this extension, or add `claudally-<version>.mcpb` from the release to the organization's
+  extensions so members can install it from there, and
+- install Claudally itself on each PC, since the extension only launches it.
+
+The names and locations of these settings change between Claude releases. Check the current
+options in your organization's Claude admin settings and the Claude Help Center before rolling
+the extension out.
+
+### Not yet verified
+
+The following could not be checked when the extension was added, and must be verified before it is
+announced:
+
+- installing and running it on the **classic** (non-packaged) Claude Desktop build on Windows;
+- installing and running it on the **packaged** (Microsoft Store / MSIX) Claude Desktop build;
+- installing it on a **Team-plan** account, including with desktop extensions restricted by an
+  Owner;
+- that Claude Desktop's built-in Node.js loads the installed server's native DuckDB module (it is
+  a Node-API module, which is designed to load across Node versions).
 
 ## Why Inno Setup, not WiX
 

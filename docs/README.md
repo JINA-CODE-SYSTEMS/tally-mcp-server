@@ -208,6 +208,54 @@ Because the MCP server typically runs as a Windows service in **Session 0** (no 
 - **`load-company` pings the agent before doing anything destructive** — if the agent isn't responding (or is too old), the tool refuses to kill Tally and returns a clear error. So a misconfigured deployment never ends up worse than it started.
 - **Check liveness** any time via `open-company-debug` — it returns `guiAgentResponding`, `guiAgentVersion`, `guiAgentVersionOk`, and `guiAgentVersionRequired`.
 
+### People working in Tally, and several AI windows at once
+
+Every AI app window starts its own copy of the server, and they all share one Tally — usually
+one a person is also working in. The server protects that person and keeps the copies out of
+each other's way (coordination files: [`docs/dev/coordination.md`](dev/coordination.md)):
+
+- **The AI is visibly working.** While a voucher is posted, the screen is driven or Tally is
+  reopened, the tray draws an orange frame around Tally with "Your AI assistant is posting to
+  Tally" / "…controlling Tally - please don't use the keyboard or mouse" / "…reopening Tally".
+  It disappears a few seconds after the last action and never appears in screenshots.
+- **No typing over a person.** A screen action refuses with `USER_ACTIVE` if the keyboard or
+  mouse was used in the last few seconds (`GUI_USER_IDLE_SEC`), and checks again between steps.
+  A locked PC, a disconnected session or another Windows user fail fast with
+  `SESSION_LOCKED` / `SESSION_DISCONNECTED` / `WRONG_USER`; posting and reports keep working.
+- **No surprise restarts.** `load-company` only previews until it is called with
+  `confirmRestart: true` (the assistant must ask the user first), refuses if the PC was used in
+  the last minute, and shows the person at the PC a 10-second countdown with a Cancel button.
+- **One at a time.** Screen actions and company loads take a machine-wide lock; a second window
+  gets `BUSY` with `retryAfterSec` at once instead of a timeout. XML posting does not queue
+  behind screen actions, but waits out a company load.
+- **Right books.** `status` reports `machine` and `companyId`; the instruction sheet records
+  them, and write tools accept `expectedCompanyId` (refused with `COMPANY_MISMATCH` otherwise).
+- **Duplicate-safe bulk entry.** Batches of about 50 with references and `skipIfExists`; manual
+  voucher numbers are checked for duplicates before posting.
+
+### Tally on another computer
+
+Some firms run Tally Gold as a server on another PC. Set `TALLY_HOST` (and `TALLY_PORT`) to that
+computer — the tray's **Tally is on another computer…** item does it with a connectivity test.
+Then:
+
+- Posting, reports, masters and GST work as usual over Tally's XML port.
+- Screen control, `load-company` / `switch-company` / `load-company-by-alias`, `open-tally` and
+  company-folder scanning are refused with `NOT_AVAILABLE_REMOTE_TALLY`: they need Tally's window
+  and files on this PC. Someone at the Tally computer opens the company.
+- `status` reports `tallyHost` and `tallyLocation: "another-computer"`.
+
+Requirements and cautions:
+
+- On the Tally computer: Tally open, **F1 > Settings > Connectivity > Client/Server
+  Configuration**, "TallyPrime acts as" **Server** (or Both), port 9000. Allow inbound TCP 9000
+  in Windows Firewall, **only from the PCs that need it**.
+- **Tally's XML port has no authentication.** Anyone who can reach it can read and write the
+  books. Use it only on a trusted office network, never expose it to the internet, and prefer a
+  firewall rule scoped to specific IP addresses.
+- Not yet verified end to end against a Tally server on a second machine; treat it as
+  supported-with-care until it is.
+
 ## Setup
 
 ### Connecting — which URL?
@@ -259,6 +307,14 @@ To add the entry by hand instead (File → Settings → Developer):
 ### Local (Cursor)
 
 If Cursor is installed for the Windows user, the installer and **Connect your AI assistant to Tally** also add the server to Cursor's global `~/.cursor/mcp.json`, merging beside any servers already there. Cursor is skipped, and nothing is created, when it is not installed. Close every Cursor window and reopen it to see the tools.
+
+### Local (Windsurf, LM Studio)
+
+The same applies to Windsurf (`%USERPROFILE%\.codeium\windsurf\mcp_config.json`) and LM Studio (`%USERPROFILE%\.lmstudio\mcp.json`): each is connected when it is installed for the Windows user and skipped otherwise, and uninstalling removes the entry again. To connect one installed after Claudally, run **Connect your AI assistant to Tally**, or `connect-client.ps1 -Target windsurf` / `-Target lmstudio`. Restart the app to see the tools.
+
+### Claude Desktop extension (.mcpb)
+
+Each release also carries `claudally-<version>.mcpb`, a Claude Desktop extension that Claude Desktop installs and manages itself, without the config-file edit above. See [docs/installer.md](installer.md#claude-desktop-extension-mcpb).
 
 ### Command-line tools (Claude Code, Codex CLI, Gemini CLI)
 
@@ -356,7 +412,7 @@ Detailed setup guides:
 | `list-companies` | Lists company folders in the Tally data directory (no open company required) |
 | `list-available-companies` | Recursive scan with display names + credential-requirement hints. Handles both stock layout and Tally Prime Edit Log's nested layout. Use this BEFORE `load-company` so an LLM/human knows which folder to load and whether credentials are needed. |
 | `list-loaded-companies` | Lists companies currently resident in Tally (no restart needed) |
-| `load-company` | Loads a company by editing `tally.ini` and restarting Tally. Edition-aware. Accepts optional `userName` + `password` for password-protected companies. |
+| `load-company` | Loads a company by editing `tally.ini` and restarting Tally. Edition-aware. Accepts optional `userName` + `password` for password-protected companies. Previews only until called with `confirmRestart: true`; refuses while someone is using the PC; the tray shows a cancellable countdown. |
 | `set-active-company` | Cheap pointer flip between already-loaded companies (Gold edition) |
 | `open-company` | Legacy multi-strategy loader (**[experimental — see #1](https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues/1)**) |
 | `open-company-debug` | Reports server config, agent liveness, agent version, edition, and Tally XML reachability |

@@ -241,3 +241,100 @@ path every such install will take to receive that migration.
 **e. Interactive runs are unchanged.** Run the new installer by double-clicking over an existing
 install: the wizard appears as before. (It still pre-fills defaults rather than this install's
 values - see the note in [installer.md](installer.md#unattended-upgrade-and-silent-installs).)
+
+## 10. People working in Tally, several AI windows, bulk entry (0.11.0, epic #44)
+
+None of this can run in CI: it needs Windows, Tally and a person at the keyboard. Install the build,
+open Tally with a test company, and connect two AI apps (or two windows of one) to Claudally.
+
+**a. AI-activity frame (#22).**
+
+- [ ] Posting a voucher shows the orange frame around Tally with "Your AI assistant is posting to
+      Tally"; it disappears a few seconds after the last write
+- [ ] A `gui-send-keys` shows "…controlling Tally - please don't use the keyboard or mouse"
+- [ ] `load-company` shows "…reopening Tally" for the whole restart
+- [ ] The frame follows a moved and a maximised Tally window, never takes focus, and clicks go
+      through it to Tally
+- [ ] No frame in `gui-screenshot` output (take several in a row)
+- [ ] Tally minimised: no frame, no error. The agent draws no second frame
+
+**b. No typing over a person (#24, #35).**
+
+- [ ] Keep moving the mouse; `gui-send-keys` returns `USER_ACTIVE` and nothing is typed
+- [ ] Stop moving within 10 s: the action then goes ahead
+- [ ] Two `gui-send-keys` calls a few seconds apart, hands off: the second is NOT refused (the
+      agent's own keystrokes do not count as a person)
+- [ ] Lock the PC (Win+L): a GUI action returns `SESSION_LOCKED` within a few seconds; posting a
+      voucher still works; `status` shows `guiAvailable: false` with the reason
+- [ ] Disconnect an RDP session: `SESSION_DISCONNECTED`. Sign in as another user: `WRONG_USER`
+
+**c. Restart confirmation and countdown (#25).**
+
+- [ ] `load-company` without `confirmRestart` returns `RESTART_NEEDS_CONFIRMATION`; Tally untouched
+- [ ] With `confirmRestart: true` while you are typing in Tally: `USER_ACTIVE`, Tally untouched
+- [ ] Hands off for a minute, `confirmRestart: true`: the tray countdown appears; **Cancel**
+      returns `RESTART_CANCELLED_BY_USER` and Tally is untouched; **Restart now** proceeds at once
+- [ ] The countdown never takes focus: typing in Tally while it is up does not answer it
+- [ ] A company that is already loaded: no restart at all
+
+**d. Several AI windows (#26, #27).**
+
+- [ ] Two windows call `gui-screenshot` at the same moment: one succeeds, the other gets `BUSY`
+      with `retryAfterSec` promptly (no 20 s timeout)
+- [ ] While window A runs `load-company`, window B posts a voucher: B waits, then gets `BUSY`;
+      nothing is written into the restarting Tally
+- [ ] Kill a server process mid-`load-company`: within `MACHINE_LOCK_STALE_SEC` other windows work again
+- [ ] Both windows post with idempotency keys at once: every key replays afterwards
+
+**e. Wrong books (#29).**
+
+- [ ] `status` shows `machine`, `companyId` (GUID) and `companyNumber` for the loaded company. If
+      `companyId` is null, the TDL fields `$Guid` / `$CompanyNumber` need adjusting for this build
+- [ ] A write with a wrong `expectedCompanyId` is refused with `COMPANY_MISMATCH`; with the right
+      GUID or the company number it goes through
+
+**f. Duplicate numbers, batches, import (#28, #31, #32).**
+
+- [ ] On a manually numbered voucher type, posting an existing number is refused with
+      `DUPLICATE_NUMBER` and lists the existing voucher. If it is not refused, check the
+      `NUMBERINGMETHOD` field name for this build (the check fails open)
+- [ ] A batch where row 3 fails (a ledger that does not exist): the result has a `batchId`; fix the
+      ledger and resend with `resumeBatchId` - rows 1-2 are not posted twice
+- [ ] `undo-batch` previews exactly that batch; alter one of its vouchers in Tally, and undo refuses
+      it with `VOUCHER_CHANGED` while deleting the rest after `confirm: true`. On Edit Log builds the
+      rows come back `requires_gui`
+- [ ] Post a voucher with reference "INV/55", then a batch row for the same type and party with
+      "INV 55": Tally alters the first, and `undo-batch` lists it as existed-before, never as a
+      voucher to delete. If it shows as needs-confirmation instead, the `voucher-by-remoteid` report
+      (`$RemoteID` filter) does not work on this build
+- [ ] `import-vouchers` on a 500-row CSV and on an .xlsx saved by Excel: the dry run shows totals and
+      row-numbered errors; the real run posts in chunks of 50; resume after killing it part-way
+
+**g. Show after posting (#23).** Keep it off until this passes on each supported TallyPrime version.
+
+- [ ] Tray > "Show each posted voucher in Tally" on, restart the AI app, post a voucher: the Day Book
+      for that date opens. Nothing is altered
+- [ ] With a voucher entry screen open, and with a popup open: confirm the key sequence does nothing
+      harmful. If Alt+G does not open Go To on this build, the step must stay off for it
+
+**h. Tray tools (#33, #34, #37, #38, #39).**
+
+- [ ] Tally closed: tray says "Tally is closed"; Start Tally starts it and reports "Tally is ready"
+- [ ] XML server off in Tally: tray says so; with Tally closed, "Switch on Tally's XML server" backs
+      up `tally.ini` (`tally.ini.bak-*`) and sets the keys. **Verify the key names `Client Server`
+      and `Port` and their values on this TallyPrime version**, then that `status` turns healthy
+- [ ] Two Tally copies open: the copies dialog lists both (path, version, start time); closing one
+      asks first; loading works again afterwards
+- [ ] Dashboard "AI apps" lists Claude Desktop, Cursor, Windsurf, LM Studio with the right state;
+      Fix / Connect work
+- [ ] Install Cursor (or Windsurf / LM Studio) after Claudally: within a few minutes the tray offers
+      to connect it, once
+- [ ] "Tally is on another computer…" with a Tally server on a second PC: posting and reports work;
+      `load-company` and GUI tools return `NOT_AVAILABLE_REMOTE_TALLY`; no frame, no copy warnings
+
+**i. Claude Desktop extension (#40).** On classic and packaged Claude Desktop, and on a Team-plan
+account: open `claudally-<version>.mcpb`; Claude Desktop installs it with no file edits and Tally's
+tools appear. With Claudally not installed it says to install Claudally first.
+
+**j. Windsurf and LM Studio (#39).** Fresh install with each present: its config gets the
+`tally-prime` entry and the app lists Tally's tools; uninstall removes the entry.

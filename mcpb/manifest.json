@@ -1,0 +1,49 @@
+{
+  "manifest_version": "0.3",
+  "name": "claudally",
+  "display_name": "Claudally for Tally Prime",
+  "version": "0.11.0",
+  "description": "Connects Claude Desktop to Tally Prime through the Claudally server installed on this PC.",
+  "long_description": "Read and enter Tally Prime data from Claude Desktop. This extension is a small launcher: it starts the Claudally server already installed on this PC by Claudally-Setup.exe, so install Claudally first. Your Tally settings stay in that install; nothing is copied into the extension.",
+  "author": {
+    "name": "Jina Code Systems LLP",
+    "url": "https://github.com/JINA-CODE-SYSTEMS"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server"
+  },
+  "homepage": "https://claudally.jinacode.systems",
+  "documentation": "https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/blob/main/docs/installer.md#claude-desktop-extension-mcpb",
+  "support": "https://github.com/JINA-CODE-SYSTEMS/tally-mcp-server/issues",
+  "icon": "icon.png",
+  "license": "AGPL-3.0-or-later",
+  "keywords": ["tally", "tally-prime", "erp", "gst", "accounting"],
+  "server": {
+    "type": "node",
+    "entry_point": "server/launcher.mjs",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/server/launcher.mjs"],
+      "env": {
+        "CLAUDALLY_INSTALL_DIR": "${user_config.install_dir}"
+      }
+    }
+  },
+  "tools_generated": true,
+  "prompts_generated": true,
+  "user_config": {
+    "install_dir": {
+      "type": "directory",
+      "title": "Claudally install folder",
+      "description": "Only needed if Claudally was installed somewhere other than Program Files. Leave empty to find it automatically.",
+      "required": false
+    }
+  },
+  "compatibility": {
+    "platforms": ["win32"],
+    "runtimes": {
+      "node": ">=22.0.0"
+    }
+  }
+}

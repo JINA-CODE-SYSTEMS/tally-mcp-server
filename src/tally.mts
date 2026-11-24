@@ -6,6 +6,8 @@ import path from 'node:path';
 import nunjucks from 'nunjucks';
 import * as m from './models.mjs';
 import { utility, parseIntEnv } from './utility.mjs';
+import { describeBusy, retryAfterFor, waitOutCompanyLoad, withActivity } from './coordination.mjs';
+import { beginInflightWrite } from './write-inflight.mjs';
 
 // Tally connection settings are read at CALL time, never frozen at module load.
 //
@@ -541,7 +543,52 @@ export function parseImportResponse(resultObj: any): m.ModelPushResponse {
     return retval;
 }
 
+// Every XML write goes through here (#22, #26). Three things happen around it:
+//  - it waits out a company load another server process is running: that process is about to kill and
+//    relaunch Tally, so a write now would race the restart. After a short wait it gives up with `busy`
+//    set rather than writing into a Tally that is going away.
+//  - it announces itself with an in-flight marker (write-inflight.mts) BEFORE looking at the lock, and
+//    keeps it up for the whole write. A load that takes the lock just after our check still sees the
+//    marker and waits for this write to finish before it kills Tally. Checking first and announcing
+//    second would leave a gap in which neither side sees the other.
+//  - it raises the "posting" activity signal, which the tray turns into the orange frame around Tally,
+//    so a person at the PC can see the AI is writing to their books.
+// XML writes do NOT take the machine lock: Tally serialises XML requests itself, and posting must not
+// queue behind a screen action.
+async function guardedWrite(fn: () => Promise<m.ModelPushResponse>): Promise<m.ModelPushResponse> {
+    const busy = (holder: NonNullable<Awaited<ReturnType<typeof waitOutCompanyLoad>>>): m.ModelPushResponse => {
+        const retryAfterSec = retryAfterFor(holder, Date.now());
+        return {
+            success: false, created: 0, altered: 0, cancelled: 0, deleted: 0, lastVchId: 0,
+            error: `${describeBusy(holder)} Tally is about to close and reopen, so nothing was written. Try again in about ${retryAfterSec}s.`,
+            busy: { retryAfterSec, tool: holder.tool },
+        };
+    };
+    // A load that finishes while we wait may be followed at once by another; re-announce and re-check
+    // a bounded number of times rather than writing on a stale "it is free now".
+    for (let attempt = 0; ; attempt++) {
+        const endMarker = beginInflightWrite('tally-write');
+        const loading = await waitOutCompanyLoad({ waitMs: 0 });
+        if (!loading) {
+            try {
+                return await withActivity('posting', 'tally-write', fn);
+            } finally {
+                endMarker();
+            }
+        }
+        // Do not hold the marker while waiting: the load is waiting for markers to clear.
+        endMarker();
+        if (attempt >= 2) return busy(loading);
+        const still = await waitOutCompanyLoad();
+        if (still) return busy(still);
+    }
+}
+
 export function handlePush(templateName: string, inputParams: Map<string, any>): Promise<m.ModelPushResponse> {
+    return guardedWrite(() => handlePushUnguarded(templateName, inputParams));
+}
+
+function handlePushUnguarded(templateName: string, inputParams: Map<string, any>): Promise<m.ModelPushResponse> {
     return new Promise<m.ModelPushResponse>(async (resolve, reject) => {
         let retval: m.ModelPushResponse = {
             success: false,
@@ -652,6 +699,10 @@ export function handlePush(templateName: string, inputParams: Map<string, any>):
 // which the flat template/config system can't express) and parses Tally's RESPONSE exactly like
 // handlePush. Pings first (fail fast if Tally is wedged) and injects company credentials if set.
 export function pushXml(xml: string): Promise<m.ModelPushResponse> {
+    return guardedWrite(() => pushXmlUnguarded(xml));
+}
+
+function pushXmlUnguarded(xml: string): Promise<m.ModelPushResponse> {
     return new Promise<m.ModelPushResponse>(async (resolve) => {
         const retval: m.ModelPushResponse = { success: false, created: 0, altered: 0, cancelled: 0, deleted: 0, lastVchId: 0 };
         try {

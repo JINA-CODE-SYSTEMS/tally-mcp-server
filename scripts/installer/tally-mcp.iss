@@ -157,6 +157,15 @@ Source: "{#RepoRoot}\scripts\dpapi-helper.ps1"; DestDir: "{app}\scripts"; Flags:
 ; --- Manage Companies dialog, dot-sourced by tally-mcp-tray.ps1 at startup. ---
 Source: "{#RepoRoot}\scripts\tray\manage-companies-dialog.ps1"; DestDir: "{app}\scripts\tray"; Flags: ignoreversion
 
+; --- Tray helpers, also dot-sourced by tally-mcp-tray.ps1 at startup: the AI-activity frame and
+; restart countdown, the Tally actions (start / XML server / copies / another computer), the
+; tally.ini XML-server edit (also run on its own, elevated, when tally.ini is not user-writable),
+; and the per-app connection status. ---
+Source: "{#RepoRoot}\scripts\tray\tray-coordination.ps1"; DestDir: "{app}\scripts\tray"; Flags: ignoreversion
+Source: "{#RepoRoot}\scripts\tray\tray-tally.ps1";        DestDir: "{app}\scripts\tray"; Flags: ignoreversion
+Source: "{#RepoRoot}\scripts\tray\tally-ini-xml.ps1";     DestDir: "{app}\scripts\tray"; Flags: ignoreversion
+Source: "{#RepoRoot}\scripts\tray\tray-ai-apps.ps1";      DestDir: "{app}\scripts\tray"; Flags: ignoreversion
+
 ; --- Bundled portable Node.js. Avoids version conflicts with anything else on the box.
 ; The build script populates installer-staging/node-portable/ from the official Node zip. ---
 Source: "{#StagingRoot}\node-portable\*"; DestDir: "{app}\node-portable"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -185,7 +194,7 @@ Name: "{group}\Open {#MyAppName} Dashboard"; Filename: "powershell.exe"; Paramet
 Name: "{autodesktop}\{#MyAppName}";          Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File ""{app}\scripts\tray\tally-mcp-tray.ps1"" -InstallDir ""{app}"" -ShowDashboard"; WorkingDir: "{app}"; Tasks: desktopicon; IconFilename: "{app}\assets\tally-mcp.ico"; Comment: "Open the Tally MCP status dashboard"
 Name: "{group}\{#MyAppName} Logs";       Filename: "{app}\logs"
 Name: "{group}\Reconfigure {#MyAppName}"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\firstrun-config.ps1"" -InstallDir ""{app}"""; WorkingDir: "{app}"
-Name: "{group}\Connect your AI assistant to Tally"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\connect-client.ps1"" -InstallDir ""{app}"""; WorkingDir: "{app}"; Comment: "Point Claude Desktop at this Tally server (run as the person who uses the AI assistant)"
+Name: "{group}\Connect your AI assistant to Tally"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\scripts\installer\connect-client.ps1"" -InstallDir ""{app}"""; WorkingDir: "{app}"; Comment: "Point Claude Desktop and other installed AI apps at this Tally server (run as the person who uses the AI assistant)"
 Name: "{group}\Uninstall {#MyAppName}";  Filename: "{uninstallexe}"
 
 [InstallDelete]
@@ -621,6 +630,16 @@ begin
   //    The helper decides ownership by install path, and deliberately spares anything under
   //    {app}\update: #177 s updater orchestrator runs from there and must outlive the install
   //    it is driving, because it is what performs the rollback if the new build fails to start.
+  //
+  //    "By install path" includes a process with a module loaded from {app}. That is how the
+  //    Claude Desktop extension's server is found: Claude Desktop runs mcpb\server\launcher.mjs
+  //    with its own Node.js from its extensions folder, and the launcher loads {app}\dist\index.mjs
+  //    (and with it duckdb.dll) into that process, so neither its executable nor its command line
+  //    names {app}. Without this, that process kept duckdb.dll locked and the copy below failed.
+  //    CloseApplications stays at its default (offer to close, never force). The helper already
+  //    stops every process with a module loaded from {app}, which covers all that the default
+  //    filter (*.exe,*.dll,*.chm) can report; force would add only that a silent run terminates,
+  //    without asking, whatever else the Restart Manager lists.
   ExtractTemporaryFile('stop-install-processes.ps1');
   Exec('powershell.exe',
        '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{tmp}\stop-install-processes.ps1') + '" -InstallDir "' + ExpandConstant('{app}') + '"',

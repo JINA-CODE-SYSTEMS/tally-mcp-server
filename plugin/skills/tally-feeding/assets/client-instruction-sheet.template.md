@@ -11,6 +11,8 @@
 # Instruction sheet — <Company Name>
 
 - **Company (exact Tally name):** <Company Name as shown in Tally>
+- **Machine (PC name, from status; pass as expectedMachine on every write):** <machine>
+- **Company id (from status; pass as expectedCompanyId on every write):** <companyId>
 - **Slug (filename):** <company-slug>
 - **GSTIN(s):** <GSTIN or "none">
 - **Financial year in use:** <e.g. 2025-26>

@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import dotenv from 'dotenv';
 import { execSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
 import { cacheTable, executeSQL, validateSQL } from './database.mjs';
@@ -12,7 +13,12 @@ import type { ModelPushResponse } from './models.mjs';
 import { FEEDING_INSTRUCTIONS_LINE, registerFeedingGuide } from './feeding-guide.mjs';
 import { registerUpdateCheck } from './update-check.mjs';
 import { makeIdempotencyStore, type IdempotencyStore } from './idempotency.mjs';
+import { ACTIVITY_BANNERS, MachineBusyError, describeBusy, readLockHolder, runRestartCountdown, withActivity, withMachineLock, type LockHolder } from './coordination.mjs';
+import { buildJournal, describeBatchBusy, executeUndo, findEarlierBatch, makeBatchJournalStore, NOT_SENT, OUTCOME_UNKNOWN, openJournalForResume, planUndo, runJournaledBatch, isValidBatchId, type BatchJournal, type BatchJournalStore, type BeforeSend, type JournaledBatchResult } from './batch-journal.mjs';
+import { allowedImportRoots, checkImportPath, convertRows, importVouchersInputShape, loadImportTable, summarizeImport } from './import-vouchers.mjs';
+import { describeExistingNumber, findManualNumberClash, inBatchNumberClashes, inBatchNumberRefusals, makeDuplicateNumberChecker, makeNumberingResolver, type DuplicateNumberChecker } from './voucher-numbering.mjs';
 import { normalizePartyFields, validatePartyFields, planPartyUpdate, changesFromPlan, buildPartyAlterXml, verifyPartyFields, type PartyRow } from './party.mjs';
+import { waitForInflightWrites } from './write-inflight.mjs';
 
 // Load .env from the install directory by ABSOLUTE path (next to dist/), never relative to the
 // process working directory. Under NSSM the service cwd happens to equal the install directory, so
@@ -261,7 +267,7 @@ export function describeTallyUnreachable(
   if (/not running/i.test(instance.reason)) {
     return {
       message: 'Tally Prime is not open.',
-      remedy: `Start Tally Prime and open your company, then try again. If this is the first time: ${TALLY_CONNECTIVITY_STEPS}`
+      remedy: `Start Tally Prime and open your company, then try again — the Claudally icon in the Windows taskbar tray has a "Start Tally" option that does it in one click. If this is the first time: ${TALLY_CONNECTIVITY_STEPS}`
     };
   }
   // Several instances, or something else holding the port — resolveTallyInstance already wrote a
@@ -310,7 +316,10 @@ async function listLoadedCompanies(): Promise<string[]> {
     const re = /<COMPANY[^>]*\sNAME\s*=\s*"([^"]+)"/gi;
     let match: RegExpExecArray | null;
     while ((match = re.exec(resp)) !== null) {
-      const name = match[1].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').trim();
+      // The same full decoder the identity report's names go through (&apos; and numeric references
+      // included). A partial decoder here made "Shah's Enterprises" a different name from the one the
+      // identity report returns for it, and the #29 guard then compared against another company's id.
+      const name = decodeXmlEntities(match[1]).trim();
       if (name && !names.includes(name)) names.push(name);
     }
     return names;
@@ -441,6 +450,107 @@ async function fetchCompanyPeriod(companyName: string | null): Promise<CompanyPe
   const xml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPPeriodReport</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>${svCompany}</STATICVARIABLES><TDL><TDLMESSAGE><REPORT NAME="MCPPeriodReport"><FORMS>MCPPeriodForm</FORMS></REPORT><FORM NAME="MCPPeriodForm"><PARTS>MCPPeriodPart</PARTS><XMLTAG>DATA</XMLTAG></FORM><PART NAME="MCPPeriodPart"><LINES>MCPPeriodLine</LINES><REPEAT>MCPPeriodLine : MCPPeriodColl</REPEAT><SCROLLED>Vertical</SCROLLED></PART><LINE NAME="MCPPeriodLine"><FIELDS>FCname,FCfrom,FCto,FCcur,FClast,FCbooks</FIELDS><XMLTAG>ROW</XMLTAG></LINE><FIELD NAME="FCname"><SET>$Name</SET><XMLTAG>F01</XMLTAG></FIELD><FIELD NAME="FCfrom"><SET>$StartingFrom</SET><XMLTAG>F02</XMLTAG></FIELD><FIELD NAME="FCto"><SET>$EndingAt</SET><XMLTAG>F03</XMLTAG></FIELD><FIELD NAME="FCcur"><SET>##SVCurrentDate</SET><XMLTAG>F04</XMLTAG></FIELD><FIELD NAME="FClast"><SET>$LastVoucherDate</SET><XMLTAG>F05</XMLTAG></FIELD><FIELD NAME="FCbooks"><SET>$BooksFrom</SET><XMLTAG>F06</XMLTAG></FIELD><COLLECTION NAME="MCPPeriodColl"><TYPE>Company</TYPE></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
   const resp = await postTallyXML(xml);
   return parseCompanyPeriod(resp, companyName);
+}
+
+// ── machine and company identity (#29) ──────────────────────────────────────────────────────────
+// The same AI account can be used on two PCs, each with its own Tally, and a chat or instruction sheet
+// built against PC A's books can be continued on PC B. A company with the same NAME on B (a copy of
+// the client's data) would then take the writes. So report something that tells the books apart: the
+// machine, and the company's GUID (every Tally object has one) plus its company number (the data
+// folder id). Both fields MUST be verified on the supported TallyPrime versions; an empty value is
+// reported as null rather than guessed.
+export type CompanyIdentity = { machine: string; company: string | null; companyGuid: string | null; companyNumber: string | null; companyId: string | null };
+
+// Which Tally PC the identity describes. With Tally on this PC that is this PC's name. With TALLY_HOST
+// pointing at another computer (#37) this server's own name says nothing about whose books answered,
+// so the identity names both ends: "<this server>@<tally host>". Two servers pointed at different Tallys
+// then never look alike, and a sheet recorded through one route is not silently matched through another.
+export function tallyMachineName(host: string | undefined = process.env.TALLY_HOST, thisHost: string = os.hostname()): string {
+  return isRemoteTallyHost(host, thisHost) ? `${thisHost}@${String(host).trim()}` : thisHost;
+}
+
+// Reads the identity report. With preferCompany, ONLY a row whose name is that company counts: the
+// report lists every loaded company, so falling back to the first row would hand back another company's
+// GUID, and the guard would compare the caller's id against books it is not about to write. With no
+// preference the answer is only meaningful when exactly one company is loaded; which one Tally happens
+// to list first is arbitrary. Two loaded companies with the same name cannot be told apart by name at
+// all. Every one of those cases reports null ids rather than a guess, and the guard fails closed on null.
+export function parseCompanyIdentity(xml: string, preferCompany: string | null, machine: string = tallyMachineName()): CompanyIdentity {
+  const out: CompanyIdentity = { machine, company: preferCompany && preferCompany.trim() ? preferCompany : null, companyGuid: null, companyNumber: null, companyId: null };
+  const rows: string[] = String(xml || '').match(/<ROW>[\s\S]*?<\/ROW>/gi) || [];
+  if (!rows.length) return out;
+  const field = (row: string, tag: string): string | null => {
+    const m = row.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'i'));
+    const v = m ? decodeXmlEntities(m[1]!).trim() : '';
+    return v || null;
+  };
+  let candidates = rows;
+  if (preferCompany && preferCompany.trim()) {
+    const want = masterKey(preferCompany);
+    candidates = rows.filter(r => masterKey(field(r, 'F01') || '') === want);
+  }
+  if (candidates.length !== 1) return out;
+  const chosen = candidates[0]!;
+  out.company = field(chosen, 'F01');
+  out.companyGuid = field(chosen, 'F02');
+  out.companyNumber = field(chosen, 'F03');
+  out.companyId = out.companyGuid ?? out.companyNumber;
+  return out;
+}
+
+async function fetchCompanyIdentity(companyName: string | null): Promise<CompanyIdentity> {
+  const svCompany = companyName ? `<SVCURRENTCOMPANY>${escapeXml(companyName)}</SVCURRENTCOMPANY>` : '';
+  const xml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>MCPCompanyIdReport</ID></HEADER><BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>${svCompany}</STATICVARIABLES><TDL><TDLMESSAGE><REPORT NAME="MCPCompanyIdReport"><FORMS>MCPCompanyIdForm</FORMS></REPORT><FORM NAME="MCPCompanyIdForm"><PARTS>MCPCompanyIdPart</PARTS><XMLTAG>DATA</XMLTAG></FORM><PART NAME="MCPCompanyIdPart"><LINES>MCPCompanyIdLine</LINES><REPEAT>MCPCompanyIdLine : MCPCompanyIdColl</REPEAT><SCROLLED>Vertical</SCROLLED></PART><LINE NAME="MCPCompanyIdLine"><FIELDS>CIname,CIguid,CInum</FIELDS><XMLTAG>ROW</XMLTAG></LINE><FIELD NAME="CIname"><SET>$Name</SET><XMLTAG>F01</XMLTAG></FIELD><FIELD NAME="CIguid"><SET>$Guid</SET><XMLTAG>F02</XMLTAG></FIELD><FIELD NAME="CInum"><SET>$CompanyNumber</SET><XMLTAG>F03</XMLTAG></FIELD><COLLECTION NAME="MCPCompanyIdColl"><TYPE>Company</TYPE></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+  try {
+    return parseCompanyIdentity(await postTallyXML(xml), companyName);
+  } catch {
+    return { machine: tallyMachineName(), company: companyName, companyGuid: null, companyNumber: null, companyId: null };
+  }
+}
+
+// Does the caller's expectedCompanyId name these books? Pure.
+//
+// The GUID is the identity whenever it can be read. A company NUMBER is not: numbers repeat across
+// installs (the first company on most PCs is 10000), and a copied data folder or restored backup carries
+// both the number and the GUID with it. So a bare number is accepted only where status itself reports
+// the number as the id (this build cannot read the GUID), and only when the caller has also confirmed
+// the machine (expectedMachine matched) — a number alone would match the first company on any PC.
+export function companyIdMatches(expected: string, id: CompanyIdentity, opts: { machineConfirmed?: boolean } = {}): boolean {
+  const want = expected.trim().toLowerCase();
+  if (!want) return true;
+  if (id.companyGuid) return id.companyGuid.trim().toLowerCase() === want;
+  return !!opts.machineConfirmed && !!id.companyNumber && id.companyNumber.trim().toLowerCase() === want;
+}
+
+export function machineMatches(expected: string, actual: string): boolean {
+  return expected.trim().toLowerCase() === actual.trim().toLowerCase();
+}
+
+// ── open-period error text (#36) ─────────────────────────────────────────────────────────────────
+// "Outside the open period" alone is a dead end for someone who typed the wrong financial year. Name the
+// period, name the year the date falls in, and say how to fix it. fyStartMonthDay defaults to Indian
+// April-March when the period does not give it.
+export function financialYearLabel(isoDate: string, fyStartIso: string | null): string | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate);
+  if (!m) return null;
+  const [sm, sd] = fyStartIso && /^\d{4}-\d{2}-\d{2}$/.test(fyStartIso) ? [Number(fyStartIso.slice(5, 7)), Number(fyStartIso.slice(8, 10))] : [4, 1];
+  const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3]);
+  const startYear = (mo > sm || (mo === sm && d >= sd)) ? y : y - 1;
+  return sm === 1 && sd === 1 ? `FY ${startYear}` : `FY ${startYear}-${String((startYear + 1) % 100).padStart(2, '0')}`;
+}
+
+export function describeOutOfPeriod(date: string, period: { fyFrom: string | null; fyTo: string | null; booksFrom?: string | null }): { message: string; remedy: string } {
+  const lo = period.booksFrom || period.fyFrom;
+  const dateFy = financialYearLabel(date, period.fyFrom);
+  const openFy = period.fyFrom ? financialYearLabel(period.fyFrom, period.fyFrom) : null;
+  const beforeBooks = !!period.booksFrom && date < period.booksFrom;
+  const message = `Voucher date ${date} is outside the company's open period (${lo ?? '?'} to ${period.fyTo ?? '?'}).`
+    + (period.booksFrom ? ` Books begin on ${period.booksFrom}.` : '')
+    + (dateFy && openFy && dateFy !== openFy ? ` The date is in ${dateFy}; the company is open for ${openFy}.` : '');
+  const remedy = beforeBooks
+    ? `This date is before the company's books begin (${period.booksFrom}), so Tally cannot take it. Check the date with the user; if it is right, the entry belongs in an earlier company or the books-beginning date must change in Tally (Alt+F3 > Alter company).`
+    : `Check the date with the user. If it is right, change the period in Tally to cover it (press F2 on the Gateway of Tally and set the period${dateFy ? ` to ${dateFy}` : ''}), then try again. If the date is wrong, correct it and post again.`;
+  return { message, remedy };
 }
 
 // ── read-surface helpers (#92 H-6, #93 H-7) ────────────────────────────────
@@ -1484,7 +1594,10 @@ export function getTallyEdition(rawValue: string | undefined = process.env.TALLY
 // current server with a stale agent is exactly the silent wrong-window bug, so fail closed and make
 // the operator restart the agent. (Local/in-session deployments never hit this check — they run the
 // script shipped in the same install.)
-export const REQUIRED_AGENT_VERSION = '1.8.0';
+// 1.9.0 (#24, #35): the agent refuses to type while someone is using the keyboard or mouse, or while the
+// PC is locked or the session disconnected, and answers idle-status. Without it load-company's
+// "nobody at the PC" check has nothing to ask.
+export const REQUIRED_AGENT_VERSION = '1.9.0';
 
 // The agent version that introduced the `switch-company` action. switch-company refuses to dispatch
 // to an older agent (which would return "Unknown action" and leave Tally untouched) — but we also
@@ -1624,8 +1737,45 @@ export function guiTransportNeedsVersionHandshake(mode: GuiTransportMode = guiTr
   return mode === 'ipc';
 }
 
+// Agent actions that never touch the screen: no activity frame, no idle check. Under the IPC transport
+// they still take the machine lock (as a short "probe" hold), because every IPC call shares the same
+// command and result files: see callGuiAgent.
+const PASSIVE_GUI_ACTIONS = new Set(['ping', 'idle-status']);
+
+// Seconds without human keyboard/mouse input the agent requires before it acts (#24). The agent also
+// reads GUI_USER_IDLE_SEC itself, but under IPC it runs with its own environment, so send it along.
+export function guiUserIdleSec(raw: string | undefined = process.env.GUI_USER_IDLE_SEC): number {
+  const n = Number.parseFloat(String(raw ?? ''));
+  return Number.isFinite(n) && n >= 0 ? Math.min(n, 120) : 5;
+}
+
+// How long the agent waits for a person to stop using the keyboard or mouse before refusing (#24).
+const GUI_USER_IDLE_WAIT_SEC = 10;
+
+// A synthetic agent response for "another call holds the machine lock", so every call site handles it
+// through the same errorCode path as the agent's own refusals.
+export function busyGuiResponse(holder: LockHolder | null, retryAfterSec: number): GuiAgentResponse {
+  return {
+    status: 'error',
+    message: describeBusy(holder),
+    agentVersion: null,
+    raw: { status: 'error', errorCode: 'BUSY', retryAfterSec, holderTool: holder?.tool ?? null, holderStartedAt: holder?.startedAt ?? null },
+  };
+}
+
+// True for the synthetic BUSY above: the agent was NOT asked, because another call holds the screen.
+export function isBusyGuiResponse(resp: GuiAgentResponse | null): boolean {
+  return resp?.raw?.errorCode === 'BUSY';
+}
+
 // Sends a command to the GUI agent and waits for its response, via whichever transport is active.
 // Returns the response, or null on timeout. Every GUI call site goes through here.
+//
+// Screen actions run under the machine-wide lock (#26): every AI window on the PC has its own server
+// process, and two of them typing into Tally at once interleave keystrokes. The second caller gets an
+// immediate BUSY rather than overwriting the first one's IPC command and timing out. They also raise the
+// "controlling" activity signal (#22) for the tray's frame — except a screenshot, which asks the tray to
+// HIDE the frame so it never appears in what the model sees.
 async function callGuiAgent(
   action: string,
   payload: Record<string, any>,
@@ -1633,10 +1783,408 @@ async function callGuiAgent(
   dataPath: string,
   logs: string[]
 ): Promise<GuiAgentResponse | null> {
-  if (guiTransportMode === 'in-session') {
-    return callGuiAgentInSession(action, payload, timeoutSec, dataPath, logs);
+  const dispatch = (p: Record<string, any>) => guiTransportMode === 'in-session'
+    ? callGuiAgentInSession(action, p, timeoutSec, dataPath, logs)
+    : callGuiAgentViaIpc(action, p, timeoutSec, dataPath, logs);
+  if (PASSIVE_GUI_ACTIONS.has(action)) {
+    // In-session runs a private child per call with nothing shared, so a probe needs no lock there.
+    if (guiTransportMode === 'in-session') return dispatch(payload);
+    // Under IPC every call shares _mcp_gui_command.json / _mcp_gui_result.json and the agent runs one
+    // command at a time. An unlocked ping from status/get-context in another window could overwrite a
+    // screen action's pending command, or consume its result, so the screen action times out and a
+    // retry re-types its keys (or credentials) into a Tally that already moved on. So a probe takes
+    // the lock too, as a short "probe" hold that other callers wait out instead of answering BUSY.
+    // If a screen action holds the lock, the probe does not touch the IPC files at all and answers
+    // with the synthetic BUSY: the agent is working for someone else. Inside a call chain that already
+    // holds the lock (load-company's own pings) withMachineLock just runs it.
+    try {
+      return await withMachineLock(`gui:${action}`, 'gui', () => dispatch(payload), { probe: true });
+    } catch (err) {
+      if (!(err instanceof MachineBusyError)) throw err;
+      logs.push(`  [gui-agent] ${action} not sent: ${err.message}`);
+      return busyGuiResponse(err.holder, err.retryAfterSec);
+    }
   }
-  return callGuiAgentViaIpc(action, payload, timeoutSec, dataPath, logs);
+  const enriched = { userIdleSec: guiUserIdleSec(), userIdleWaitSec: GUI_USER_IDLE_WAIT_SEC, ...payload };
+  // The agent may now wait up to userIdleWaitSec for a person to stop typing before it acts (#24), so the
+  // caller's budget grows by that much; otherwise a polite wait would surface as AGENT_UNREACHABLE.
+  timeoutSec += Number(enriched.userIdleWaitSec) || 0;
+  try {
+    return await withMachineLock(`gui:${action}`, 'gui', async () => {
+      // show-voucher judges each step by comparing captures of the Tally window, and the tray's pulsing
+      // frame inside those captures can read as "the screen changed" when it did not. Keep the frame
+      // down for it exactly as for a screenshot (it is display-only, so no warning is lost).
+      if (action === 'screenshot' || action === 'show-voucher') {
+        // The hide request is refreshed for the whole capture (the agent may first wait for a person to
+        // stop typing) and survives any other activity heartbeat in this process. Give the tray's 200 ms
+        // timer a beat to take the frame down before the capture.
+        return withActivity('controlling', action, async () => { await sleep(300); return dispatch(enriched); }, undefined, { hideForScreenshot: true });
+      }
+      return withActivity('controlling', action, () => dispatch(enriched));
+    });
+  } catch (err) {
+    if (err instanceof MachineBusyError) {
+      logs.push(`  [gui-agent] ${action} refused: ${err.message}`);
+      return busyGuiResponse(err.holder, err.retryAfterSec);
+    }
+    throw err;
+  }
+}
+
+// ── Tally on another computer (#37) ──────────────────────────────────────────────────────────────
+// TALLY_HOST may point at a Tally Gold server elsewhere on the LAN. XML (posting, reports) works the
+// same; everything that needs Tally's window, process or files on THIS machine does not. Pure so the
+// host classification is pinned by a test.
+export function isRemoteTallyHost(
+  host: string | undefined = process.env.TALLY_HOST,
+  thisHost: string = os.hostname(),
+  computerName: string | undefined = process.env.COMPUTERNAME,
+): boolean {
+  const h = String(host ?? '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!h || h === 'localhost' || h === '::1' || h === '0.0.0.0' || /^127\./.test(h)) return false;
+  // The tray uses the same rule (scripts/tray/tray-tally.ps1 Test-TallyHostIsLocal): the DNS host name, or
+  // Windows' 15-character NetBIOS COMPUTERNAME, which can differ from it.
+  const names = [thisHost, computerName ?? ''].map(n => n.trim().toLowerCase()).filter(Boolean);
+  return !names.some(me => h === me || h.split('.')[0] === me);
+}
+
+// Tools that need Tally's window, process or data folder on this machine.
+export const LOCAL_TALLY_ONLY_TOOLS = new Set([
+  'load-company', 'load-company-by-alias', 'switch-company', 'open-tally', 'use-company', 'resolve-company',
+  'list-companies', 'list-available-companies', 'gui-screenshot', 'gui-send-keys', 'gui-delete-voucher',
+  'unlock-stored-credentials',
+]);
+
+// Longest load-company waits for Tally's XML port after the restart. The whole restart holds the machine
+// lock; with the countdown (up to 120 s), start-tally, verification and login it must stay well inside
+// the lock's hard ceiling (MACHINE_LOCK_MAX_HOLD_SEC, default 900 s).
+export const LOAD_COMPANY_MAX_WAIT_SEC = 300;
+
+// ── Restart gate (#25) ───────────────────────────────────────────────────────────────────────────
+// load-company closes and reopens Tally. Anyone mid-entry loses unsaved work, so: never without an
+// explicit confirmRestart from a caller who asked the user, and never while someone has touched the
+// keyboard or mouse in the last minute. Pure so the gate is pinned by tests.
+export function restartUserIdleSec(raw: string | undefined = process.env.RESTART_USER_IDLE_SEC): number {
+  const n = Number.parseFloat(String(raw ?? ''));
+  return Number.isFinite(n) && n >= 0 ? Math.min(n, 600) : 60;
+}
+
+export type RestartGateDecision =
+  | { proceed: true }
+  | { proceed: false; code: 'RESTART_NEEDS_CONFIRMATION' | 'USER_ACTIVE'; message: string; remedy?: string; idleMs?: number };
+
+// Whether a PERSON (not the agent's own injected keys) used the PC within minIdleSec. GetLastInputInfo,
+// behind idleMs, counts the agent's keystrokes too: after any AI screen action (switch-company, a
+// show-after-post Day Book, gui-send-keys) idleMs is a few seconds although nobody touched the PC. The
+// agent tells the two apart itself: userActive is judged against the userIdleSec we send, ignoring its
+// own keys. An older agent that does not report userActive falls back to idleMs, skipped when the last
+// input was the agent's (any human input then predates it and cannot be measured, which is "unknown").
+export function isPersonActive(a: { idleMs: number | null; userActive?: boolean | null; lastInputWasAgent?: boolean | null; minIdleSec: number }): boolean {
+  if (!(a.minIdleSec > 0)) return false;
+  if (typeof a.userActive === 'boolean') return a.userActive;
+  if (a.lastInputWasAgent === true || a.idleMs === null) return false;
+  return a.idleMs < a.minIdleSec * 1000;
+}
+
+export function decideRestartGate(a: {
+  confirmRestart?: boolean; idleMs: number | null; userActive?: boolean | null; lastInputWasAgent?: boolean | null; minIdleSec: number; company: string;
+}): RestartGateDecision {
+  if (a.confirmRestart !== true) {
+    return {
+      proceed: false, code: 'RESTART_NEEDS_CONFIRMATION',
+      message: `Tally will close and reopen to load "${a.company}". Anyone entering data in Tally will lose unsaved work. Nothing has been changed yet.`,
+    };
+  }
+  // Unknown idle time (an agent too old to report it, or the probe failed) does not block: the caller
+  // has the user's confirmation, and the tray still shows a cancellable countdown.
+  if (isPersonActive(a)) {
+    // idleMs is the time since the PERSON's input only when the last input was not the agent's.
+    const humanIdleMs = a.idleMs !== null && a.lastInputWasAgent !== true ? a.idleMs : null;
+    return {
+      proceed: false, code: 'USER_ACTIVE',
+      message: humanIdleMs !== null
+        ? `Someone used the keyboard or mouse on the Tally PC ${Math.round(humanIdleMs / 1000)}s ago, so Tally was not restarted.`
+        : `Someone used the keyboard or mouse on the Tally PC in the last ${a.minIdleSec}s, so Tally was not restarted.`,
+      remedy: `Someone is using the Tally PC. Ask them to save their work and stop for a moment (no input for ${a.minIdleSec}s), then try again.`,
+      ...(humanIdleMs !== null ? { idleMs: humanIdleMs } : {}),
+    };
+  }
+  return { proceed: true };
+}
+
+export type IdleStatus = {
+  idleMs: number | null;
+  /** Agent's verdict: a person used the PC within the userIdleSec we sent (its own keys excluded). */
+  userActive: boolean | null;
+  lastInputWasAgent: boolean | null;
+  session: { state: string; user?: string; sessionId?: number } | null;
+  /** Another call holds the screen, so the agent was not asked. */
+  busy?: { holderTool: string | null; retryAfterSec: number; message: string };
+};
+
+const UNKNOWN_IDLE: IdleStatus = { idleMs: null, userActive: null, lastInputWasAgent: null, session: null };
+
+// Reads an idle-status answer. Null fields when the agent cannot say (old agent, timeout, busy). Pure so
+// the field handling is pinned by a test.
+export function parseIdleStatusResponse(resp: GuiAgentResponse | null): IdleStatus {
+  if (isBusyGuiResponse(resp)) {
+    return { ...UNKNOWN_IDLE, busy: { holderTool: resp!.raw?.holderTool ?? null, retryAfterSec: Number(resp!.raw?.retryAfterSec) || 2, message: resp!.message } };
+  }
+  if (!resp || resp.status !== 'success') return { ...UNKNOWN_IDLE };
+  const raw = resp.raw ?? {};
+  const idle = raw.idleMs === null || raw.idleMs === undefined ? Number.NaN : Number(raw.idleMs);
+  const session = raw.session && typeof raw.session.state === 'string' ? raw.session : null;
+  return {
+    idleMs: Number.isFinite(idle) ? idle : null,
+    userActive: typeof raw.userActive === 'boolean' ? raw.userActive : null,
+    lastInputWasAgent: typeof raw.lastInputWasAgent === 'boolean' ? raw.lastInputWasAgent : null,
+    session,
+  };
+}
+
+// Asks the agent how long the person has been idle and what state the Windows session is in, without
+// touching the screen. userIdleSec is the threshold the agent judges userActive against: the restart
+// gate sends its own (RESTART_USER_IDLE_SEC); without it the agent would use its 5 s default.
+async function queryIdleStatus(dataPath: string, logs: string[], userIdleSec?: number): Promise<IdleStatus> {
+  const resp = await callGuiAgent('idle-status', userIdleSec === undefined ? {} : { userIdleSec }, 8, dataPath, logs);
+  return parseIdleStatusResponse(resp);
+}
+
+// status/get-context view of the screen (#35): XML tools keep working whatever this says.
+export function describeGuiAvailability(
+  agentAlive: boolean, session: IdleStatus['session'], remote: boolean, busyHolderTool?: string | null
+): { guiAvailable: boolean; guiUnavailableReason?: string } {
+  if (remote) return { guiAvailable: false, guiUnavailableReason: 'Tally runs on another computer; screen control is only possible at that PC.' };
+  if (!agentAlive) return { guiAvailable: false, guiUnavailableReason: 'The screen-control helper is not responding.' };
+  // Busy is not "down": the helper is working for another AI window, and screen actions will answer
+  // BUSY (retryable) until it finishes.
+  if (busyHolderTool !== undefined) return { guiAvailable: false, guiUnavailableReason: `Another AI window is using the Tally screen right now${busyHolderTool ? ` (${busyHolderTool})` : ''}. Screen actions will work again when it finishes.` };
+  switch (session?.state) {
+    case 'locked': return { guiAvailable: false, guiUnavailableReason: 'The Tally PC is locked. Unlock it to allow screen actions.' };
+    case 'disconnected': return { guiAvailable: false, guiUnavailableReason: 'The Windows session on the Tally PC is disconnected. Sign back in to allow screen actions.' };
+    case 'wrong-user': return { guiAvailable: false, guiUnavailableReason: `A different Windows user is signed in at the Tally PC.${session.user ? ` Sign in as ${session.user}.` : ''}` };
+    default: return { guiAvailable: true };
+  }
+}
+
+// Runs a company switch under the machine-wide lock as a 'load' (#26): XML writes from other windows
+// wait it out, because the company they would post into is changing underneath them.
+async function withCompanyChangeLock<T>(tool: string, fn: () => Promise<T>): Promise<{ ok: true; value: T } | { ok: false; error: ReturnType<typeof errorResult> }> {
+  try {
+    return { ok: true, value: await withMachineLock(tool, 'load', fn) };
+  } catch (err) {
+    if (!(err instanceof MachineBusyError)) throw err;
+    return { ok: false, error: errorResult('BUSY', { message: err.message, extra: { retryAfterSec: err.retryAfterSec, holderTool: err.holder?.tool ?? null } }) };
+  }
+}
+
+// May load-company skip the restart because the requested FOLDER is already the resident company (#25)?
+// Pure, for the test. Tally lists loaded companies by NAME only, and several data folders can share a
+// name (split financial years, restored backups); resolveCompanyInput answers AMBIGUOUS for such a name
+// and asks for the folder id, so the folder-id retry is exactly the call a name match would get wrong:
+// it would report "already loaded" for the OTHER folder's books, and every later write would go there.
+// So a name match alone is never enough:
+//  - when the loaded company's number can be read, it decides: skip only if it is the requested folder
+//    id (Tally's company number is the data folder's id);
+//  - when it cannot be read, skip only if no other folder in the data path Tally itself uses has that
+//    name. A dataPath override is a different folder tree from the one Tally loaded from, so it never
+//    qualifies.
+// Anything else restarts through the confirmRestart gate: an unneeded restart is safe, a wrong match is not.
+export function decideAlreadyLoaded(a: {
+  folderId: string;
+  folderName: string;
+  folders: Array<{ folder: string; name: string | null }>;
+  loaded: string[];
+  replace: boolean;
+  /** The resident company's $CompanyNumber, null when it could not be read (or the name is not unique among loaded companies). */
+  residentNumber: string | null;
+  /** True when `folders` was scanned from the data path tally.ini names (where Tally loads from). */
+  scannedTallysDataPath: boolean;
+}): { skip: true; resident: string; via: 'company-number' | 'unique-name' } | { skip: false; reason: string } {
+  const norm = (v: string | null | undefined) => String(v ?? '').trim().toLowerCase();
+  const target = norm(a.folderName);
+  const resident = target ? a.loaded.find(n => norm(n) === target) : undefined;
+  if (!resident) return { skip: false, reason: 'not loaded' };
+  // Gold with replace: a restart is still needed to unload the others, unless the target is alone.
+  if (a.replace && a.loaded.length !== 1) return { skip: false, reason: 'replace needs the others unloaded' };
+  const digits = (v: string) => (/^\d+$/.test(v.trim()) ? String(Number.parseInt(v.trim(), 10)) : v.trim());
+  if (a.residentNumber && a.residentNumber.trim()) {
+    return digits(a.residentNumber) === digits(a.folderId)
+      ? { skip: true, resident, via: 'company-number' }
+      : { skip: false, reason: `the loaded "${resident}" is company ${a.residentNumber.trim()}, not folder ${a.folderId}` };
+  }
+  const sameName = a.folders.filter(f => norm(f.name) === target).length;
+  if (sameName === 1 && a.scannedTallysDataPath) return { skip: true, resident, via: 'unique-name' };
+  return { skip: false, reason: sameName > 1 ? `${sameName} folders are named "${a.folderName}" and the loaded one could not be identified` : 'the loaded company could not be identified' };
+}
+
+// How long load-company waits for XML writes already in flight before it gives up rather than kill
+// Tally under them. One write is bounded by the request timeout (30s by default), so this covers it.
+const LOAD_WAIT_FOR_WRITES_MS = 30_000;
+
+// ── expectedCompanyId guard (#29) ────────────────────────────────────────────────────────────────
+export const COMPANY_GUARDED_WRITE_TOOLS = new Set([
+  'create-voucher', 'create-vouchers', 'create-gst-voucher', 'alter-voucher', 'reverse-voucher', 'delete-voucher',
+  'delete-vouchers', 'gui-delete-voucher', 'create-ledger', 'set-ledger-gst', 'update-party-details', 'create-stock-item',
+  'repair-master-names', 'import-vouchers', 'undo-batch',
+]);
+
+// The company a guarded tool will actually write to, worked out the way its handler does, so the guard
+// checks the same books the write lands in:
+//  - undo-batch deletes in the company its batch journal records, never the active one;
+//  - every other guarded tool writes to targetCompany, else the active company. create-vouchers and
+//    import-vouchers stamp every row with that one batch company (a per-voucher targetCompany is ignored),
+//    so the first voucher's targetCompany is not the target either.
+// Returns undefined when the handler itself will refuse first (undo-batch with an unknown batch).
+function intendedCompanyFor(tool: string, args: any): string | null | undefined {
+  if (tool === 'undo-batch') {
+    if (!isValidBatchId(args?.batchId)) return undefined;
+    const journal = getBatchJournalStore().load(args.batchId);
+    return journal ? journal.company : undefined;
+  }
+  const named = typeof args?.targetCompany === 'string' ? args.targetCompany.trim() : '';
+  return named || activeCompany || null;
+}
+
+// The #29 guard. Returns a refusal, or the exact loaded company it checked (null when nothing was asked
+// of it) so the caller can hand that same company to the handler.
+async function checkExpectedCompany(tool: string, args: any): Promise<{ refusal: ReturnType<typeof errorResult> } | { refusal: null; checkedCompany: string | null }> {
+  const expected = typeof args?.expectedCompanyId === 'string' ? args.expectedCompanyId.trim() : '';
+  const expectedMachine = typeof args?.expectedMachine === 'string' ? args.expectedMachine.trim() : '';
+  if (!expected && !expectedMachine) return { refusal: null, checkedCompany: null };
+  const intended = intendedCompanyFor(tool, args);
+  if (intended === undefined) return { refusal: null, checkedCompany: null }; // the handler refuses with the reason
+  const pick = await resolveExactLoadedCompany(intended);
+  if (!pick.ok) {
+    auditLog(tool, args, 'denied', 0);
+    return { refusal: errorResult('COMPANY_NOT_FOUND', { message: pick.message }) };
+  }
+  const id = await fetchCompanyIdentity(pick.name);
+  const machineOk = !expectedMachine || machineMatches(expectedMachine, id.machine);
+  const idOk = !expected || companyIdMatches(expected, id, { machineConfirmed: !!expectedMachine && machineOk });
+  if (machineOk && idOk) return { refusal: null, checkedCompany: pick.name };
+  auditLog(tool, args, 'denied', 0);
+  // Fail closed when the id cannot be read at all: the caller asked for the guard explicitly.
+  const found = id.companyId ? `${id.machine} / ${pick.name} (company id ${id.companyId})` : `${id.machine} / ${pick.name} (its company id could not be read)`;
+  const wanted = [expectedMachine || null, expected ? `company id ${expected}` : null].filter(Boolean).join(' / ');
+  // A bare company number that would have matched, refused only because it cannot identify books alone.
+  const numberOnly = !!expected && !id.companyGuid && !!id.companyNumber && id.companyNumber.trim().toLowerCase() === expected.toLowerCase() && !expectedMachine;
+  const why = !machineOk
+    ? ` This request was made on a different machine (${expectedMachine}); a company with the same name and even the same id here may be a copy of those books.`
+    : numberOnly
+      ? ` A company number on its own cannot identify the books (numbers repeat from PC to PC), so it is only accepted together with expectedMachine.`
+      : '';
+  return { refusal: errorResult('COMPANY_MISMATCH', {
+    message: `This request was made for ${wanted}, but the books open here are ${found}. Nothing was written.${why}`,
+    remedy: numberOnly
+      ? `Pass the instruction sheet's machine as expectedMachine as well. If the sheet does not record it, STOP and ask the user which books to use; do not write until they answer.`
+      : `STOP and ask the user: "The instruction sheet was made for ${wanted}; this PC (${id.machine}) has ${pick.name}${id.companyId ? ` with id ${id.companyId}` : ''} open. Which books should I use?" Do not write until they answer.`,
+    extra: { expectedCompanyId: expected || null, expectedMachine: expectedMachine || null, machine: id.machine, company: pick.name, companyId: id.companyId },
+  }) };
+}
+
+// ── show each posted voucher on screen (#23) ─────────────────────────────────────────────────────
+// Writes stay on XML; this only DISPLAYS the result, for people who want to see the entry in Tally
+// itself. Opt-in (SHOW_AFTER_POST=true, or show: true per call), skipped silently whenever the screen
+// is not free, and never turns a successful post into an error.
+export const SHOW_AFTER_POST_TOOLS = new Set(['create-voucher', 'create-vouchers', 'create-gst-voucher', 'alter-voucher']);
+
+export function wantsShowAfterPost(args: any, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (args?.dryRun === true) return false;
+  if (typeof args?.show === 'boolean') return args.show;
+  return String(env.SHOW_AFTER_POST ?? '').trim().toLowerCase() === 'true';
+}
+
+// Which voucher to show from a tool result: the posted one, or for a batch the LAST posted row (never
+// every row). Pure so it is pinned by a test.
+//
+// The agent opens the Day Book on `date`, and refuses anything but YYYY-MM-DD, so only such a date is
+// ever passed; otherwise none, and the Day Book opens on its own date. A date is never recovered from a
+// serialised result: a Date round-trips through JSON as a UTC timestamp, which in India is the previous
+// day ("2025-04-14T18:30:00.000Z" for 15 Apr).
+export function pickVoucherToShow(tool: string, args: any, body: any): { masterId: string; voucherType?: string; voucherNumber?: string; date?: string } | null {
+  if (!body || typeof body !== 'object') return null;
+  const isoOnly = (d: unknown): string | undefined => (typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : undefined);
+  if (tool === 'create-vouchers' || Array.isArray(body.results)) {
+    const rows = Array.isArray(body.results) ? body.results : [];
+    const last = [...rows].reverse().find((r: any) => r?.status === 'success' && r?.masterId);
+    if (!last) return null;
+    const v = Array.isArray(args?.vouchers) ? args.vouchers[last.index] : undefined;
+    return { masterId: String(last.masterId), voucherType: v?.voucherType, voucherNumber: v?.voucherNumber, date: isoOnly(v?.date) };
+  }
+  const masterId = body.masterId ?? body.lastVchId;
+  if (!body.success || !masterId) return null;
+  if (tool === 'alter-voucher') {
+    // The voucher as it stands AFTER the alter: args.date / args.voucherNumber are what it USED to be (and
+    // the usual confirm call carries neither). alter-voucher reports the new values in `after`, computed
+    // server-side in local time.
+    return {
+      masterId: String(masterId),
+      voucherType: body?.voucher?.voucher_type ?? args?.voucherType,
+      voucherNumber: args?.newVoucherNumber ?? body?.after?.voucherNumber,
+      date: isoOnly(args?.newDate) ?? isoOnly(body?.after?.date),
+    };
+  }
+  return {
+    masterId: String(masterId),
+    voucherType: args?.voucherType ?? body?.voucher?.voucher_type,
+    voucherNumber: args?.voucherNumber ?? body?.voucher?.voucher_number,
+    date: isoOnly(args?.date) ?? isoOnly(body?.voucher?.date),
+  };
+}
+
+// Showing a voucher brings Tally to the front, sends Alt+G / Enter / F2 and replaces the clipboard. It is
+// optional and the model can ask for it per call (show: true), so it must not get past the operator's
+// opt-out of screen control (ENABLE_GUI_CONTROL, the tray's "Allow the AI assistant to control Tally").
+// Unlike load-company or switch-company, which have no keyboard-free way to do their job, nothing is
+// lost by skipping it. Pure so the gate is pinned by a test.
+export function showAfterPostBlockedReason(env: NodeJS.ProcessEnv = process.env): string | null {
+  return env.ENABLE_GUI_CONTROL === 'true' ? null : 'GUI control is disabled (ENABLE_GUI_CONTROL is not true), so the voucher was not opened on screen.';
+}
+
+function withShownInTally(result: any, body: any, shownInTally: Record<string, unknown>): any {
+  body.shownInTally = shownInTally;
+  return { ...result, content: [{ ...result.content[0], text: JSON.stringify(body) }, ...result.content.slice(1)] };
+}
+
+async function showAfterPost(tool: string, args: any, result: any): Promise<any> {
+  try {
+    if (!wantsShowAfterPost(args) || result?.isError || isRemoteTallyHost()) return result;
+    const text = result?.content?.[0]?.text;
+    let body: any;
+    try { body = JSON.parse(text); } catch { return result; }
+    const target = pickVoucherToShow(tool, args, body);
+    if (!target) return result;
+    const blocked = showAfterPostBlockedReason();
+    if (blocked) return withShownInTally(result, body, { shown: false, reason: blocked });
+    const logs: string[] = [];
+    const dataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
+    const resp = await callGuiAgent('show-voucher', { ...target, banner: 'Posted by your AI assistant' }, 25, dataPath, logs);
+    return withShownInTally(result, body, resp?.status === 'success'
+      ? { shown: true, ...(resp.raw?.shown ? { screen: resp.raw.shown } : {}) }
+      : { shown: false, reason: resp?.raw?.errorCode ?? (resp ? resp.message : 'the screen-control helper did not respond') });
+  } catch {
+    return result;
+  }
+}
+
+// The agent's typed refusals (#24 idle check, #35 session state) and our own BUSY, as a tool error.
+// Returns null for any other response, so call sites keep their existing handling for those.
+const AGENT_ERROR_CODES = new Set<ToolErrorCode>(['USER_ACTIVE', 'SESSION_LOCKED', 'SESSION_DISCONNECTED', 'WRONG_USER', 'BUSY']);
+export function agentErrorResult(resp: GuiAgentResponse | null, logs?: string[]): ReturnType<typeof errorResult> | null {
+  const code = resp?.raw?.errorCode;
+  if (!resp || typeof code !== 'string' || !AGENT_ERROR_CODES.has(code as ToolErrorCode)) return null;
+  const extra: Record<string, unknown> = {};
+  if (code === 'BUSY') {
+    extra.retryAfterSec = Number(resp.raw.retryAfterSec) || 5;
+    extra.holderTool = resp.raw.holderTool ?? null;
+  }
+  if (code === 'USER_ACTIVE' && Number.isFinite(Number(resp.raw.idleMs))) extra.idleMs = Number(resp.raw.idleMs);
+  return errorResult(code as ToolErrorCode, {
+    message: resp.message || undefined,
+    logs: logs?.length ? logs.join('\n') : undefined,
+    extra,
+  });
 }
 
 // Runs the agent script as a short-lived child in this process's own session.
@@ -1742,11 +2290,15 @@ async function callGuiAgentViaIpc(
   const resultFile = path.join(dataPath, '_mcp_gui_result.json');
   const commandId = createGuiAgentCommandId(action);
 
-  try { fs.unlinkSync(resultFile); } catch {}
+  // No unlink of the result file on entry, and none of a result carrying another commandId below: the
+  // files are shared by every caller, and deleting a result we do not own is how one caller used to
+  // make another time out after its command had already run. A leftover result cannot be mistaken for
+  // ours (commandIds are unique), and the agent overwrites the file with its next result.
   const command = JSON.stringify({ action, ...payload, commandId, timestamp: new Date().toISOString() });
   atomicWriteFile(commandFile, command);
   logs.push(`  [gui-agent] sent action=${action} commandId=${commandId}, waiting up to ${timeoutSec}s`);
 
+  let lastOtherId = '';
   try {
     for (let i = 0; i < timeoutSec; i++) {
       await sleep(1000);
@@ -1756,8 +2308,9 @@ async function callGuiAgentViaIpc(
         const resultText = fs.readFileSync(resultFile, 'utf-8').replace(/^﻿/, '');
         const result = JSON.parse(resultText);
         if (!isMatchingGuiAgentCommand(result, commandId)) {
-          logs.push(`  [gui-agent] ignoring stale response for commandId ${result?.commandId || 'unknown'}`);
-          try { fs.unlinkSync(resultFile); } catch {}
+          const otherId = String(result?.commandId || 'unknown');
+          if (otherId !== lastOtherId) logs.push(`  [gui-agent] ignoring response for another command (${otherId})`);
+          lastOtherId = otherId;
           continue;
         }
         const versionStr = typeof result.agentVersion === 'string' ? result.agentVersion : null;
@@ -1770,7 +2323,7 @@ async function callGuiAgentViaIpc(
           raw: result
         };
       } catch {
-        try { fs.unlinkSync(resultFile); } catch {}
+        // Half-written (the agent is still writing it) or unreadable: read it again on the next poll.
       }
     }
     logs.push(`  [gui-agent] no response within ${timeoutSec}s`);
@@ -1790,23 +2343,52 @@ export type GuiAgentPingResult = {
   alive: boolean;
   agentVersion: string | null;
   versionOk: boolean;
+  /**
+   * Set when another call holds the screen, so the agent was not pinged (see callGuiAgent). It is then
+   * reported alive (it is working for someone) with the version this process last saw, if any. Callers
+   * about to drive the screen must answer BUSY rather than read versionOk.
+   */
+  busy?: { holderTool: string | null; retryAfterSec: number; message: string };
 };
+
+// The agent version from this process's last answered ping, for reporting while the agent is busy.
+let lastPingedAgentVersion: string | null = null;
+
+// Pure so busy / dead / alive are pinned by a test.
+export function interpretPingResponse(resp: GuiAgentResponse | null, needsHandshake: boolean, cachedVersion: string | null): GuiAgentPingResult {
+  // Only the IPC transport can be paired with a stale agent — that one is launched separately, by a
+  // scheduled task, and updated on its own schedule. In-session runs the script from this very
+  // install, so a version check there could only ever fail on a broken install, and reporting "your
+  // agent is too old" would point the user at a component that no longer exists in this mode.
+  const versionOk = (v: string | null) => needsHandshake ? isAgentVersionAtLeast(v, REQUIRED_AGENT_VERSION) : true;
+  if (isBusyGuiResponse(resp)) {
+    return {
+      // Busy for another window is not "outdated": with no version seen yet, report it as OK (unknown)
+      // rather than send the user to restart a healthy agent. The real check runs on the next free ping.
+      alive: true, agentVersion: cachedVersion, versionOk: cachedVersion ? versionOk(cachedVersion) : true,
+      busy: { holderTool: resp!.raw?.holderTool ?? null, retryAfterSec: Number(resp!.raw?.retryAfterSec) || 2, message: resp!.message },
+    };
+  }
+  if (!resp || resp.status !== 'success') {
+    return { alive: false, agentVersion: null, versionOk: false };
+  }
+  return { alive: true, agentVersion: resp.agentVersion, versionOk: versionOk(resp.agentVersion) };
+}
 
 // Lightweight ping to confirm the GUI agent is alive. Returns its version if reachable.
 // Used as a pre-flight in load-company so we never kill Tally without confirming we can bring it back.
 async function pingGuiAgent(dataPath: string, timeoutSec = 4, logs: string[] = []): Promise<GuiAgentPingResult> {
   const resp = await callGuiAgent('ping', {}, timeoutSec, dataPath, logs);
-  if (!resp || resp.status !== 'success') {
-    return { alive: false, agentVersion: null, versionOk: false };
-  }
-  // Only the IPC transport can be paired with a stale agent — that one is launched separately, by a
-  // scheduled task, and updated on its own schedule. In-session runs the script from this very
-  // install, so a version check there could only ever fail on a broken install, and reporting "your
-  // agent is too old" would point the user at a component that no longer exists in this mode.
-  const versionOk = guiTransportNeedsVersionHandshake()
-    ? isAgentVersionAtLeast(resp.agentVersion, REQUIRED_AGENT_VERSION)
-    : true;
-  return { alive: true, agentVersion: resp.agentVersion, versionOk };
+  const result = interpretPingResponse(resp, guiTransportNeedsVersionHandshake(), lastPingedAgentVersion);
+  if (result.alive && !result.busy) lastPingedAgentVersion = result.agentVersion;
+  return result;
+}
+
+// A pre-flight ping that found the screen in use: the caller is about to drive the screen itself, so it
+// answers BUSY (retryable) now rather than queueing behind, or being mistaken for a dead agent.
+function pingBusyError(ping: GuiAgentPingResult): ReturnType<typeof errorResult> | null {
+  if (!ping.busy) return null;
+  return errorResult('BUSY', { message: ping.busy.message, extra: { retryAfterSec: ping.busy.retryAfterSec, holderTool: ping.busy.holderTool } });
 }
 
 // Polls the Tally XML server until it responds successfully, or timeout elapses.
@@ -2137,6 +2719,28 @@ function makeReferenceChecker(company?: string): (reference: string) => Promise<
   };
 }
 
+// Every voucher bound to a REMOTEID (all-time), CANCELLED AND OPTIONAL ONES INCLUDED (voucher-by-remoteid).
+// This is the key Tally's import matches on: a voucher sent with a REMOTEID some voucher already holds
+// ALTERS that voucher instead of creating one. find-voucher-by-reference cannot answer "would this alter
+// something?": it filters the exact $Reference text and skips cancelled/optional vouchers, while the
+// REMOTEID is a slug of the reference (deriveRemoteId), so "INV/55", "INV 55" and "INV-55" of the same type
+// and party share one — and a voucher whose reference was edited in Tally keeps its REMOTEID. Null on a
+// read error. An empty answer is only as good as this build's $RemoteID: undo-batch therefore trusts it
+// only once the same lookup has been seen to find the batch's own voucher (planUndo's proof of newness).
+function makeRemoteIdChecker(company?: string): (remoteId: string) => Promise<any[] | null> {
+  return async (remoteId: string) => {
+    const p = new Map<string, any>([['remoteId', remoteId], ['fromDate', '1990-04-01'], ['toDate', '2099-03-31']]);
+    if (company) p.set('targetCompany', company);
+    try {
+      const resp = await pull('voucher-by-remoteid', p);
+      if (resp.error) return null;
+      return Array.isArray(resp.data) ? resp.data : [];
+    } catch {
+      return null;
+    }
+  };
+}
+
 export type VoucherLookupOutcome =
   | { status: 'ok'; voucher: any }
   | { status: 'not_found' }
@@ -2208,6 +2812,8 @@ export type ResolvedDeleteResult =
   | { status: 'deleted'; deleted: number; deleteForm: string; attempts: any[] }
   | { status: 'created_instead'; form: string; created: number; attempts: any[] }
   | { status: 'requires_gui'; attempts: any[]; message: string }
+  // Another AI window is reloading Tally (#26): nothing was written; the caller stops and reports BUSY.
+  | { status: 'busy'; message: string; retryAfterSec: number; holderTool: string; attempts: any[] }
   | { status: 'error'; message: string };
 
 async function deleteResolvedVoucher(located: any, company?: string): Promise<ResolvedDeleteResult> {
@@ -2225,6 +2831,7 @@ async function deleteResolvedVoucher(located: any, company?: string): Promise<Re
   const attempts: Array<{ form: string; deleted: number; created: number; error?: string }> = [];
   for (const v of variants) {
     const resp = await pushXml(v.xml);
+    if (resp.busy) return { status: 'busy', message: resp.error || 'Another AI window is reloading Tally; nothing was written.', retryAfterSec: resp.busy.retryAfterSec, holderTool: resp.busy.tool, attempts };
     attempts.push({ form: v.name, deleted: resp.deleted, created: resp.created, error: resp.error ? String(resp.error).slice(0, 140) : undefined });
     if (resp.created > 0) return { status: 'created_instead', form: v.name, created: resp.created, attempts };
     if (interpretDeleteResponse(resp, masterId).status === 'deleted') return { status: 'deleted', deleted: resp.deleted, deleteForm: v.name, attempts };
@@ -2379,11 +2986,67 @@ Driving the Tally GUI (on by default; disabled only if the operator set ENABLE_G
 
 // Shared liveness probe used by both `status` and `get-context`. Retries each
 // probe so a single transient blip doesn't flip the reported state.
-async function probeLiveness(): Promise<{ tallyReachable: boolean; agentAlive: boolean }> {
+// A ping that found the screen in use by another AI window reports the agent alive (it is working)
+// and busy, instead of "not responding": the ping was deliberately not sent (see callGuiAgent).
+async function probeLiveness(): Promise<{ tallyReachable: boolean; agentAlive: boolean; agentBusy: GuiAgentPingResult['busy'] }> {
   const tallyDataPath = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
   const tallyReachable = await probeWithRetry(() => pingTally());
-  const agentAlive = await probeWithRetry(async () => (await pingGuiAgent(tallyDataPath, 2)).alive, 2);
-  return { tallyReachable, agentAlive };
+  let agentBusy: GuiAgentPingResult['busy'];
+  const agentAlive = await probeWithRetry(async () => {
+    const ping = await pingGuiAgent(tallyDataPath, 2);
+    agentBusy = ping.busy;
+    return ping.alive;
+  }, 2);
+  return { tallyReachable, agentAlive, agentBusy };
+}
+
+// The fields status and get-context add on top of their original contract (epic #44). Every probe is
+// best-effort: a failure leaves a field null, never fails the call.
+async function probeEnvironment(tallyReachable: boolean, agentAlive: boolean, agentBusy?: GuiAgentPingResult['busy']): Promise<Record<string, unknown>> {
+  const remote = isRemoteTallyHost();
+  const out: Record<string, unknown> = {
+    // #29: which machine answered, and which books are open — compare with the instruction sheet.
+    machine: tallyMachineName(),
+    // #37: where Tally is.
+    tallyHost: process.env.TALLY_HOST || 'localhost',
+    tallyLocation: remote ? 'another-computer' : 'this-computer',
+  };
+  // #33: "Tally is closed" and "Tally is open but its XML server is off" need different fixes.
+  let tallyRunning: boolean | null = null;
+  if (!remote && process.platform === 'win32') {
+    try { tallyRunning = parseTasklistCsvPids(runCmd('tasklist /FI "IMAGENAME eq tally.exe" /FO CSV /NH')).length > 0; } catch { tallyRunning = null; }
+  }
+  if (tallyReachable) tallyRunning = remote ? null : true;
+  out.tallyRunning = tallyRunning;
+  out.xmlServer = tallyReachable ? 'answering' : tallyRunning === true ? 'not-answering' : tallyRunning === false ? 'tally-closed' : 'unknown';
+  // #29
+  if (tallyReachable) {
+    const id = await fetchCompanyIdentity(activeCompany || null);
+    out.company = id.company;
+    out.companyId = id.companyId;
+    out.companyGuid = id.companyGuid;
+    out.companyNumber = id.companyNumber;
+  } else {
+    out.companyId = null;
+  }
+  // #35: can the screen be driven right now? (XML tools work regardless.)
+  // idle-status, like the ping, takes the machine lock under IPC; when the screen is in use it is not
+  // sent at all and comes back busy.
+  let session: IdleStatus['session'] = null;
+  let busy = agentBusy;
+  if (agentAlive && !remote && !busy) {
+    try {
+      const idle = await queryIdleStatus(process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data', []);
+      session = idle.session;
+      busy = idle.busy;
+    } catch { session = null; }
+  }
+  Object.assign(out, describeGuiAvailability(agentAlive, session, remote, busy ? busy.holderTool : undefined));
+  // #26: another AI window holding Tally right now. A passive probe's hold (another window's status
+  // call) lasts one round-trip and is not "busy".
+  const holder = readLockHolder();
+  if (holder && !holder.probe) out.busy = { tool: holder.tool, kind: holder.kind, since: holder.startedAt, sameProcess: holder.pid === process.pid };
+  return out;
 }
 
 // Server version, read from package.json (single source of truth). Falls back to
@@ -2413,7 +3076,7 @@ export async function getHttpStatusReport(): Promise<{
   edition: 'silver' | 'gold';
   readonly: boolean;
   activeCompany: string | null;
-  agent: { responding: boolean; version: string | null; versionOk: boolean };
+  agent: { responding: boolean; version: string | null; versionOk: boolean; busy: boolean };
   tally: { reachable: boolean; loadedCompanies: string[] };
   build: { commit: string | null; builtAt: string | null };
 }> {
@@ -2430,7 +3093,7 @@ export async function getHttpStatusReport(): Promise<{
     edition: getTallyEdition(),
     readonly: process.env.READONLY_MODE === 'true',
     activeCompany: activeCompany || null,
-    agent: { responding: agentPing.alive, version: agentPing.agentVersion ?? null, versionOk: agentPing.versionOk },
+    agent: { responding: agentPing.alive, version: agentPing.agentVersion ?? null, versionOk: agentPing.versionOk, busy: !!agentPing.busy },
     tally: { reachable: tallyReachable, loadedCompanies },
     build: { commit: process.env.GIT_COMMIT ?? null, builtAt: process.env.BUILD_TIME ?? null },
   };
@@ -2467,6 +3130,18 @@ export type ToolErrorCode =
   | 'UNSAVED_ENTRY_OPEN'
   | 'GUI_HANDOFF'
   | 'ENTRY_ORDER_UNSET'
+  // ── concurrency, data safety and visibility (epic #44) ──
+  | 'USER_ACTIVE'
+  | 'BUSY'
+  | 'RESTART_NEEDS_CONFIRMATION'
+  | 'RESTART_CANCELLED_BY_USER'
+  | 'DUPLICATE_NUMBER'
+  | 'COMPANY_MISMATCH'
+  | 'SESSION_LOCKED'
+  | 'SESSION_DISCONNECTED'
+  | 'WRONG_USER'
+  | 'NOT_AVAILABLE_REMOTE_TALLY'
+  | 'VOUCHER_CHANGED'
   | 'UNKNOWN';
 
 export type ToolErrorEnvelope = {
@@ -2475,6 +3150,9 @@ export type ToolErrorEnvelope = {
   retryable: boolean;
   remedy?: string;
   logs?: string;
+  // Code-specific machine-readable fields, e.g. BUSY's retryAfterSec / holderTool, DUPLICATE_NUMBER's
+  // existing vouchers. Spread at the top level so a caller reads env.retryAfterSec directly.
+  [extra: string]: unknown;
 };
 
 // Sensible default message / retryable / remedy per code so call sites stay terse.
@@ -2501,17 +3179,30 @@ const TOOL_ERROR_DEFAULTS: Record<ToolErrorCode, { retryable: boolean; message: 
   AMBIGUOUS_INPUT: { retryable: false, message: 'The input matched more than one master on an exact key.', remedy: 'Disambiguate with the exact, fully-qualified name.' },
   UNBALANCED: { retryable: false, message: 'Voucher entries do not balance (total debits != total credits).', remedy: 'Adjust the entries so debits equal credits before retrying.' },
   DUPLICATE: { retryable: false, message: 'A voucher or master with the same deterministic key already exists.', remedy: 'Use a different voucher number / master name, or reverse-voucher to cancel the existing one.' },
+  // epic #44: people working in Tally, several AI windows, and the wrong books.
+  USER_ACTIVE: { retryable: true, message: 'Someone is using the keyboard or mouse on the Tally PC, so the screen was not touched.', remedy: 'Someone is using the keyboard or mouse on the Tally PC. Ask them to stop for a moment, then try again.' },
+  BUSY: { retryable: true, message: 'Another AI window is using Tally right now.', remedy: 'Wait a few seconds and try again. Only one screen action or company load runs at a time across all AI apps on this PC.' },
+  RESTART_NEEDS_CONFIRMATION: { retryable: true, message: 'Loading this company closes and reopens Tally.', remedy: 'ASK THE USER first, in these words: "Tally will close and reopen to load the company. Anyone entering data in Tally will lose unsaved work. Shall I go ahead?" Only if they say yes, call again with confirmRestart: true.' },
+  RESTART_CANCELLED_BY_USER: { retryable: false, message: 'The person at the Tally PC cancelled the restart. Tally was not touched.', remedy: 'Tell the user the restart was cancelled at the PC. Do not retry unless they ask you to.' },
+  DUPLICATE_NUMBER: { retryable: false, message: 'A voucher of this type already has this number.', remedy: 'Use a different voucherNumber, leave it out so Tally numbers it, or pass allowDuplicateNumber: true if the user confirms a repeated number is intended.' },
+  COMPANY_MISMATCH: { retryable: false, message: 'The loaded company is not the one this request was made for.', remedy: 'STOP and ask the user: the instruction sheet was made for a different machine or company. Do not write until they confirm which books to use.' },
+  SESSION_LOCKED: { retryable: true, message: 'The Tally PC is locked, so the screen cannot be driven.', remedy: 'Unlock the Tally PC, then try again. Posting and reports still work while it is locked.' },
+  SESSION_DISCONNECTED: { retryable: true, message: 'The Windows session on the Tally PC is disconnected, so the screen cannot be driven.', remedy: 'Sign back in to the Tally PC (reconnect the remote desktop session), then try again. Posting and reports still work.' },
+  WRONG_USER: { retryable: true, message: 'A different Windows user is signed in at the Tally PC.', remedy: 'Sign in to Windows on the Tally PC as the user Tally runs under, then try again.' },
+  NOT_AVAILABLE_REMOTE_TALLY: { retryable: false, message: 'Tally runs on another computer, so this tool is not available.', remedy: 'Screen control, company loading and folder scanning need Tally on this PC. Do this at the Tally computer; posting and reports still work from here.' },
+  VOUCHER_CHANGED: { retryable: false, message: 'A voucher was changed after it was posted, so it was not touched.', remedy: 'Show the user which voucher changed. Delete it by hand in Tally, or with delete-voucher after they confirm.' },
   UNKNOWN: { retryable: false, message: 'An unexpected error occurred.' },
 };
 
 // Pure builder — returns the envelope object (tested directly).
 export function buildToolError(
   code: ToolErrorCode,
-  opts?: { message?: string; retryable?: boolean; remedy?: string; logs?: string }
+  opts?: { message?: string; retryable?: boolean; remedy?: string; logs?: string; extra?: Record<string, unknown> }
 ): ToolErrorEnvelope {
   const d = TOOL_ERROR_DEFAULTS[code];
   const remedy = opts?.remedy ?? d.remedy;
   const env: ToolErrorEnvelope = {
+    ...(opts?.extra ?? {}),
     code,
     message: opts?.message ?? d.message,
     retryable: opts?.retryable ?? d.retryable,
@@ -2525,7 +3216,7 @@ export function buildToolError(
 // JSON text (machine-parseable) and as structuredContent, with isError set.
 export function errorResult(
   code: ToolErrorCode,
-  opts?: { message?: string; retryable?: boolean; remedy?: string; logs?: string }
+  opts?: { message?: string; retryable?: boolean; remedy?: string; logs?: string; extra?: Record<string, unknown> }
 ) {
   const env = buildToolError(code, opts);
   return {
@@ -2533,6 +3224,20 @@ export function errorResult(
     content: [{ type: 'text' as const, text: JSON.stringify(env, null, 2) }],
     structuredContent: env,
   };
+}
+
+// A write refused by guardedWrite because another AI window is reloading Tally (#26). Nothing was
+// written and retrying shortly is safe, so it is BUSY (retryable) and never "Tally rejected it". Every
+// caller of pushXml / push checks this FIRST, before it reads counters or tries another form: a busy
+// response has every counter at 0, which a delete or alter loop would otherwise read as "this form was
+// refused", try the next form (waiting out the load again each time) and finally report a permanent
+// Tally restriction, steering the caller to the riskier screen path for a write XML would have done.
+export function busyWriteResult(resp: { busy?: { retryAfterSec: number; tool: string }; error?: string }, extra: Record<string, unknown> = {}) {
+  if (!resp.busy) return null;
+  return errorResult('BUSY', {
+    message: resp.error || `Another AI window is reloading Tally, so nothing was written. Try again in about ${resp.busy.retryAfterSec}s.`,
+    extra: { ...extra, retryAfterSec: resp.busy.retryAfterSec, holderTool: resp.busy.tool },
+  });
 }
 
 // ── voucher schemas + shared executor (#94 H-8, #97 H-11) ──────────────────
@@ -2574,6 +3279,7 @@ const voucherInputShape = {
   voucherNumber: z.string().optional().describe('optional; blank for auto-numbering'),
   reference: z.string().optional().describe('voucher Reference / Ref No (Tally <REFERENCE>) — put the bank instrument id here (NEFT UTR / IMPS RRN / RTGS ref / cheque no) so the row is dedupe-able'),
   skipIfExists: z.boolean().optional().describe('if true AND reference is set, first check Tally for a LIVE voucher with that reference; if one exists, SKIP posting (report skipped) instead of creating a duplicate. Makes re-runs / concurrent posting idempotent on the bank reference.'),
+  allowDuplicateNumber: z.boolean().optional().describe('only with voucherNumber on a MANUALLY numbered voucher type: if the number is already used by another voucher of that type in the same financial year (or by another row of the batch), the write is refused with DUPLICATE_NUMBER. Pass true ONLY after the user confirms that a repeated number is intended. Ignored for automatically numbered types.'),
   partyLedger: z.string().optional().describe('party ledger for GST/invoice vouchers (PARTYLEDGERNAME)'),
   inventory: z.array(inventoryLineSchema).optional(),
   gst: gstBlockSchema.optional()
@@ -2584,6 +3290,7 @@ type VoucherArgs = {
   debitLedger?: string; creditLedger?: string; amount?: number;
   narration?: string; voucherNumber?: string; reference?: string; skipIfExists?: boolean; partyLedger?: string;
   inventory?: VoucherInput['inventory']; gst?: VoucherInput['gst'];
+  allowDuplicateNumber?: boolean;
 };
 
 // Normalizes a voucher's ledger lines: prefer entries[]; else fold the deprecated
@@ -2629,6 +3336,11 @@ export type ToolResult = { content: { type: 'text'; text: string }[]; isError?: 
 // (date-in-period, master-existence, idempotency) via optional opts.
 export type VoucherExecOpts = {
   dryRun?: boolean;
+  // Duplicate MANUAL voucher numbers (#28, see voucher-numbering.mts). numberingFor returns the type's
+  // numbering method (null = unknown); checkDuplicateNumber returns the vouchers already holding the
+  // number in the voucher's financial year (null = read failed). Both fail open. Injected by the handler.
+  numberingFor?: (voucherType: string) => Promise<string | null>;
+  checkDuplicateNumber?: DuplicateNumberChecker;
   // Active company's open period for the OUT_OF_PERIOD check (fetched by the handler via get-period).
   period?: { fyFrom: string | null; fyTo: string | null; booksFrom?: string | null } | null;
   // Exact known master names for the MASTER_NOT_FOUND check. Empty/omitted → skip (don't block on an
@@ -2648,19 +3360,81 @@ export type VoucherExecOpts = {
   // null on a read failure (so a failed check never blocks a legitimate write). Injected by the handler
   // (bound to findVouchersByReference for the resolved company) to keep executeVoucher I/O-agnostic.
   checkExisting?: (reference: string) => Promise<any[] | null>;
+  // Company-bound REMOTEID lookup (makeRemoteIdChecker): every voucher bound to a REMOTEID, cancelled and
+  // optional ones included, or null on a read failure. Only a journalled batch uses it, to record which
+  // voucher Tally would ALTER rather than create (executeVoucherBatch's onBeforeSend).
+  checkRemoteId?: (remoteId: string) => Promise<any[] | null>;
 };
+
+// A replay of an idempotency key whose first call is still posting (#27 follow-up). Retryable: once the
+// first call finishes, the same key replays its stored result.
+export function idempotencyInProgressResult(key: string, retryAfterSec: number, what = 'A call') {
+  return errorResult('BUSY', {
+    message: `${what} with idempotencyKey "${key}" is still running, so this one posted nothing (it would have posted the same voucher(s) twice).`,
+    remedy: `Wait about ${retryAfterSec}s and send the SAME call again with the same idempotencyKey: once the first call has finished it returns that call's result without posting anything. Do not change the key to get round this.`,
+    extra: { retryAfterSec, inProgress: true, idempotencyKey: key },
+  });
+}
+
+// Runs `post` under the idempotency contract for `key`: a stored result is replayed; otherwise the key is
+// reserved for the duration of the post (#27 follow-up) so a concurrent replay cannot post it a second
+// time. `post` is responsible for store.put() on success, which writes the final record BEFORE the
+// reservation is released here, so a reader never sees neither. A dry run posts nothing and reserves
+// nothing. Every exit releases the reservation, so a failed first attempt never blocks a retry.
+export async function withIdempotencyKey(
+  store: IdempotencyStore, key: string,
+  opts: { dryRun?: boolean; what?: string; onReplay?: () => void },
+  post: () => Promise<ToolResult>
+): Promise<ToolResult> {
+  const { dryRun, what } = opts;
+  const replay = (rec: { result: unknown }): ToolResult => {
+    opts.onReplay?.();
+    return { content: [{ type: 'text', text: JSON.stringify({ idempotentReplay: true, result: rec.result }) }] };
+  };
+  const prior = store.get(key);
+  if (prior) return replay(prior);
+  if (dryRun) return post();
+  const claim = store.reserve(key);
+  if (!claim.ok) {
+    // The holder may be in the gap between writing its record and releasing the reservation.
+    const done = store.get(key);
+    return done ? replay(done) : idempotencyInProgressResult(key, claim.retryAfterSec, what);
+  }
+  try {
+    // A first call that finished (record written, reservation released) after our get() above: replay it.
+    const done = store.get(key);
+    if (done) return replay(done);
+    return await post();
+  } finally {
+    claim.reservation.release();
+  }
+}
+
+// The vouchers a skipIfExists hit or a DUPLICATE_NUMBER refusal found, as the result reports them.
+// reference is included so a batch journal can tell its own earlier attempt from someone else's voucher.
+function existingSummary(rows: any[]): Array<{ master_id: unknown; voucher_number: unknown; date: unknown; amount: unknown; reference?: string }> {
+  return rows.map((e: any) => ({
+    master_id: e?.master_id, voucher_number: e?.voucher_number, date: e?.date, amount: e?.amount,
+    ...(e?.reference != null && String(e.reference) !== '' ? { reference: String(e.reference) } : {}),
+  }));
+}
 
 export async function executeVoucher(
   args: VoucherArgs & { targetCompany?: string; idempotencyKey?: string; remoteId?: string },
   opts: VoucherExecOpts = {}
 ): Promise<ToolResult> {
-  // Idempotent replay: a repeated key returns the prior result, posts nothing.
+  // Idempotent replay: a repeated key returns the prior result, posts nothing; a key still in flight is
+  // refused as BUSY instead of posted twice.
   if (args.idempotencyKey && opts.idempotency) {
-    const prior = opts.idempotency.store.get(args.idempotencyKey);
-    if (prior) {
-      return { content: [{ type: 'text', text: JSON.stringify({ idempotentReplay: true, result: prior.result }) }] };
-    }
+    return withIdempotencyKey(opts.idempotency.store, args.idempotencyKey, { dryRun: opts.dryRun }, () => executeVoucherOnce(args, opts));
   }
+  return executeVoucherOnce(args, opts);
+}
+
+async function executeVoucherOnce(
+  args: VoucherArgs & { targetCompany?: string; idempotencyKey?: string; remoteId?: string },
+  opts: VoucherExecOpts
+): Promise<ToolResult> {
   const norm = normalizeVoucherEntries(args);
   if ('error' in norm) return errorResult('PRECONDITION_FAILED', { message: norm.error, retryable: false });
   const entries = norm.entries;
@@ -2694,8 +3468,8 @@ export async function executeVoucher(
   };
   // (b) date within the open period (#95 H-9 → OUT_OF_PERIOD).
   if (opts.period && !isDateInOpenPeriod(args.date, opts.period)) {
-    const lo = opts.period.booksFrom || opts.period.fyFrom;
-    return errorResult('OUT_OF_PERIOD', { message: `Voucher date ${args.date} is outside the open period (${lo}..${opts.period.fyTo}).` });
+    const d = describeOutOfPeriod(args.date, opts.period);
+    return errorResult('OUT_OF_PERIOD', { message: d.message, remedy: d.remedy, extra: { openPeriod: { booksFrom: opts.period.booksFrom ?? null, fyFrom: opts.period.fyFrom, fyTo: opts.period.fyTo } } });
   }
   // (c) referenced masters exist (#95 H-9 → MASTER_NOT_FOUND). Exact-name only; skipped when the
   // known list is unavailable so a fetch failure never blocks a legitimate write.
@@ -2744,12 +3518,21 @@ export async function executeVoucher(
   if (args.skipIfExists && args.reference && opts.checkExisting) {
     const existing = await opts.checkExisting(args.reference);
     if (existing && existing.length > 0) {
-      const summary = existing.map((e: any) => ({ master_id: e.master_id, voucher_number: e.voucher_number, date: e.date, amount: e.amount }));
+      const summary = existingSummary(existing);
       const body = opts.dryRun
         ? { dryRun: true, wouldSkip: true, reason: 'ALREADY_EXISTS', reference: args.reference, existing: summary }
         : { skipped: true, reason: 'ALREADY_EXISTS', reference: args.reference, existing: summary };
       return { content: [{ type: 'text', text: JSON.stringify(body) }] };
     }
+  }
+  // (e2) Duplicate manual voucher number (#28). After skipIfExists (an already-booked reference is a skip,
+  // not a clash) and as late as possible before the write. dryRun refuses too, so an atomic batch's
+  // pre-validation catches it. Read failures return null and never block.
+  if (args.voucherNumber && !args.allowDuplicateNumber) {
+    const clash = await findManualNumberClash(voucher.voucherType, args.voucherNumber, args.date, opts);
+    // The clashing vouchers travel with the refusal (existing[]): a batch journal re-sending a row whose
+    // first attempt may have landed reads them to recognise that attempt's own voucher (batch-journal.mts).
+    if (clash) return errorResult('DUPLICATE_NUMBER', { message: describeExistingNumber(voucher.voucherType, args.voucherNumber, clash), extra: { existing: existingSummary(clash) } });
   }
   // Ask before the first voucher OF THIS TYPE, not after. Entry order changes how the voucher reads
   // when the user opens it, it legitimately differs between receipts, payments, sales and purchases,
@@ -2780,6 +3563,9 @@ export async function executeVoucher(
   }
   const resp = await pushXml(xml);
   if (!resp.success) {
+    // Another AI window is reloading Tally (#26): nothing was written, and retrying shortly is safe.
+    const busy = busyWriteResult(resp);
+    if (busy) return busy;
     // Re-map Tally's duplicate-voucher signal to the typed DUPLICATE code (#95/#99).
     if (/duplicat/i.test(resp.error || '')) return errorResult('DUPLICATE', { message: resp.error });
     return errorResult('UNKNOWN', { message: resp.error || 'Failed to create voucher.' });
@@ -2820,11 +3606,12 @@ export async function executeVoucher(
 }
 
 // File-backed idempotency store singleton (lives in TALLY_DATA_PATH when set, else next to dist/).
+// One file per key under <dir>/.tally-mcp-idempotency/ (#27); the old single .json is migrated on first use.
 let _idempotencyStore: IdempotencyStore | null = null;
 function getIdempotencyStore(): IdempotencyStore {
   if (!_idempotencyStore) {
     const dir = process.env.TALLY_DATA_PATH || path.join(import.meta.dirname, '..');
-    _idempotencyStore = makeIdempotencyStore(path.join(dir, '.tally-mcp-idempotency.json'));
+    _idempotencyStore = makeIdempotencyStore(dir);
   }
   return _idempotencyStore;
 }
@@ -2897,7 +3684,8 @@ async function buildVoucherExecOpts(args: { targetCompany?: string; inventory?: 
     (args.inventory && (args.inventory as unknown[]).length) ? fetchMasterNames('stockitem', company) : Promise.resolve<string[]>([]),
     fetchMasterNames('vouchertype', company),
   ]);
-  return { exactCompany: company, period, knownLedgers, knownStockItems, knownVoucherTypes, checkExisting: makeReferenceChecker(company), idempotency: { store: getIdempotencyStore(), now: new Date().toISOString() } };
+  return { exactCompany: company, period, knownLedgers, knownStockItems, knownVoucherTypes, checkExisting: makeReferenceChecker(company), idempotency: { store: getIdempotencyStore(), now: new Date().toISOString() },
+    ...numberingExecOpts(company, period) };
 }
 
 // Echoes the exact posting a write WOULD make, without calling Tally (#96 H-10). Used by
@@ -2907,7 +3695,19 @@ function dryRunEcho(template: string, inputParams: Map<string, any>, extra?: obj
 }
 
 // ── batch voucher execution (#97 H-11) ─────────────────────────────────────
-export type BatchRow = { index: number; status: 'success' | 'error' | 'skipped'; code?: string; message?: string; retryable?: boolean; written?: number; created?: number; altered?: number; masterId?: number; lastVchId?: number; reference?: string; note?: string };
+// existing: the vouchers a skipIfExists hit (skipped) or a DUPLICATE_NUMBER refusal (error) found in Tally,
+// as master id + reference. The batch journal reads them when it re-sends a row whose first attempt may
+// have landed: that attempt's own voucher is then among them (runJournaledBatch).
+export type BatchRow = { index: number; status: 'success' | 'error' | 'skipped'; code?: string; message?: string; retryable?: boolean; written?: number; created?: number; altered?: number; masterId?: number; lastVchId?: number; reference?: string; note?: string; existing?: BatchRowExisting[] };
+export type BatchRowExisting = { masterId: string; reference?: string };
+
+const existingOf = (list: unknown): BatchRowExisting[] | undefined => {
+  if (!Array.isArray(list)) return undefined;
+  const out = list
+    .map((e: any) => ({ masterId: String(e?.master_id ?? '').trim(), ...(e?.reference != null && String(e.reference) !== '' ? { reference: String(e.reference) } : {}) }))
+    .filter(e => e.masterId !== '');
+  return out.length ? out : undefined;
+};
 
 // Flattens a single executeVoucher result into a per-row batch entry.
 //
@@ -2918,11 +3718,15 @@ export type BatchRow = { index: number; status: 'success' | 'error' | 'skipped';
 export function rowResult(index: number, r: ToolResult): BatchRow {
   if (r.isError) {
     const e: any = r.structuredContent || {};
-    return { index, status: 'error', code: e.code ?? 'UNKNOWN', message: e.message, retryable: e.retryable };
+    const existing = e.code === 'DUPLICATE_NUMBER' ? existingOf(e.existing) : undefined;
+    return { index, status: 'error', code: e.code ?? 'UNKNOWN', message: e.message, retryable: e.retryable, ...(existing ? { existing } : {}) };
   }
-  const body = JSON.parse(r.content[0]!.text) as { written?: number; created?: number; altered?: number; masterId?: number; lastVchId?: number; skipped?: boolean; wouldSkip?: boolean; reference?: string; note?: string };
+  const body = JSON.parse(r.content[0]!.text) as { written?: number; created?: number; altered?: number; masterId?: number; lastVchId?: number; skipped?: boolean; wouldSkip?: boolean; reference?: string; note?: string; existing?: unknown };
   // A skipIfExists hit (real 'skipped' or dryRun 'wouldSkip') is neither a success nor a failure.
-  if (body.skipped || body.wouldSkip) return { index, status: 'skipped', reference: body.reference };
+  if (body.skipped || body.wouldSkip) {
+    const existing = existingOf(body.existing);
+    return { index, status: 'skipped', reference: body.reference, ...(existing ? { existing } : {}) };
+  }
   return {
     index, status: 'success',
     written: body.written ?? ((body.created ?? 0) + (body.altered ?? 0)),
@@ -2932,7 +3736,19 @@ export function rowResult(index: number, r: ToolResult): BatchRow {
   };
 }
 
-export type BatchResult = { atomic: boolean; aborted: boolean; posted: number; skipped: number; results: BatchRow[] };
+export type BatchResult = { atomic: boolean; aborted: boolean; posted: number; skipped: number; results: BatchRow[]; batchId?: string };
+
+// What pushXml (tally.mts) reports when the import request itself failed AFTER it may have reached Tally:
+// postTallyXML's timeout destroys the socket once the envelope is written, a dropped connection throws,
+// and a reply that is empty or not a Tally RESPONSE says nothing about what was saved. All three come
+// back from executeVoucher as UNKNOWN with exactly these messages. A ping that failed, the busy guard and
+// a RESPONSE with ERRORS are definite "not saved" answers and are NOT in this list.
+const TRANSPORT_OUTCOME_UNKNOWN = /^(Server exception|Empty response received from Tally|Unexpected response format from Tally)$/;
+
+/** True for a row whose post failed in a way that does not say whether Tally saved the voucher. */
+export function isTransportOutcomeUnknown(row: BatchRow): boolean {
+  return row.status === 'error' && row.code === 'UNKNOWN' && TRANSPORT_OUTCOME_UNKNOWN.test(String(row.message ?? '').trim());
+}
 
 // Executes a batch of vouchers. atomic=true: validate ALL rows first (via the deterministic dryRun
 // path); if any fails, abort and post NOTHING. Otherwise post each and report per row (best-effort).
@@ -2940,16 +3756,88 @@ export type BatchResult = { atomic: boolean; aborted: boolean; posted: number; s
 // rollback, so an atomic batch guarantees "don't start posting unless all rows pass deterministic
 // validation" — a mid-batch WRITE failure (Tally-side) can still leave earlier rows posted; that is
 // surfaced in the per-row results.
+//
+// Journalled runs (#31, batch-journal.mts) also pass:
+//  - onBeforeSend: called just before each real post with the master ids of the vouchers that already
+//    hold the row's reference, so undo can tell a voucher Tally ALTERED (same REMOTEID) from one the batch
+//    created. The lookup is the skipIfExists one, reused by executeVoucher for that row, so a row with
+//    skipIfExists costs no extra Tally read. With checkRemoteId it also passes the vouchers already bound
+//    to the row's REMOTEID (cancelled and optional ones included): the key Tally's alter really matches.
+//  - signal: the tool call's abort signal; once it fires, no further row is sent (NOT_SENT).
+// A real post whose request failed with an unknown outcome is reported as OUTCOME_UNKNOWN (retryable
+// false), never as a plain error: the journal must not re-send it blindly.
 export async function executeVoucherBatch(
   vouchers: Array<VoucherArgs & { targetCompany?: string }>,
-  opts: { atomic?: boolean } & VoucherExecOpts
+  opts: { atomic?: boolean; onRow?: (row: BatchRow) => void; onBeforeSend?: BeforeSend; signal?: AbortSignal } & VoucherExecOpts
 ): Promise<BatchResult> {
-  const { atomic, dryRun, ...baseOpts } = opts;
+  const { atomic, dryRun, onRow, onBeforeSend, signal, ...baseOpts } = opts;
   const countSkipped = (rows: BatchRow[]) => rows.filter(r => r.status === 'skipped').length;
+  // Two rows of the batch carrying the same MANUAL voucher number in the same financial year (#28): the
+  // later ones are refused before anything posts. The Tally lookup in executeVoucher cannot catch this on
+  // its own — the second row's lookup only sees the first once it is posted, and in an atomic
+  // pre-validation never. The company's FY start is the one the Tally lookup is scoped by.
+  const numberRefusals = await inBatchNumberRefusals(vouchers, baseOpts.numberingFor, baseOpts.period?.fyFrom);
+  const validate = async (i: number): Promise<BatchRow> => {
+    const refusal = numberRefusals.get(i);
+    return rowResult(i, refusal ? errorResult('DUPLICATE_NUMBER', { message: refusal }) : await executeVoucher(vouchers[i]!, { ...baseOpts, dryRun: true }));
+  };
+  const post = async (i: number): Promise<BatchRow> => {
+    if (signal?.aborted) return { index: i, status: 'error', code: NOT_SENT, retryable: true, message: 'Not sent: the call was cancelled before this row was reached. Nothing was posted for it; resume the batch with resumeBatchId.' };
+    const refusal = numberRefusals.get(i);
+    if (refusal) return rowResult(i, errorResult('DUPLICATE_NUMBER', { message: refusal }));
+    const v = vouchers[i]!;
+    let o: VoucherExecOpts = baseOpts;
+    if (onBeforeSend) {
+      let preExisting: any[] | null = null;
+      const ref = (v.reference ?? '').trim();
+      const explicitRemoteId = (v as unknown as { remoteId?: string }).remoteId;
+      if (!ref) {
+        // No reference: no derived REMOTEID, so Tally can only create. An explicit REMOTEID without a
+        // reference could bind anything and cannot be looked up: unknown (null).
+        preExisting = explicitRemoteId ? null : [];
+      } else if (baseOpts.checkExisting) {
+        try { preExisting = await baseOpts.checkExisting(v.reference!); } catch { preExisting = null; }
+        if (preExisting) {
+          const found = preExisting;
+          const lookup = baseOpts.checkExisting;
+          // executeVoucher's skipIfExists check for this row reads the same thing: answer it from here.
+          o = { ...baseOpts, checkExisting: async (r: string) => (r === v.reference ? found : lookup(r)) };
+        }
+      }
+      // The reference lookup above is exact-text and live-only; what Tally actually keys an alter on is the
+      // REMOTEID, which a slug-equivalent reference ("INV/55" vs "INV 55"), a cancelled or optional voucher,
+      // or a voucher whose reference was edited in Tally can share. So look that up too (no REMOTEID: Tally
+      // can only create, nothing to find).
+      const remoteId = explicitRemoteId ?? deriveRemoteId(v.voucherType, v.reference, v.partyLedger);
+      let byRemoteId: any[] | null = remoteId ? null : [];
+      if (remoteId && baseOpts.checkRemoteId) {
+        try { byRemoteId = await baseOpts.checkRemoteId(remoteId); } catch { byRemoteId = null; }
+      }
+      const ids = (list: any[] | null) => (list ? list.map((e: any) => String(e?.master_id ?? '').trim()).filter(Boolean) : null);
+      try {
+        onBeforeSend(i, { preExistingMasterIds: ids(preExisting), remoteIdMasterIds: ids(byRemoteId) });
+      } catch { /* the journal is best-effort */ }
+    }
+    const row = rowResult(i, await executeVoucher(v, o));
+    if (isTransportOutcomeUnknown(row)) {
+      return {
+        ...row, code: OUTCOME_UNKNOWN, retryable: false,
+        message: `Sent, but the request failed before Tally answered (${row.message}), so it is not known whether the voucher was saved. Do not re-send it blindly: check the Day Book first.`,
+      };
+    }
+    return row;
+  };
+  // onRow (#31) sees each row the moment it is settled for real, so a batch journal written from it is
+  // accurate even if the process dies mid-batch. Never called for validation-only (dryRun) passes, nor for
+  // a row that was never sent.
+  const settled = (row: BatchRow): BatchRow => {
+    if (onRow && row.code !== NOT_SENT) { try { onRow(row); } catch { /* journal is best-effort */ } }
+    return row;
+  };
   if (atomic) {
     const checks: BatchRow[] = [];
     for (let i = 0; i < vouchers.length; i++) {
-      checks.push(rowResult(i, await executeVoucher(vouchers[i]!, { ...baseOpts, dryRun: true })));
+      checks.push(await validate(i));
     }
     if (checks.some(c => c.status === 'error')) {
       return { atomic: true, aborted: true, posted: 0, skipped: countSkipped(checks), results: checks };
@@ -2957,15 +3845,151 @@ export async function executeVoucherBatch(
     if (dryRun) return { atomic: true, aborted: false, posted: 0, skipped: countSkipped(checks), results: checks };
     const results: BatchRow[] = [];
     for (let i = 0; i < vouchers.length; i++) {
-      results.push(rowResult(i, await executeVoucher(vouchers[i]!, baseOpts)));
+      results.push(settled(await post(i)));
     }
     return { atomic: true, aborted: false, posted: results.filter(r => r.status === 'success').length, skipped: countSkipped(results), results };
   }
   const results: BatchRow[] = [];
   for (let i = 0; i < vouchers.length; i++) {
-    results.push(rowResult(i, await executeVoucher(vouchers[i]!, { ...baseOpts, dryRun })));
+    results.push(dryRun ? await validate(i) : settled(await post(i)));
   }
   return { atomic: false, aborted: false, posted: results.filter(r => r.status === 'success').length, skipped: countSkipped(results), results };
+}
+
+// The duplicate-manual-number guard (#28) bound to one company: numbering methods from a VoucherType
+// collection (cached per company), clashes via the same voucher-lookup report locate-voucher uses, within
+// the voucher's financial year (the company's own FY start when the period is known).
+function numberingExecOpts(company: string | undefined, period?: { fyFrom?: string | null } | null): Pick<VoucherExecOpts, 'numberingFor' | 'checkDuplicateNumber'> {
+  return {
+    numberingFor: makeNumberingResolver(company, xml => postTallyXML(xml)),
+    checkDuplicateNumber: makeDuplicateNumberChecker((t, n, from, to) => locateVouchers(t, n, from, to, company), period?.fyFrom),
+  };
+}
+
+// Batch journals (#31) live next to the idempotency records: TALLY_DATA_PATH, else the install folder.
+let _batchJournalStore: BatchJournalStore | null = null;
+function getBatchJournalStore(): BatchJournalStore {
+  if (!_batchJournalStore) {
+    _batchJournalStore = makeBatchJournalStore(process.env.TALLY_DATA_PATH || path.join(import.meta.dirname, '..'));
+  }
+  return _batchJournalStore;
+}
+
+// undo-batch's resolve: resolveDeleteTarget's master_id branch, but with the voucher type compared the way
+// Tally matches masters (masterKey: entity-decoded, case-folded, edge-trimmed). The journal holds the type
+// as the caller spelled it ('receipt'), which executeVoucher accepted and posted under Tally's own spelling
+// ('Receipt'); resolveDeleteTarget's exact comparison refused every such voucher as VOUCHER_CHANGED, so the
+// batch could not be undone. Loosening it here is safe: the master id already pins the voucher, and the
+// posting fingerprint undo checks next compares the live voucher type too.
+export async function resolveUndoTarget(
+  masterId: string, voucherType: string, locate: (masterId: string) => Promise<{ voucher: any | null } | { error: string }>
+): Promise<{ status: 'resolved' | 'already_gone' | 'mismatch' | 'error'; located?: any; message?: string }> {
+  const loc = await locate(masterId);
+  if ('error' in loc) return { status: 'error', message: loc.error };
+  if (!loc.voucher) return { status: 'already_gone', message: `master_id ${masterId} no longer exists (already deleted?).` };
+  if (masterKey(String(loc.voucher.voucher_type ?? '')) !== masterKey(voucherType)) {
+    return { status: 'mismatch', message: `master_id ${masterId} is a ${loc.voucher.voucher_type} (#${loc.voucher.voucher_number}), not a ${voucherType}.` };
+  }
+  return { status: 'resolved', located: loc.voucher };
+}
+
+// What a stored create-vouchers idempotency record says to do on a replay: the batchId to resume, or null
+// to replay the stored result. Resume when the run never recorded a result (the in-progress marker
+// written at its start: a timeout or crash), or when rows were told they may simply be retried (BUSY and
+// other retryable errors, rows never sent because the call was cancelled). An OUTCOME_UNKNOWN row is not
+// retryable and does not trigger it: it needs a person to check the Day Book first.
+export function idempotentResumeTarget(result: unknown): string | null {
+  const r = result as { inProgress?: boolean; batchId?: unknown; results?: BatchRow[] } | null;
+  if (!r || !isValidBatchId(r.batchId)) return null;
+  if (r.inProgress === true) return r.batchId;
+  const rows = Array.isArray(r.results) ? r.results : [];
+  return rows.some(x => x?.status === 'error' && (x.retryable === true || x.code === NOT_SENT)) ? r.batchId : null;
+}
+
+type BatchRunResult = JournaledBatchResult & { journalError?: string; earlierBatch?: ReturnType<typeof findEarlierBatch> };
+
+// Runs a create-vouchers / import-vouchers batch under its journal (#31): a fresh journal for a new write
+// batch, or the existing one for resumeBatchId (refused unless it is the same batch). A dryRun without
+// resumeBatchId runs unjournalled, exactly as before. If the journal cannot be written at all (data folder
+// unwritable) the batch still posts as it always did, and the result says it has no batchId.
+//
+// The whole run holds the batch's lock (batch-journal.mts): a resume while another call is still working
+// on the same batch is refused with BUSY instead of posting the same rows a second time. A new batch whose
+// rows are exactly those of a recent batch that already put something in Tally is refused too, naming that
+// batch to resume: that is the caller whose earlier result never arrived (newBatch:true overrides it).
+// onStart is told the batchId as soon as the journal exists, before any row is sent.
+async function runBatchWithJournal(
+  rows: Array<VoucherArgs & { targetCompany?: string }>,
+  ctx: VoucherExecOpts & {
+    company: string; atomic?: boolean; dryRun?: boolean; resumeBatchId?: string; chunkSize?: number; tool: string;
+    source?: BatchJournal['source']; sourceRows?: number[][]; preErrors?: Map<number, { code: string; message: string }>;
+    confirmedNotPosted?: Set<number>; newBatch?: boolean; signal?: AbortSignal; onStart?: (batchId: string) => void;
+  }
+): Promise<{ ok: true; batch: BatchResult & Partial<BatchRunResult> } | { ok: false; error: ToolResult }> {
+  const { company, atomic, dryRun, resumeBatchId, chunkSize, tool, source, sourceRows, preErrors, confirmedNotPosted, newBatch, signal, onStart, ...execOpts } = ctx;
+  // The journalled run looks up each row's REMOTEID before sending it (executeVoucherBatch's onBeforeSend),
+  // so undo can tell a voucher Tally altered from one this batch created.
+  const checkRemoteId = execOpts.checkRemoteId ?? makeRemoteIdChecker(company);
+  const execute = (r: typeof rows, o: { dryRun?: boolean; atomic?: boolean; onRow?: (row: BatchRow) => void; onBeforeSend?: BeforeSend; signal?: AbortSignal }) =>
+    executeVoucherBatch(r, { ...execOpts, checkRemoteId, exactCompany: company, ...o });
+  const store = getBatchJournalStore();
+  const run = (journal: BatchJournal, s: BatchJournalStore = store) =>
+    runJournaledBatch({ store: s, journal, rows, execute, atomic, dryRun, chunkSize, preErrors, confirmedNotPosted, signal });
+  if (!resumeBatchId && dryRun) {
+    // A preview says so when these rows were already sent as a batch, before the caller posts them again.
+    let earlier: ReturnType<typeof findEarlierBatch> = null;
+    try { earlier = findEarlierBatch(store, tool, company, rows); } catch { /* a preview never fails on this */ }
+    const extra = earlier ? { earlierBatch: earlier } : {};
+    if (!preErrors?.size) return { ok: true, batch: { ...await executeVoucherBatch(rows, { ...execOpts, exactCompany: company, atomic, dryRun }), ...extra } };
+    // A preview with rows already refused: the journalled runner, on a journal that is never saved.
+    return { ok: true, batch: { ...await run(buildJournal({ tool, company, rows, source, sourceRows })), ...extra } };
+  }
+  let journal: BatchJournal;
+  let release: () => void = () => {};
+  if (resumeBatchId) {
+    // Lock first, then load: the journal read is then the final state of any run that finished before.
+    if (isValidBatchId(resumeBatchId)) {
+      const got = store.lock(resumeBatchId, tool);
+      if (!got.ok) {
+        return { ok: false, error: errorResult('BUSY', {
+          message: describeBatchBusy(resumeBatchId, got.holder),
+          remedy: `Wait for that call to finish, then resume again with resumeBatchId:"${resumeBatchId}" (rows it posted are not re-sent). Do NOT re-send the rows without resumeBatchId.`,
+          extra: { retryAfterSec: got.retryAfterSec, batchId: resumeBatchId, ...(got.holder ? { holderTool: got.holder.tool } : {}) },
+        }) };
+      }
+      release = got.release;
+    }
+    const opened = openJournalForResume(store, resumeBatchId, rows, company);
+    if (!opened.ok) { release(); return { ok: false, error: errorResult(opened.code, { message: opened.message, remedy: opened.remedy, retryable: false }) }; }
+    journal = opened.journal;
+  } else {
+    if (!newBatch) {
+      let earlier: ReturnType<typeof findEarlierBatch> = null;
+      try { earlier = findEarlierBatch(store, tool, company, rows); } catch { /* unreadable folder: create() decides */ }
+      if (earlier) {
+        const parts = [`${earlier.posted} posted`, earlier.outcomeUnknown ? `${earlier.outcomeUnknown} sent with an unknown outcome` : '', earlier.failed ? `${earlier.failed} failed` : '', earlier.notSent ? `${earlier.notSent} not sent yet` : ''].filter(Boolean);
+        return { ok: false, error: errorResult('PRECONDITION_FAILED', {
+          message: `These ${rows.length} row(s) were already sent to ${company} as batch ${earlier.batchId} (started ${earlier.createdAt}): ${parts.join(', ')}. Posting them as a new batch would book the posted ones twice. Nothing was posted.`,
+          remedy: `To finish that batch, call again with the same rows and resumeBatchId:"${earlier.batchId}" (rows already in Tally are not re-sent). To take it back, use undo-batch with that batchId. Only if the user confirms these vouchers are meant to be booked a second time, pass newBatch:true.`,
+          retryable: false,
+          extra: { batchId: earlier.batchId, earlierBatch: earlier },
+        }) };
+      }
+    }
+    try {
+      ({ journal, release } = store.createLocked({ tool, company, rows, source, sourceRows }, tool));
+    } catch (err: any) {
+      // Same run, on a journal kept only in memory, so pre-refused rows still never reach Tally.
+      const { batchId: _none, ...batch } = await run(buildJournal({ tool, company, rows, source, sourceRows }), { ...store, save: () => {} });
+      return { ok: true, batch: { ...batch, journalError: `No batch journal could be written (${err?.message ?? err}), so this batch has no batchId and cannot be resumed or undone with undo-batch.` } };
+    }
+  }
+  try {
+    try { onStart?.(journal.batchId); } catch { /* a marker must not stop the post */ }
+    return { ok: true, batch: await run(journal) };
+  } finally {
+    release();
+  }
 }
 
 export async function registerMcpServer(): Promise<McpServer> {
@@ -2986,6 +4010,53 @@ export async function registerMcpServer(): Promise<McpServer> {
   }, {
     instructions: `${TALLY_MCP_INSTRUCTIONS}\n\n${FEEDING_INSTRUCTIONS_LINE}`
   });
+
+  // Cross-cutting rules applied at registration, so each one lives in one place rather than in every
+  // handler (and covers tools added later):
+  //  - #37: tools that need Tally's window, process or folders on this PC refuse when TALLY_HOST points
+  //    at another computer.
+  //  - #29: write tools accept expectedCompanyId and refuse with COMPANY_MISMATCH when the target books
+  //    are not the ones the caller's instruction sheet was made for.
+  //  - #23: voucher writes can show the posted voucher on Tally's screen afterwards.
+  const rawRegisterTool = mcpServer.registerTool.bind(mcpServer) as (...a: any[]) => any;
+  (mcpServer as any).registerTool = (name: string, config: any, handler: (...a: any[]) => any) => {
+    let wrapped = handler;
+    if (LOCAL_TALLY_ONLY_TOOLS.has(name)) {
+      const inner = wrapped;
+      wrapped = async (args: any, extra: any) => {
+        if (isRemoteTallyHost()) {
+          auditLog(name, args ?? {}, 'denied', 0);
+          return errorResult('NOT_AVAILABLE_REMOTE_TALLY', { message: `${name} is not available: Tally runs on another computer (${process.env.TALLY_HOST}).` });
+        }
+        return inner(args, extra);
+      };
+    }
+    if (COMPANY_GUARDED_WRITE_TOOLS.has(name)) {
+      // The guard checks one company; the handler must then write to that same one. When the caller left
+      // targetCompany out, hand the handler the exact company the guard checked, so a set-active-company
+      // from another session between the check and the write cannot move the write to other books.
+      // undo-batch is the exception: it writes to its journal's company, which the guard already checked.
+      const injectTarget = !!config.inputSchema?.targetCompany && name !== 'undo-batch';
+      config = { ...config, inputSchema: {
+        ...(config.inputSchema ?? {}),
+        expectedCompanyId: z.string().max(128).optional().describe('the company id recorded in the client\'s instruction sheet (companyId from status / get-context). When given, the write is refused with COMPANY_MISMATCH unless the target company has this id. Pass it whenever the sheet records one.'),
+        expectedMachine: z.string().max(256).optional().describe('the machine recorded in the client\'s instruction sheet (machine from status / get-context). When given, the write is refused with COMPANY_MISMATCH unless this is that machine: a copy of the same books on another PC carries the same company id. Pass it with expectedCompanyId whenever the sheet records it; a company id that is a bare company number is only accepted with it.'),
+      } };
+      const inner = wrapped;
+      wrapped = async (args: any, extra: any) => {
+        const check = await checkExpectedCompany(name, args);
+        if (check.refusal) return check.refusal;
+        const named = typeof args?.targetCompany === 'string' && args.targetCompany.trim();
+        return inner(injectTarget && check.checkedCompany && !named ? { ...args, targetCompany: check.checkedCompany } : args, extra);
+      };
+    }
+    if (SHOW_AFTER_POST_TOOLS.has(name)) {
+      config = { ...config, inputSchema: { ...(config.inputSchema ?? {}), show: z.boolean().optional().describe('after a successful post, open the voucher on Tally\'s screen for the person at the PC (display only; never changes data; skipped silently if someone is using the PC, and when the operator has turned GUI control off). Defaults to the SHOW_AFTER_POST setting.') } };
+      const inner = wrapped;
+      wrapped = async (args: any, extra: any) => showAfterPost(name, args, await inner(args, extra));
+    }
+    return rawRegisterTool(name, config, wrapped);
+  };
 
   // The data-entry method, for every client: two prompts and a read-only tool. See feeding-guide.mts.
   registerFeedingGuide(mcpServer, (toolName, durationMs) => auditLog(toolName, {}, 'success', durationMs));
@@ -3378,6 +4449,14 @@ export async function registerMcpServer(): Promise<McpServer> {
         }
 
         if (strategy === 'auto' || strategy === 'gui-agent') {
+          if (isRemoteTallyHost()) {
+            auditLog('open-company', args, 'denied', Date.now() - start);
+            return errorResult('NOT_AVAILABLE_REMOTE_TALLY', {
+              message: `"${companyName}" is not open in Tally on ${process.env.TALLY_HOST}, and loading a company there needs that computer's screen.`,
+              remedy: 'Ask someone at the Tally computer to open the company, then call open-company again (its XML checks work from here).',
+              logs: logs.join('\n'),
+            });
+          }
           const guiOutcome = await tryGuiAgent();
           if (guiOutcome === 'loaded') {
             activeCompany = companyName;
@@ -3476,6 +4555,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         report.guiAgentVersion = agentPing.agentVersion;
         report.guiAgentVersionRequired = REQUIRED_AGENT_VERSION;
         report.guiAgentVersionOk = agentPing.versionOk;
+        if (agentPing.busy) report.guiAgentBusy = agentPing.busy.message;
         if (!agentPing.alive) {
           report.guiAgentHint = 'Agent did not respond to ping. Start tally-gui-agent-v2.ps1 in the user session (Task Scheduler at logon is recommended; setup-windows.ps1 registers the task as TallyMCPAgent).';
         } else if (!agentPing.versionOk) {
@@ -3559,7 +4639,7 @@ export async function registerMcpServer(): Promise<McpServer> {
     'status',
     {
       title: 'Status',
-      description: `Authoritative one-shot health/usability check for this Tally MCP server. Returns a stable five-field contract: { tallyReachable, agentAlive, activeCompany, edition, readonly }, plus { tallyProblem: { message, remedy } } whenever tallyReachable is false — RELAY THAT REMEDY TO THE USER VERBATIM, it contains the exact Tally menu path they need and is written for a non-technical reader. Also returns { entryOrder }: when entryOrder.configured is false, ASK THE USER the question in entryOrder.action BEFORE attempting any voucher write — writes are refused until it is answered. Both liveness probes are retried briefly so a single transient blip doesn't flip the reported state. Call this to answer "is this usable right now, and in what mode?" instead of stitching list-loaded-companies + open-company-debug. Use open-company-debug for the verbose troubleshooting dump (paths, files, agent version, XML sample).`,
+      description: `Authoritative one-shot health/usability check for this Tally MCP server. Returns a stable five-field contract: { tallyReachable, agentAlive, activeCompany, edition, readonly }, and also { machine, company, companyId, tallyRunning, xmlServer, tallyLocation, guiAvailable, guiUnavailableReason?, busy? }. machine + companyId identify WHICH books answered: record them in a client's instruction sheet, and before the first write in a session compare them with the sheet — on a mismatch STOP and ask the user (the same account may be used on two PCs, each with its own Tally). xmlServer is 'answering', 'not-answering' (Tally open, connection off or a dialog blocking it) or 'tally-closed'. guiAvailable=false means screen actions will be refused (PC locked, session disconnected, other Windows user); posting and reports still work. busy names another AI window currently using Tally. Plus { tallyProblem: { message, remedy } } whenever tallyReachable is false — RELAY THAT REMEDY TO THE USER VERBATIM, it contains the exact Tally menu path they need and is written for a non-technical reader. Also returns { entryOrder }: when entryOrder.configured is false, ASK THE USER the question in entryOrder.action BEFORE attempting any voucher write — writes are refused until it is answered. Both liveness probes are retried briefly so a single transient blip doesn't flip the reported state. Call this to answer "is this usable right now, and in what mode?" instead of stitching list-loaded-companies + open-company-debug. Use open-company-debug for the verbose troubleshooting dump (paths, files, agent version, XML sample).`,
       inputSchema: {},
       annotations: {
         readOnlyHint: true,
@@ -3569,7 +4649,7 @@ export async function registerMcpServer(): Promise<McpServer> {
     async (args) => {
       const start = Date.now();
       try {
-        const { tallyReachable, agentAlive } = await probeLiveness();
+        const { tallyReachable, agentAlive, agentBusy } = await probeLiveness();
         const status: Record<string, unknown> = {
           tallyReachable,
           agentAlive,
@@ -3582,7 +4662,10 @@ export async function registerMcpServer(): Promise<McpServer> {
         // anything else — and the commonest reason it is false is not a fault at all, it is that
         // Tally ships with its data connection switched off and nobody told the user to turn it on.
         // Attach the diagnosis and the click-path so the caller can relay something actionable.
-        if (!tallyReachable) status.tallyProblem = describeTallyUnreachable();
+        if (!tallyReachable) status.tallyProblem = isRemoteTallyHost()
+          ? { message: `Tally on ${process.env.TALLY_HOST} is not answering.`, remedy: `Check that Tally is open on that computer with its connection switched on, and that this PC can reach it on port ${process.env.TALLY_PORT || 9000} (firewall). ${TALLY_CONNECTIVITY_STEPS}` }
+          : describeTallyUnreachable();
+        Object.assign(status, await probeEnvironment(tallyReachable, agentAlive, agentBusy));
         // Reported ALWAYS, not only when unset: a caller that has already written vouchers this
         // session should still be able to see which way round they are going without asking again.
         // The whole map, because "is this configured?" now has a per-type answer. A caller about to
@@ -3608,7 +4691,7 @@ export async function registerMcpServer(): Promise<McpServer> {
     'get-context',
     {
       title: 'Get Context',
-      description: `One-shot environment + requirements snapshot: { edition, readonly, activeCompany, agentAlive, tallyReachable, requirements }, plus { tallyProblem: { message, remedy } } when tallyReachable is false — relay that remedy to the user verbatim. Also returns { entryOrder }; when configured is false, ask the user and save it with set-entry-order before writing any voucher. Wraps status (live liveness, retried) and adds the static list of external requirements so a fresh agent can learn what must be running before it can load a company — without triggering a failure first.`,
+      description: `One-shot environment + requirements snapshot: { edition, readonly, activeCompany, agentAlive, tallyReachable, requirements, machine, company, companyId, tallyRunning, xmlServer, tallyLocation, guiAvailable }, plus { tallyProblem: { message, remedy } } when tallyReachable is false — relay that remedy to the user verbatim. Also returns { entryOrder }; when configured is false, ask the user and save it with set-entry-order before writing any voucher. Wraps status (live liveness, retried) and adds the static list of external requirements so a fresh agent can learn what must be running before it can load a company — without triggering a failure first.`,
       inputSchema: {},
       annotations: {
         readOnlyHint: true,
@@ -3618,7 +4701,7 @@ export async function registerMcpServer(): Promise<McpServer> {
     async (args) => {
       const start = Date.now();
       try {
-        const { tallyReachable, agentAlive } = await probeLiveness();
+        const { tallyReachable, agentAlive, agentBusy } = await probeLiveness();
         const context: Record<string, unknown> = {
           edition: getTallyEdition(),
           readonly: process.env.READONLY_MODE === 'true',
@@ -3627,7 +4710,10 @@ export async function registerMcpServer(): Promise<McpServer> {
           tallyReachable,
           requirements: getTallyRequirements()
         };
-        if (!tallyReachable) context.tallyProblem = describeTallyUnreachable();
+        if (!tallyReachable) context.tallyProblem = isRemoteTallyHost()
+          ? { message: `Tally on ${process.env.TALLY_HOST} is not answering.`, remedy: `Check that Tally is open on that computer with its connection switched on, and that this PC can reach it on port ${process.env.TALLY_PORT || 9000} (firewall). ${TALLY_CONNECTIVITY_STEPS}` }
+          : describeTallyUnreachable();
+        Object.assign(context, await probeEnvironment(tallyReachable, agentAlive, agentBusy));
         const ctxCfg = readEntryOrderConfig();
         context.entryOrder = {
           byVoucherType: ctxCfg.byVoucherType ?? {},
@@ -3843,14 +4929,15 @@ export async function registerMcpServer(): Promise<McpServer> {
     'load-company',
     {
       title: 'Load Company (via Tally Restart)',
-      description: `loads a company into Tally Prime by editing tally.ini and restarting Tally. Use this when the target company is NOT in list-loaded-companies. Slow (~10-30s for restart) but reliable — Tally has no XML primitive for loading from disk, so a restart is the only option. Accepts either a folder ID (e.g. "100000") or a company name (e.g. "Ross Industries"); resolves names by reading Company.900 from each folder. If multiple folders share a name, returns an ambiguity error listing folder IDs so you can re-call with the specific ID. EDITION-AWARE: on Silver (set TALLY_EDITION=silver), this is always a SWAP — the new company replaces any current one (Silver allows only one company resident). On Gold (TALLY_EDITION=gold), additive by default; pass replace=true to force a swap. Requires the GUI agent (tally-gui-agent-v2.ps1) running in the user's interactive session — the tool pings it before doing anything destructive and refuses to kill Tally if the agent is unreachable. After the restart, the tool verifies the requested company actually appears in the loaded list. CREDENTIAL HANDLING: if Tally's auto-load fails because the company is password-protected (common with Edit Log boxes — Tally drops to Select Company because it can't bypass the credential prompt), pass userName + password and the tool will use the GUI agent to deterministically keystroke through the Select Company → credentials prompt → Gateway sequence. Credentials are filtered from audit logs.`,
+      description: `loads a company into Tally Prime by editing tally.ini and restarting Tally. Use this when the target company is NOT in list-loaded-companies. Slow (~10-30s for restart) but reliable — Tally has no XML primitive for loading from disk, so a restart is the only option. Accepts either a folder ID (e.g. "100000") or a company name (e.g. "Ross Industries"); resolves names by reading Company.900 from each folder. If multiple folders share a name, returns an ambiguity error listing folder IDs so you can re-call with the specific ID. EDITION-AWARE: on Silver (set TALLY_EDITION=silver), this is always a SWAP — the new company replaces any current one (Silver allows only one company resident). On Gold (TALLY_EDITION=gold), additive by default; pass replace=true to force a swap. RESTART CONFIRMATION: the restart discards any unsaved entry open in Tally, so a call without confirmRestart: true changes nothing and returns RESTART_NEEDS_CONFIRMATION — ask the user, and only on their yes call again with confirmRestart: true. Even then it refuses with USER_ACTIVE if someone used the keyboard or mouse on the Tally PC in the last minute, and the person at the PC gets a 10-second countdown they can cancel (RESTART_CANCELLED_BY_USER). If the company is already loaded, nothing is restarted. Requires the GUI agent (tally-gui-agent-v2.ps1) running in the user's interactive session — the tool pings it before doing anything destructive and refuses to kill Tally if the agent is unreachable. After the restart, the tool verifies the requested company actually appears in the loaded list. CREDENTIAL HANDLING: if Tally's auto-load fails because the company is password-protected (common with Edit Log boxes — Tally drops to Select Company because it can't bypass the credential prompt), pass userName + password and the tool will use the GUI agent to deterministically keystroke through the Select Company → credentials prompt → Gateway sequence. Credentials are filtered from audit logs.`,
       inputSchema: {
         company: z.string().describe('folder ID (digits only, e.g. "100000") OR company name as stored in Company.900 (e.g. "Ross Industries"). Use list-companies to see both.'),
-        waitTimeoutSec: z.number().optional().describe('seconds to wait for the Tally XML server to come back up after restart. Default 60.'),
+        waitTimeoutSec: z.number().optional().describe('seconds to wait for the Tally XML server to come back up after restart. Default 60, at most 300.'),
         replace: z.boolean().optional().describe('if true, only this company is loaded — all other Load= lines are removed from tally.ini. Default false (additive).'),
         dataPath: z.string().optional().describe('override the data path to scan for company folders. By default, this is read from tally.ini\'s Data= directive (the same path Tally itself uses). Pass this only when you know the data lives somewhere different — e.g. a backup folder or a secondary drive.'),
         userName: z.string().optional().describe('Tally username for the company (if user-based security is enabled). Used by the GUI agent to keystroke through the credential prompt when auto-load is blocked by Tally\'s login dialog. Filtered from audit logs.'),
-        password: z.string().optional().describe('Tally password for the company. Filtered from audit logs. Lives in the IPC file briefly during the call (~5s) — acceptable on a single-user box, document carefully if multi-user.')
+        password: z.string().optional().describe('Tally password for the company. Filtered from audit logs. Lives in the IPC file briefly during the call (~5s) — acceptable on a single-user box, document carefully if multi-user.'),
+        confirmRestart: z.boolean().optional().describe('REQUIRED to actually restart Tally. Without it the call only previews and returns RESTART_NEEDS_CONFIRMATION. Set it to true ONLY after asking the user "Tally will close and reopen to load the company; anyone entering data in Tally will lose unsaved work. Shall I go ahead?" and they said yes.')
       },
       annotations: {
         readOnlyHint: false,
@@ -3861,7 +4948,10 @@ export async function registerMcpServer(): Promise<McpServer> {
       const start = Date.now();
       const logs: string[] = [];
       const company = args.company;
-      const timeoutMs = (args.waitTimeoutSec ?? 60) * 1000;
+      // Bounded so the whole restart, which holds the machine lock, stays inside the lock's hard ceiling
+      // (lockMaxHoldMs): past it, another window may take the lock over mid-restart.
+      const waitTimeoutSec = Math.min(Math.max(0, args.waitTimeoutSec ?? 60), LOAD_COMPANY_MAX_WAIT_SEC);
+      const timeoutMs = waitTimeoutSec * 1000;
       const edition = getTallyEdition();
       // Silver allows only one company resident, so any "add" semantics are meaningless — force replace.
       const replace = edition === 'silver' ? true : !!args.replace;
@@ -3923,6 +5013,11 @@ export async function registerMcpServer(): Promise<McpServer> {
         const agentWatchDir = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
         logs.push('  Pinging GUI agent (must be alive before we kill Tally)...');
         const agentPing = await pingGuiAgent(agentWatchDir, 4, logs);
+        const pingBusyLc = pingBusyError(agentPing);
+        if (pingBusyLc) {
+          auditLog('load-company', args, 'denied', Date.now() - start);
+          return pingBusyLc;
+        }
         if (!agentPing.alive) {
           auditLog('load-company', args, 'error', Date.now() - start);
           return errorResult('AGENT_UNREACHABLE', {
@@ -3943,141 +5038,256 @@ export async function registerMcpServer(): Promise<McpServer> {
         }
         logs.push(`    GUI agent is alive (version ${agentPing.agentVersion ?? '(unknown)'}).`);
 
-        const currentLoads = parseTallyIniLoads(ini);
-        logs.push(`  Current Load= entries: ${currentLoads.length === 0 ? '(none)' : currentLoads.join(', ')}`);
-
-        const newLoads = replace ? [companyId] : Array.from(new Set([...currentLoads, companyId]));
-        const noChange = newLoads.length === currentLoads.length && newLoads.every((id, i) => id === currentLoads[i]);
-
-        if (!noChange) {
-          const updated = rewriteTallyIniLoads(ini, newLoads);
-          atomicWriteFile(tallyIniPath, updated);
-          logs.push(`  Updated tally.ini Load= to: ${newLoads.join(', ')}`);
-        } else {
-          logs.push('  tally.ini already has the requested Load= entries — skipping rewrite.');
-        }
-
-        // Stop Tally — BY PID, never by image name.
-        //
-        // This used to be `taskkill /F /IM tally.exe`. /IM matches on the image name, so on any
-        // machine running more than one Tally (an old version kept open for a closed financial
-        // year, say) asking to load a company force-killed EVERY instance, discarding whatever
-        // unsaved voucher was open in the others. That is data loss, from a tool the user thinks
-        // of as "open a company".
-        //
-        // Kill only the instance we actually read from, and if we cannot identify it, do not kill
-        // anything: a restart we cannot aim is worse than no restart.
-        const target = resolveTallyInstance();
-        if (!target.ok) {
-          auditLog('load-company', args, 'error', Date.now() - start);
-          return errorResult('PRECONDITION_FAILED', {
-            message: `Refusing to restart Tally: ${target.reason} load-company force-closes Tally, so it will not run without knowing exactly which instance to close.`,
-            remedy: `${target.remedy} Or use switch-company, which changes the resident company through Tally's own Select Company screen and never restarts anything.`,
-            logs: logs.join('\n'),
+        // Already resident: there is nothing to gain from closing Tally (#25) — but only when the resident
+        // company is provably THIS folder, not merely one with the same name (see decideAlreadyLoaded).
+        const alreadyLoaded = await listLoadedCompanies();
+        const targetName = resolved.companyName.trim().toLowerCase();
+        const residentByName = targetName ? alreadyLoaded.find(n => n.trim().toLowerCase() === targetName) : undefined;
+        if (residentByName) {
+          const residentId = await fetchCompanyIdentity(residentByName);
+          const decision = decideAlreadyLoaded({
+            folderId: companyId, folderName: resolved.companyName, folders, loaded: alreadyLoaded, replace,
+            residentNumber: residentId.companyNumber,
+            scannedTallysDataPath: !args.dataPath || (!!iniDataPath && path.resolve(args.dataPath).toLowerCase() === path.resolve(iniDataPath).toLowerCase()),
           });
-        }
-        logs.push(`  Stopping Tally (pid ${target.pid}, identified via ${target.via})...`);
-        try {
-          execSync(`taskkill /F /PID ${target.pid}`, { timeout: 10000, windowsHide: true });
-          logs.push('    Tally stopped.');
-        } catch (err: any) {
-          // Non-zero also covers "already gone", which is fine — we wanted it stopped.
-          logs.push(`    taskkill: ${String(err?.stderr || err?.message || err).trim().split('\n')[0]} (proceeding)`);
-        }
-        await sleep(2000);
-
-        // Start Tally via the GUI agent IPC. The MCP service typically runs in Windows Session 0 (no desktop),
-        // so it can't spawn GUI apps directly. The agent (tally-gui-agent-v2.ps1) runs in the interactive
-        // user session and does the Start-Process on our behalf.
-        // The agent's watch directory comes from TALLY_DATA_PATH env (same as the agent's startup logic) —
-        // it must match what the agent is watching, NOT what tally.ini's Data= says (those can differ).
-        logs.push(`  Starting Tally via GUI agent (${tallyExePath})...`);
-        const agentResp = await callGuiAgent('start-tally', { exePath: tallyExePath, waitSec: 30 }, 35, agentWatchDir, logs);
-        if (!agentResp) {
-          logs.push('    GUI agent did not respond — is tally-gui-agent-v2.ps1 running in the user session?');
-        } else if (agentResp.status !== 'success') {
-          logs.push(`    GUI agent reported failure: ${agentResp.message}`);
-        } else {
-          logs.push(`    GUI agent reports Tally window detected.`);
-        }
-
-        // Poll XML server until ready (or timeout)
-        logs.push(`  Polling Tally XML server (timeout ${args.waitTimeoutSec ?? 60}s)...`);
-        const ready = await waitForTallyReady(timeoutMs, logs);
-        if (!ready) {
-          auditLog('load-company', args, 'error', Date.now() - start);
-          return errorResult('TALLY_DOWN', {
-            message: 'Tally was restarted but never answered on its data connection.',
-            remedy:
-              `The most likely cause on a new setup is that the connection is switched off — it is off by ` +
-              `default in a fresh Tally, and restarting does not turn it on. ${TALLY_CONNECTIVITY_STEPS} ` +
-              `(Engineering note: if this server runs as a Session 0 service, Tally has no desktop there and ` +
-              `will never show a window — the GUI agent must launch it in the user session.)`,
-            logs: logs.join('\n'),
-          });
-        }
-
-        // Verify load: Tally silently skips auto-load when data is missing/empty or password-protected,
-        // so XML reachability alone isn't proof of success. We need the requested company to appear in the loaded list.
-        const expectedName = resolved.companyName.trim();
-        let loaded = await listLoadedCompanies();
-        if (expectedName && !loaded.some(n => n.toLowerCase() === expectedName.toLowerCase())) {
-          await sleep(2000);
-          loaded = await listLoadedCompanies();
-        }
-        logs.push(`  Loaded companies after restart: ${loaded.length === 0 ? '(none)' : loaded.join(', ')}`);
-
-        let verified = expectedName
-          ? loaded.some(n => n.toLowerCase() === expectedName.toLowerCase())
-          : loaded.length > 0;
-
-        // Credential fallback: if auto-load failed AND credentials were provided, ask the GUI agent
-        // to keystroke through the Select Company dialog + credential prompt. This handles user-based
-        // security where Tally drops to Select Company because the credential dialog blocked auto-load.
-        if (!verified && (args.userName || args.password)) {
-          logs.push('  Auto-load did not complete — likely blocked by credential prompt. Trying keystroke fallback via GUI agent...');
-          const unlockResp = await callGuiAgent(
-            'select-and-unlock-company',
-            { companyId, userName: args.userName || '', password: args.password || '' },
-            20,
-            agentWatchDir,
-            logs
-          );
-          if (!unlockResp || unlockResp.status !== 'success') {
-            logs.push(`    GUI agent reported: ${unlockResp ? unlockResp.message : 'no response'}`);
+          if (decision.skip) {
+            activeCompany = decision.resident;
+            logs.push(`  Already loaded (matched by ${decision.via}); not restarting.`);
+            auditLog('load-company', args, 'success', Date.now() - start);
+            return { content: [{ type: 'text', text: JSON.stringify({ success: true, alreadyLoaded: true, restarted: false, activeCompany: decision.resident, folderId: companyId, note: 'The company is already open in Tally, so Tally was not restarted.' }) }] };
           }
-          // Re-verify after keystrokes settle
-          await sleep(3000);
-          loaded = await listLoadedCompanies();
-          logs.push(`  Loaded companies after keystroke fallback: ${loaded.length === 0 ? '(none)' : loaded.join(', ')}`);
-          verified = expectedName
-            ? loaded.some(n => n.toLowerCase() === expectedName.toLowerCase())
-            : loaded.length > 0;
+          logs.push(`  "${residentByName}" is loaded, but a restart is still needed: ${decision.reason}.`);
         }
 
-        if (!verified) {
-          auditLog('load-company', args, 'error', Date.now() - start);
-          const hint = (args.userName || args.password)
-            ? 'Even with credentials, the company did not load. Verify the username/password are correct, and that the company is reachable via Alt+F3 → type id → Enter manually.'
-            : 'If the company is password-protected, retry with userName and password arguments to use the keystroke fallback.';
-          return errorResult('PASSWORD_REQUIRED', {
-            message: `Tally restarted but the requested company is not in the loaded list. ${hint}`,
-            logs: logs.join('\n'),
-          });
+        // Restart gate (#25): explicit confirmation from the user, and nobody at the keyboard. The agent
+        // judges "a person was active" against the restart threshold, not its own 5 s default, and
+        // leaves its own keystrokes out of it.
+        const minIdleSec = restartUserIdleSec();
+        const gateCompany = resolved.companyName || company;
+        const gateRefusal = (decision: Exclude<RestartGateDecision, { proceed: true }>, messageSuffix = '') => errorResult(decision.code, {
+          message: decision.message + messageSuffix,
+          ...(decision.remedy ? { remedy: decision.remedy } : {}),
+          extra: { company: gateCompany, folderId: companyId, ...(decision.idleMs !== undefined ? { idleMs: decision.idleMs } : {}) },
+        });
+        if (args.confirmRestart === true) {
+          const idle = await queryIdleStatus(agentWatchDir, logs, minIdleSec);
+          // Another window took the screen since the ping: say BUSY now rather than at the lock.
+          if (idle.busy) {
+            auditLog('load-company', args, 'denied', Date.now() - start);
+            return errorResult('BUSY', { message: idle.busy.message, extra: { retryAfterSec: idle.busy.retryAfterSec, holderTool: idle.busy.holderTool } });
+          }
+          const gateDecision = decideRestartGate({ confirmRestart: true, ...idle, minIdleSec, company: gateCompany });
+          if (!gateDecision.proceed) {
+            auditLog('load-company', args, 'denied', Date.now() - start);
+            return gateRefusal(gateDecision);
+          }
+        } else {
+          const gateDecision = decideRestartGate({ confirmRestart: args.confirmRestart, idleMs: null, minIdleSec, company: gateCompany });
+          if (!gateDecision.proceed) {
+            auditLog('load-company', args, 'dryrun', Date.now() - start);
+            return gateRefusal(gateDecision);
+          }
         }
 
-        // Pick activeCompany: prefer the verified name match; fall back to the only loaded company on Silver/single-load setups.
-        if (expectedName && loaded.some(n => n.toLowerCase() === expectedName.toLowerCase())) {
-          activeCompany = loaded.find(n => n.toLowerCase() === expectedName.toLowerCase()) || expectedName;
-        } else if (loaded.length === 1) {
-          activeCompany = loaded[0];
-        }
-        if (activeCompany) logs.push(`  Set activeCompany = "${activeCompany}".`);
+        // From here on Tally is restarted. Hold the machine-wide lock (#26) for the whole restart so no
+        // other AI window drives the screen or posts while Tally goes away, and raise the "reopening
+        // Tally" frame (#22). The countdown runs inside the lock so nothing sneaks in during it.
+        try {
+          return await withMachineLock('load-company', 'load', () => withActivity('loading', 'load-company', async () => {
+            // An XML write from another window (or another request in this one) may have passed its load
+            // check just before we took the lock; it is still on the wire and killing Tally now would
+            // leave its outcome unknown. The lock stops new writes, so wait for those already in flight
+            // to finish (see write-inflight.mts). This runs BEFORE the countdown and before tally.ini is
+            // touched: the countdown's end then lines up with the restart, and giving up here leaves nothing to
+            // undo. The lock is already held, so no new write can start during the countdown.
+            const writing = await waitForInflightWrites({ maxWaitMs: LOAD_WAIT_FOR_WRITES_MS });
+            if (writing.length) {
+              auditLog('load-company', args, 'denied', Date.now() - start);
+              return errorResult('BUSY', {
+                message: `An XML write to Tally is still in progress (${writing.length}, from another AI window or another request in this one), so Tally was not restarted. Nothing was changed.`,
+                remedy: 'Wait a few seconds and call load-company again (still with confirmRestart: true; the user already agreed).',
+                extra: { retryAfterSec: 10, holderTool: writing[0]!.tool, company: resolved.companyName || company },
+              });
+            }
+            logs.push('  No XML writes in flight; safe to restart Tally.');
 
-        auditLog('load-company', args, 'success', Date.now() - start);
-        return {
-          content: [{ type: 'text', text: logs.join('\n') + `\n\nTally is back up with ${loaded.length} loaded company/companies (edition: ${edition}). Active company: ${activeCompany || '(unset)'}.` }]
-        };
+            const countdown = await runRestartCountdown('load-company', resolved.companyName || company);
+            if (countdown === 'cancelled') {
+              auditLog('load-company', args, 'denied', Date.now() - start);
+              return errorResult('RESTART_CANCELLED_BY_USER', { extra: { company: resolved.companyName || company } });
+            }
+            // The keyboard check above ran before the lock and the countdown. With no tray running (or
+            // nobody looking at it) the countdown just elapses, and someone may have sat down and started
+            // an entry meanwhile: check again, right before anything is changed. Not after "Restart
+            // now": that click is itself mouse input from the person at the PC, who has said go.
+            if (countdown === 'elapsed') {
+              const again = await queryIdleStatus(agentWatchDir, logs, minIdleSec);
+              // Inside our own lock a probe only comes back busy if that lock was taken over (judged stale)
+              // by another window, which may now be driving the screen. Stop: never restart Tally unguarded.
+              if (again.busy) {
+                auditLog('load-company', args, 'denied', Date.now() - start);
+                return errorResult('BUSY', {
+                  message: 'Another AI window took over the Tally screen during the restart countdown, so Tally was not restarted. Nothing has been changed.',
+                  remedy: 'Wait for it to finish, then call load-company again (still with confirmRestart: true; the user already agreed).',
+                  extra: { retryAfterSec: 30, company: resolved.companyName || company },
+                });
+              }
+              const recheck = decideRestartGate({ confirmRestart: true, ...again, minIdleSec, company: gateCompany });
+              if (!recheck.proceed) {
+                auditLog('load-company', args, 'denied', Date.now() - start);
+                return gateRefusal(recheck, ' (Checked again at the end of the restart countdown; nothing has been changed.)');
+              }
+            }
+
+
+            const currentLoads = parseTallyIniLoads(ini);
+            logs.push(`  Current Load= entries: ${currentLoads.length === 0 ? '(none)' : currentLoads.join(', ')}`);
+
+            const newLoads = replace ? [companyId] : Array.from(new Set([...currentLoads, companyId]));
+            const noChange = newLoads.length === currentLoads.length && newLoads.every((id, i) => id === currentLoads[i]);
+
+            if (!noChange) {
+              const updated = rewriteTallyIniLoads(ini, newLoads);
+              atomicWriteFile(tallyIniPath, updated);
+              logs.push(`  Updated tally.ini Load= to: ${newLoads.join(', ')}`);
+            } else {
+              logs.push('  tally.ini already has the requested Load= entries — skipping rewrite.');
+            }
+
+            // Stop Tally — BY PID, never by image name.
+            //
+            // This used to be `taskkill /F /IM tally.exe`. /IM matches on the image name, so on any
+            // machine running more than one Tally (an old version kept open for a closed financial
+            // year, say) asking to load a company force-killed EVERY instance, discarding whatever
+            // unsaved voucher was open in the others. That is data loss, from a tool the user thinks
+            // of as "open a company".
+            //
+            // Kill only the instance we actually read from, and if we cannot identify it, do not kill
+            // anything: a restart we cannot aim is worse than no restart.
+            const target = resolveTallyInstance();
+            if (!target.ok) {
+              auditLog('load-company', args, 'error', Date.now() - start);
+              return errorResult('PRECONDITION_FAILED', {
+                message: `Refusing to restart Tally: ${target.reason} load-company force-closes Tally, so it will not run without knowing exactly which instance to close.`,
+                remedy: `${target.remedy} Or use switch-company, which changes the resident company through Tally's own Select Company screen and never restarts anything.`,
+                logs: logs.join('\n'),
+              });
+            }
+            logs.push(`  Stopping Tally (pid ${target.pid}, identified via ${target.via})...`);
+            try {
+              execSync(`taskkill /F /PID ${target.pid}`, { timeout: 10000, windowsHide: true });
+              logs.push('    Tally stopped.');
+            } catch (err: any) {
+              // Non-zero also covers "already gone", which is fine — we wanted it stopped.
+              logs.push(`    taskkill: ${String(err?.stderr || err?.message || err).trim().split('\n')[0]} (proceeding)`);
+            }
+            await sleep(2000);
+
+            // Start Tally via the GUI agent IPC. The MCP service typically runs in Windows Session 0 (no desktop),
+            // so it can't spawn GUI apps directly. The agent (tally-gui-agent-v2.ps1) runs in the interactive
+            // user session and does the Start-Process on our behalf.
+            // The agent's watch directory comes from TALLY_DATA_PATH env (same as the agent's startup logic) —
+            // it must match what the agent is watching, NOT what tally.ini's Data= says (those can differ).
+            logs.push(`  Starting Tally via GUI agent (${tallyExePath})...`);
+            const agentResp = await callGuiAgent('start-tally', { exePath: tallyExePath, waitSec: 30 }, 35, agentWatchDir, logs);
+            if (!agentResp) {
+              logs.push('    GUI agent did not respond — is tally-gui-agent-v2.ps1 running in the user session?');
+            } else if (agentResp.status !== 'success') {
+              logs.push(`    GUI agent reported failure: ${agentResp.message}`);
+            } else {
+              logs.push(`    GUI agent reports Tally window detected.`);
+            }
+
+            // Poll XML server until ready (or timeout)
+            logs.push(`  Polling Tally XML server (timeout ${waitTimeoutSec}s${(args.waitTimeoutSec ?? 60) > waitTimeoutSec ? `, capped from ${args.waitTimeoutSec}s` : ''})...`);
+            const ready = await waitForTallyReady(timeoutMs, logs);
+            if (!ready) {
+              auditLog('load-company', args, 'error', Date.now() - start);
+              return errorResult('TALLY_DOWN', {
+                message: 'Tally was restarted but never answered on its data connection.',
+                remedy:
+                  `The most likely cause on a new setup is that the connection is switched off — it is off by ` +
+                  `default in a fresh Tally, and restarting does not turn it on. ${TALLY_CONNECTIVITY_STEPS} ` +
+                  `(Engineering note: if this server runs as a Session 0 service, Tally has no desktop there and ` +
+                  `will never show a window — the GUI agent must launch it in the user session.)`,
+                logs: logs.join('\n'),
+              });
+            }
+
+            // Verify load: Tally silently skips auto-load when data is missing/empty or password-protected,
+            // so XML reachability alone isn't proof of success. We need the requested company to appear in the loaded list.
+            const expectedName = resolved.companyName.trim();
+            let loaded = await listLoadedCompanies();
+            if (expectedName && !loaded.some(n => n.toLowerCase() === expectedName.toLowerCase())) {
+              await sleep(2000);
+              loaded = await listLoadedCompanies();
+            }
+            logs.push(`  Loaded companies after restart: ${loaded.length === 0 ? '(none)' : loaded.join(', ')}`);
+
+            let verified = expectedName
+              ? loaded.some(n => n.toLowerCase() === expectedName.toLowerCase())
+              : loaded.length > 0;
+
+            // Credential fallback: if auto-load failed AND credentials were provided, ask the GUI agent
+            // to keystroke through the Select Company dialog + credential prompt. This handles user-based
+            // security where Tally drops to Select Company because the credential dialog blocked auto-load.
+            if (!verified && (args.userName || args.password)) {
+              logs.push('  Auto-load did not complete — likely blocked by credential prompt. Trying keystroke fallback via GUI agent...');
+              const unlockResp = await callGuiAgent(
+                'select-and-unlock-company',
+                { companyId, userName: args.userName || '', password: args.password || '' },
+                20,
+                agentWatchDir,
+                logs
+              );
+              const refusedUnlockLc = agentErrorResult(unlockResp, logs);
+              if (refusedUnlockLc) {
+                // Tally has already been restarted at this point; say so alongside the refusal.
+                auditLog('load-company', args, 'denied', Date.now() - start);
+                logs.push('    Tally was restarted, but the login keystrokes were not sent. Retry load-company with the same credentials once the PC is free.');
+                return agentErrorResult(unlockResp, logs)!;
+              }
+              if (!unlockResp || unlockResp.status !== 'success') {
+                logs.push(`    GUI agent reported: ${unlockResp ? unlockResp.message : 'no response'}`);
+              }
+              // Re-verify after keystrokes settle
+              await sleep(3000);
+              loaded = await listLoadedCompanies();
+              logs.push(`  Loaded companies after keystroke fallback: ${loaded.length === 0 ? '(none)' : loaded.join(', ')}`);
+              verified = expectedName
+                ? loaded.some(n => n.toLowerCase() === expectedName.toLowerCase())
+                : loaded.length > 0;
+            }
+
+            if (!verified) {
+              auditLog('load-company', args, 'error', Date.now() - start);
+              const hint = (args.userName || args.password)
+                ? 'Even with credentials, the company did not load. Verify the username/password are correct, and that the company is reachable via Alt+F3 → type id → Enter manually.'
+                : 'If the company is password-protected, retry with userName and password arguments to use the keystroke fallback.';
+              return errorResult('PASSWORD_REQUIRED', {
+                message: `Tally restarted but the requested company is not in the loaded list. ${hint}`,
+                logs: logs.join('\n'),
+              });
+            }
+
+            // Pick activeCompany: prefer the verified name match; fall back to the only loaded company on Silver/single-load setups.
+            if (expectedName && loaded.some(n => n.toLowerCase() === expectedName.toLowerCase())) {
+              activeCompany = loaded.find(n => n.toLowerCase() === expectedName.toLowerCase()) || expectedName;
+            } else if (loaded.length === 1) {
+              activeCompany = loaded[0];
+            }
+            if (activeCompany) logs.push(`  Set activeCompany = "${activeCompany}".`);
+
+            auditLog('load-company', args, 'success', Date.now() - start);
+            return {
+              content: [{ type: 'text', text: logs.join('\n') + `\n\nTally is back up with ${loaded.length} loaded company/companies (edition: ${edition}). Active company: ${activeCompany || '(unset)'}.` }]
+            };
+          }));
+        } catch (lockErr) {
+          if (!(lockErr instanceof MachineBusyError)) throw lockErr;
+          auditLog('load-company', args, 'denied', Date.now() - start);
+          return errorResult('BUSY', { message: lockErr.message, extra: { retryAfterSec: lockErr.retryAfterSec, holderTool: lockErr.holder?.tool ?? null } });
+        }
       } catch (err) {
         auditLog('load-company', args, 'error', Date.now() - start);
         return errorResult('UNKNOWN', { message: `load-company failed: ${err}`, logs: logs.join('\n') });
@@ -4218,6 +5428,11 @@ export async function registerMcpServer(): Promise<McpServer> {
       let renamed = 0;
       for (const r of repairs) {
         const resp = await pushXml(buildRenameMasterXml(tag, r.stored, r.proposed, company));
+        const busy = busyWriteResult(resp, { renamed, attempted: repairs.length, results });
+        if (busy) {
+          auditLog('repair-master-names', args, 'error', Date.now() - start);
+          return busy;
+        }
         // Never trust the response counters to tell a match from a fallback create — re-read and compare.
         // An ACTION="Alter" that fails to match CREATES a master, exactly as it does for vouchers.
         const after = await fetchMasterNames(collection, company);
@@ -4894,13 +6109,16 @@ export async function registerMcpServer(): Promise<McpServer> {
     'create-vouchers',
     {
       title: 'Create Vouchers (batch)',
-      description: `Posts a batch of vouchers, each the same shape as create-voucher (entries[] + optional blocks). Returns per-row typed results aligned to the input. atomic=true validates EVERY row first (deterministic invariants) and posts NOTHING if any fails — but note Tally has no cross-voucher rollback, so a mid-batch Tally-side write failure can leave earlier rows posted (surfaced per-row). atomic=false (default) posts each independently; a failed row doesn't stop the rest. idempotencyKey makes a replayed batch return the prior result without re-posting. Session assembles the well-formed vouchers[]; the host executes deterministically.`,
+      description: `BULK GUIDANCE: post in chunks of about 50 vouchers per call and report each chunk's results before sending the next; always pass a reference (the bill or document number) with skipIfExists: true for vouchers from documents; after a partial failure resend the same rows with resumeBatchId, never the whole batch without it. For a CSV or Excel file use import-vouchers instead. Posts a batch of vouchers, each the same shape as create-voucher (entries[] + optional blocks). Returns per-row typed results aligned to the input, and a batchId: every real batch is journalled, so if rows failed re-send the SAME vouchers with resumeBatchId to post only the rows not yet in Tally, and undo-batch can delete exactly the vouchers this batch posted. If the call timed out and no batchId came back, re-send the SAME vouchers unchanged: the server recognises them, posts nothing, and names the batchId to resume (or pass the same idempotencyKey, which resumes that batch). A resume while the earlier call is still posting is refused with BUSY: wait and resume again. A row whose request failed after it may have reached Tally comes back OUTCOME_UNKNOWN: with a reference it is safely re-sent on resume; without one it is NOT re-sent until the user has checked the Day Book and you list it in resendUnknownRows. A voucherNumber on a manually numbered type that is already used (in Tally or earlier in the batch) is refused with DUPLICATE_NUMBER. For CSV/Excel files use import-vouchers instead. atomic=true validates EVERY row first (deterministic invariants) and posts NOTHING if any fails — but note Tally has no cross-voucher rollback, so a mid-batch Tally-side write failure can leave earlier rows posted (surfaced per-row). atomic=false (default) posts each independently; a failed row doesn't stop the rest. idempotencyKey makes a replayed batch return the prior result without re-posting; if that result still has rows to retry (BUSY, not sent) or the call never finished, the replay resumes the same batch instead. Session assembles the well-formed vouchers[]; the host executes deterministically.`,
       inputSchema: {
         targetCompany: z.string().optional().describe('optional company name; defaults to the active company'),
         vouchers: z.array(z.object(voucherInputShape)).min(1).describe('array of vouchers, each the create-voucher shape (entries[] + optional blocks)'),
         atomic: z.boolean().optional().describe('true = all-or-nothing validation (post nothing if any row fails deterministic checks). Default false = best-effort per row.'),
-        idempotencyKey: z.string().optional().describe('optional; replaying the same key returns the prior batch result without re-posting'),
-        dryRun: z.boolean().optional().describe('if true, validate all rows and echo per-row results WITHOUT writing to Tally')
+        idempotencyKey: z.string().optional().describe('optional; replaying the same key returns the prior batch result without re-posting (or resumes that batch when rows are left to retry)'),
+        dryRun: z.boolean().optional().describe('if true, validate all rows and echo per-row results WITHOUT writing to Tally'),
+        resumeBatchId: z.string().optional().describe('batchId of an earlier create-vouchers call that did not finish (crash, timeout, some rows failed). Send the SAME vouchers[] in the same order: rows that batch already posted are not sent again, the rest are posted under the same batchId. Refused if any already-posted row was changed.'),
+        resendUnknownRows: z.array(z.number().int().min(0)).optional().describe('with resumeBatchId: 0-based indexes of OUTCOME_UNKNOWN rows without a reference that the USER has checked are NOT in the Day Book, so they may be sent again. Never list a row without that check: it would be booked twice.'),
+        newBatch: z.boolean().optional().describe('post as a new batch even though an earlier batch already sent these exact vouchers. Only when the user confirms they are meant to be booked a second time.'),
       },
       annotations: {
         readOnlyHint: false,
@@ -4908,7 +6126,7 @@ export async function registerMcpServer(): Promise<McpServer> {
         openWorldHint: false
       }
     },
-    async (args) => {
+    async (args, extra) => {
       const start = Date.now();
       if (process.env.READONLY_MODE === 'true') {
         auditLog('create-vouchers', { count: args.vouchers.length }, 'denied');
@@ -4916,13 +6134,38 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
       const store = getIdempotencyStore();
       const batchKey = args.idempotencyKey ? `batch:${args.idempotencyKey}` : '';
-      if (batchKey) {
+      // An explicit resumeBatchId is never short-circuited by the key: the caller asked to finish the batch.
+      let resumeBatchId = args.resumeBatchId;
+      if (batchKey && !resumeBatchId) {
         const prior = store.get(batchKey);
         if (prior) {
-          auditLog('create-vouchers', { count: args.vouchers.length, idempotentReplay: true }, 'success', Date.now() - start);
-          return { content: [{ type: 'text', text: JSON.stringify({ idempotentReplay: true, result: prior.result }) }] };
+          // A settled result replays as before. One the key cannot settle (a run that never finished, or
+          // rows told to try again: BUSY, cancelled) resumes its batch: the journal skips every row already
+          // in Tally, so this still never re-posts, and the retryable rows finally get sent.
+          const resumable = idempotentResumeTarget(prior.result);
+          if (!resumable) {
+            auditLog('create-vouchers', { count: args.vouchers.length, idempotentReplay: true }, 'success', Date.now() - start);
+            return { content: [{ type: 'text', text: JSON.stringify({ idempotentReplay: true, result: prior.result }) }] };
+          }
+          resumeBatchId = resumable;
         }
       }
+      // A replay arriving while the first call with this key is still posting, before its journal exists
+      // (a client timeout then a resend, #27): reserve the key for the duration so the replay is refused
+      // as BUSY rather than starting a second batch of the same rows. A dry run reserves nothing.
+      let keyClaim: ReturnType<IdempotencyStore['reserve']> | null = null;
+      if (batchKey && !args.dryRun) {
+        keyClaim = store.reserve(batchKey);
+        if (!keyClaim.ok) {
+          const done = store.get(batchKey);
+          if (done && !idempotentResumeTarget(done.result)) {
+            auditLog('create-vouchers', { count: args.vouchers.length, idempotentReplay: true }, 'success', Date.now() - start);
+            return { content: [{ type: 'text', text: JSON.stringify({ idempotentReplay: true, result: done.result }) }] };
+          }
+          return idempotencyInProgressResult(batchKey, keyClaim.retryAfterSec, 'A create-vouchers batch');
+        }
+      }
+      try {
       // Resolve the EXACT loaded company once for the whole batch, and fail closed if not loaded.
       const target = await resolveExactLoadedCompany(args.targetCompany || activeCompany || null);
       if (!target.ok) {
@@ -4952,15 +6195,33 @@ export async function registerMcpServer(): Promise<McpServer> {
           retryable: false,
         });
       }
-      const batch = await executeVoucherBatch(rows, { atomic: args.atomic ?? false, dryRun: args.dryRun, period, knownLedgers, knownStockItems, knownVoucherTypes, exactCompany: company, checkExisting: makeReferenceChecker(company) });
-      if (batchKey && !args.dryRun && !batch.aborted) {
+      // Every real batch is journalled (#31): the result carries a batchId for resumeBatchId / undo-batch.
+      const ran = await runBatchWithJournal(rows, {
+        tool: 'create-vouchers', company, atomic: args.atomic ?? false, dryRun: args.dryRun, resumeBatchId,
+        confirmedNotPosted: new Set(args.resendUnknownRows ?? []), newBatch: args.newBatch, signal: extra?.signal,
+        // With a key, the batchId is recorded under it BEFORE the first row is sent, so a replay after a
+        // timeout or a crash finds (and resumes) this batch rather than starting a second one.
+        onStart: batchKey && !args.dryRun ? (batchId) => { try { store.put(batchKey, { inProgress: true, batchId }, new Date().toISOString()); } catch {} } : undefined,
+        period, knownLedgers, knownStockItems, knownVoucherTypes, checkExisting: makeReferenceChecker(company), ...numberingExecOpts(company, period),
+      });
+      if (!ran.ok) {
+        auditLog('create-vouchers', { count: args.vouchers.length, resumeBatchId }, 'denied', Date.now() - start);
+        return ran.error;
+      }
+      const batch = ran.batch;
+      // Stored whatever its rows say: a replay decides from the rows whether to return it or resume it. An
+      // aborted (atomic) batch keeps the in-progress marker instead, so a replay re-validates its rows.
+      if (batchKey && !args.dryRun && !batch.aborted && batch.batchId) {
         try { store.put(batchKey, batch, new Date().toISOString()); } catch {}
       }
       // A skipped row (already-booked reference) is NOT a failure — only a real post error is. So the
       // batch is 'success' when every row either posted or was skipped.
       const status = args.dryRun ? 'dryrun' : (batch.aborted || (batch.posted + batch.skipped) < args.vouchers.length ? 'error' : 'success');
-      auditLog('create-vouchers', { count: args.vouchers.length, atomic: args.atomic, dryRun: args.dryRun }, status, Date.now() - start);
+      auditLog('create-vouchers', { count: args.vouchers.length, atomic: args.atomic, dryRun: args.dryRun, batchId: batch.batchId, resumeBatchId }, status, Date.now() - start);
       return { content: [{ type: 'text', text: JSON.stringify(batch, null, 2) }], isError: batch.aborted };
+      } finally {
+        if (keyClaim?.ok) keyClaim.reservation.release();
+      }
     }
   );
 
@@ -5037,6 +6298,11 @@ export async function registerMcpServer(): Promise<McpServer> {
 
       const xml = buildCancelVoucherXml({ voucherType: args.voucherType, voucherNumber: args.voucherNumber, date: args.date, masterId }, company);
       const resp = await pushXml(xml);
+      const busy = busyWriteResult(resp, { masterId });
+      if (busy) {
+        auditLog('reverse-voucher', args, 'error', Date.now() - start);
+        return busy;
+      }
       const result = interpretCancelResponse(resp, masterId);
       if (result.status === 'duplicate_created') {
         auditLog('reverse-voucher', args, 'error', Date.now() - start);
@@ -5180,6 +6446,11 @@ export async function registerMcpServer(): Promise<McpServer> {
       const attempts: Array<{ form: string; deleted: number; created: number; error?: string }> = [];
       for (const v of variants) {
         const resp = await pushXml(v.xml);
+        const busy = busyWriteResult(resp, { masterId });
+        if (busy) {
+          auditLog('delete-voucher', args, 'error', Date.now() - start);
+          return busy;
+        }
         attempts.push({ form: v.name, deleted: resp.deleted, created: resp.created, error: resp.error ? String(resp.error).slice(0, 140) : undefined });
         if (resp.created > 0) {
           auditLog('delete-voucher', args, 'error', Date.now() - start);
@@ -5294,6 +6565,13 @@ export async function registerMcpServer(): Promise<McpServer> {
           { action: 'wait', value: '1500' }
         ];
         const resp = await callGuiAgent('sendkeys', { keys }, 45, dataPath, logs);
+        // A typed refusal (someone at the keyboard, PC locked, another AI window busy) means NO
+        // keystroke was sent, so the outcome is known: nothing happened. Say that, not "unverified".
+        const refusedDel = agentErrorResult(resp, logs);
+        if (refusedDel) {
+          auditLog('gui-delete-voucher', args, 'denied', Date.now() - start);
+          return refusedDel;
+        }
         if (!resp) {
           auditLog('gui-delete-voucher', args, 'error', Date.now() - start);
           return errorResult('AGENT_UNREACHABLE', { message: 'The GUI agent did not respond, so it is UNKNOWN whether the keystroke landed. Check the Day Book before retrying.', logs: logs.join('\n') });
@@ -5529,6 +6807,11 @@ export async function registerMcpServer(): Promise<McpServer> {
       const attempts: Array<{ form: string; altered: number; created: number; error?: string }> = [];
       for (const v of variants) {
         const resp = await pushXml(v.xml);
+        const busy = busyWriteResult(resp, { masterId });
+        if (busy) {
+          auditLog('alter-voucher', args, 'error', Date.now() - start);
+          return busy;
+        }
         attempts.push({ form: v.name, altered: resp.altered, created: resp.created, error: resp.error ? String(resp.error).slice(0, 140) : undefined });
         const outcome = interpretAlterResponse(resp, masterId);
         if (outcome.status === 'created_instead') {
@@ -5537,7 +6820,10 @@ export async function registerMcpServer(): Promise<McpServer> {
         }
         if (outcome.status === 'altered') {
           auditLog('alter-voucher', args, 'success', Date.now() - start);
-          return { content: [{ type: 'text', text: JSON.stringify({ success: true, altered: outcome.altered, alterForm: v.name, masterId, changes, voucher: preview }) }] };
+          // `after`: the date and number the voucher now carries, as YYYY-MM-DD in local time (preview.date
+          // is a Date, which JSON turns into a UTC timestamp). Show-after-post opens the Day Book on it.
+          const after = { date: args.newDate || isoDate, voucherNumber: args.newVoucherNumber ?? voucherNumber };
+          return { content: [{ type: 'text', text: JSON.stringify({ success: true, altered: outcome.altered, alterForm: v.name, masterId, changes, voucher: preview, after }) }] };
         }
       }
       auditLog('alter-voucher', args, 'error', Date.now() - start);
@@ -5620,6 +6906,15 @@ export async function registerMcpServer(): Promise<McpServer> {
         const r = resolved[i];
         if (r.status === 'already_gone') { results.push({ ...previews[i], status: 'already_gone' }); skipped++; continue; }
         const out = await deleteResolvedVoucher(r.located, company);
+        if (out.status === 'busy') {
+          // Stop here: every further target would wait out the same load and be refused the same way.
+          auditLog('delete-vouchers', args, 'error', Date.now() - start);
+          return errorResult('BUSY', {
+            message: `${out.message} Stopped at master_id ${r.located.master_id}: ${deleted} voucher(s) were deleted before this; it and the remaining ${resolved.length - i - 1} target(s) were NOT processed.`,
+            remedy: `Wait about ${out.retryAfterSec}s, then call delete-vouchers again with only the targets not yet deleted (a target already deleted would come back as already_gone anyway).`,
+            extra: { retryAfterSec: out.retryAfterSec, holderTool: out.holderTool, deleted, results },
+          });
+        }
         if (out.status === 'created_instead') {
           auditLog('delete-vouchers', args, 'error', Date.now() - start);
           return errorResult('PRECONDITION_FAILED', { message: `HALTED mid-batch: deleting master_id ${r.located.master_id} made Tally CREATE ${out.created} voucher(s) via form "${out.form}". ${deleted} voucher(s) were deleted before this; check the Day Book. Remaining targets were NOT processed.`, retryable: false });
@@ -5630,6 +6925,256 @@ export async function registerMcpServer(): Promise<McpServer> {
       }
       auditLog('delete-vouchers', args, failed > 0 ? 'error' : 'success', Date.now() - start);
       return { content: [{ type: 'text', text: JSON.stringify({ success: failed === 0, deleted, skipped, requiresGui, failed, results }) }] };
+    }
+  );
+
+  mcpServer.registerTool(
+    'undo-batch',
+    {
+      title: 'Undo Batch (delete what one batch posted)',
+      description: `Deletes EXACTLY the vouchers one create-vouchers / import-vouchers batch posted, identified by the batchId that call returned — nothing else. Two-step: the default (dryRun true) previews, from the batch journal and a live read of each voucher, the list that would be deleted (masterId, voucherType, voucherNumber, date, amount) plus any that cannot be: a voucher CHANGED in Tally after the batch posted it (date, type, ledgers or amounts differ) is refused with VOUCHER_CHANGED and left alone, and one already deleted is just recorded. A voucher that was already in Tally before the batch (the batch's row carried the same reference or REMOTEID, so Tally altered it instead of creating one) is listed under existedBefore and NOT deleted; one Tally altered that cannot be proven new, one found in Tally only when a row whose answer was lost was re-sent, and a row sent with an unknown outcome whose re-send met possible matches (candidateMasterIds) are listed under needsConfirmation. Delete any of them only if the user confirms, by re-calling with its masterId in confirmMasterIds. Other rows sent with an unknown outcome are listed under unresolved: check them in the Day Book. SHOW THE USER THE LIST, then re-call with dryRun:false and confirm:true to delete. Refused with BUSY while a create-vouchers / import-vouchers call is still posting the same batch. Deletion goes through the same safe master_id-bound path as delete-vouchers, one voucher at a time; a voucher Tally will only delete on screen (Edit Log builds) comes back requires_gui — delete it with gui-delete-voucher, then run undo-batch again. Deleting is permanent. Refused when READONLY_MODE=true (preview included).`,
+      inputSchema: {
+        batchId: z.string().min(1).describe('the batchId returned by create-vouchers or import-vouchers (b-YYYYMMDD-HHMMSS-xxxxxx)'),
+        dryRun: z.boolean().optional().describe('default true: preview only. Set false together with confirm:true to delete.'),
+        confirm: z.boolean().optional().describe('must be true (with dryRun:false) to delete, after the user has seen the preview'),
+        targetCompany: z.string().optional().describe('optional; must be the company the batch was posted to (the journal records it)'),
+        confirmMasterIds: z.array(z.string()).optional().describe('master ids listed under existedBefore / needsConfirmation that the USER has confirmed may be deleted anyway (they are still checked for changes)'),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const start = Date.now();
+      if (process.env.READONLY_MODE === 'true') {
+        auditLog('undo-batch', args, 'denied');
+        return errorResult('READONLY');
+      }
+      if (!isValidBatchId(args.batchId)) {
+        auditLog('undo-batch', args, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: `"${args.batchId}" is not a batchId (expected b-YYYYMMDD-HHMMSS-xxxxxx).`, retryable: false });
+      }
+      const journals = getBatchJournalStore();
+      // Held for the preview too, so neither reads a journal a running post is still rewriting, and an undo
+      // can never run while a resume of the same batch posts (whose saves would put back 'success').
+      let lock: ReturnType<BatchJournalStore['lock']>;
+      try {
+        lock = journals.lock(args.batchId, 'undo-batch');
+      } catch (err) {
+        // The journal folder cannot be written (read-only or locked data folder): without the batch lock an
+        // undo could race a resume of the same batch, so refuse rather than go on unguarded.
+        auditLog('undo-batch', args, 'error', Date.now() - start);
+        return errorResult('PRECONDITION_FAILED', { message: `Batch ${args.batchId} could not be locked: ${err instanceof Error ? err.message : String(err)}. Nothing was deleted.`, remedy: 'Check that the Tally data folder is writable, then run undo-batch again.', retryable: true });
+      }
+      if (!lock.ok) {
+        auditLog('undo-batch', args, 'denied', Date.now() - start);
+        return errorResult('BUSY', {
+          message: describeBatchBusy(args.batchId, lock.holder),
+          remedy: 'Wait for that call to finish, then run undo-batch again.',
+          extra: { retryAfterSec: lock.retryAfterSec, batchId: args.batchId, ...(lock.holder ? { holderTool: lock.holder.tool } : {}) },
+        });
+      }
+      try {
+        const journal = journals.load(args.batchId);
+        if (!journal) {
+          auditLog('undo-batch', args, 'error', Date.now() - start);
+          return errorResult('PRECONDITION_FAILED', { message: `No journal for batch ${args.batchId}. Journals are kept for 30 days in this machine's data folder.`, remedy: 'Find the vouchers with find-voucher-by-reference / list-vouchers and use delete-vouchers.', retryable: false });
+        }
+        // The batch's own company, never "whatever is loaded": a master_id means nothing in another company.
+        if (args.targetCompany && args.targetCompany.trim().toLowerCase() !== journal.company.trim().toLowerCase()) {
+          auditLog('undo-batch', args, 'denied', Date.now() - start);
+          return errorResult('COMPANY_MISMATCH', { message: `Batch ${args.batchId} was posted to "${journal.company}", not "${args.targetCompany}". Nothing was deleted.` });
+        }
+        const target = await resolveExactLoadedCompany(journal.company);
+        if (!target.ok) {
+          auditLog('undo-batch', args, 'error', Date.now() - start);
+          return errorResult('COMPANY_NOT_FOUND', { message: `Batch ${args.batchId} was posted to "${journal.company}": ${target.message}`, retryable: false });
+        }
+        const company = target.name;
+        let busyStop: Extract<ResolvedDeleteResult, { status: 'busy' }> | null = null;
+        const deps = {
+          resolve: (masterId: string, voucherType: string) => resolveUndoTarget(masterId, voucherType, mid => locateByMasterId(mid, company)),
+          // The proof that an altered (or re-sent) row's voucher is this batch's own (planUndo).
+          findByRemoteId: makeRemoteIdChecker(company),
+          fetchBlock: async (located: any) => {
+            const iso = toIsoDate(located.date);
+            if (!iso) return { error: 'missing voucher date' };
+            const num = located.voucher_number != null && String(located.voucher_number).length ? String(located.voucher_number) : undefined;
+            const ex = await fetchVoucherExportBlock(String(located.master_id), String(located.voucher_type), num, iso, company);
+            return ex.block ? { block: ex.block } : { error: ex.error ?? 'could not isolate the voucher export block' };
+          },
+          // A delete refused because another AI window is reloading Tally (#26) wrote nothing. The first one
+          // stops the undo: the rest are not attempted (each would wait out the same load and be refused),
+          // and the whole call reports BUSY below.
+          deleteOne: async (located: any) => {
+            if (busyStop) return { status: 'failed', message: `Not attempted: ${busyStop.message}` };
+            const out = await deleteResolvedVoucher(located, company);
+            if (out.status === 'busy') { busyStop = out; return { status: 'failed', message: out.message }; }
+            return out;
+          },
+        };
+        const plan = await planUndo(journal, deps, { confirmMasterIds: new Set((args.confirmMasterIds ?? []).map(m => String(m).trim())) });
+        const view = plan.map(({ located: _l, ...p }) => p);
+        const summary = {
+          batchId: journal.batchId, company: journal.company, postedAt: journal.createdAt,
+          wouldDelete: view.filter(p => p.status === 'will_delete'),
+          refusedChanged: view.filter(p => p.status === 'changed'),
+          existedBefore: view.filter(p => p.status === 'existed_before'),
+          needsConfirmation: view.filter(p => p.status === 'needs_confirmation'),
+          alreadyGone: view.filter(p => p.status === 'already_gone'),
+          unresolved: view.filter(p => p.status === 'error'),
+        };
+        if (args.dryRun !== false || args.confirm !== true) {
+          auditLog('undo-batch', args, 'dryrun', Date.now() - start);
+          const count = summary.wouldDelete.length;
+          return { content: [{ type: 'text', text: JSON.stringify({
+            dryRun: true, ...summary,
+            message: count
+              ? `This will PERMANENTLY delete ${count} voucher(s) posted by batch ${journal.batchId}. Show the user the list; to proceed re-call with dryRun:false and confirm:true.`
+              : `Nothing to delete for batch ${journal.batchId}.`,
+          }, null, 2) }] };
+        }
+        if (!summary.wouldDelete.length && summary.refusedChanged.length) {
+          auditLog('undo-batch', args, 'denied', Date.now() - start);
+          return errorResult('VOUCHER_CHANGED', { message: `Every remaining voucher of batch ${journal.batchId} was changed after it was posted, so none was deleted: ${summary.refusedChanged.map(p => p.message).join(' | ')}` });
+        }
+        const out = await executeUndo(journal, plan, deps, () => journals.save(journal));
+        const deleted = out.results.filter(r => r.status === 'deleted').length;
+        const stoppedBusy = busyStop as Extract<ResolvedDeleteResult, { status: 'busy' }> | null;
+        if (stoppedBusy) {
+          auditLog('undo-batch', { batchId: args.batchId, deleted, busy: true }, 'error', Date.now() - start);
+          return errorResult('BUSY', {
+            message: `${stoppedBusy.message} The undo stopped there: ${deleted} voucher(s) were deleted and recorded in the journal; the rest were not touched.`,
+            remedy: `Wait about ${stoppedBusy.retryAfterSec}s, then run undo-batch again with the same batchId (preview first): it picks up where this one stopped.`,
+            extra: { retryAfterSec: stoppedBusy.retryAfterSec, holderTool: stoppedBusy.holderTool, batchId: journal.batchId, deleted, results: out.results },
+          });
+        }
+        const problems = out.results.filter(r => r.status !== 'deleted' && r.status !== 'already_gone').length;
+        auditLog('undo-batch', { batchId: args.batchId, deleted, problems }, out.halted || problems ? 'error' : 'success', Date.now() - start);
+        return { content: [{ type: 'text', text: JSON.stringify({ success: !out.halted && problems === 0, batchId: journal.batchId, deleted, halted: out.halted, results: out.results }, null, 2) }], isError: out.halted };
+      } finally {
+        lock.release();
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'import-vouchers',
+    {
+      title: 'Import Vouchers from CSV / Excel',
+      description: `Posts vouchers straight from a .csv or .xlsx file on the Tally PC — use this instead of reading a file and re-typing its rows into create-vouchers. You describe the MAPPING (which column is the date, amount, reference, ledgers); the server reads every row itself. Shape A: one row = one two-line voucher (debitLedger / creditLedger columns, or a constant for one side such as creditLedgerConstant:"Sales"). Shape B: several rows = one voucher, grouped by groupBy, each row one ledger line with side (Dr/Cr), debit/credit amount columns, or a signed amount. dryRun defaults to TRUE: it validates every voucher with the same checks as create-vouchers and returns the totals per voucher type, the first few vouchers as they would be posted, and EVERY error by spreadsheet row number (header = row 1) — show these to the user. Then call again with dryRun:false to post in chunks (default 50) under ONE batchId: resume an interrupted import with resumeBatchId, take it back with undo-batch. If a post timed out with no batchId, call it again unchanged: it posts nothing and names the batchId to resume. OUTCOME_UNKNOWN rows (sent, answer lost) without a reference are only re-sent once the user has checked the Day Book and you list their spreadsheet rows in resendUnknownRows. skipIfExists (default true) skips rows whose reference is already in Tally. The file must be inside Documents, Downloads, Desktop, the Tally data folder or TALLY_ALLOWED_IMPORT_ROOTS. Posting is refused when READONLY_MODE=true.`,
+      inputSchema: importVouchersInputShape,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args, extra) => {
+      const start = Date.now();
+      const dryRun = args.dryRun !== false;
+      const audit = { path: args.path, sheet: args.sheet, dryRun, atomic: args.atomic, resumeBatchId: args.resumeBatchId };
+      // The preview reads Tally and writes nothing, so it stays available in READONLY_MODE; posting does not.
+      if (!dryRun && process.env.READONLY_MODE === 'true') {
+        auditLog('import-vouchers', audit, 'denied');
+        return errorResult('READONLY');
+      }
+      const where = checkImportPath(args.path, allowedImportRoots(), isPathWithinRoots);
+      if (!where.ok) {
+        auditLog('import-vouchers', audit, 'denied');
+        return errorResult('PRECONDITION_FAILED', { message: where.message, retryable: false });
+      }
+      const loaded = loadImportTable(where.resolved, args.sheet);
+      if (!loaded.ok) {
+        auditLog('import-vouchers', audit, 'error', Date.now() - start);
+        return errorResult('PRECONDITION_FAILED', { message: loaded.message, retryable: false });
+      }
+      const conv = convertRows(loaded.table, args.mapping, { skipIfExists: args.skipIfExists ?? true });
+      if (!conv.ok) {
+        auditLog('import-vouchers', audit, 'denied', Date.now() - start);
+        return errorResult('PRECONDITION_FAILED', { message: conv.message, remedy: 'Fix the mapping (column names must match the header row) and run the preview again.', retryable: false });
+      }
+      if (!conv.slots.length) {
+        auditLog('import-vouchers', audit, 'denied', Date.now() - start);
+        return errorResult('PRECONDITION_FAILED', { message: `No data rows below the header row in "${where.resolved}"${loaded.table.sheet ? ` (sheet "${loaded.table.sheet}")` : ''}.`, retryable: false });
+      }
+      const target = await resolveExactLoadedCompany(args.targetCompany || activeCompany || null);
+      if (!target.ok) {
+        auditLog('import-vouchers', audit, 'error', Date.now() - start);
+        return errorResult('COMPANY_NOT_FOUND', { message: target.message, retryable: false });
+      }
+      const company = target.name;
+      const [period, knownLedgers, knownVoucherTypes] = await Promise.all([
+        fetchPeriodForWrite(company),
+        fetchMasterNames('ledger', company),
+        fetchMasterNames('vouchertype', company),
+      ]);
+      const numbering = numberingExecOpts(company, period);
+      // One position per voucher slot of the file, valid or not, so a resume after fixing bad rows lines
+      // up with the journal. A slot that is not a voucher is a placeholder that is never sent to Tally.
+      const rows = conv.slots.map(s => (s.voucher
+        ? { ...s.voucher, targetCompany: company }
+        : { voucherType: '', date: '', entries: [], invalidSourceRows: s.sourceRows } as unknown as VoucherArgs & { targetCompany?: string }));
+      const preErrors = new Map<number, { code: string; message: string }>();
+      conv.slots.forEach((s, i) => { if (s.error) preErrors.set(i, { code: s.error.code, message: s.error.message }); });
+      const valid = conv.slots.map((s, i) => ({ s, i })).filter(x => x.s.voucher);
+      const rowsLabel = (i: number) => conv.slots[i]!.sourceRows.join(', ');
+      // Two rows deriving the same REMOTEID would make the second re-key the first voucher (the
+      // create-vouchers rule); two rows sharing a manual voucher number would book the number twice.
+      // Checked across the WHOLE file, not per chunk: the first row of each group posts, later ones are refused.
+      for (const c of findRemoteIdCollisions(valid.map(x => x.s.voucher!))) {
+        const [first, ...later] = c.rows.map(k => valid[k]!.i);
+        for (const i of later) preErrors.set(i, { code: 'PRECONDITION_FAILED', message: `Row(s) ${rowsLabel(i)}: same voucher type, party and reference as row(s) ${rowsLabel(first!)} (REMOTEID ${c.remoteId}); posting both would overwrite the first. Not posted.` });
+      }
+      // Per financial year, as the Tally-side check is: a register spanning two years may restart INV-1.
+      for (const g of await inBatchNumberClashes(valid.map(x => x.s.voucher!), numbering.numberingFor, period?.fyFrom)) {
+        const [first, ...later] = g.rows.map(k => valid[k]!.i);
+        for (const i of later) if (!preErrors.has(i)) preErrors.set(i, { code: 'DUPLICATE_NUMBER', message: `Row(s) ${rowsLabel(i)}: ${g.voucherType} voucher number "${g.voucherNumber}" is also used by row(s) ${rowsLabel(first!)} of this file in the same financial year (manual numbering). Not posted.` });
+      }
+      // resendUnknownRows names spreadsheet rows; the journal counts voucher slots.
+      const unknownRows = new Set(args.resendUnknownRows ?? []);
+      const confirmedNotPosted = new Set(conv.slots.flatMap((s, i) => (s.sourceRows.some(r => unknownRows.has(r)) ? [i] : [])));
+      const ran = await runBatchWithJournal(rows, {
+        tool: 'import-vouchers', company, atomic: args.atomic ?? false, dryRun, resumeBatchId: args.resumeBatchId,
+        confirmedNotPosted, newBatch: args.newBatch, signal: extra?.signal,
+        chunkSize: args.chunkSize ?? 50, source: { path: where.resolved, ...(loaded.table.sheet ? { sheet: loaded.table.sheet } : {}) },
+        sourceRows: conv.slots.map(s => s.sourceRows), preErrors,
+        period, knownLedgers, knownStockItems: [], knownVoucherTypes, checkExisting: makeReferenceChecker(company), ...numbering,
+      });
+      if (!ran.ok) {
+        auditLog('import-vouchers', audit, 'denied', Date.now() - start);
+        return ran.error;
+      }
+      const batch = ran.batch;
+      const summary = summarizeImport(conv.slots, batch.results, { dryRun, sampleSize: args.sampleSize });
+      const rowSpan = (from: number, to: number) => {
+        const all = conv.slots.slice(from, to + 1).flatMap(s => s.sourceRows);
+        return [Math.min(...all), Math.max(...all)];
+      };
+      const body = {
+        ...(dryRun ? { dryRun: true } : { batchId: batch.batchId }),
+        file: where.resolved, format: loaded.table.format,
+        ...(loaded.table.sheet ? { sheet: loaded.table.sheet } : {}),
+        company, totalRows: conv.totalRows, blankRowsSkipped: conv.blankRows, totalVouchers: conv.slots.length,
+        ...(batch.aborted ? { aborted: true } : {}),
+        ...summary,
+        ...(batch.chunks ? { chunks: batch.chunks.map(c => ({ chunk: c.chunk, sourceRows: rowSpan(c.rows[0], c.rows[1]), posted: c.posted, skipped: c.skipped, errors: c.errors })) } : {}),
+        ...(batch.journalError ? { journalError: batch.journalError } : {}),
+        ...(batch.cancelled ? { cancelled: true } : {}),
+        ...(batch.earlierBatch ? { earlierBatch: batch.earlierBatch } : {}),
+        next: dryRun
+          ? (batch.earlierBatch
+            ? `These rows were already sent as batch ${batch.earlierBatch.batchId} (${batch.earlierBatch.posted} posted). Tell the user; to finish that import call again with dryRun:false and resumeBatchId:"${batch.earlierBatch.batchId}".`
+            : 'Show the user the totals, the sample and the errors. To post, call import-vouchers again with the same path and mapping and dryRun:false.')
+          : (batch.aborted
+            ? 'Nothing was posted (atomic). Fix the rows listed in errors and run again.'
+            : `Posted under batch ${batch.batchId ?? '(none)'}. If rows failed, fix them in the file and call again with resumeBatchId:"${batch.batchId}" (already-posted rows are not re-sent). Rows with OUTCOME_UNKNOWN may already be in Tally: ask the user to check the Day Book before listing any in resendUnknownRows. To take the whole import back: undo-batch.`),
+      };
+      const status = dryRun ? 'dryrun' : (batch.aborted || summary.invalid > 0 ? 'error' : 'success');
+      auditLog('import-vouchers', { ...audit, batchId: batch.batchId, vouchers: conv.slots.length, invalid: summary.invalid }, status, Date.now() - start);
+      return { content: [{ type: 'text', text: JSON.stringify(body, null, 2) }], isError: !dryRun && !!batch.aborted };
     }
   );
 
@@ -5697,6 +7242,8 @@ export async function registerMcpServer(): Promise<McpServer> {
       const resp = await push('ledger', inputParams);
       if (!resp.success) {
         auditLog('create-ledger', args, 'error', Date.now() - start);
+        const busy = busyWriteResult(resp);
+        if (busy) return busy;
         return errorResult('UNKNOWN', { message: resp.error || 'Failed to create ledger.' });
       }
       auditLog('create-ledger', args, 'success', Date.now() - start);
@@ -5763,6 +7310,8 @@ export async function registerMcpServer(): Promise<McpServer> {
       const resp = await push('ledger-gst', inputParams);
       if (!resp.success) {
         auditLog('set-ledger-gst', args, 'error', Date.now() - start);
+        const busy = busyWriteResult(resp);
+        if (busy) return busy;
         return errorResult('UNKNOWN', { message: resp.error || 'Failed to configure ledger GST.' });
       }
       auditLog('set-ledger-gst', args, 'success', Date.now() - start);
@@ -5818,7 +7367,15 @@ export async function registerMcpServer(): Promise<McpServer> {
         auditLog(tool, args, 'denied');
         return errorResult('PRECONDITION_FAILED', { message: `${errors.join(' ')} Nothing was changed.`, retryable: false });
       }
-      const company = args.targetCompany;
+      // One company for every read and the ALTER, defaulting to the active company like every other write.
+      // Leaving it unset let Tally apply the ALTER to ITS current company while the party rows were read
+      // from the server's active one (pull() injects it), so the two could be different books.
+      const target = await resolveExactLoadedCompany((args.targetCompany && args.targetCompany.trim()) || activeCompany || null);
+      if (!target.ok) {
+        auditLog(tool, args, 'error', Date.now() - start);
+        return errorResult('COMPANY_NOT_FOUND', { message: target.message, retryable: false });
+      }
+      const company = target.name;
 
       // The ALTER must carry the exact stored name: Tally matches it byte-for-byte, and an ALTER that matches
       // nothing can create a new ledger instead. No master list means no way to know, so refuse.
@@ -5873,6 +7430,8 @@ export async function registerMcpServer(): Promise<McpServer> {
       const resp = await pushXml(buildPartyAlterXml(storedName, changes, company));
       if (!resp.success) {
         auditLog(tool, args, 'error', Date.now() - start);
+        const busy = busyWriteResult(resp);
+        if (busy) return busy;
         return errorResult('UNKNOWN', { message: resp.error || 'Tally rejected the update.' });
       }
 
@@ -5953,6 +7512,8 @@ export async function registerMcpServer(): Promise<McpServer> {
       const resp = await push('stock-item', inputParams);
       if (!resp.success) {
         auditLog('create-stock-item', args, 'error', Date.now() - start);
+        const busy = busyWriteResult(resp);
+        if (busy) return busy;
         return errorResult('UNKNOWN', { message: resp.error || 'Failed to create stock item.' });
       }
       auditLog('create-stock-item', args, 'success', Date.now() - start);
@@ -6134,6 +7695,8 @@ export async function registerMcpServer(): Promise<McpServer> {
       const resp = await push('gst-voucher', inputParams);
       if (!resp.success) {
         auditLog('create-gst-voucher', args, 'error', Date.now() - start);
+        const busy = busyWriteResult(resp);
+        if (busy) return busy;
         return errorResult('UNKNOWN', { message: resp.error || 'Failed to create GST voucher.' });
       }
       auditLog('create-gst-voucher', args, 'success', Date.now() - start);
@@ -6321,6 +7884,11 @@ export async function registerMcpServer(): Promise<McpServer> {
         const agentWatchDir = process.env.TALLY_DATA_PATH || 'C:\\Users\\Public\\TallyPrimeEditLog\\data';
         logs.push('  Pinging GUI agent (needed to launch Tally in the interactive session)...');
         const agentPing = await pingGuiAgent(agentWatchDir, 4, logs);
+        const pingBusyOt = pingBusyError(agentPing);
+        if (pingBusyOt) {
+          auditLog('open-tally', args, 'denied', Date.now() - start);
+          return pingBusyOt;
+        }
         if (!agentPing.alive) {
           auditLog('open-tally', args, 'error', Date.now() - start);
           return errorResult('AGENT_UNREACHABLE', {
@@ -6415,13 +7983,25 @@ export async function registerMcpServer(): Promise<McpServer> {
         // select-and-unlock up to N times (the agent re-keys + re-verifies each attempt) before
         // surrendering PASSWORD_REQUIRED — so a transient miss isn't reported like a wrong password.
         const maxRetries = Math.max(1, parseInt(process.env.UNLOCK_MAX_RETRIES || '3', 10) || 3);
-        const { result: resp, attempts } = await retryForResult(
+        const lockedAlias = await withCompanyChangeLock('load-company-by-alias', () => retryForResult(
           () => callGuiAgent('select-and-unlock-company', { companyId: entry.folderId, userName: entry.username ?? '', password: plaintextPassword }, timeoutSec, dataPath, logs),
-          (r) => !!r && r.status === 'success',
+          // Do not re-dispatch a typed refusal: nothing was typed, and the reason will not clear by retrying.
+          (r) => !!r && (r.status === 'success' || !!agentErrorResult(r)),
           maxRetries
-        );
+        ));
+        plaintextPassword = '';
+        if (!lockedAlias.ok) {
+          auditLog('load-company-by-alias', args, 'denied', Date.now() - start);
+          return lockedAlias.error;
+        }
+        const { result: resp, attempts } = lockedAlias.value;
         logs.push(`  [unlock] select-and-unlock-company: ${attempts} attempt(s)`);
 
+        const refusedAlias = agentErrorResult(resp, logs);
+        if (refusedAlias) {
+          auditLog('load-company-by-alias', args, 'denied', Date.now() - start);
+          return refusedAlias;
+        }
         if (!resp) {
           auditLog('load-company-by-alias', args, 'error', Date.now() - start);
           return errorResult('AGENT_UNREACHABLE', { logs: logs.join('\n') });
@@ -6522,6 +8102,11 @@ export async function registerMcpServer(): Promise<McpServer> {
 
         // Confirm the GUI agent is alive AND new enough to know the switch-company action.
         const agentPing = await pingGuiAgent(tallyDataPath, 4, logs);
+        const pingBusySc = pingBusyError(agentPing);
+        if (pingBusySc) {
+          auditLog('switch-company', auditArgs, 'denied', Date.now() - start);
+          return pingBusySc;
+        }
         if (!agentPing.alive) {
           auditLog('switch-company', auditArgs, 'error', Date.now() - start);
           return errorResult('AGENT_UNREACHABLE', { logs: logs.join('\n') });
@@ -6538,13 +8123,23 @@ export async function registerMcpServer(): Promise<McpServer> {
         // Dispatch the keystroke macro. Bounded retry (each attempt re-opens Select Company via Alt+F3
         // and re-verifies against Tally's XML server), so a single transient keystroke miss isn't fatal.
         const maxRetries = Math.max(1, parseInt(process.env.SWITCH_MAX_RETRIES || '2', 10) || 2);
-        const { result: resp, attempts } = await retryForResult(
+        const lockedSwitch = await withCompanyChangeLock('switch-company', () => retryForResult(
           () => callGuiAgent('switch-company', { companyId: company.folderId, companyName: company.name, userName, password }, 30, tallyDataPath, logs),
-          (r) => !!r && r.status === 'success',
+          (r) => !!r && (r.status === 'success' || !!agentErrorResult(r)),
           maxRetries
-        );
+        ));
         password = ''; userName = ''; // drop secrets from locals ASAP
+        if (!lockedSwitch.ok) {
+          auditLog('switch-company', auditArgs, 'denied', Date.now() - start);
+          return lockedSwitch.error;
+        }
+        const { result: resp, attempts } = lockedSwitch.value;
         logs.push(`  [switch-company] ${attempts} attempt(s)`);
+        const refusedSwitch = agentErrorResult(resp, logs);
+        if (refusedSwitch) {
+          auditLog('switch-company', auditArgs, 'denied', Date.now() - start);
+          return refusedSwitch;
+        }
 
         const outcome = interpretSwitchResult(resp, { target: company.name, isProtected: company.isProtected, hadCreds });
         if (!outcome.ok) {
@@ -6597,7 +8192,8 @@ export async function registerMcpServer(): Promise<McpServer> {
       // retry (#5) — retry up to 3× so a transient miss isn't surfaced as a hard error.
       const { result: resp } = await retryForResult(
         () => callGuiAgent('screenshot', {}, 20, dataPath, logs),
-        (r) => !!r && r.status === 'success',
+        // A typed refusal (locked PC, someone typing, another window busy) will not clear in 300 ms.
+        (r) => !!r && (r.status === 'success' || !!agentErrorResult(r)),
         3, 300
       );
       // The agent writes the PNG BEFORE writing its result, so a credential/financial frame can be on
@@ -6608,6 +8204,12 @@ export async function registerMcpServer(): Promise<McpServer> {
         cleanupShot();
         auditLog('gui-screenshot', {}, 'error', Date.now() - start);
         return errorResult('AGENT_UNREACHABLE', { message: 'GUI agent did not respond. Is it running (tray > Restart GUI agent) and is Tally open?', logs: logs.join('\n') });
+      }
+      const refusedShot = agentErrorResult(resp, logs);
+      if (refusedShot) {
+        cleanupShot();
+        auditLog('gui-screenshot', {}, 'denied', Date.now() - start);
+        return refusedShot;
       }
       if (resp.status !== 'success') {
         cleanupShot();
@@ -6657,6 +8259,11 @@ export async function registerMcpServer(): Promise<McpServer> {
       if (!resp) {
         auditLog('gui-send-keys', redacted, 'error', Date.now() - start);
         return errorResult('AGENT_UNREACHABLE', { message: 'GUI agent did not respond. Is it running and is Tally open?', logs: logs.join('\n') });
+      }
+      const refusedKeys = agentErrorResult(resp, logs);
+      if (refusedKeys) {
+        auditLog('gui-send-keys', redacted, 'denied', Date.now() - start);
+        return refusedKeys;
       }
       if (resp.status !== 'success') {
         auditLog('gui-send-keys', redacted, 'error', Date.now() - start);
@@ -6717,6 +8324,11 @@ export async function registerMcpServer(): Promise<McpServer> {
         if (!resp) {
           auditLog('unlock-stored-credentials', auditArgs, 'error', Date.now() - start);
           return errorResult('AGENT_UNREACHABLE', { message: 'GUI agent did not respond.' });
+        }
+        const refusedUnlock = agentErrorResult(resp);
+        if (refusedUnlock) {
+          auditLog('unlock-stored-credentials', auditArgs, 'denied', Date.now() - start);
+          return refusedUnlock;
         }
         if (resp.status !== 'success') {
           auditLog('unlock-stored-credentials', auditArgs, 'error', Date.now() - start);

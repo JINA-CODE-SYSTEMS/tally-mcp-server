@@ -74,9 +74,10 @@ test('dryRun echoes the posting and posts nothing', async () => {
 });
 
 test('idempotent replay returns the prior result without re-posting', async () => {
-  const tmp = path.join(os.tmpdir(), `idem-${process.pid}-${Math.floor(process.hrtime()[1])}.json`);
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'idem-'));
   const store = makeIdempotencyStore(tmp);
-  store.put('K1', { success: true, lastVchId: 42 }, '2026-10-10T00:00:00Z');
+  // A recent timestamp: records older than 30 days expire (#27) and would not be replayed.
+  store.put('K1', { success: true, lastVchId: 42 }, new Date().toISOString());
   const r = await executeVoucher(
     { voucherType: 'Journal', date: '2026-10-10', entries: balanced, idempotencyKey: 'K1' },
     { idempotency: { store, now: '2026-10-10T00:00:00Z' } }
@@ -84,14 +85,14 @@ test('idempotent replay returns the prior result without re-posting', async () =
   const out = JSON.parse(r.content[0].text);
   assert.equal(out.idempotentReplay, true);
   assert.equal((out.result as any).lastVchId, 42);
-  try { fs.unlinkSync(tmp); } catch {}
+  fs.rmSync(tmp, { recursive: true, force: true });
 });
 
 // ── idempotency store persistence ──────────────────────────────────────────
 test('idempotency store persists across instances', () => {
-  const tmp = path.join(os.tmpdir(), `idem2-${process.pid}-${Math.floor(process.hrtime()[1])}.json`);
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'idem2-'));
   makeIdempotencyStore(tmp).put('A', { ok: 1 }, 't');
   assert.equal(makeIdempotencyStore(tmp).get('A')?.result && (makeIdempotencyStore(tmp).get('A')!.result as any).ok, 1);
   assert.equal(makeIdempotencyStore(tmp).get('missing'), null);
-  try { fs.unlinkSync(tmp); } catch {}
+  fs.rmSync(tmp, { recursive: true, force: true });
 });

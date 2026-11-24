@@ -14,6 +14,8 @@ scripts/TallyUI.dll
 deploy-diagnostics.txt
 installer-staging/
 dist-installer/
+# Claude Desktop extension, built from mcpb/ by scripts/build-mcpb.mjs.
+dist-mcpb/
 
 # Local-only Claude Code state (per-developer tooling config).
 # Anchored to the repo root: unanchored patterns match at any depth, and an

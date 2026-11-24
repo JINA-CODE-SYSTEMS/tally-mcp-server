@@ -58,20 +58,49 @@ jobs:
       # site/index.html ships {{RELEASE_*}} placeholders rather than hardcoded version numbers,
       # so the published page cannot drift from the actual latest release. If no release exists
       # yet, the buttons degrade to the releases listing instead of rendering broken placeholders.
+      #
+      # On a `release` event, look up THAT release by its tag (#43). Asking for "latest" seconds after
+      # publishing still returned the previous release, so the site kept advertising the old version
+      # until someone re-ran this by hand. But `published` also fires for a pre-release and for an older
+      # release published by hand (a backport), and the site's download button must offer neither: the
+      # event tag is used only when it is not a pre-release and is at least as new as "latest" (which
+      # may simply not have caught up yet). Push, dispatch and the workflow_call from release.yml (whose
+      # event is the caller's push or dispatch) keep the latest lookup. Values reach the script through
+      # env, never as expressions expanded inside the script.
       - name: Inject current release details
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          EVENT_PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
           set -euo pipefail
           REPO="$GITHUB_REPOSITORY"
           RELEASES_URL="https://github.com/$REPO/releases"
 
-          if gh release view --repo "$REPO" --json tagName,assets > /tmp/rel.json 2>/dev/null; then
+          LOOKUP=(gh release view --repo "$REPO" --json tagName,assets)
+          if [ "$EVENT_NAME" = "release" ] && [ -n "$EVENT_TAG" ]; then
+            if [ "$EVENT_PRERELEASE" = "true" ]; then
+              echo "$EVENT_TAG is a pre-release; the site keeps advertising the latest release."
+            else
+              LATEST_TAG=$(gh release view --repo "$REPO" --json tagName -q .tagName 2>/dev/null || true)
+              NEWEST=$(printf '%s\n%s\n' "${LATEST_TAG#v}" "${EVENT_TAG#v}" | sed '/^$/d' | sort -V | tail -n 1)
+              if [ -z "$LATEST_TAG" ] || [ "$NEWEST" = "${EVENT_TAG#v}" ]; then
+                echo "Triggered by the release of $EVENT_TAG (latest reports ${LATEST_TAG:-none}); using $EVENT_TAG."
+                LOOKUP=(gh release view "$EVENT_TAG" --repo "$REPO" --json tagName,assets)
+              else
+                echo "$EVENT_TAG is older than the latest release $LATEST_TAG; the site keeps advertising $LATEST_TAG."
+              fi
+            fi
+          fi
+
+          if "${LOOKUP[@]}" > /tmp/rel.json 2>/dev/null; then
             TAG=$(jq -r '.tagName' /tmp/rel.json)
             VERSION="${TAG#v}"
             FILE=$(jq -r '[.assets[] | select(.name | endswith(".exe"))][0].name // ""' /tmp/rel.json)
             BYTES=$(jq -r '[.assets[] | select(.name | endswith(".exe"))][0].size // 0' /tmp/rel.json)
-            SHA_URL=$(jq -r '[.assets[] | select(.name | endswith(".sha256"))][0].url // ""' /tmp/rel.json)
+            # The installer's own checksum file: a release also carries the extension's .sha256.
+            SHA_URL=$(jq -r --arg n "$FILE.sha256" '[.assets[] | select(.name == $n)][0].url // ""' /tmp/rel.json)
 
             if [ -n "$FILE" ]; then
               DOWNLOAD="$RELEASES_URL/download/$TAG/$FILE"

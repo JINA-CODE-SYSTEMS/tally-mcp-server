@@ -9,7 +9,7 @@ import {
   CLIENT_TARGETS, targetById, localLaunchSpec, parseClientConfig, serializeClientConfig,
   statusOfEntry, entryIdentity, mergeEntry, applyEntryToText, removeEntryFromText, parseCliArgs,
   applyToFile, removeFromFile, backupConfigFile,
-  stripJsonComments, stripTrailingCommas, type EditOutcome, type ClientTarget, entryPointsInside, envForAppdata } from './client-config.mjs';
+  stripJsonComments, stripTrailingCommas, type EditOutcome, type ClientTarget, entryPointsInside, envForAppdata, appFolderCandidates } from './client-config.mjs';
 
 // --- #172 B1: the client-config merge engine ---
 //
@@ -57,6 +57,8 @@ test('the target list is data, and each target names the key it merges into', ()
   assert.deepEqual(CLIENT_TARGETS.map(t => [t.id, t.serversKey]), [
     ['claude-desktop', 'mcpServers'],
     ['cursor', 'mcpServers'],
+    ['windsurf', 'mcpServers'],
+    ['lmstudio', 'mcpServers'],
     ['vscode', 'servers']
   ]);
 });
@@ -516,7 +518,7 @@ test('a bare invocation defaults to the read-only command', () => {
   const o = parseCliArgs([]);
   assert.equal(o.command, 'status');
   assert.equal(o.dryRun, false);
-  assert.deepEqual(o.targets, ['claude-desktop', 'cursor', 'vscode']);
+  assert.deepEqual(o.targets, ['claude-desktop', 'cursor', 'windsurf', 'lmstudio', 'vscode']);
 });
 
 test('flags parse, and --target all expands to every target', () => {
@@ -965,7 +967,7 @@ const CURSOR = targetById('cursor')!;
 test('Cursor: the global mcp.json under the home folder, with the entry shape its docs give', () => {
   assert.deepEqual(CURSOR.resolvePath({ home: 'C:\\Users\\asha', p: path.win32 }), { ok: true, file: 'C:\\Users\\asha\\.cursor\\mcp.json' });
   assert.deepEqual(CURSOR.resolvePath({ home: '/home/asha', p: path.posix }), { ok: true, file: '/home/asha/.cursor/mcp.json' });
-  assert.equal(CURSOR.appFolder!({ home: 'C:\\Users\\asha', p: path.win32 }), 'C:\\Users\\asha\\.cursor');
+  assert.deepEqual(CURSOR.appFolder!({ home: 'C:\\Users\\asha', p: path.win32, platform: 'linux' }), ['C:\\Users\\asha\\.cursor']);
   const launch = localLaunchSpec(INSTALL, NODE, path.win32);
   assert.deepEqual(CURSOR.buildEntry(launch), { type: 'stdio', command: NODE, args: [...launch.args] });
   assert.equal(CURSOR.serverName, 'tally-prime');
@@ -975,17 +977,24 @@ test('Cursor: the global mcp.json under the home folder, with the entry shape it
 });
 
 test('--target apps expands to the per-user apps and leaves the workspace-scoped target out', () => {
-  assert.deepEqual(parseCliArgs(['apply', '--target', 'apps']).targets, ['claude-desktop', 'cursor']);
-  assert.deepEqual(parseCliArgs(['apply', '--target', 'apps', '--target', 'vscode']).targets, ['claude-desktop', 'cursor', 'vscode']);
-  assert.deepEqual(parseCliArgs(['apply', '--target', 'cursor', '--target', 'apps']).targets, ['cursor', 'claude-desktop']);
+  const APPS = ['claude-desktop', 'cursor', 'windsurf', 'lmstudio'];
+  assert.deepEqual(parseCliArgs(['apply', '--target', 'apps']).targets, APPS);
+  assert.deepEqual(parseCliArgs(['apply', '--target', 'apps', '--target', 'vscode']).targets, [...APPS, 'vscode']);
+  assert.deepEqual(parseCliArgs(['apply', '--target', 'cursor', '--target', 'apps']).targets, ['cursor', 'claude-desktop', 'windsurf', 'lmstudio']);
+  assert.deepEqual(parseCliArgs(['apply', '--target', 'windsurf']).targets, ['windsurf']);
+  assert.deepEqual(parseCliArgs(['apply', '--target', 'lmstudio']).targets, ['lmstudio']);
   assert.equal(parseCliArgs(['remove', '--target', 'cursor', '--home', 'C:\\Users\\asha']).home, 'C:\\Users\\asha');
   assert.throws(() => parseCliArgs(['apply', '--home']), /--home needs a value/);
 });
 
 test('CLI: Cursor is skipped when it is not installed, connected when it is, and cleaned up on remove', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'tally-cursor-'));
+  // An empty Program Files, so a machine-wide Cursor on the PC running the tests (Windows) cannot
+  // make "not installed" read as installed.
+  const programFiles = fs.mkdtempSync(path.join(os.tmpdir(), 'tally-cursor-pf-'));
   const run = (args: string[]) => {
-    const r = spawnSync(process.execPath, [CLI, ...args, '--target', 'cursor', '--home', home, '--install-root', INSTALL, '--node', NODE, '--json'], { encoding: 'utf-8' });
+    const r = spawnSync(process.execPath, [CLI, ...args, '--target', 'cursor', '--home', home, '--install-root', INSTALL, '--node', NODE, '--json'],
+      { encoding: 'utf-8', env: { ...process.env, ProgramFiles: programFiles } });
     return { code: r.status, result: JSON.parse(r.stdout).results[0] };
   };
   const cursorDir = path.join(home, '.cursor');
@@ -1021,4 +1030,163 @@ test('CLI: Cursor is skipped when it is not installed, connected when it is, and
   assert.equal(run(['remove']).result.wrote, true);
   assert.equal(JSON.parse(fs.readFileSync(file, 'utf-8')).mcpServers?.['tally-prime'], undefined);
   fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(programFiles, { recursive: true, force: true });
 });
+
+// The program-folder candidates exist only on Windows (LOCALAPPDATA, ProgramFiles), so this end-to-end
+// case runs only when `npm test` runs on Windows; the candidate list itself is checked everywhere above.
+test('CLI: Cursor installed but never launched (no ~/.cursor yet) is connected, as the tray offers', { skip: process.platform !== 'win32' }, () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'tally-cursor-'));
+  const programFiles = fs.mkdtempSync(path.join(os.tmpdir(), 'tally-cursor-pf-'));
+  const run = (args: string[]) => {
+    const r = spawnSync(process.execPath, [CLI, ...args, '--target', 'cursor', '--home', home, '--install-root', INSTALL, '--node', NODE, '--json'],
+      { encoding: 'utf-8', env: { ...process.env, ProgramFiles: programFiles } });
+    return { code: r.status, result: JSON.parse(r.stdout).results[0] };
+  };
+  const file = path.join(home, '.cursor', 'mcp.json');
+  try {
+    for (const programFolder of [path.join(programFiles, 'cursor'), path.join(home, 'AppData', 'Local', 'Programs', 'cursor')]) {
+      fs.mkdirSync(programFolder, { recursive: true });
+      const applied = run(['apply']);
+      assert.equal(applied.code, 0, programFolder);
+      assert.equal(applied.result.notInstalled, undefined, programFolder);
+      assert.equal(applied.result.wrote, true, programFolder);
+      assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(file, 'utf-8')).mcpServers), ['tally-prime']);
+      fs.rmSync(programFolder, { recursive: true, force: true });
+      fs.rmSync(path.join(home, '.cursor'), { recursive: true, force: true });
+    }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(programFiles, { recursive: true, force: true });
+  }
+});
+
+// --- Windsurf and LM Studio (#39): per-user apps, connected only when installed, like Cursor ---
+
+const WINDSURF = targetById('windsurf')!;
+const LMSTUDIO = targetById('lmstudio')!;
+
+test('Windsurf: ~/.codeium/windsurf/mcp_config.json, with the command/args entry its docs give', () => {
+  assert.deepEqual(WINDSURF.resolvePath({ home: 'C:\\Users\\asha', p: path.win32 }), { ok: true, file: 'C:\\Users\\asha\\.codeium\\windsurf\\mcp_config.json' });
+  assert.deepEqual(WINDSURF.resolvePath({ home: '/home/asha', p: path.posix, platform: 'linux' }), { ok: true, file: '/home/asha/.codeium/windsurf/mcp_config.json' });
+  const launch = localLaunchSpec(INSTALL, NODE, path.win32);
+  assert.deepEqual(WINDSURF.buildEntry(launch), { command: NODE, args: [...launch.args] });
+  assert.equal(WINDSURF.serversKey, 'mcpServers');
+  assert.equal(WINDSURF.serverName, 'tally-prime');
+  assert.equal(WINDSURF.jsonc, false);
+});
+
+test('LM Studio: ~/.lmstudio/mcp.json, with the Cursor-style entry', () => {
+  assert.deepEqual(LMSTUDIO.resolvePath({ home: 'C:\\Users\\asha', p: path.win32 }), { ok: true, file: 'C:\\Users\\asha\\.lmstudio\\mcp.json' });
+  assert.deepEqual(LMSTUDIO.resolvePath({ home: '/home/asha', p: path.posix, platform: 'linux' }), { ok: true, file: '/home/asha/.lmstudio/mcp.json' });
+  const launch = localLaunchSpec(INSTALL, NODE, path.win32);
+  assert.deepEqual(LMSTUDIO.buildEntry(launch), CURSOR.buildEntry(launch));
+  assert.equal(LMSTUDIO.serversKey, 'mcpServers');
+  assert.equal(LMSTUDIO.serverName, 'tally-prime');
+  assert.equal(LMSTUDIO.jsonc, false);
+});
+
+test('Windsurf and LM Studio: installed when the program folder OR the profile data folder exists', () => {
+  const win = { platform: 'win32' as const, p: path.win32, env: { LOCALAPPDATA: 'C:\\Users\\asha\\AppData\\Local' } };
+  // The caller's own profile: LOCALAPPDATA from the environment.
+  assert.deepEqual(appFolderCandidates(WINDSURF, { ...win, home: undefined, env: win.env })!.slice(0, 1), ['C:\\Users\\asha\\AppData\\Local\\Programs\\Windsurf']);
+  // Another profile via --home: that profile's AppData\Local, never the caller's.
+  assert.deepEqual(appFolderCandidates(WINDSURF, { ...win, home: 'C:\\Users\\ravi', env: win.env }), [
+    'C:\\Users\\ravi\\AppData\\Local\\Programs\\Windsurf', 'C:\\Users\\ravi\\.codeium\\windsurf'
+  ]);
+  assert.deepEqual(appFolderCandidates(LMSTUDIO, { ...win, home: 'C:\\Users\\ravi', env: win.env }), [
+    'C:\\Users\\ravi\\.lmstudio', 'C:\\Users\\ravi\\AppData\\Local\\Programs\\LM Studio'
+  ]);
+  // Off Windows there is no LOCALAPPDATA: only the profile folder counts.
+  assert.deepEqual(appFolderCandidates(LMSTUDIO, { platform: 'linux', p: path.posix, home: '/home/asha' }), ['/home/asha/.lmstudio']);
+  assert.deepEqual(appFolderCandidates(CURSOR, { platform: 'linux', p: path.posix, home: '/home/asha' }), ['/home/asha/.cursor']);
+  assert.equal(appFolderCandidates(CD, {}), undefined);
+});
+
+test('Cursor: installed when either program folder the tray tests exists, not only once ~/.cursor does', () => {
+  // ~/.cursor appears only when Cursor is first launched, but the tray offers to connect Cursor as
+  // soon as %LOCALAPPDATA%\Programs\cursor or %ProgramFiles%\cursor exists (tray-ai-apps.ps1).
+  // Both sides must agree, or that offer ends in "Cursor does not appear to be installed".
+  const env = { LOCALAPPDATA: 'C:\\Users\\asha\\AppData\\Local', ProgramFiles: 'C:\\Program Files' };
+  const win = { platform: 'win32' as const, p: path.win32, env };
+  assert.deepEqual(appFolderCandidates(CURSOR, { ...win, home: 'C:\\Users\\asha' }), [
+    'C:\\Users\\asha\\AppData\\Local\\Programs\\cursor', 'C:\\Program Files\\cursor', 'C:\\Users\\asha\\.cursor'
+  ]);
+  // Another profile via --home: its own per-user folder; Program Files is the same for everyone.
+  assert.deepEqual(appFolderCandidates(CURSOR, { ...win, home: 'C:\\Users\\ravi' }), [
+    'C:\\Users\\ravi\\AppData\\Local\\Programs\\cursor', 'C:\\Program Files\\cursor', 'C:\\Users\\ravi\\.cursor'
+  ]);
+  // No ProgramFiles variable (a stripped environment): only the per-user folders.
+  assert.deepEqual(appFolderCandidates(CURSOR, { ...win, env: { LOCALAPPDATA: env.LOCALAPPDATA }, home: 'C:\\Users\\asha' }), [
+    'C:\\Users\\asha\\AppData\\Local\\Programs\\cursor', 'C:\\Users\\asha\\.cursor'
+  ]);
+  // Off Windows a stray ProgramFiles variable means nothing.
+  assert.deepEqual(appFolderCandidates(CURSOR, { platform: 'linux', p: path.posix, env, home: '/home/asha' }), ['/home/asha/.cursor']);
+});
+
+for (const { id, configRel, appRel } of [
+  { id: 'windsurf', configRel: ['.codeium', 'windsurf', 'mcp_config.json'], appRel: ['.codeium', 'windsurf'] },
+  { id: 'lmstudio', configRel: ['.lmstudio', 'mcp.json'], appRel: ['.lmstudio'] },
+]) {
+  const target = targetById(id)!;
+  test(`CLI: ${target.label} is skipped when not installed, merged beside other servers when it is, and cleaned up on remove`, () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), `tally-${id}-`));
+    // A native path, so --require-install-root compares real paths on whatever OS runs the tests.
+    const install = path.join(os.tmpdir(), 'claudally-test-install');
+    const ours = target.buildEntry(localLaunchSpec(install, NODE));
+    const run = (args: string[], extra: string[] = []) => {
+      const r = spawnSync(process.execPath, [CLI, ...args, '--target', id, '--home', home, '--install-root', install, '--node', NODE, '--json', ...extra], { encoding: 'utf-8' });
+      return { code: r.status, result: JSON.parse(r.stdout).results[0] };
+    };
+    const file = path.join(home, ...configRel);
+    try {
+      // Not installed: nothing is created, and it is not an error.
+      for (const command of ['apply', 'status']) {
+        const r = run([command]);
+        assert.equal(r.code, 0, command);
+        assert.equal(r.result.notInstalled, true);
+        assert.match(r.result.skipped, /does not appear to be installed/);
+      }
+      assert.deepEqual(fs.readdirSync(home), [], `no folder is created for ${target.label} when it is not there`);
+      assert.deepEqual(run(['detect']).result, { target: id, file, exists: false, installed: false });
+
+      // Installed, with another server already configured: ours is merged in beside it.
+      fs.mkdirSync(path.join(home, ...appRel), { recursive: true });
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify({ mcpServers: { other: { command: 'npx', args: ['-y', 'x'] } }, otherSetting: true }, null, 2));
+      const applied = run(['apply']);
+      assert.equal(applied.code, 0);
+      assert.equal(applied.result.wrote, true);
+      const written = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      assert.deepEqual(written.mcpServers.other, { command: 'npx', args: ['-y', 'x'] });
+      assert.equal(written.otherSetting, true);
+      assert.deepEqual(written.mcpServers['tally-prime'], ours);
+      assert.equal(run(['apply']).result.wrote, false, 'a second apply changes nothing');
+
+      // Installed but no config yet: the file is created.
+      fs.rmSync(file);
+      assert.equal(run(['apply']).result.wrote, true);
+      assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(file, 'utf-8')).mcpServers), ['tally-prime']);
+
+      // The uninstaller's sweep: an entry pointing elsewhere is left alone...
+      // (same script tail, so only the install-root check tells them apart)
+      const foreign = { mcpServers: { 'tally-prime': { command: NODE, args: [path.join(os.tmpdir(), 'my-fork', 'dist', 'index.mjs')] }, other: { command: 'x' } } };
+      fs.writeFileSync(file, JSON.stringify(foreign, null, 2));
+      const before = fs.readFileSync(file, 'utf-8');
+      const sweep = run(['remove'], ['--require-install-root']);
+      assert.equal(sweep.code, 2);
+      assert.equal(sweep.result.state, 'foreign');
+      assert.equal(fs.readFileSync(file, 'utf-8'), before);
+
+      // ...and ours is removed, siblings kept.
+      fs.writeFileSync(file, JSON.stringify({ mcpServers: { 'tally-prime': ours, other: { command: 'x' } } }, null, 2));
+      assert.equal(run(['remove'], ['--require-install-root']).result.wrote, true);
+      const after = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      assert.equal(after.mcpServers['tally-prime'], undefined);
+      assert.deepEqual(after.mcpServers.other, { command: 'x' });
+      assert.equal(run(['remove']).result.wrote, false, 'removing again is a no-op');
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+}
