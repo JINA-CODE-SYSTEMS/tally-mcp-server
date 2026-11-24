@@ -1129,6 +1129,12 @@ export interface CliOptions {
   /** Override for the home directory, for targets that live under it (Cursor, Windsurf, LM Studio). Same purpose as --appdata. */
   home?: string;
   /**
+   * Override for %ProgramFiles%, where a machine-wide app install is looked for. An option and not
+   * just the environment variable because Windows sets ProgramFiles itself when a process starts,
+   * so a caller (a test, mainly) cannot redirect it through the child's environment.
+   */
+  programFiles?: string;
+  /**
    * Refuse to remove an entry unless it actually points INSIDE --install-root.
    *
    * Off by default, because the normal single-user remove SHOULD still clean up an entry left
@@ -1180,6 +1186,7 @@ export function parseCliArgs(argv: string[]): CliOptions {
     else if (a === '--workspace') opts.workspace = value(a);
     else if (a === '--appdata') opts.appdata = value(a);
     else if (a === '--home') opts.home = value(a);
+    else if (a === '--program-files') opts.programFiles = value(a);
     else if (a === '--require-install-root') opts.requireInstallRoot = true;
     else if (a === '--install-root') opts.installRoot = value(a);
     else if (a === '--node') opts.nodeExe = value(a);
@@ -1200,7 +1207,19 @@ export function parseCliArgs(argv: string[]): CliOptions {
 const CLI_COMMANDS = ['detect', 'status', 'apply', 'remove', 'show'];
 
 const USAGE = 'usage: node dist/client-config.mjs <detect|status|apply|remove|show> [--target claude-desktop|cursor|windsurf|lmstudio|vscode|apps|all]'
-  + ' [--workspace DIR] [--appdata DIR] [--home DIR] [--require-install-root] [--install-root DIR] [--node PATH] [--json] [--dry-run] [--allow-comment-loss]\n';
+  + ' [--workspace DIR] [--appdata DIR] [--home DIR] [--program-files DIR] [--require-install-root] [--install-root DIR] [--node PATH] [--json] [--dry-run] [--allow-comment-loss]\n';
+
+/** The environment the targets see: the real one, with --appdata and --program-files applied. Undefined when neither is given. */
+function cliEnv(opts: CliOptions): NodeJS.ProcessEnv | undefined {
+  if (!opts.appdata && !opts.programFiles) return undefined;
+  let env: NodeJS.ProcessEnv = opts.appdata ? envForAppdata(opts.appdata) : { ...process.env };
+  if (opts.programFiles) {
+    // Windows names are case-insensitive: drop every spelling so ours is the only one.
+    env = Object.fromEntries(Object.entries(env).filter(([k]) => k.toLowerCase() !== 'programfiles'));
+    env.ProgramFiles = opts.programFiles;
+  }
+  return env;
+}
 
 export function runCli(argv: string[]): number {
   let opts: CliOptions;
@@ -1234,7 +1253,7 @@ export function runCli(argv: string[]): number {
       // Only override when asked: an empty --appdata must not blank out the real one. LOCALAPPDATA
       // moves with it (Roaming's sibling), so another user's packaged config is found under THEIR
       // profile and never under the caller's.
-      env: opts.appdata ? envForAppdata(opts.appdata) : undefined,
+      env: cliEnv(opts),
     };
     const resolved = target.resolvePath(ctx);
     if (!resolved.ok) { report.push({ target: id, skipped: resolved.reason }); continue; }

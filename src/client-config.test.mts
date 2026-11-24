@@ -654,6 +654,7 @@ test('removeFromFile leaves a hijacked entry — and the file\'s bytes — alone
 
 const CLI = fileURLToPath(new URL('./client-config.mjs', import.meta.url));
 
+
 function cli(args: string[]): { code: number; out: string; err: string } {
   const r = spawnSync(process.execPath, [CLI, ...args, '--target', 'vscode', '--install-root', INSTALL, '--node', NODE], { encoding: 'utf-8' });
   return { code: r.status ?? -1, out: r.stdout ?? '', err: r.stderr ?? '' };
@@ -993,8 +994,8 @@ test('CLI: Cursor is skipped when it is not installed, connected when it is, and
   // make "not installed" read as installed.
   const programFiles = fs.mkdtempSync(path.join(os.tmpdir(), 'tally-cursor-pf-'));
   const run = (args: string[]) => {
-    const r = spawnSync(process.execPath, [CLI, ...args, '--target', 'cursor', '--home', home, '--install-root', INSTALL, '--node', NODE, '--json'],
-      { encoding: 'utf-8', env: { ...process.env, ProgramFiles: programFiles } });
+    const r = spawnSync(process.execPath, [CLI, ...args, '--target', 'cursor', '--home', home, '--program-files', programFiles, '--install-root', INSTALL, '--node', NODE, '--json'],
+      { encoding: 'utf-8' });
     return { code: r.status, result: JSON.parse(r.stdout).results[0] };
   };
   const cursorDir = path.join(home, '.cursor');
@@ -1039,8 +1040,8 @@ test('CLI: Cursor installed but never launched (no ~/.cursor yet) is connected, 
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'tally-cursor-'));
   const programFiles = fs.mkdtempSync(path.join(os.tmpdir(), 'tally-cursor-pf-'));
   const run = (args: string[]) => {
-    const r = spawnSync(process.execPath, [CLI, ...args, '--target', 'cursor', '--home', home, '--install-root', INSTALL, '--node', NODE, '--json'],
-      { encoding: 'utf-8', env: { ...process.env, ProgramFiles: programFiles } });
+    const r = spawnSync(process.execPath, [CLI, ...args, '--target', 'cursor', '--home', home, '--program-files', programFiles, '--install-root', INSTALL, '--node', NODE, '--json'],
+      { encoding: 'utf-8' });
     return { code: r.status, result: JSON.parse(r.stdout).results[0] };
   };
   const file = path.join(home, '.cursor', 'mcp.json');
@@ -1049,7 +1050,7 @@ test('CLI: Cursor installed but never launched (no ~/.cursor yet) is connected, 
       fs.mkdirSync(programFolder, { recursive: true });
       const applied = run(['apply']);
       assert.equal(applied.code, 0, programFolder);
-      assert.equal(applied.result.notInstalled, undefined, programFolder);
+      assert.equal(applied.result.notInstalled, undefined, `${programFolder}: ${applied.result.skipped}`);
       assert.equal(applied.result.wrote, true, programFolder);
       assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(file, 'utf-8')).mcpServers), ['tally-prime']);
       fs.rmSync(programFolder, { recursive: true, force: true });

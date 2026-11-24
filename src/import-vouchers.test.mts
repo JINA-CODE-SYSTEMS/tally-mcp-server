@@ -280,7 +280,9 @@ test('a 500-row CSV: preview with errors by row number, chunked post under one b
     assert.equal(journal.rows.filter((x: any) => x.status === 'success').length, 496);
     assert.deepEqual(journal.rows[249].sourceRows, [251]);
     assert.equal(journal.rows[249].status, 'error');
-    assert.equal(journal.source.path, fs.realpathSync(file));
+    // .native, as the server uses: on Windows only the native call expands 8.3 short names
+    // (C:\\Users\\RUNNER~1 -> C:\\Users\\runneradmin), and the temp folder is reached through one.
+    assert.equal(journal.source.path, fs.realpathSync.native(file));
 
     // 3. Fix the file and the ledger, resume: only the 4 missing vouchers are sent.
     fs.writeFileSync(file, statement(500, false));
